@@ -50,6 +50,14 @@ pub const OPEN_GETS: usize = 4;
 pub const WINDOW_CREDITS: u32 = 2;
 pub const MAX_CHAIN: usize = 65_536;
 pub const NO_PROGRESS: Duration = Duration::from_secs(3);
+
+/// Whether an operation that has been idle for `idle` has stalled. A put whose client has
+/// delivered everything (`delivered`) waits on this manager's own disk, whose jobs queue behind
+/// each other, so it has stalled only if the disk made no progress either (`disk_idle`, `None`
+/// when no job is outstanding). Otherwise the idle time alone decides.
+fn stalled(idle: Duration, delivered: bool, disk_idle: Option<Duration>) -> bool {
+    idle >= NO_PROGRESS && !(delivered && disk_idle.is_some_and(|disk| disk < NO_PROGRESS))
+}
 pub const DEFAULT_MAX_WINDOW: u64 = 4 * 1024 * 1024;
 pub const DEFAULT_REMOTE_CATALOG: usize = 1_000_000;
 
@@ -756,6 +764,8 @@ pub struct Store {
     sessions: HashMap<u64, Session>,
     jobs: HashMap<u64, Job>,
     job_counter: u64,
+    /// The last time any disk job finished, or the last tick with none outstanding.
+    disk_progress: Instant,
     clock: u64,
     boot: u64,
     counter: u64,
@@ -877,6 +887,7 @@ impl Store {
             sessions: HashMap::new(),
             jobs: HashMap::new(),
             job_counter: 0,
+            disk_progress: Instant::now(),
             clock: 0,
             boot: u64::from_le_bytes(nonce),
             counter: 0,
@@ -5713,6 +5724,9 @@ impl Store {
                 completions.push(completion);
             }
         }
+        if !completions.is_empty() {
+            self.disk_progress = Instant::now();
+        }
         for completion in completions {
             self.metrics.nvme_bytes += completion.bytes;
             self.metrics.nvme_seconds += completion.elapsed.as_secs_f64();
@@ -6399,15 +6413,20 @@ impl Store {
         for session in self.sessions.values_mut() {
             session.budget.refill(now);
         }
+        if self.jobs.is_empty() {
+            self.disk_progress = now;
+        }
         self.timeouts();
         self.room();
     }
 
     fn timeouts(&mut self) {
         let mut expired = Vec::new();
+        let disk_idle = (!self.jobs.is_empty()).then(|| self.disk_progress.elapsed());
         for (connection, session) in &self.sessions {
             for (transfer, open) in &session.ops {
-                if open.progress.elapsed() >= NO_PROGRESS {
+                let delivered = matches!(&open.operation, Operation::Put(put) if put.committed);
+                if stalled(open.progress.elapsed(), delivered, disk_idle) {
                     expired.push((*connection, *transfer));
                 }
             }
@@ -7719,6 +7738,22 @@ fn validate_commit(put: &mut Put, descriptor: &Descriptor) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_delivered_put_waits_while_the_disk_makes_progress() {
+        use super::{NO_PROGRESS, stalled};
+        use std::time::Duration;
+        let long = NO_PROGRESS + Duration::from_secs(1);
+        let short = Duration::from_millis(10);
+        // Waiting on the client for too long is a stall.
+        assert!(stalled(long, false, Some(short)));
+        assert!(!stalled(short, false, None));
+        // Everything delivered and the disk busy but moving: not a stall, however long.
+        assert!(!stalled(long, true, Some(short)));
+        // The disk has made no progress either, or nothing is queued for it.
+        assert!(stalled(long, true, Some(long)));
+        assert!(stalled(long, true, None));
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
