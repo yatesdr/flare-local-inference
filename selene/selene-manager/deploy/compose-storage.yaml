@@ -1,0 +1,40 @@
+# A storage node: holds the pool and serves PeerCache to other managers over mutual TLS.
+# See docs/network-operations.md for the topology, certificates and sizing.
+#
+# TLS material, mounted read-only at /tls: ca.pem, server.pem, server-key.pem.
+# The peer and data listeners accept connections from the network; publish them only to
+# the hosts that run the near managers.
+services:
+  storage:
+    image: ${MANAGER_IMAGE:-selene:local}
+    user: "${CACHE_UID:-1000}:${CACHE_GID:-1000}"
+    command:
+      - --name
+      - pool
+      - --root
+      - /var/lib/selene
+      - --memory
+      - 16G
+      - --nvme
+      - 1T
+      - --staging
+      - 1G
+      - --listen-peer
+      - 0.0.0.0:9200
+      - --listen-data
+      - 0.0.0.0:9201
+      - --tls-cert
+      - /tls/server.pem
+      - --tls-key
+      - /tls/server-key.pem
+      - --tls-ca
+      - /tls/ca.pem
+      - --metrics
+      - 0.0.0.0:9108
+    volumes:
+      - ${SELENE_DATA:-/var/lib/selene}:/var/lib/selene
+      - ./tls:/tls:ro
+    ports:
+      - "9200:9200"
+      - "9201:9201"
+    restart: unless-stopped
