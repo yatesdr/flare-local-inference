@@ -586,8 +586,12 @@ Offload limits interference through bounded work and explicit ownership:
   the GPU has already lost; the derived default's lower clamp exists for the
   staging minimum, and the sizing guidance for operators is a pool whose row
   slabs exceed the GPU's state rows.
+- Pool: `--prefix-cache-pool ADDRESS` and `--prefix-cache-pool-tenant NAME`,
+  the tenant only with the pool; see
+  [section 2.15](#215-sharing-through-a-pool). Unset, the instance uses its
+  local tiers only.
 - `LoadOptions` gains `prefix_cache: PrefixCacheOffload` with the resolved
-  memory size, directory, limit, and transport.
+  memory size, directory, limit, transport, and pool.
 - The startup phase reports the selected store, transport, pool sizes, the
   directory, the limit, and the scanned record count.
 - The GPU prefix cache remains derived, as the CLI design specifies. Host
@@ -758,6 +762,70 @@ or until rank zero's connection ends. When the peer's own drain is not
 confirmed, the peer retains its transport, transfer threads, disk thread, and
 registered staging together and exits with the error, rather than releasing
 memory its transfers may still use.
+
+### 2.15 Sharing through a pool
+
+`--prefix-cache-pool ADDRESS` and `--prefix-cache-pool-tenant NAME` attach the
+instance to a pool manager, at `unix:PATH` on this host or `HOST:PORT`. The
+tenant requires the pool and defaults to the pool's default scope; it scopes
+what the manager shares, so nothing crosses tenants. Without the pool flag none
+of the code below runs: the worker builds no lookup history, tracks no evictions, sees no export requests, and
+local tiers behave as in the earlier sections. A pooled instance still reads
+its own memory and disk tiers first; the pool supplies what they lack.
+
+The worker's part is a set of defaulted `PrefixStore` hooks, all run on the
+model worker thread and none waiting on the network.
+
+- **Exports.** The store reports an `ExportRequested` event through `poll`.
+  `service_store` answers it in the same iteration: it finds the checkpoint by
+  key and generation (`NotFound`, `GenerationChanged`), describes the chain
+  from the requested start page (`ChainGap` when nothing can be exported),
+  checks headroom (`NoHeadroom`), pins the checkpoint with `pin_checkpoint`,
+  records the export in a map from export to checkpoint, and then calls
+  `export_pinned`. The pin therefore exists before the store hears of the
+  export, and eviction, which also runs on the worker, cannot interleave.
+  `ExportEnded` is the only release: it removes the map entry and unpins once,
+  and a second end for the same export finds nothing. An export the store never
+  ends, because its copies could not be drained, keeps its pin. A store that
+  rejects a pinned export gets the pin back at once. The store, which knows the
+  record sizes, refuses an export larger than the staging the manager reserved.
+- **Headroom.** `RequestScheduler::export_fits` is read-only. It asks whether,
+  with the checkpoint pinned, the free pages and rows, those awaiting
+  retirement fences, and what eviction could still reclaim cover the next step
+  of every running decode and the request admission would take next, the first
+  eligible one, parked before pending. `Cache::reclaimable_if_pinned` runs the
+  cache's own leaf and compaction rules on the pin-adjusted counts, so a
+  branching ancestor or a directly pinned one keeps its row and the rest does
+  not; snapshot aliases go through the same `projected_fits` arithmetic that
+  admission uses, and the next request's pages come from `admission_pages`,
+  which admission also uses. A pin is never revoked once a copy has started.
+- **Evictions.** Every `Cache::evict` call goes through
+  `RequestScheduler::evict`, which queues the key and generation of each
+  retired checkpoint, and for a compaction the child that took its pages. The
+  worker passes them to `PrefixStore::evicted` before the next `store`. The
+  notice is sent when the checkpoint is logically retired, not at its fence;
+  the pin of an export in flight keeps a leaf from being evicted and
+  compaction never moves pages. The queue is bounded like the publication
+  queue; when it drops its oldest entries the worker calls
+  `PrefixStore::evictions_lost`, so the pool client announces holdings again.
+- **Lookups.** When a request reaches the worker, the worker builds its prefix
+  history once and calls `begin_lookup`; the store returns a ticket whose state
+  never waits for a reply, and the ticket stays on the request while it queues.
+  Admission passes it to `lookup_for`, which answers from the local tiers and
+  adds pool candidates only if the ticket is ready, so a late answer costs
+  nothing. When the request is admitted the worker clears the ticket, which
+  withdraws a lookup still on the wire. A request that waits on capacity keeps
+  it for the next attempt, a cancelled one drops it with the request, and a
+  request readmitted without the store after a failed restore starts none.
+- **Two sources.** A restore reads at most two parts: the longest prefix held
+  at the closest level, then one farther source from exactly where that part
+  ends, with the endpoint's row from whichever ends last. The parts are planned
+  by the store, which holds the first locally before planning the second; to the
+  worker the restore is one inbound ticket and one `Fetched` event, after both
+  parts' writes drain, and a failure of either discards the destination pages.
+
+A pooled instance supports a single host. Multi-host packages keep disk-only
+retention and do not use a pool.
 
 ## 3. Implementation sequence
 
