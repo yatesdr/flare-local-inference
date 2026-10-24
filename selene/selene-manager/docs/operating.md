@@ -48,7 +48,15 @@ block, rounded up to the allocator's size class), so the source's GPU pin lasts 
 device-to-host copy: with too little free staging the claim fails `NO_WINDOWS` at once and
 nothing is pinned. Host-tier exports that do not fit stream with two windows at a time. Provision
 staging for the largest export you expect to run concurrently times `export_slots` (default 2 per
-instance), plus the quarantined bytes below. The minimum is 8 MiB and the default 256 MiB.
+instance), plus the quarantined bytes below. The minimum is 8 MiB and the default 4 GiB.
+
+One export of a long context needs staging for all of its pages and its row: a Qwen prefix of
+about 33,000 tokens did not fit the former 256 MiB default and was refused `NO_WINDOWS` on every
+request, so the requester recomputed it. When the first session of a scope arrives the manager
+logs, once for that scope, how many tokens of context one export can hold in the configured
+staging and warns if that is under 262,144 tokens (Flare's usual per-request limit; the manager
+does not know a model's real maximum). The warning names the staging size that would hold it.
+Size `--staging` from that line and from your longest contexts.
 
 `--nvme` is the durable budget and includes the 4096-byte envelope per record. It must exceed the
 largest record an instance can put, or the put is refused `OVERSIZE`. Keep it above `--memory`:
