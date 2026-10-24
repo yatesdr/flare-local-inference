@@ -37,6 +37,7 @@ io-uring = "0.7"
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
+flare-selene-manager = { path = "../selene-manager" }
 rcgen = { version = "0.14", features = ["pem"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
 tokio-stream = { version = "0.1", features = ["net"] }
