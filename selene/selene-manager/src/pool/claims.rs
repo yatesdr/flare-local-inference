@@ -107,7 +107,11 @@ pub struct ManagerGet {
     pub meta: std::collections::HashMap<u32, Vec<u8>>,
     /// The chain page at which each record's tail starts.
     pub starts: Vec<u64>,
+    /// The store has finished its reads into the windows (its drain).
     pub done: bool,
+    /// The requester's exact COPY_OK arrived before the store's drain; the claim
+    /// completes when `done` does.
+    pub copied: bool,
     pub transfer_released: bool,
 }
 
@@ -568,6 +572,7 @@ impl Core {
                     })
                     .collect(),
                 done: false,
+                copied: false,
                 transfer_released: false,
             }),
         };
@@ -703,8 +708,13 @@ impl Core {
                 );
             }
             Ok(GetAnswer::Done) => {
+                let mut copied = false;
                 if let Some(manager) = claim.manager.as_mut() {
                     manager.done = true;
+                    copied = manager.copied;
+                }
+                if copied && !terminal {
+                    self.finish(key, v2::ClaimState::Copied, v2::ClaimReason::ReasonNone);
                 }
             }
             Ok(GetAnswer::Refused(refused)) => {
@@ -1088,13 +1098,23 @@ impl Core {
                     .iter()
                     .map(|window| u64::from(window.plan.page_count))
                     .sum();
-                let store_done = claim.manager.as_ref().is_none_or(|manager| {
-                    manager.done
-                        && pages == claim.total_pages
-                        && (!claim.want_row || claim.windows.iter().any(|window| window.plan.row))
-                });
-                if covered && store_done && claim.all_windows_done() && !claim.windows.is_empty() {
+                let exact = pages == claim.total_pages
+                    && (!claim.want_row || claim.windows.iter().any(|window| window.plan.row));
+                let complete =
+                    covered && exact && claim.all_windows_done() && !claim.windows.is_empty();
+                let store_done = claim.manager.as_ref().is_none_or(|manager| manager.done);
+                if complete && store_done {
                     self.finish(key, v2::ClaimState::Copied, v2::ClaimReason::ReasonNone);
+                } else if complete {
+                    // The copy is exact; the store has not yet reported that its own reads
+                    // into the windows have drained. Completing waits for that.
+                    if let Some(manager) = self
+                        .claims
+                        .get_mut(&key)
+                        .and_then(|claim| claim.manager.as_mut())
+                    {
+                        manager.copied = true;
+                    }
                 } else {
                     self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
                 }
@@ -1537,4 +1557,173 @@ fn shapes_of(walk: &super::index::ChainWalk, want_row: bool) -> Vec<RecordShape>
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        arena::Arena,
+        pool::core::{Core, PoolConfig, Session},
+    };
+    use std::collections::HashSet;
+    use tokio::sync::mpsc;
+
+    const INSTANCE: InstanceId = [1; 16];
+    const NONCE: Nonce = [2; 16];
+
+    fn core() -> (Core, mpsc::Receiver<v2::ServerMessage>) {
+        let (mut core, _handle, _events) = Core::new(
+            PoolConfig::default(),
+            v2::SharedMemory::default(),
+            Arena::new(1 << 20).unwrap(),
+            true,
+            0,
+            None,
+        );
+        let (tx, rx) = mpsc::channel(64);
+        core.sessions.insert(
+            1,
+            Session {
+                sid: 1,
+                instance: INSTANCE,
+                nonce: NONCE,
+                scope: [3; 32],
+                tx,
+                shm: true,
+                pid: 1,
+                export_slots: 2,
+                claim_slots: 2,
+                need_resync: false,
+                resync_requested: false,
+                expected_next: 1,
+                staged: None,
+                lookups: HashSet::new(),
+                goodbye: None,
+                installed_once: true,
+                overflowed: false,
+            },
+        );
+        (core, rx)
+    }
+
+    /// A claim on the manager's store whose five pages and row were all delivered and
+    /// released.
+    fn delivered(core: &mut Core) -> ClaimKey {
+        let key: ClaimKey = (INSTANCE, NONCE, 1);
+        let plan = PlannedWindow {
+            index: 0,
+            record: 0,
+            first_page: 0,
+            page_count: 5,
+            row: true,
+            length: 6 * 4096,
+        };
+        let now = Instant::now();
+        core.claims.insert(
+            key,
+            Claim {
+                key,
+                requester_sid: 1,
+                source: SourceId::Manager,
+                source_proc: None,
+                source_sid: 0,
+                endpoint: Key::default(),
+                want_row: true,
+                state: v2::ClaimState::Copying,
+                reason: v2::ClaimReason::Unspecified,
+                deadline: now + Duration::from_secs(30),
+                last_progress: now,
+                pin_deadline: now,
+                export_id: 0,
+                export: ExportState::None,
+                records: Vec::new(),
+                total_pages: 5,
+                row: true,
+                retained: false,
+                reserved_bytes: 0,
+                block: None,
+                windows: vec![Win {
+                    plan,
+                    region: v2::Region::Staging as i32,
+                    offset: 0,
+                    phase: Phase::Free,
+                    extent: None,
+                    page_xxh3: Vec::new(),
+                    row_xxh3: 0,
+                }],
+                requester_fence: Party::Pending,
+                source_fence: Party::Idle,
+                terminal_at: None,
+                granted_at: Some(now),
+                page_bytes: 4096,
+                row_bytes: 4096,
+                manager: Some(ManagerGet {
+                    checks: Default::default(),
+                    meta: Default::default(),
+                    starts: vec![0],
+                    done: false,
+                    copied: false,
+                    transfer_released: false,
+                }),
+            },
+        );
+        key
+    }
+
+    fn copy_ok() -> v2::CopyResult {
+        v2::CopyResult {
+            claim_id: 1,
+            outcome: v2::CopyOutcome::CopyOk as i32,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn copy_ok_before_the_stores_drain_completes_when_it_arrives() {
+        let (mut core, _out) = core();
+        let key = delivered(&mut core);
+        core.copy_result(1, copy_ok()).unwrap();
+        assert!(
+            !core.claims[&key].is_terminal(),
+            "waits for the store's drain"
+        );
+        core.get_answer(key, Ok(GetAnswer::Done));
+        assert_eq!(core.claims[&key].state, v2::ClaimState::Copied);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn copy_ok_after_the_stores_drain_completes_at_once() {
+        let (mut core, _out) = core();
+        let key = delivered(&mut core);
+        core.get_answer(key, Ok(GetAnswer::Done));
+        assert!(!core.claims[&key].is_terminal());
+        core.copy_result(1, copy_ok()).unwrap();
+        assert_eq!(core.claims[&key].state, v2::ClaimState::Copied);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_store_error_after_an_early_copy_ok_fails_the_claim() {
+        let (mut core, _out) = core();
+        let key = delivered(&mut core);
+        core.copy_result(1, copy_ok()).unwrap();
+        core.get_answer(
+            key,
+            Ok(GetAnswer::Refused(crate::store::Refused {
+                reason: 8,
+                detail: "disk read failed".into(),
+            })),
+        );
+        assert_eq!(core.claims[&key].state, v2::ClaimState::Failed);
+        assert_eq!(core.claims[&key].reason, v2::ClaimReason::CopyError);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_inexact_copy_ok_still_fails_whatever_the_store_says() {
+        let (mut core, _out) = core();
+        let key = delivered(&mut core);
+        core.claims.get_mut(&key).unwrap().total_pages = 6;
+        core.get_answer(key, Ok(GetAnswer::Done));
+        core.copy_result(1, copy_ok()).unwrap();
+        assert_eq!(core.claims[&key].state, v2::ClaimState::Failed);
+    }
 }
