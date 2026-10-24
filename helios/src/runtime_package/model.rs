@@ -1053,6 +1053,7 @@ mod tests {
                 disk: Some("unopened-prefix-cache".into()),
                 disk_limit: Some(0),
                 transport: Some(crate::offload::Transport::Direct),
+                pool: None,
             },
         ] {
             let options = LoadOptions {
