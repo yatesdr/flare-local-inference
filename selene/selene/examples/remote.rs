@@ -10,8 +10,10 @@
 //! Modes: `check` puts the records and restores each once, comparing every page with what
 //! was put; `bench` times the puts and `--rounds` restores of each record without keeping
 //! the pages; `hang` starts a large restore and then waits, for a harness that kills this
-//! process in the middle of it. The device is simulated, so the numbers are the network and
-//! the host copies, not a GPU.
+//! process in the middle of it. `export` offers the records as host records of its own and
+//! serves the manager's export requests for `--seconds`; `import` (or `import-check`, which
+//! compares every page) restores what another instance exports, through the manager's relay.
+//! The device is simulated, so the numbers are the network and the host copies, not a GPU.
 
 use std::{
     sync::{Arc, Mutex},
@@ -25,8 +27,9 @@ use flare_selene::{
     geometry::fingerprint,
     plan::{self, Identity, Request},
     pool::{
-        Checksums, FetchPart, LookupState, PoolAddress, PoolClient, PoolConfig, PoolEvent,
-        PoolFetch, PoolStatus, PutBytes, PutRequest, PutSource, Scope,
+        Checksums, FetchPart, HostChain, HostPin, HostRecord, HostWindow, IndexEntry, LookupState,
+        PoolAddress, PoolClient, PoolConfig, PoolEvent, PoolFetch, PoolStatus, PutBytes,
+        PutRequest, PutSource, Scope, Tier,
     },
     record::checksum,
     testing::{SimulatedGpu, TestHistory, geometry},
@@ -45,6 +48,7 @@ struct Options {
     rounds: usize,
     name: String,
     gpu: u8,
+    seconds: u64,
 }
 
 fn options() -> Options {
@@ -58,6 +62,7 @@ fn options() -> Options {
         rounds: 3,
         name: "remote".into(),
         gpu: 1,
+        seconds: 3600,
     };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -74,6 +79,7 @@ fn options() -> Options {
             "--rounds" => options.rounds = value.parse().unwrap(),
             "--name" => options.name = value,
             "--gpu" => options.gpu = value.parse().unwrap(),
+            "--seconds" => options.seconds = value.parse().unwrap(),
             other => panic!("unknown option {other}"),
         }
     }
@@ -181,6 +187,22 @@ impl PutBytes for Record {
             pages: self.sums[first as usize..][..count as usize].to_vec(),
             row: row.then_some(self.row),
         })
+    }
+}
+
+/// A host record this instance exports: the pages of `Record`, pinned for the manager.
+struct ExportPin {
+    chain: HostChain,
+    record: Record,
+}
+
+impl HostPin for ExportPin {
+    fn chain(&self) -> &HostChain {
+        &self.chain
+    }
+    fn read(&mut self, window: &HostWindow, dst: &mut [u8]) -> Result<Checksums> {
+        self.record
+            .fill(window.first_page as u64, window.page_count, window.row, dst)
     }
 }
 
@@ -313,7 +335,7 @@ fn main() {
         &[("k", page as u64 / 2), ("v", page as u64 / 2)],
         ROW as u64,
     )];
-    let keep = o.mode == "check";
+    let keep = matches!(o.mode.as_str(), "check" | "import-check");
     let (copier, memory) = if keep {
         let (copier, memory) = SimulatedGpu::shared(&geo).unwrap();
         (copier, Some(memory))
@@ -369,7 +391,8 @@ fn main() {
     // Put every record, timing each.
     let record_bytes = (o.pages * page + ROW) as f64;
     let mut put_secs = Vec::new();
-    for record in 0..o.records {
+    let puts = !matches!(o.mode.as_str(), "export" | "import" | "import-check");
+    for record in 0..if puts { o.records } else { 0 } {
         let history = history_for(record, o.pages);
         let key = history.key_at(o.pages as u64 * PT).unwrap();
         let request = PutRequest {
@@ -402,6 +425,117 @@ fn main() {
 
     let scratch: Vec<u32> = (0..o.pages as u32).collect();
     match o.mode.as_str() {
+        "export" => {
+            for record in 0..o.records {
+                let history = history_for(record, o.pages);
+                let key = history.key_at(o.pages as u64 * PT).unwrap();
+                pool.client.saved(IndexEntry {
+                    key,
+                    parent: None,
+                    bucket: history.bucket_at(key.consumed_tokens).unwrap(),
+                    tail_pages: o.pages as u32,
+                    row: true,
+                    tier: Tier::Dram,
+                    generation: 1,
+                    bytes: record_bytes as u64,
+                });
+            }
+            let keys: Vec<_> = (0..o.records)
+                .map(|r| history_for(r, o.pages).key_at(o.pages as u64 * PT).unwrap())
+                .collect();
+            println!("serving");
+            let deadline = Instant::now() + Duration::from_secs(o.seconds);
+            let (mut served, mut ended) = (0, 0);
+            while Instant::now() < deadline {
+                let mut fresh = Vec::new();
+                pool.client.poll(&mut fresh).unwrap();
+                for event in fresh {
+                    match event {
+                        PoolEvent::Export(request) => {
+                            let record = keys
+                                .iter()
+                                .position(|k| *k == request.key)
+                                .expect("an export of a record this instance offered");
+                            pool.client.host_pinned(
+                                request.export,
+                                Box::new(ExportPin {
+                                    chain: HostChain {
+                                        records: vec![HostRecord {
+                                            key: request.key,
+                                            generation: request.generation,
+                                            first_page: 0,
+                                            pages: o.pages as u32,
+                                            row: true,
+                                        }],
+                                        total_pages: o.pages as u64,
+                                        row: true,
+                                    },
+                                    record: Record::new(record, o.pages, page),
+                                }),
+                            );
+                            served += 1;
+                        }
+                        PoolEvent::ExportEnded { .. } => ended += 1,
+                        _ => {}
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            println!("exports_served={served} ended={ended}");
+        }
+        "import" | "import-check" => {
+            // Wait for the manager to offer what the other instance exports.
+            let probe = history_for(0, o.pages);
+            wait("a candidate", Duration::from_secs(60), || {
+                let ticket = pool.client.begin_lookup(&probe, Vec::new());
+                let answer = wait("a lookup", Duration::from_secs(10), || {
+                    match ticket.state() {
+                        LookupState::Pending => None,
+                        LookupState::Ready(answer) => Some(Some(answer)),
+                        LookupState::None => Some(None),
+                    }
+                });
+                answer.filter(|a| !a.candidates.is_empty()).map(|_| ())
+            });
+            let mut totals = Vec::new();
+            let mut lookups = Vec::new();
+            for _ in 0..o.rounds {
+                for record in 0..o.records.max(1) {
+                    let (lookup, total) = pool.restore(&o, &identity, record, &scratch);
+                    lookups.push(lookup);
+                    totals.push(total);
+                    if keep {
+                        let memory = memory.as_ref().unwrap();
+                        let pages = memory.pages.lock().unwrap();
+                        for index in 0..o.pages {
+                            assert_eq!(
+                                pages[&scratch[index]],
+                                page_bytes(record, index, page),
+                                "record {record} page {index}"
+                            );
+                        }
+                        assert_eq!(
+                            memory.rows.lock().unwrap()[&9],
+                            page_bytes(record, o.pages, ROW),
+                            "record {record} row"
+                        );
+                    }
+                }
+            }
+            totals.sort_by(f64::total_cmp);
+            let sum: f64 = totals.iter().sum();
+            println!(
+                "restores={} restore_mib_per_s={:.1} restore_ms_mean={:.2} restore_ms_median={:.2} restore_ms_min={:.2} restore_ms_max={:.2} lookup_ms_mean={:.2}{}",
+                totals.len(),
+                totals.len() as f64 * record_bytes / (1 << 20) as f64 / sum,
+                sum / totals.len() as f64 * 1000.0,
+                totals[totals.len() / 2] * 1000.0,
+                totals[0] * 1000.0,
+                totals[totals.len() - 1] * 1000.0,
+                lookups.iter().sum::<f64>() / lookups.len() as f64 * 1000.0,
+                if keep { " verified=true" } else { "" }
+            );
+        }
         "check" => {
             for record in 0..o.records {
                 pool.restore(&o, &identity, record, &scratch);
