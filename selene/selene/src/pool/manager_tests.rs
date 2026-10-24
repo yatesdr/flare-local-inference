@@ -135,6 +135,7 @@ impl Manager {
         net.socket = manager.socket.clone();
         net.socket_explicit = true;
         net.memory = 16 << 20;
+        net.staging = 8 << 20;
         net.listen = Some(free());
         net.listen_data = Some(free());
         net.metrics = Some(free());
