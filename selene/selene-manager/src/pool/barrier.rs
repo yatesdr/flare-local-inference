@@ -16,7 +16,7 @@ use std::{
 const FILE: &str = "instances";
 const HEADER: &str = "selene-instances-v2";
 
-/// Instance ids with the unix time each was last seen.
+/// Instance ids with the unix time (milliseconds) each was last seen.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Remembered {
     seen: BTreeMap<InstanceId, u64>,
@@ -40,7 +40,7 @@ impl Remembered {
                 ),
             ));
         }
-        let oldest = unix(now).saturating_sub(retention.as_secs());
+        let oldest = unix(now).saturating_sub(retention.as_millis() as u64);
         for line in lines {
             let Some((id, time)) = line.split_once(' ') else {
                 continue;
@@ -79,7 +79,7 @@ impl Remembered {
     }
 
     pub fn forget_older_than(&mut self, retention: Duration, now: SystemTime) {
-        let oldest = unix(now).saturating_sub(retention.as_secs());
+        let oldest = unix(now).saturating_sub(retention.as_millis() as u64);
         self.seen.retain(|_, time| *time >= oldest);
     }
 
@@ -102,7 +102,7 @@ impl Remembered {
 
 fn unix(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
+        .map_or(0, |duration| duration.as_millis() as u64)
 }
 
 pub fn hex(bytes: &[u8]) -> String {

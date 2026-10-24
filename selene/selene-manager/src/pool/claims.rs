@@ -238,9 +238,23 @@ impl Core {
         let (scope_id, shm, claim_slots) = (session.scope, session.shm, session.claim_slots);
         let key: ClaimKey = (instance, nonce, m.claim_id);
         if let Some(existing) = self.claims.get(&key) {
-            if existing.is_terminal() {
+            let replied = existing
+                .terminal_at
+                .is_some_and(|at| at.elapsed() < self.cfg.reply_retention);
+            if existing.is_terminal() && replied {
                 let message = self.terminal_message(existing);
                 self.send(sid, M::ClaimTerminal(message));
+            } else if existing.is_terminal() {
+                // The reply is gone; the record stays for its fences. A repeat is a replay.
+                self.send(
+                    sid,
+                    M::ClaimTerminal(v2::ClaimTerminal {
+                        claim_id: m.claim_id,
+                        state: v2::ClaimState::Failed as i32,
+                        reason: v2::ClaimReason::InvalidClaim as i32,
+                        fence_required: false,
+                    }),
+                );
             }
             return Ok(());
         }
@@ -531,7 +545,6 @@ impl Core {
         let limits = self.cfg.limits.clone();
         let claim = self.claims.get(&key).expect("claim exists");
         let bad = |core: &mut Core, reason: v2::ClaimReason| {
-            core.cancel_export(key, reason);
             core.finish(key, v2::ClaimState::Failed, reason);
         };
         if ack.records.is_empty() || ack.records.len() > limits.max_chain_nodes as usize {
@@ -664,7 +677,6 @@ impl Core {
         let outstanding = claim.unreleased();
         let (export_id, source_sid) = (claim.export_id, claim.source_sid);
         if specs.is_empty() && starved && outstanding == 0 {
-            self.cancel_export(key, v2::ClaimReason::NoWindows);
             self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::NoWindows);
             return;
         }
@@ -711,7 +723,6 @@ impl Core {
         }
         let status = v2::FillStatus::try_from(m.status).unwrap_or(v2::FillStatus::Unspecified);
         if status == v2::FillStatus::FillFailed {
-            self.cancel_export(key, v2::ClaimReason::CopyError);
             self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
             return Ok(());
         }
@@ -720,7 +731,6 @@ impl Core {
         }
         let plan = window.plan;
         if m.page_xxh3.len() != plan.page_count as usize || m.has_row != plan.row {
-            self.cancel_export(key, v2::ClaimReason::CopyError);
             self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
             return Ok(());
         }
@@ -805,20 +815,16 @@ impl Core {
                 if covered && claim.all_windows_done() && !claim.windows.is_empty() {
                     self.finish(key, v2::ClaimState::Copied, v2::ClaimReason::ReasonNone);
                 } else {
-                    self.cancel_export(key, v2::ClaimReason::CopyError);
                     self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
                 }
             }
             v2::CopyOutcome::CopyChecksum => {
-                self.cancel_export(key, v2::ClaimReason::Checksum);
                 self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::Checksum);
             }
             v2::CopyOutcome::CopyErrorOutcome => {
-                self.cancel_export(key, v2::ClaimReason::CopyError);
                 self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
             }
             v2::CopyOutcome::CopyAbandoned => {
-                self.cancel_export(key, v2::ClaimReason::Cancelled);
                 self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::Cancelled);
             }
             v2::CopyOutcome::Unspecified => {
@@ -846,11 +852,16 @@ impl Core {
                 );
             }
             Some(claim) if claim.is_terminal() => {
-                let message = self.terminal_message(claim);
-                self.send(sid, M::ClaimTerminal(message));
+                // Answered again while the reply is kept; a no-op afterwards.
+                if claim
+                    .terminal_at
+                    .is_some_and(|at| at.elapsed() < self.cfg.reply_retention)
+                {
+                    let message = self.terminal_message(claim);
+                    self.send(sid, M::ClaimTerminal(message));
+                }
             }
             Some(_) => {
-                self.cancel_export(key, v2::ClaimReason::Cancelled);
                 self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::Cancelled);
             }
         }

@@ -2036,8 +2036,12 @@ pub fn run_peer(
     let admin_backend: Arc<dyn crate::admin::AdminBackend> = Arc::new(StoreAdmin {
         commands: commands.clone(),
     });
-    let admin_stop = stop.clone();
-    let final_stop = stop.clone();
+    // The network listeners outlive the stop request until the pool has drained its claims.
+    let admin_stop = Arc::new(AtomicBool::new(false));
+    let serve_stop = admin_stop.clone();
+    let final_stop = serve_stop.clone();
+    let drain_wait =
+        Duration::from_millis(u64::from(pool_settings.limits.max_claim_deadline_ms) + 2000);
     runtime.block_on(async move {
         let listener = tokio::net::UnixListener::from_std(listener)?;
         let incoming = UnixListenerStream::new(listener).map(move |stream| {
@@ -2167,7 +2171,7 @@ pub fn run_peer(
             }
             None => None,
         };
-        let signal_stop = final_stop.clone();
+        let signal_stop = async_stop.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = terminate.recv() => {}
@@ -2176,25 +2180,32 @@ pub fn run_peer(
             signal_stop.store(true, Ordering::Release);
         });
         let server = server.serve_with_incoming(incoming);
+        // A stop request first lets the pool finish the claims in flight, then closes
+        // its sessions; only then do the listeners stop.
+        let drain = {
+            let events = pool_handle.events.clone();
+            async move {
+                watcher(async_stop).await;
+                let (done, finished) = oneshot::channel();
+                if events
+                    .send(crate::pool::core::Event::Shutdown { done })
+                    .await
+                    .is_ok()
+                {
+                    let _ = tokio::time::timeout(drain_wait, finished).await;
+                }
+            }
+        };
         let local = tokio::select! {
             result = server => result
                 .map_err(|error| invalid(format!("server: {error}"))),
             // A long-lived subscription would make a graceful shutdown wait for the peer to
             // close it; the manager owns the session and stops it.
-            _ = watcher(async_stop) => Ok(()),
+            _ = drain => Ok(()),
         };
         // A local-server error must not leave the TCP listeners waiting for a stop that no
         // signal will set.
-        final_stop.store(true, Ordering::Release);
-        let (done, finished) = oneshot::channel();
-        if pool_handle
-            .events
-            .send(crate::pool::core::Event::Shutdown { done })
-            .await
-            .is_ok()
-        {
-            let _ = tokio::time::timeout(Duration::from_secs(5), finished).await;
-        }
+        serve_stop.store(true, Ordering::Release);
         pool_task.abort();
         if let Some(task) = peer_task {
             let _ = task.await;
