@@ -13,6 +13,12 @@
 !helios/proto/**
 !helios/native/
 !helios/native/**
+!selene/
+!selene/selene/
+!selene/selene/Cargo.toml
+!selene/selene/Cargo.lock
+!selene/selene/src/
+!selene/selene/src/**
 !ignition/recipes/qwen38/assets/
 !ignition/recipes/qwen38/assets/**
 !ignition/recipes/step5/assets/
