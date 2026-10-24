@@ -1159,6 +1159,58 @@ fn a_failed_a_claim_stops_b_from_ever_being_claimed() {
     assert!(fetched(&rig.events())[0].1.is_err());
 }
 
+#[test]
+fn when_a_fails_after_b_was_granted_b_is_released_and_the_restore_fails_once() {
+    let mut rig = Rig::new();
+    rig.open();
+    let out = rig.command(Command::Fetch(two_parts()));
+    let a = pick!(out, Claim)[0].claim_id;
+    let b = pick!(
+        rig.send(grant(a, vec![record(key(128, 1), 0, 2, false)], 2, false)),
+        Claim
+    )[0]
+    .claim_id;
+    rig.send(grant(b, vec![record(key(192, 2), 0, 1, true)], 1, true));
+    let wb = ready(&rig, b, window(0, 0, 0, 1, true, 4 * PAGE), 2);
+    rig.send(In::WindowReady(wb));
+    let out = rig.send(terminal(
+        a,
+        wire::ClaimState::Failed,
+        wire::ClaimReason::SourceLost,
+        true,
+    ));
+    assert_eq!(pick!(out, FenceAck).len(), 1, "A had nothing in flight");
+    assert!(
+        pick!(out, CopyResult).is_empty(),
+        "B's copy is still running"
+    );
+    assert!(fetched(&rig.events()).is_empty());
+    let out = rig.drain_copies();
+    assert_eq!(
+        pick!(out, CopyResult)[0].outcome,
+        wire::CopyOutcome::CopyAbandoned as i32
+    );
+    assert_eq!(fetched(&rig.events()).len(), 1);
+}
+
+#[test]
+fn goodbye_is_quiesced_only_when_nothing_is_left_to_drain() {
+    let mut rig = Rig::new();
+    rig.open();
+    rig.engine.goodbye();
+    let out = rig.engine.take_out();
+    assert!(pick!(out, Goodbye)[0].quiesced);
+    let (_, claim) = granted_single(&mut rig);
+    windows_for(&mut rig, claim);
+    rig.copier.lock().unwrap().stall = true;
+    rig.engine.goodbye();
+    let out = rig.engine.take_out();
+    assert!(
+        !pick!(out, Goodbye)[0].quiesced,
+        "copies still read the windows"
+    );
+}
+
 // ---- loss -------------------------------------------------------------------
 
 #[test]

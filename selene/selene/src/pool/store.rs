@@ -1435,4 +1435,28 @@ mod tests {
             [(ExportId(3), ExportRefusal::NotFound)]
         );
     }
+
+    #[test]
+    fn a_candidate_that_disagrees_with_the_history_is_dropped_and_the_others_kept() {
+        let mut rig = rig();
+        let mut forged = rig.candidate(Level::HostDram, 1, 0, 0, &[1200], 0);
+        forged.plan.nodes[0].key.digest[0] ^= 1;
+        forged.plan.key.digest[0] ^= 1;
+        let good = rig.candidate(Level::HostNvme, 2, 0, 0, &[800], 0);
+        rig.answer(vec![forged, good]);
+        let hit = rig.lookup().unwrap();
+        assert_eq!(hit.key, rig.key(800));
+    }
+
+    #[test]
+    fn a_candidate_starting_above_what_is_held_is_discarded_and_one_at_the_local_end_is_kept() {
+        let mut rig = rig();
+        // Nothing local and nothing resident: a candidate that begins at 800 leaves a hole.
+        rig.answer(vec![rig.candidate(Level::HostNvme, 2, 800, 0, &[1600], 0)]);
+        assert!(rig.lookup().is_none());
+        // With a local part ending at 800 it is the second part.
+        rig.local_hit(800, Local::Memory);
+        let hit = rig.lookup().unwrap();
+        assert_eq!(hit.key, rig.key(1600));
+    }
 }
