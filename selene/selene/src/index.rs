@@ -43,6 +43,10 @@ impl<L> Node<L> {
     pub fn pinned(&self) -> bool {
         self.pins > 0
     }
+    /// Access order: larger is more recent.
+    pub fn accessed(&self) -> u64 {
+        self.accessed
+    }
 }
 
 /// A chain of records that restores the endpoint `key` on top of a GPU
@@ -432,14 +436,13 @@ impl<L> Index<L> {
         Ok(removed)
     }
 
-    /// Retire the oldest eligible leaf or, when `need_row`, compactable ancestor.
-    pub fn evict(
-        &mut self,
+    /// The oldest eligible leaf or, when `need_row`, compactable ancestor.
+    pub fn candidate(
+        &self,
         need_row: bool,
         evictable: impl Fn(&Node<L>) -> bool,
-    ) -> Option<Eviction<L>> {
-        let candidate = self
-            .nodes
+    ) -> Option<PrefixKey> {
+        self.nodes
             .values()
             .filter(|node| {
                 node.ready
@@ -448,7 +451,16 @@ impl<L> Index<L> {
                     && (node.children == 0 || (need_row && node.row && node.children == 1))
             })
             .min_by_key(|node| (node.accessed, node.key.consumed_tokens))
-            .map(|node| node.key)?;
+            .map(|node| node.key)
+    }
+
+    /// Retire the oldest eligible leaf or, when `need_row`, compactable ancestor.
+    pub fn evict(
+        &mut self,
+        need_row: bool,
+        evictable: impl Fn(&Node<L>) -> bool,
+    ) -> Option<Eviction<L>> {
+        let candidate = self.candidate(need_row, evictable)?;
         if self.nodes[&candidate].children == 0 {
             return self.remove(&candidate).ok().map(Eviction::Leaves);
         }

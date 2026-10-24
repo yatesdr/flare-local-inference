@@ -197,6 +197,33 @@ pub enum StoreReason {
     Budget,
 }
 
+/// A record a host tier would drop under pressure. The tier keeps it, and the
+/// chain it needs, until [`HostStore::retired`] says what became of its move.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Retiring {
+    pub tier: PoolTier,
+    pub key: PrefixKey,
+    /// The generation the tier announced for the record.
+    pub generation: u64,
+    pub parent: Option<PrefixKey>,
+    pub bucket: [u8; 16],
+    /// Pages the record owns, counted from its parent.
+    pub tail_pages: usize,
+    pub row: bool,
+}
+
+/// How the move of a retiring record ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retirement {
+    /// The next tier holds a committed copy: the tier drops its own.
+    Moved,
+    /// There is no next tier to take it, or it failed twice: the tier drops it.
+    Dropped,
+    /// The move failed once: the tier keeps the record and offers it again
+    /// when it next needs room.
+    Failed,
+}
+
 /// A host tier the model worker drives without waiting on it.
 ///
 /// `store` and `fetch` enqueue work and return. `poll` reports completions.
@@ -279,6 +306,20 @@ pub trait HostStore {
     ) -> Result<Option<std::time::Duration>> {
         Ok(None)
     }
+    /// Join a pool: from now on a tier gives up a record only after the next
+    /// tier holds a committed copy, instead of writing every publication
+    /// through to the disk tier. Called once, before the first store.
+    fn cascade(&mut self) {}
+    /// Whether the last tier may hand its records on to the pool's manager
+    /// instead of dropping them. Set whenever the manager's availability changes.
+    fn set_spill(&mut self, _enabled: bool) {}
+    /// Records the last local tier wants to move to the manager, coldest first.
+    /// Each stays in place until [`HostStore::retired`] reports its move.
+    fn take_retiring(&mut self) -> Vec<Retiring> {
+        Vec::new()
+    }
+    /// The move of a retiring record ended.
+    fn retired(&mut self, _key: PrefixKey, _tier: PoolTier, _how: Retirement) {}
     /// Start looking for pool candidates for a request that just queued. `None`
     /// when no lookup is wanted or possible.
     fn begin_lookup(&mut self, _history: &dyn History) -> Option<LookupTicket> {

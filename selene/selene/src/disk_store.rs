@@ -32,8 +32,8 @@ use crate::{
 
 use super::{
     CacheGeometry, HostHit, HostStore, INITIAL_DIRECT_DISK_RATE, INITIAL_STAGED_DISK_RATE,
-    InboundTicket, JobId, Layout, PublishedCheckpoint, StoreEvent, StoreOutcome, StoreReason,
-    StoreStats, Tier, Transport,
+    InboundTicket, JobId, Layout, PublishedCheckpoint, Retirement, Retiring, StoreEvent,
+    StoreOutcome, StoreReason, StoreStats, Tier, Transport,
     copier::{self, Direction, PageCopier, SharedCopier},
     disk::{self, DiskThread, Operation},
     geometry::invalid,
@@ -1454,6 +1454,15 @@ pub struct DiskStore {
     outbound_rate: Rate,
     inbound_rate: Rate,
     announce: Option<Announce>,
+    /// Eviction hands records to the pool's manager instead of unlinking them.
+    spill: bool,
+    /// Records chosen for the manager and not yet taken by the pool store.
+    retiring: Vec<Retiring>,
+    /// Records held in place until their move ends, with the bytes freed when
+    /// they go.
+    held: HashMap<PrefixKey, u64>,
+    /// Records whose moves ended and that leave once nothing reads them.
+    finishing: Vec<PrefixKey>,
     pub directory_lock: record::DirectoryLock,
 }
 
@@ -1524,6 +1533,10 @@ impl DiskStore {
             outbound_rate: Rate(rate),
             inbound_rate: Rate(rate),
             announce: None,
+            spill: false,
+            retiring: Vec::new(),
+            held: HashMap::new(),
+            finishing: Vec::new(),
             directory_lock,
         })
     }
@@ -1729,6 +1742,7 @@ impl DiskStore {
                 NodeEvent::Gone => a.view.retire(&notice.key),
             }
         }
+        let _ = self.finish_retired();
     }
 
     /// Pin the chain of complete record files ending at `key` for an export
@@ -2135,6 +2149,9 @@ impl DiskStore {
                 .map_or(self.limit, |b| b.checkpoint_limit())
                 .min(self.limit)
         {
+            if self.spill && self.retire_for(bytes) {
+                return Ok(false);
+            }
             match self.index.evict(true, |_| true) {
                 Some(Eviction::Leaves(nodes)) => {
                     for node in nodes {
@@ -2151,6 +2168,86 @@ impl DiskStore {
             }
         }
         Ok(true)
+    }
+
+    /// Choose the coldest announced leaves to hand on until the files now held
+    /// free what `bytes` more need, and keep them in place. True when some are
+    /// held, so the caller waits for their moves instead of unlinking a record
+    /// the next tier does not have.
+    fn retire_for(&mut self, bytes: u64) -> bool {
+        let limit = self
+            .budget
+            .as_ref()
+            .map_or(self.limit, |b| b.checkpoint_limit())
+            .min(self.limit);
+        let mut freed: u64 = self.held.values().sum();
+        while self.used.saturating_sub(freed).saturating_add(bytes) > limit {
+            let announce = self.announce.as_ref();
+            let Some(key) = self.index.candidate(false, |node| {
+                announce.is_some_and(|a| a.view.generation(&node.key).is_some())
+            }) else {
+                break;
+            };
+            let (Some(node), Some(generation)) = (
+                self.index.node(&key),
+                announce.and_then(|a| a.view.generation(&key)),
+            ) else {
+                break;
+            };
+            let retiring = Retiring {
+                tier: PoolTier::Nvme,
+                key,
+                generation,
+                parent: node.parent,
+                bucket: node.bucket,
+                tail_pages: node.tail_pages,
+                row: node.row,
+            };
+            let node_bytes = node.location.bytes;
+            if self.index.pin(&key).is_err() {
+                break;
+            }
+            freed += node_bytes;
+            self.held.insert(key, node_bytes);
+            self.retiring.push(retiring);
+        }
+        !self.held.is_empty()
+    }
+
+    /// The move of a held record ended: unlink it, or let it be offered again.
+    fn retired(&mut self, key: &PrefixKey, how: Retirement) -> Result<()> {
+        if self.held.remove(key).is_none() {
+            return Ok(());
+        }
+        self.index.unpin(key)?;
+        if how != Retirement::Failed {
+            self.finishing.push(*key);
+            self.finish_retired()?;
+        }
+        Ok(())
+    }
+
+    /// Unlink the records whose moves ended, once no export pin still reads
+    /// them. A record that gained a child meanwhile stays.
+    fn finish_retired(&mut self) -> Result<()> {
+        let mut finishing = std::mem::take(&mut self.finishing);
+        let mut result = Ok(());
+        finishing.retain(|key| {
+            if self.index.node(key).is_some_and(|node| node.pinned()) {
+                return true;
+            }
+            if let Ok(removed) = self.index.remove(key) {
+                for node in removed {
+                    if let Err(error) = self.unlink(node) {
+                        result = Err(error);
+                    }
+                }
+                self.stats.progress += 1;
+            }
+            false
+        });
+        self.finishing = finishing;
+        result
     }
 
     /// Return a removed node's bytes to the budget and unlink its file.
@@ -2484,6 +2581,20 @@ impl HostStore for DiskStore {
 
     fn announce_to(&mut self, announcer: Announcer) {
         self.announce_records(announcer);
+    }
+
+    fn set_spill(&mut self, enabled: bool) {
+        self.spill = enabled && self.announce.is_some();
+    }
+
+    fn take_retiring(&mut self) -> Vec<Retiring> {
+        std::mem::take(&mut self.retiring)
+    }
+
+    fn retired(&mut self, key: PrefixKey, tier: PoolTier, how: Retirement) {
+        if tier == PoolTier::Nvme {
+            let _ = DiskStore::retired(self, &key, how);
+        }
     }
 
     fn probe(
@@ -5116,5 +5227,108 @@ mod tests {
         // Nothing further changed, so nothing further is announced.
         store.flush_announcements();
         assert!(announcer.take_batch(10).is_none());
+    }
+
+    fn announced(store: &mut DiskStore) -> crate::pool::Announcer {
+        let announcer = crate::pool::Announcer::new(Arc::new(tokio::sync::Notify::new()));
+        announcer.begin_session();
+        store.announce_to(announcer.clone());
+        store.flush_announcements();
+        announcer
+    }
+
+    #[test]
+    fn a_spilling_store_holds_the_coldest_leaf_until_its_move_ends() {
+        let full = history(1000);
+        let cold = header(&geometry(), &full, 128, None);
+        let warm = header(&geometry(), &full, 256, None);
+        let limit = cold.length_with_row() + warm.length_with_row();
+        let records = vec![
+            scanned(&directory(), cold.clone(), 0, true),
+            scanned(&directory(), warm.clone(), 1, true),
+        ];
+        let (mut store, log) = store_with(records, limit);
+        let _announcer = announced(&mut store);
+        store.set_spill(true);
+
+        // Room for one more page: the coldest file is held, nothing is unlinked.
+        assert!(!store.make_room(PAGE_RECORD).unwrap());
+        let retiring = store.take_retiring();
+        assert_eq!(retiring.len(), 1);
+        assert_eq!(
+            (retiring[0].key, retiring[0].tier, retiring[0].row),
+            (cold.key, PoolTier::Nvme, true)
+        );
+        assert!(unlinked(&log).is_empty());
+        assert!(store.index.node(&cold.key).unwrap().pinned());
+
+        // The held file already covers the request: nothing more is chosen.
+        assert!(!store.make_room(PAGE_RECORD).unwrap());
+        assert!(store.take_retiring().is_empty());
+
+        // A failed move keeps the file, which is offered again.
+        HostStore::retired(&mut store, cold.key, PoolTier::Nvme, Retirement::Failed);
+        assert!(unlinked(&log).is_empty());
+        assert!(!store.index.node(&cold.key).unwrap().pinned());
+        assert!(!store.make_room(PAGE_RECORD).unwrap());
+        assert_eq!(store.take_retiring()[0].key, cold.key);
+
+        // Once moved, the file is unlinked and its bytes are free.
+        HostStore::retired(&mut store, cold.key, PoolTier::Nvme, Retirement::Moved);
+        assert_eq!(unlinked(&log).len(), 1);
+        assert!(!store.index.contains(&cold.key));
+        assert_eq!(store.take_evicted(), [cold.key]);
+        assert!(store.make_room(PAGE_RECORD).unwrap());
+    }
+
+    #[test]
+    fn a_store_that_is_not_spilling_unlinks_the_coldest_leaf_as_before() {
+        let full = history(1000);
+        let cold = header(&geometry(), &full, 128, None);
+        let warm = header(&geometry(), &full, 256, None);
+        let limit = cold.length_with_row() + warm.length_with_row();
+        let records = vec![
+            scanned(&directory(), cold.clone(), 0, true),
+            scanned(&directory(), warm.clone(), 1, true),
+        ];
+        let (mut store, log) = store_with(records, limit);
+        let _announcer = announced(&mut store);
+        // Spilling was on and the manager went away.
+        store.set_spill(true);
+        store.set_spill(false);
+        assert!(store.make_room(PAGE_RECORD).unwrap());
+        assert!(store.take_retiring().is_empty());
+        assert_eq!(unlinked(&log).len(), 1);
+        assert!(!store.index.contains(&cold.key));
+    }
+
+    #[test]
+    fn a_moved_record_stays_until_the_pin_that_reads_it_is_released() {
+        use crate::pool::Tier as PoolTier;
+        let geometry = geometry();
+        let directory = directory();
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let full = history(2000);
+        let mut leaf = header(&geometry, &full, 700, None);
+        write_record(&directory, &mut leaf, 1);
+        let (mut store, log) = store_with(
+            vec![scanned(&directory, leaf.clone(), 0, true)],
+            leaf.length_with_row(),
+        );
+        let _announcer = announced(&mut store);
+        store.set_spill(true);
+        assert!(!store.make_room(PAGE_RECORD).unwrap());
+        let retiring = store.take_retiring().remove(0);
+        let pin = store
+            .pin_export(PoolTier::Nvme, leaf.key, retiring.generation, 0, true)
+            .unwrap();
+
+        HostStore::retired(&mut store, leaf.key, PoolTier::Nvme, Retirement::Moved);
+        assert!(unlinked(&log).is_empty(), "a pin still reads the file");
+        drop(pin);
+        store.flush_announcements();
+        assert_eq!(unlinked(&log).len(), 1);
+        assert!(!store.index.contains(&leaf.key));
     }
 }
