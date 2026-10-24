@@ -212,6 +212,8 @@ impl Drop for Held {
 pub(crate) enum Id {
     Claim(u64),
     Put(u64),
+    /// An export relayed through the manager: this instance is the source.
+    Export(u64),
 }
 
 #[derive(Debug)]
@@ -224,10 +226,10 @@ pub(crate) enum Event {
     },
     /// The manager ended a claim's transfer cleanly.
     End { claim: u64 },
-    /// The manager granted a put's window; its bytes go in `slot`.
-    Granted { put: u64, shape: Shape, slot: u32 },
-    /// A put's filled window has left `slot`.
-    Sent { put: u64, index: u32, slot: u32 },
+    /// The manager granted a window of a put or an export; its bytes go in `slot`.
+    Granted { id: Id, shape: Shape, slot: u32 },
+    /// A filled window has left `slot`.
+    Sent { id: Id, index: u32, slot: u32 },
     /// The transfer failed. `Closed` follows.
     Failed { id: Id, error: String },
     /// The task is gone and its connection closed.
@@ -399,7 +401,7 @@ impl Dial for Tcp {
                     filled: None,
                 })
             }
-            Id::Put(_) => {
+            Id::Put(_) | Id::Export(_) => {
                 let (filled, commands) = mpsc::unbounded_channel();
                 let task = tokio::spawn(async move {
                     let _closed = ClosedOnDrop {
@@ -797,9 +799,10 @@ async fn receive_lent(
 
 /// A put: the manager grants windows and the engine fills and returns them.
 async fn fill(target: &Target, id: Id, filled: mpsc::UnboundedReceiver<Filled>) -> io::Result<()> {
-    let Id::Put(put) = id else {
-        unreachable!("fill serves puts");
-    };
+    assert!(
+        matches!(id, Id::Put(_) | Id::Export(_)),
+        "fill serves puts and exports"
+    );
     let link = connect(target).await?;
     let rdma = link.pair.is_some();
     // The pair, if any, outlives the reading and writing: it is the fence.
@@ -824,7 +827,7 @@ async fn fill(target: &Target, id: Id, filled: mpsc::UnboundedReceiver<Filled>) 
                     }
                     let held = target.staging.take().await;
                     target.events.push(Event::Granted {
-                        put,
+                        id,
                         shape,
                         slot: held.give(),
                     });
@@ -836,7 +839,7 @@ async fn fill(target: &Target, id: Id, filled: mpsc::UnboundedReceiver<Filled>) 
                         .unwrap()
                         .remove(&index)
                         .ok_or_else(|| invalid("a window was taken that was not offered"))?;
-                    target.events.push(Event::Sent { put, index, slot });
+                    target.events.push(Event::Sent { id, index, slot });
                 }
                 ToInstance::Abort(text) => {
                     return Err(io::Error::other(format!(
@@ -884,7 +887,7 @@ async fn fill(target: &Target, id: Id, filled: mpsc::UnboundedReceiver<Filled>) 
             .await
             .map_err(|_| timed_out("the manager stopped reading a window"))??;
             target.events.push(Event::Sent {
-                put,
+                id,
                 index: window.index,
                 slot: window.slot,
             });
@@ -1324,7 +1327,7 @@ mod tests {
             .unwrap();
         let events = rig.until(|e| matches!(e, Event::Granted { .. })).await;
         let Some(Event::Granted {
-            put: 6,
+            id: Id::Put(6),
             shape: granted,
             slot,
         }) = events.into_iter().last()
@@ -1362,7 +1365,7 @@ mod tests {
         let events = rig.until(|e| matches!(e, Event::Sent { .. })).await;
         assert!(matches!(
             events.last(),
-            Some(Event::Sent { put: 6, index: 0, slot: sent }) if *sent == slot
+            Some(Event::Sent { id: Id::Put(6), index: 0, slot: sent }) if *sent == slot
         ));
         // Stopping the put ends the task; it reports Closed and the slot stays the engine's.
         channel.stop();

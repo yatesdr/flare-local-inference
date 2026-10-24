@@ -22,6 +22,7 @@ use super::{
     super::{
         codec,
         exporter::{Checksums, HostPin, HostWindow},
+        net::{Channel, Filled, Id},
         shared::{ExportRequest, PoolEvent},
         wire::{self, client_message::M as Out},
     },
@@ -57,6 +58,16 @@ struct Export {
     jobs_outstanding: u32,
     /// Windows the copies of which are still running, by index.
     windows: HashMap<u32, wire::WindowSpec>,
+    /// The windows go to the manager on the data channel (no shared memory), which the
+    /// request named.
+    reference: Option<wire::DataChannelRef>,
+    /// The channel's task, until it has reported that it is gone.
+    channel: Option<Channel>,
+    channel_open: bool,
+    /// The staging slot of each granted window until it has been written out.
+    slots: HashMap<u32, u32>,
+    /// Filled windows the channel has not yet written out.
+    sends_outstanding: u32,
 }
 
 #[derive(Default)]
@@ -108,7 +119,12 @@ impl Engine {
         if request.session_incarnation != sess.header.session_incarnation {
             return self.pin_refused(id, wire::ClaimReason::StaleSource);
         }
-        if sess.regions.is_none()
+        let reachable = if request.channel.is_some() {
+            self.dial.is_some()
+        } else {
+            sess.regions.is_some()
+        };
+        if !reachable
             || sess.export_slots == 0
             || self.source.exports.len() >= sess.export_slots as usize
             || self.closing
@@ -135,6 +151,11 @@ impl Engine {
             coverage: None,
             jobs_outstanding: 0,
             windows: HashMap::new(),
+            reference: request.channel.clone(),
+            channel: None,
+            channel_open: false,
+            slots: HashMap::new(),
+            sends_outstanding: 0,
         };
         self.source.exports.insert(id, export);
         self.event(PoolEvent::Export(ExportRequest {
@@ -258,6 +279,7 @@ impl Engine {
         run.phase = Phase::Pinned;
         run.coverage = Some(Coverage::new(expected));
         run.pin = Some(pin);
+        let reference = run.reference.clone();
         self.emit(Out::PinAck(wire::PinAck {
             export_id: id,
             result: wire::PinResult::Pinned as i32,
@@ -266,6 +288,22 @@ impl Engine {
             total_pages: total,
             row,
         }));
+        if let Some(reference) = reference {
+            // The manager grants this export's windows on the channel from now on.
+            match self.open_channel(Id::Export(id), &reference) {
+                Ok(channel) => {
+                    let run = self.source.exports.get_mut(&id).expect("present");
+                    run.channel = Some(channel);
+                    run.channel_open = true;
+                }
+                Err(_) => {
+                    if let Some(run) = self.source.exports.get_mut(&id) {
+                        run.failed = true;
+                    }
+                    self.drive_export(id);
+                }
+            }
+        }
     }
 
     /// The worker did not pin the checkpoint.
@@ -317,106 +355,160 @@ impl Engine {
 
     pub(crate) fn on_export_fill(&mut self, fill: wire::ExportFill) {
         let id = fill.export_id;
-        let (page_bytes, row_bytes) = (self.st.page_record_bytes(), self.st.row_record_bytes());
-        let regions = self.sess.as_ref().and_then(|s| s.regions.clone());
         let Some(run) = self.source.exports.get_mut(&id) else {
             return;
         };
         if !matches!(run.phase, Phase::Pinned) || run.cancelled || run.failed {
             return;
         }
-        let Some(regions) = regions else {
-            run.failed = true;
-            return self.drive_export(id);
-        };
+        if run.reference.is_some() {
+            // This export's windows are granted on its channel.
+            return;
+        }
         for spec in fill.windows {
-            let run = self.source.exports.get_mut(&id).expect("present");
-            if run.failed {
+            if !self.export_window(id, spec, None) {
                 break;
-            }
-            let coverage = run.coverage.as_mut().expect("pinned has coverage");
-            let ok = coverage.accept(&spec, page_bytes, row_bytes);
-            let region = (spec.region() == wire::Region::Staging).then_some(&regions.staging);
-            let address = region.and_then(|r| r.address(spec.offset, spec.length));
-            let (Ok(_), Some(address)) = (ok, address) else {
-                run.failed = true;
-                self.fill_failed(id, spec.index);
-                break;
-            };
-            let record = spec.record as usize;
-            let first = spec.first_page as usize;
-            let count = spec.page_count as usize;
-            match run.pin.as_ref().expect("pinned") {
-                Pin::Gpu(chain) => {
-                    let node = &chain.nodes[record];
-                    let mut jobs = Vec::new();
-                    let mut from = 0;
-                    while from < count || (count == 0 && jobs.is_empty()) {
-                        let end = (from + WINDOW_PAGES).min(count);
-                        let pages = (from..end)
-                            .map(|i| (node.pages[first + i], address + i * page_bytes as usize))
-                            .collect();
-                        let row = (end == count && spec.row).then(|| {
-                            (
-                                chain.row.expect("row window"),
-                                address + count * page_bytes as usize,
-                            )
-                        });
-                        jobs.push(Job {
-                            id: JobId(0),
-                            window: spec.index,
-                            direction: Direction::Out,
-                            pages,
-                            row,
-                        });
-                        from = end;
-                        if count == 0 {
-                            break;
-                        }
-                    }
-                    run.jobs_outstanding += jobs.len() as u32;
-                    run.windows.insert(spec.index, spec);
-                    for job in jobs {
-                        self.queue_job(
-                            job,
-                            Owner::Export {
-                                export: id,
-                                window: spec.index,
-                            },
-                        );
-                    }
-                }
-                Pin::Host(pin) => {
-                    let pin = pin.clone();
-                    run.jobs_outstanding += 1;
-                    run.windows.insert(spec.index, spec);
-                    let span = HostWindow {
-                        record: spec.record,
-                        first_page: spec.first_page,
-                        page_count: spec.page_count,
-                        row: spec.row,
-                    };
-                    let job = FillJob {
-                        owner: FillOwner::Export(id),
-                        window: spec.index,
-                        address,
-                        length: spec.length as usize,
-                        work: Box::new(move |dst| pin.lock().unwrap().read(&span, dst)),
-                    };
-                    if !self.submit_fill(job) {
-                        let run = self.source.exports.get_mut(&id).expect("present");
-                        run.jobs_outstanding -= 1;
-                        run.failed = true;
-                        self.fill_failed(id, spec.index);
-                        break;
-                    }
-                }
             }
         }
         self.drive_export(id);
     }
 
+    /// The manager granted a window of an export over the data channel; its bytes go
+    /// in `slot`.
+    pub(crate) fn on_export_grant(
+        &mut self,
+        export: u64,
+        shape: super::super::frame::Shape,
+        slot: u32,
+    ) {
+        let Some(staging) = self.net.clone() else {
+            return;
+        };
+        let spec = wire::WindowSpec {
+            index: shape.index,
+            region: wire::Region::Staging as i32,
+            offset: staging.offset(slot),
+            length: shape.length,
+            record: shape.record,
+            first_page: shape.first_page,
+            page_count: shape.page_count,
+            row: shape.row,
+        };
+        let taken = self.export_window(export, spec, Some(slot));
+        if !taken {
+            self.free_slot(slot);
+        }
+        self.drive_export(export);
+    }
+
+    /// Start filling one window. `false` when it was not taken up: the export is over, or
+    /// the window is wrong and the export failed. A slot, if any, then is still the
+    /// caller's.
+    fn export_window(&mut self, id: u64, spec: wire::WindowSpec, slot: Option<u32>) -> bool {
+        let (page_bytes, row_bytes) = (self.st.page_record_bytes(), self.st.row_record_bytes());
+        let memory = self.memory();
+        let Some(run) = self.source.exports.get_mut(&id) else {
+            return false;
+        };
+        if !matches!(run.phase, Phase::Pinned) || run.cancelled || run.failed {
+            return false;
+        }
+        let coverage = run.coverage.as_mut().expect("pinned has coverage");
+        let ok = coverage.accept(&spec, page_bytes, row_bytes);
+        let address = memory
+            .as_ref()
+            .and_then(|m| m.region(spec.region()))
+            .and_then(|region| region.address(spec.offset, spec.length));
+        let (Ok(_), Some(address)) = (ok, address) else {
+            run.failed = true;
+            self.fill_failed(id, spec.index);
+            return false;
+        };
+        if let Some(slot) = slot {
+            run.slots.insert(spec.index, slot);
+        }
+        let record = spec.record as usize;
+        let first = spec.first_page as usize;
+        let count = spec.page_count as usize;
+        match run.pin.as_ref().expect("pinned") {
+            Pin::Gpu(chain) => {
+                let node = &chain.nodes[record];
+                let mut jobs = Vec::new();
+                let mut from = 0;
+                while from < count || (count == 0 && jobs.is_empty()) {
+                    let end = (from + WINDOW_PAGES).min(count);
+                    let pages = (from..end)
+                        .map(|i| (node.pages[first + i], address + i * page_bytes as usize))
+                        .collect();
+                    let row = (end == count && spec.row).then(|| {
+                        (
+                            chain.row.expect("row window"),
+                            address + count * page_bytes as usize,
+                        )
+                    });
+                    jobs.push(Job {
+                        id: JobId(0),
+                        window: spec.index,
+                        direction: Direction::Out,
+                        pages,
+                        row,
+                    });
+                    from = end;
+                    if count == 0 {
+                        break;
+                    }
+                }
+                run.jobs_outstanding += jobs.len() as u32;
+                run.windows.insert(spec.index, spec);
+                for job in jobs {
+                    self.queue_job(
+                        job,
+                        Owner::Export {
+                            export: id,
+                            window: spec.index,
+                        },
+                    );
+                }
+            }
+            Pin::Host(pin) => {
+                let pin = pin.clone();
+                run.jobs_outstanding += 1;
+                run.windows.insert(spec.index, spec);
+                let span = HostWindow {
+                    record: spec.record,
+                    first_page: spec.first_page,
+                    page_count: spec.page_count,
+                    row: spec.row,
+                };
+                let job = FillJob {
+                    owner: FillOwner::Export(id),
+                    window: spec.index,
+                    address,
+                    length: spec.length as usize,
+                    work: Box::new(move |dst| pin.lock().unwrap().read(&span, dst)),
+                };
+                if !self.submit_fill(job) {
+                    let run = self.source.exports.get_mut(&id).expect("present");
+                    run.jobs_outstanding -= 1;
+                    run.failed = true;
+                    self.fill_failed(id, spec.index);
+                    return true;
+                }
+            }
+        }
+        true
+    }
+
     fn fill_failed(&mut self, export: u64, window: u32) {
+        if self
+            .source
+            .exports
+            .get(&export)
+            .is_some_and(|run| run.reference.is_some())
+        {
+            // The channel carries the windows: dropping it tells the manager.
+            return;
+        }
         self.emit(Out::WindowFilled(wire::WindowFilled {
             export_id: export,
             index: window,
@@ -466,13 +558,13 @@ impl Engine {
     /// checksums for a host source and fresh ones for a GPU source.
     fn fill_done(&mut self, export: u64, spec: wire::WindowSpec, persisted: Option<Checksums>) {
         let page_bytes = self.st.page_record_bytes() as usize;
+        let memory = self.memory();
         let sums = match persisted {
             Some(sums) => Some(sums),
-            None => self
-                .sess
+            None => memory
                 .as_ref()
-                .and_then(|s| s.regions.as_ref())
-                .and_then(|r| r.staging.bytes(spec.offset, spec.length))
+                .and_then(|m| m.region(spec.region()))
+                .and_then(|r| r.bytes(spec.offset, spec.length))
                 .map(|bytes| {
                     let count = spec.page_count as usize;
                     Checksums {
@@ -489,6 +581,31 @@ impl Engine {
             }
             return self.fill_failed(export, spec.index);
         };
+        let Some(run) = self.source.exports.get_mut(&export) else {
+            return;
+        };
+        run.windows.remove(&spec.index);
+        if run.reference.is_some() {
+            // The window is written to the manager on the channel, from its slot.
+            let slot = run.slots.get(&spec.index).copied();
+            let sent = slot.is_some_and(|slot| {
+                run.channel.as_ref().is_some_and(|channel| {
+                    channel.send(Filled {
+                        index: spec.index,
+                        row_xxh3: sums.row,
+                        page_xxh3: sums.pages.clone(),
+                        slot,
+                        length: spec.length,
+                    })
+                })
+            });
+            if sent {
+                run.sends_outstanding += 1;
+            } else {
+                run.failed = true;
+            }
+            return;
+        }
         self.emit(Out::WindowFilled(wire::WindowFilled {
             export_id: export,
             index: spec.index,
@@ -497,9 +614,45 @@ impl Engine {
             row_xxh3: sums.row.unwrap_or(0),
             has_row: sums.row.is_some(),
         }));
+    }
+
+    /// A filled window of an export has left its slot.
+    pub(crate) fn on_export_sent(&mut self, export: u64, index: u32, slot: u32) {
+        // The slot is free whatever became of the export: the task is done with it.
         if let Some(run) = self.source.exports.get_mut(&export) {
-            run.windows.remove(&spec.index);
+            run.sends_outstanding = run.sends_outstanding.saturating_sub(1);
+            run.slots.remove(&index);
         }
+        self.free_slot(slot);
+        self.drive_export(export);
+    }
+
+    /// An export's transfer failed.
+    pub(crate) fn net_export_failed(&mut self, export: u64, _error: String) {
+        if let Some(run) = self.source.exports.get_mut(&export) {
+            run.failed = true;
+            self.drive_export(export);
+        }
+    }
+
+    /// An export's task is gone and its connection closed.
+    pub(crate) fn net_export_closed(&mut self, export: u64) {
+        let Some(run) = self.source.exports.get_mut(&export) else {
+            return;
+        };
+        run.channel = None;
+        run.channel_open = false;
+        // Nothing sends from a slot any more.
+        run.sends_outstanding = 0;
+        let slots: Vec<u32> = run.slots.drain().map(|(_, slot)| slot).collect();
+        let complete = run.coverage.as_ref().is_some_and(|c| c.complete());
+        if !complete && !run.cancelled && !run.lost {
+            run.failed = true;
+        }
+        for slot in slots {
+            self.free_slot(slot);
+        }
+        self.drive_export(export);
     }
 
     /// End the export if it is over and nothing reads its pages any more.
@@ -512,6 +665,19 @@ impl Engine {
         }
         let complete = run.coverage.as_ref().is_some_and(|c| c.complete());
         if !(complete || run.cancelled || run.failed || run.lost) {
+            return;
+        }
+        // Windows still on their way to the manager are let out first, unless the export
+        // is being abandoned. The task is then stopped, and nothing is ended while it
+        // may still use a slot.
+        let abandoned = run.cancelled || run.failed || run.lost;
+        if run.sends_outstanding > 0 && !abandoned {
+            return;
+        }
+        if let Some(channel) = &run.channel {
+            channel.stop();
+        }
+        if run.channel_open {
             return;
         }
         let status = if run.failed {

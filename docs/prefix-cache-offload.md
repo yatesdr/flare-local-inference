@@ -861,14 +861,18 @@ per GiB, depends on sizes the manager announces and is not included.
 
 A manager on another host shares no memory, so its restores and puts pass through
 **staging of the instance's own**: slots of one registered region, one window each, made
-when the first such session opens and kept across reconnects. Their count is the claims
-and open puts the manager allows times its window credits (twelve with the defaults) and
-their size is its window limit (4 MiB), so about 48 MiB of registered host memory, not
+when the first such session opens and kept across reconnects. Their count is the claims,
+open puts and exports the manager allows times its window credits (sixteen with the defaults)
+and their size is its window limit (4 MiB), so about 64 MiB of registered host memory, not
 counted in the startup budget. A claim arrives window by window on the manager's data
 channel into those slots, each page and the row is checked against the checksums stored
 with the record before it is copied to the GPU, and the slot is freed only when its copy
 has drained; a put hands filled slots to the channel and commits after the last one has
-left. The connection is TLS exactly when `--prefix-cache-pool-ca` names the manager's CA,
+left. Such an instance is also a source: the manager grants an export's windows on a
+channel the instance dials after pinning, the instance copies each into a slot and writes
+it with its checksums, and the manager relays it to the requester, so instances on
+different hosts (or on and off the manager's host) share their GPU and host caches
+through the manager. The connection is TLS exactly when `--prefix-cache-pool-ca` names the manager's CA,
 and a manager that declares the other setting disables the pool for the process. With the
 `rdma` cargo feature, a manager started with `--rdma` is reached by RDMA instead: the
 manager writes into slots the instance lends and reads the slots a put fills; an instance

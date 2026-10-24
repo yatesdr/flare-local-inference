@@ -569,6 +569,7 @@ impl Engine {
         match id {
             Id::Claim(claim) => self.net_claim_failed(claim, error),
             Id::Put(put) => self.net_put_failed(put, error),
+            Id::Export(export) => self.net_export_failed(export, error),
         }
     }
 
@@ -576,6 +577,7 @@ impl Engine {
         match id {
             Id::Claim(claim) => self.net_claim_closed(claim),
             Id::Put(put) => self.net_put_closed(put),
+            Id::Export(export) => self.net_export_closed(export),
         }
     }
 
