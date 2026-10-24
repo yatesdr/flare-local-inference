@@ -243,11 +243,6 @@ impl Announcer {
         Some((first, state.queue.drain(..count).collect()))
     }
 
-    /// Highest sequence assigned in the open session.
-    pub(crate) fn sequence(&self) -> u64 {
-        self.state.lock().unwrap().sequence
-    }
-
     pub fn len(&self) -> usize {
         self.state.lock().unwrap().entries.len()
     }
