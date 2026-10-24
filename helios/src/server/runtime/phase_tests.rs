@@ -192,6 +192,7 @@ impl Fixture {
                 prompt_scored: 0,
                 blocked: None,
                 pool_lookup: None,
+                pool_lookup_ns: 0,
             },
             Generation {
                 events: receiver,
@@ -1250,6 +1251,8 @@ struct FakeStore {
     needs_characterization: bool,
     characterize_fails: bool,
     undrained: bool,
+    /// Tickets stay unanswered instead of answering with nothing.
+    pending_tickets: bool,
     characterized: Vec<crate::offload::Scratch>,
     /// Each eviction notice with the number of `store` calls made before it.
     evicted: Vec<(
@@ -1286,6 +1289,7 @@ impl FakeStore {
             needs_characterization: false,
             characterize_fails: false,
             undrained: false,
+            pending_tickets: false,
             characterized: Vec::new(),
             evicted: Vec::new(),
         }
@@ -1303,7 +1307,11 @@ impl crate::offload::PrefixStore for FakeStore {
         self.begun.push(history.token_count());
         let withdrawn = self.withdrawn.clone();
         Some(crate::offload::LookupTicket::watched(
-            flare_selene::pool::LookupState::Pending,
+            if self.pending_tickets {
+                flare_selene::pool::LookupState::Pending
+            } else {
+                flare_selene::pool::LookupState::None
+            },
             move || {
                 withdrawn.fetch_add(1, Ordering::Relaxed);
             },
@@ -2199,6 +2207,32 @@ fn a_probe_whose_copies_cannot_be_shown_to_have_stopped_quarantines_its_ids() {
         assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
         assert!(worker.active[0].is_some());
     }
+}
+
+#[test]
+fn a_request_waits_a_moment_for_its_pool_lookup_and_then_goes_on_without_it() {
+    let fixture = Fixture::new();
+    let (sender, receiver) = mpsc::channel();
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    sender.send(vec![incoming]).unwrap();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.pooled = true;
+    store.pending_tickets = true;
+    let withdrawn = store.withdrawn.clone();
+    worker.attach_store(Some(Box::new(store)));
+    // The lookup is still on the wire: the request is held, the worker is not.
+    worker.admit().unwrap();
+    assert!(worker.active.iter().all(Option::is_none));
+    assert_eq!(worker.pending.len(), 1);
+    assert_eq!(withdrawn.load(Ordering::Relaxed), 0);
+    // Once the grace has passed it is admitted with the local answer and the lookup is withdrawn.
+    let grace = std::time::Duration::from_nanos(POOL_LOOKUP_GRACE_NS);
+    thread::sleep(grace + std::time::Duration::from_millis(5));
+    worker.admit().unwrap();
+    assert!(worker.active[0].is_some());
+    assert!(worker.pending.is_empty());
+    assert_eq!(withdrawn.load(Ordering::Relaxed), 1);
 }
 
 fn group_runtime(
