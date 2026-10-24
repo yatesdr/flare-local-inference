@@ -415,15 +415,14 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             seconds += if part.source == LOCAL {
                 local.map_or(0.0, |hit| hit.estimated_seconds)
             } else {
-                let us = pool
-                    .iter()
+                // With no estimate at all the cost is not held against the restore: the
+                // requester's own fetch policy decides.
+                pool.iter()
                     .find(|c| c.plan.source == part.source && c.plan.generation == part.generation)
-                    .and_then(|c| match c.plan.us_per_page {
-                        0 => ranking.us_per_page(c.plan.level),
-                        measured => Some(f64::from(measured)),
+                    .and_then(|c| {
+                        ranking.part_seconds(c.plan.level, part.pages, c.plan.us_per_page)
                     })
-                    .unwrap_or(0.0);
-                part.pages as f64 * us / 1e6
+                    .unwrap_or(0.0)
             };
         }
         HostHit {
@@ -1170,9 +1169,7 @@ mod tests {
     }
 
     fn rig() -> Rig {
-        let local = FakeLocal::default();
-        let pool = Arc::new(Mutex::new(PoolState::default()));
-        let ranking = Ranking::for_test(
+        rig_with(Ranking::for_test(
             Level::DEFAULT_ORDER,
             &[
                 (Level::NeighbourGpu, 10.0),
@@ -1180,7 +1177,12 @@ mod tests {
                 (Level::HostNvme, 100.0),
                 (Level::RemoteNvme, 200.0),
             ],
-        );
+        ))
+    }
+
+    fn rig_with(ranking: Ranking) -> Rig {
+        let local = FakeLocal::default();
+        let pool = Arc::new(Mutex::new(PoolState::default()));
         Rig {
             store: PooledStore::new(
                 local.clone(),
@@ -1458,6 +1460,37 @@ mod tests {
         let b = &fetch.parts[1];
         assert_eq!((b.part.pages, b.part.row, b.pages.len()), (0, true, 0));
         assert_eq!(b.slot, Some(StateSlotId(3)));
+    }
+
+    #[test]
+    fn the_first_long_restore_is_priced_by_the_fitted_line_not_by_the_few_page_average() {
+        // Timed at 2, 16 and 64 pages: 14 ms of latency and 0.3 ms a page, which is 7.3 ms a
+        // page at the small size.
+        let line = |pages: f64| 14_000.0 + 300.0 * pages;
+        let mut rig = rig_with(Ranking::for_test_sized(
+            Level::HostDram,
+            [line(2.0) / 2.0, line(16.0) / 16.0, line(64.0) / 64.0],
+        ));
+        // The manager has no estimate to give yet (0): only probe-sized claims so far.
+        rig.answer(vec![rig.candidate(Level::HostDram, 1, 0, 0, &[1600], 0)]);
+        let hit = rig.lookup().unwrap();
+        assert_eq!(hit.pages, 100);
+        let fitted = line(100.0) / 1e6;
+        assert!(
+            (hit.estimated_seconds - fitted).abs() < 1e-3,
+            "{}",
+            hit.estimated_seconds
+        );
+        // Half the prefill of 1600 tokens at 8000 tokens a second is 0.1 s: the restore stands
+        // where the small-size average (0.73 s) would have turned it down.
+        assert!(crate::worth_fetching(&hit, 8000.0));
+        assert!(100.0 * line(2.0) / 2.0 / 1e6 > 0.1);
+        // With no estimate of any kind the cost is not held against the restore.
+        let mut rig = rig_with(Ranking::default());
+        rig.answer(vec![rig.candidate(Level::HostDram, 1, 0, 0, &[1600], 0)]);
+        let hit = rig.lookup().unwrap();
+        assert_eq!(hit.estimated_seconds, 0.0);
+        assert!(crate::worth_fetching(&hit, 8000.0));
     }
 
     #[test]

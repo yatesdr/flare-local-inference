@@ -123,6 +123,8 @@ pub struct Ranking {
     order: [Level; 5],
     measured: [Measured; 5],
     pinned: bool,
+    /// How many pages each measured size moved.
+    pages: Pages,
 }
 
 impl Default for Ranking {
@@ -132,6 +134,11 @@ impl Default for Ranking {
             order: Level::DEFAULT_ORDER,
             measured: [Measured::default(); 5],
             pinned: false,
+            pages: Pages {
+                small: 2,
+                typical: 16,
+                long: 64,
+            },
         }
     }
 }
@@ -150,6 +157,24 @@ impl Ranking {
                 spread: 0.0,
             });
         }
+        ranking
+    }
+
+    /// A ranking whose `level` was timed at the three sizes (microseconds per page).
+    #[cfg(test)]
+    pub(crate) fn for_test_sized(level: Level, us_per_page: [f64; 3]) -> Self {
+        let cost = |us_per_page| {
+            Some(Cost {
+                us_per_page,
+                spread: 0.0,
+            })
+        };
+        let mut ranking = Self::default();
+        ranking.measured[level.index()] = Measured {
+            small: cost(us_per_page[0]),
+            typical: cost(us_per_page[1]),
+            long: cost(us_per_page[2]),
+        };
         ranking
     }
 
@@ -173,6 +198,65 @@ impl Ranking {
     /// Microseconds per page at the typical size, if it was measured.
     pub fn us_per_page(&self, level: Level) -> Option<f64> {
         self.measured(level).typical.map(|cost| cost.us_per_page)
+    }
+
+    /// The latency in microseconds and the microseconds per page that fit the transfers
+    /// measured at `level`, from the least-squares line through total time against pages
+    /// over the sizes that were timed. One size gives no latency: all of it is per page.
+    pub fn cost_line(&self, level: Level) -> Option<(f64, f64)> {
+        let measured = self.measured(level);
+        let points: Vec<(f64, f64)> = [
+            (self.pages.small, measured.small),
+            (self.pages.typical, measured.typical),
+            (self.pages.long, measured.long),
+        ]
+        .into_iter()
+        .filter_map(|(pages, cost)| {
+            cost.filter(|_| pages > 0)
+                .map(|cost| (pages as f64, pages as f64 * cost.us_per_page))
+        })
+        .collect();
+        match points.as_slice() {
+            [] => None,
+            [(pages, total)] => Some((0.0, total / pages)),
+            _ => {
+                let n = points.len() as f64;
+                let (sx, sy) = points
+                    .iter()
+                    .fold((0.0, 0.0), |(x, y), p| (x + p.0, y + p.1));
+                let sxx: f64 = points.iter().map(|p| p.0 * p.0).sum();
+                let sxy: f64 = points.iter().map(|p| p.0 * p.1).sum();
+                let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+                let latency = (sy - slope * sx) / n;
+                // Neither can be negative: a negative slope is noise around a flat cost, a
+                // negative latency a cost that is all per page.
+                if slope < 0.0 {
+                    Some((sy / n, 0.0))
+                } else if latency < 0.0 {
+                    Some((0.0, sxy / sxx))
+                } else {
+                    Some((latency, slope))
+                }
+            }
+        }
+    }
+
+    /// Seconds a transfer of `pages` pages from a source at `level` is expected to take, from
+    /// what the source's own claims have cost (`observed_us_per_page`, 0 when the source has
+    /// no estimate worth giving) and otherwise from the line fitted to the timed transfers,
+    /// which counts a fixed latency once instead of per page. `None` when neither is known.
+    pub fn part_seconds(
+        &self,
+        level: Level,
+        pages: usize,
+        observed_us_per_page: u32,
+    ) -> Option<f64> {
+        let observed = (observed_us_per_page != 0)
+            .then(|| pages as f64 * f64::from(observed_us_per_page) / 1e6);
+        let fitted = self
+            .cost_line(level)
+            .map(|(latency, per_page)| (latency + pages as f64 * per_page) / 1e6);
+        observed.or(fitted)
     }
 
     /// The single startup log line: the order in use and how it differs from the default.
@@ -251,6 +335,7 @@ impl Characterizer {
             order: self.pinned.unwrap_or_else(|| rank(&measured)),
             measured,
             pinned: self.pinned.is_some(),
+            pages: self.pages,
         };
         self.topology = Some(topology);
         true
@@ -391,6 +476,64 @@ mod tests {
         let mut characterizer = Characterizer::new(PAGES, None).unwrap();
         assert!(characterizer.update(Topology(1), script));
         characterizer.ranking().clone()
+    }
+
+    fn sized(level: Level, us_per_page: [f64; 3]) -> Ranking {
+        let mut ranking = Ranking::default();
+        let cost = |us_per_page| {
+            Some(Cost {
+                us_per_page,
+                spread: 0.0,
+            })
+        };
+        ranking.measured[level.index()] = Measured {
+            small: cost(us_per_page[0]),
+            typical: cost(us_per_page[1]),
+            long: cost(us_per_page[2]),
+        };
+        ranking
+    }
+
+    #[test]
+    fn a_fixed_cost_per_transfer_is_a_latency_and_not_a_cost_per_page() {
+        // 14 ms of latency and 0.3 ms a page, timed at 2, 16 and 64 pages.
+        let line = |pages: f64| 14_000.0 + 300.0 * pages;
+        let ranking = sized(
+            HostDram,
+            [line(2.0) / 2.0, line(16.0) / 16.0, line(64.0) / 64.0],
+        );
+        let (latency, per_page) = ranking.cost_line(HostDram).unwrap();
+        assert!((latency - 14_000.0).abs() < 1.0 && (per_page - 300.0).abs() < 0.1);
+        // The first long restore costs what the line says, not the few-page average.
+        let seconds = ranking.part_seconds(HostDram, 526, 0).unwrap();
+        assert!((seconds - line(526.0) / 1e6).abs() < 1e-3, "{seconds}");
+        let few_page_average = 526.0 * line(2.0) / 2.0 / 1e6;
+        assert!(seconds < few_page_average / 10.0);
+        // A source's own estimate, when it gives one, is what its claims cost.
+        let observed = ranking.part_seconds(HostDram, 526, 100).unwrap();
+        assert!((observed - 526.0 * 100.0 / 1e6).abs() < 1e-9);
+        // Nothing measured and nothing observed: no estimate; one observation is enough.
+        assert_eq!(ranking.part_seconds(HostNvme, 526, 0), None);
+        assert!((ranking.part_seconds(HostNvme, 10, 50).unwrap() - 500e-6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn noise_cannot_give_a_negative_latency_or_slope() {
+        // Cheaper per page at the small size: all per page.
+        let ranking = sized(HostDram, [100.0, 200.0, 400.0]);
+        let (latency, per_page) = ranking.cost_line(HostDram).unwrap();
+        assert!(latency >= 0.0 && per_page > 0.0, "{latency} {per_page}");
+        // Cheaper at the long size than a latency alone would give: flat.
+        let ranking = sized(HostDram, [5_000.0, 1_000.0, 100.0]);
+        let (latency, per_page) = ranking.cost_line(HostDram).unwrap();
+        assert!(latency >= 0.0 && per_page >= 0.0);
+        // One size is proportional, as before.
+        let mut ranking = Ranking::default();
+        ranking.measured[HostDram.index()].typical = Some(Cost {
+            us_per_page: 50.0,
+            spread: 0.0,
+        });
+        assert_eq!(ranking.cost_line(HostDram), Some((0.0, 50.0)));
     }
 
     use Level::*;
