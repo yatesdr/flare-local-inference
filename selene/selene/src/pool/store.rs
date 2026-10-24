@@ -194,6 +194,12 @@ pub struct PooledStore<S: HostStore, P: PoolPort = PoolClient> {
     characterizer: Option<Characterizer>,
     characterized_for: Option<crate::characterize::Topology>,
     model: [u8; 32],
+    /// Restores that were wholly from the pool, which the local tiers did not count.
+    pool_fetched: u64,
+    /// Restores that failed in the pool part.
+    pool_fetch_failed: u64,
+    /// Bytes the pool parts copied into the device.
+    pool_bytes_in: u64,
 }
 
 impl<S: HostStore> PooledStore<S, PoolClient> {
@@ -241,6 +247,9 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             characterizer: Characterizer::new(PROBE_PAGES, None).ok(),
             characterized_for: None,
             model: identity_model,
+            pool_fetched: 0,
+            pool_fetch_failed: 0,
+            pool_bytes_in: 0,
         }
     }
 
@@ -498,7 +507,11 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
         };
         let failure = match result {
             Ok(bytes) => {
-                self.restores.remove(&key);
+                if let Some(restore) = self.restores.remove(&key) {
+                    // A restore that began in a local tier was counted by it.
+                    self.pool_fetched += u64::from(restore.planned.plan.a.source != LOCAL);
+                }
+                self.pool_bytes_in += bytes;
                 events.push(StoreEvent::Fetched {
                     key,
                     result: Ok(bytes),
@@ -547,6 +560,7 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             }
         }
         self.restores.remove(&key);
+        self.pool_fetch_failed += 1;
         self.fail(key, failure.error, events);
     }
 }
@@ -769,7 +783,11 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
     }
 
     fn stats(&self) -> StoreStats {
-        self.inner.stats()
+        let mut stats = self.inner.stats();
+        stats.fetched += self.pool_fetched;
+        stats.fetch_failed += self.pool_fetch_failed;
+        stats.bytes_in += self.pool_bytes_in;
+        stats
     }
 
     fn close(&mut self) -> Result<()> {
@@ -1512,6 +1530,12 @@ mod tests {
             result: Ok(9),
         });
         assert_eq!(fetched(&rig.poll()), [(rig.key(1600), true)]);
+        // A restore wholly from the pool is counted by the pool, once, with its bytes.
+        let stats = rig.store.stats();
+        assert_eq!(
+            (stats.fetched, stats.fetch_failed, stats.bytes_in),
+            (1, 0, 9)
+        );
     }
 
     #[test]
@@ -1533,6 +1557,8 @@ mod tests {
         });
         assert_eq!(fetched(&rig.poll()), [(rig.key(1600), false)]);
         assert_eq!(rig.pool.lock().unwrap().fetches.len(), 1);
+        let stats = rig.store.stats();
+        assert_eq!((stats.fetched, stats.fetch_failed), (0, 1));
     }
 
     #[test]
