@@ -107,6 +107,7 @@ impl Core {
         candidates: Vec<v2::Candidate>,
         retry_after_ms: u32,
     ) {
+        self.count("lookups_total", format!("status=\"{status:?}\""));
         self.send(
             sid,
             M::LookupReply(v2::LookupReply {

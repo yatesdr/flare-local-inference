@@ -219,7 +219,12 @@ pub async fn channel(socket: &Path) -> Channel {
 
 impl Pool {
     pub async fn connect(socket: &Path) -> Self {
-        let mut client = PoolClient::new(channel(socket).await);
+        Self::over(channel(socket).await, socket).await
+    }
+
+    /// The unary and session calls over a channel the caller made (for example TCP).
+    pub async fn over(channel: Channel, socket: &Path) -> Self {
+        let mut client = PoolClient::new(channel);
         let hello = client
             .hello(Request::new(v2::HelloRequest {
                 protocol: 2,

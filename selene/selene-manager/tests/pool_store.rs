@@ -465,3 +465,67 @@ async fn a8_damage_at_rest_never_reaches_a_restore() {
     host.base = std::env::temp_dir().join(format!("selene-unused-a8-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(base);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn u4_a_cancelled_put_keeps_its_unfilled_windows_until_the_writers_fence() {
+    let mut host = host();
+    host.start();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    let mut writer = open(&mut pool, "writer").await;
+    writer
+        .send(v2::client_message::M::PutBegin(v2::PutBegin {
+            put_id: 1,
+            key: Some(pool::pkey(1024)),
+            chain_pages: 16,
+            row: true,
+            has_published_parent: false,
+            published_parent: None,
+            bucket: vec![4; 16],
+            published_tail_pages: 16,
+            mode: v2::CopyMode::SharedWindows as i32,
+            generation: 1,
+        }))
+        .await;
+    writer
+        .take(|m| match m {
+            v2::server_message::M::PutAccept(accept) if accept.put_id == 1 => Some(()),
+            _ => None,
+        })
+        .await;
+    let grant = writer
+        .take(|m| match m {
+            v2::server_message::M::PutGrant(grant) if grant.put_id == 1 => Some(*grant),
+            _ => None,
+        })
+        .await;
+    assert!(grant.window.unwrap().length > 0);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let held = host.gauge("memory_allocated_bytes") + host.gauge("staging_allocated_bytes");
+    assert!(held > 0, "a granted window is memory in use");
+    writer
+        .send(v2::client_message::M::PutCancel(v2::PutCancel {
+            put_id: 1,
+        }))
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        host.gauge("memory_allocated_bytes") + host.gauge("staging_allocated_bytes"),
+        held,
+        "the writer may still be writing the window"
+    );
+    writer
+        .send(v2::client_message::M::FenceAck(v2::FenceAck {
+            subject: Some(v2::fence_ack::Subject::PutId(1)),
+            outcome: v2::FenceOutcome::Drained as i32,
+        }))
+        .await;
+    let mut settled = false;
+    for _ in 0..100 {
+        if host.gauge("memory_allocated_bytes") + host.gauge("staging_allocated_bytes") == 0 {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(settled, "the fence releases the window");
+}

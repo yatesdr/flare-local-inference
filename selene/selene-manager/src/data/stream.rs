@@ -890,7 +890,7 @@ impl PeerSizes {
 
 /// Deadline for a client to present its whole token after connecting: one total budget from
 /// accept, not an inactivity timeout, defaulting to the peer connect budget.
-pub const TOKEN_READ_TIMEOUT: Duration = crate::peer_client::CONNECT_TIMEOUT;
+pub const TOKEN_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The receiving side of the stream data channel.
 pub struct StreamReceiver {
