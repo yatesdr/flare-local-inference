@@ -25,7 +25,7 @@ use crate::{
     CheckpointId, Error, ExportRefusal, History, PageId, PrefixKey, Result, Scratch, StateSlotId,
     index::NodeEvent,
     pool::{
-        Announcer, FilePin, HostPin, Releases, Tier as PoolTier, TierView,
+        Announcer, FilePin, HostPin, IndexEntry, Releases, Tier as PoolTier, TierView,
         pins::{FileSpan, host_chain},
     },
 };
@@ -1727,6 +1727,28 @@ impl DiskStore {
 
     #[cfg(not(unix))]
     fn drop_cache(&self, _key: &PrefixKey) {}
+
+    /// What this tier announced for a complete record, as the next tier below
+    /// memory: the entry a record spilled here is announced as.
+    pub fn announced_entry(&self, key: &PrefixKey) -> Option<IndexEntry> {
+        let node = self.index.node(key).filter(|node| node.ready)?;
+        let generation = self.announce.as_ref()?.view.generation(key)?;
+        Some(IndexEntry {
+            key: *key,
+            parent: node.parent,
+            bucket: node.bucket,
+            tail_pages: node.tail_pages as u32,
+            row: node.row,
+            tier: PoolTier::Nvme,
+            generation,
+            bytes: node.tail_pages as u64 * self.layout.page_record_bytes
+                + if node.row {
+                    self.layout.row_record_bytes
+                } else {
+                    0
+                },
+        })
+    }
 
     /// Release finished exports' pins and announce what changed.
     pub fn flush_announcements(&mut self) {

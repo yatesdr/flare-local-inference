@@ -104,6 +104,14 @@ impl TierView {
         });
     }
 
+    /// The node left the tier because the next tier holds it, which `to` describes:
+    /// one notice, so a lookup never sees neither.
+    pub fn spill(&mut self, key: &PrefixKey, to: IndexEntry) {
+        if let Some(generation) = self.generations.remove(key) {
+            self.announcer.spilled(to, (self.tier, generation));
+        }
+    }
+
     /// The node left the tier.
     pub fn retire(&mut self, key: &PrefixKey) {
         if let Some(generation) = self.generations.remove(key) {
