@@ -974,13 +974,7 @@ impl Store {
             bucket: node.bucket,
             tail_pages: node.tail_pages as u32,
             row: node.row,
-            tier: if node.location.memory.is_some() {
-                0
-            } else if node.location.durable {
-                1
-            } else {
-                1
-            },
+            tier: u8::from(node.location.memory.is_none()),
             durable: node.location.durable,
             bytes: node.location.bytes,
             unreadable: node.location.memory.is_none() && node.location.disk.is_none(),
