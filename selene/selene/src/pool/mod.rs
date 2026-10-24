@@ -16,4 +16,4 @@ mod types;
 pub use announce::{Announcer, IndexEntry, Notice, Snapshot};
 pub use identity::{Geometry, RankPlanes, Scope, instance_id, process_nonce, scope_id};
 pub use lookup::{Answer, LookupState, LookupTicket};
-pub use types::{Candidate, ChainNode, HeldRange, Level, SourceRef, Tier};
+pub use types::{HeldRange, PoolCandidate, SourceRef, Tier};
