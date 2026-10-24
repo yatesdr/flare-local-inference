@@ -123,3 +123,59 @@ impl PrefixStore for Host {
         Ok(self.store.close()?)
     }
 }
+
+/// The local tiers beneath a pooled store. Without any, nothing is retained
+/// locally and every restore comes from the pool.
+pub(super) struct Tiers(Option<Box<dyn HostStore>>);
+
+impl Tiers {
+    pub(super) fn new(tiers: Option<Box<dyn HostStore>>) -> Self {
+        Self(tiers)
+    }
+}
+
+impl HostStore for Tiers {
+    fn lookup(
+        &mut self,
+        history: &dyn flare_selene::History,
+        resident: u64,
+        before: u64,
+    ) -> Option<HostHit> {
+        self.0.as_mut()?.lookup(history, resident, before)
+    }
+
+    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> flare_selene::Result<StoreOutcome> {
+        match &mut self.0 {
+            Some(tiers) => tiers.store(checkpoint),
+            None => Ok(StoreOutcome::Present),
+        }
+    }
+
+    fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> flare_selene::Result<()> {
+        match &mut self.0 {
+            Some(tiers) => tiers.fetch(hit, ticket),
+            None => Err(flare_selene::Error::new("no local tier holds this record")),
+        }
+    }
+
+    fn poll(&mut self, events: &mut Vec<flare_selene::StoreEvent>) -> flare_selene::Result<()> {
+        match &mut self.0 {
+            Some(tiers) => tiers.poll(events),
+            None => Ok(()),
+        }
+    }
+
+    fn stats(&self) -> StoreStats {
+        self.0
+            .as_ref()
+            .map(|tiers| tiers.stats())
+            .unwrap_or_default()
+    }
+
+    fn close(&mut self) -> flare_selene::Result<()> {
+        match &mut self.0 {
+            Some(tiers) => tiers.close(),
+            None => Ok(()),
+        }
+    }
+}
