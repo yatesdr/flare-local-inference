@@ -35,6 +35,31 @@ pub type Nonce = [u8; 16];
 pub type ProcKey = (InstanceId, Nonce);
 pub type ScopeId = [u8; 32];
 
+/// The context an export is sized against when the staging region is checked: Flare's
+/// usual per-request limit. The manager does not know a model's real maximum.
+const REFERENCE_CONTEXT_TOKENS: u64 = 262_144;
+
+/// Tokens of context one export can hold in `staging` bytes: whole pages and the row.
+fn export_tokens(staging: u64, page_bytes: u64, row_bytes: u64, page_tokens: u64) -> u64 {
+    staging.saturating_sub(row_bytes) / page_bytes.max(1) * page_tokens
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+
+    #[test]
+    fn staging_holds_whole_pages_and_the_row() {
+        // 4 GiB, 2 MiB pages of 64 tokens, a 112 MiB row.
+        assert_eq!(
+            export_tokens(4 << 30, 2 << 20, 112 << 20, 64),
+            ((4 << 30) - (112 << 20)) / (2 << 20) * 64
+        );
+        assert_eq!(export_tokens(1 << 20, 2 << 20, 0, 64), 0);
+        assert_eq!(export_tokens(10, 0, 0, 64), 10 * 64);
+    }
+}
+
 pub struct PoolConfig {
     pub limits: Limits,
     /// How long a terminal claim's reply is kept to answer duplicates.
@@ -321,6 +346,32 @@ impl Core {
         (core, PoolHandle { events, shared }, receiver)
     }
 
+    /// Says once per scope, when its geometry first arrives, whether the staging region
+    /// can hold one export of a long context. A GPU export reserves staging for the
+    /// whole export, so a longer context than this is refused and recomputed.
+    fn check_staging(&self, scope: &super::ValidScope) {
+        let geometry = &scope.geometry;
+        let staging = self.staging.capacity() as u64;
+        let tokens = export_tokens(
+            staging,
+            geometry.page_bytes,
+            geometry.row_bytes,
+            geometry.page_tokens,
+        );
+        if tokens < REFERENCE_CONTEXT_TOKENS {
+            eprintln!(
+                "selene: warning: --staging {} holds one export of about {tokens} tokens for the \
+                 scope that just opened (a page is {} bytes, the row {}); longer contexts are \
+                 refused as NO_WINDOWS and recomputed. Use at least {} for {REFERENCE_CONTEXT_TOKENS} tokens.",
+                staging,
+                geometry.page_bytes,
+                geometry.row_bytes,
+                REFERENCE_CONTEXT_TOKENS.div_ceil(geometry.page_tokens.max(1)) * geometry.page_bytes
+                    + geometry.row_bytes,
+            );
+        }
+    }
+
     /// Runs until `Shutdown` has drained the claims in flight.
     pub async fn run(mut self, mut events: mpsc::Receiver<Event>) {
         let mut tick = tokio::time::interval(Duration::from_millis(10));
@@ -516,6 +567,7 @@ impl Core {
         });
         if fresh {
             self.watch_catalog(scope.id);
+            self.check_staging(&scope);
         }
         self.instances.insert(
             instance,

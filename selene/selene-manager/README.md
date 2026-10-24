@@ -45,7 +45,7 @@ Options accept bytes with binary K/M/G/T suffixes, and durations with ms/s/m/h/d
 | `--root` | none; records stay in DRAM until evicted |
 | `--memory` | 1 GiB |
 | `--nvme` | 0 without `--root`; required with `--root` |
-| `--staging` | 256 MiB (minimum 8 MiB) |
+| `--staging` | 4 GiB (minimum 8 MiB) |
 | `--write-budget` | 0 (unlimited) |
 | `--listen` | none; serve instances on other hosts at ADDR:PORT |
 | `--listen-data` | the host of `--listen`, next port; where those instances copy bytes |
