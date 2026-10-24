@@ -1374,3 +1374,90 @@ fn a_row_in_a_window_of_its_own_is_put_and_restored_over_tcp() {
 fn a_row_in_a_window_of_its_own_is_put_and_restored_through_shared_memory() {
     a_window_of_pages_with_the_row_alone(&Manager::start());
 }
+
+/// The round trip of a lookup, from asking to a ready answer, against the real manager
+/// over a Unix socket with an index to scan: the figure the worker's admission hold is
+/// set from. Run with `-- --nocapture` to see the numbers.
+#[test]
+fn a_lookup_is_answered_in_well_under_a_millisecond_over_a_unix_socket() {
+    let manager = Manager::start();
+    let a = instance(&manager, "a", 1);
+    a.ready();
+    // Noise the scan must skip, and holdings the first lookups find.
+    for n in 0..5000u32 {
+        a.client.saved(IndexEntry {
+            key: PrefixKey {
+                consumed_tokens: 64 * u64::from(n % 50 + 1),
+                digest: [
+                    (n % 251) as u8,
+                    (n / 251) as u8,
+                    9,
+                    9,
+                    9,
+                    9,
+                    9,
+                    9,
+                    9,
+                    9,
+                    9,
+                    9,
+                    9,
+                    9,
+                    9,
+                    9,
+                ],
+            },
+            parent: None,
+            bucket: [
+                (n % 251) as u8,
+                (n / 251) as u8,
+                8,
+                8,
+                8,
+                8,
+                8,
+                8,
+                8,
+                8,
+                8,
+                8,
+                8,
+                8,
+                8,
+                8,
+            ],
+            tail_pages: 1,
+            row: true,
+            tier: Tier::Gpu,
+            generation: u64::from(n) + 1,
+            bytes: 1,
+        });
+    }
+    let mut b = instance(&manager, "b", 2);
+    b.ready();
+    thread::sleep(Duration::from_millis(300));
+    let mut times = Vec::new();
+    for salt in 0..2000u32 {
+        let history = salted(salt);
+        let started = Instant::now();
+        let ticket = b.client.begin_lookup(&history, Vec::new());
+        while matches!(ticket.state(), LookupState::Pending) {
+            std::hint::spin_loop();
+        }
+        times.push(started.elapsed());
+        assert!(!matches!(ticket.state(), LookupState::Pending));
+    }
+    times.sort();
+    let at = |q: f64| times[((times.len() as f64 * q) as usize).min(times.len() - 1)];
+    eprintln!(
+        "lookup round trip over {} lookups: p50 {:?}, p90 {:?}, p99 {:?}, p99.9 {:?}, max {:?}",
+        times.len(),
+        at(0.5),
+        at(0.9),
+        at(0.99),
+        at(0.999),
+        times[times.len() - 1]
+    );
+    b.poll();
+    assert!(at(0.99) < Duration::from_millis(5), "p99 {:?}", at(0.99));
+}

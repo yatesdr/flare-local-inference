@@ -330,6 +330,12 @@ impl Core {
                 event = events.recv() => {
                     let Some(event) = event else { break };
                     self.handle(event);
+                    // Answer lookups as soon as no more work is waiting, so a lone lookup
+                    // does not wait for the clock; a burst still queues and meets the
+                    // concurrency bound before the first of it is answered.
+                    while events.is_empty() && !self.lookup_queue.is_empty() {
+                        self.lookup_pass();
+                    }
                 }
                 _ = tick.tick() => self.tick(),
             }
