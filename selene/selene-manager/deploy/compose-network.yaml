@@ -1,0 +1,38 @@
+# A manager that also serves instances on other hosts over TLS.
+# See docs/network-operations.md for the certificates and what the listener carries today.
+#
+# TLS material, mounted read-only at /tls: server.pem and server-key.pem. Instances on this
+# host still connect through /run/selene; share it and /dev/shm/selene as in compose.yaml.
+services:
+  manager:
+    image: ${MANAGER_IMAGE:-selene:local}
+    user: "${CACHE_UID:-1000}:${CACHE_GID:-1000}"
+    command:
+      - --name
+      - pool
+      - --socket
+      - /run/selene/pool.sock
+      - --root
+      - /var/lib/selene
+      - --memory
+      - 16G
+      - --nvme
+      - 1T
+      - --staging
+      - 1G
+      - --listen
+      - 0.0.0.0:9200
+      - --tls-cert
+      - /tls/server.pem
+      - --tls-key
+      - /tls/server-key.pem
+      - --metrics
+      - 127.0.0.1:9108
+    volumes:
+      - /run/selene:/run/selene
+      - /dev/shm/selene:/dev/shm/selene
+      - ${SELENE_DATA:-/var/lib/selene}:/var/lib/selene
+      - ./tls:/tls:ro
+    ports:
+      - "9200:9200"
+    restart: unless-stopped
