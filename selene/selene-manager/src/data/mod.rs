@@ -1,8 +1,8 @@
-//! Manager-to-manager data channel.
+//! The data channel instances on other hosts copy through.
 //!
-//! Control decides what to move; a `DataChannel` only moves bytes between two managers' region
-//! files. Implementations split a transfer into 1 MiB pieces and echo the grant identity
-//! `(transfer, index)` and `(piece, pieces)` in every frame.
+//! `channel` serves the connections (stream and RDMA carriers); control decides what to move, and
+//! a `DataChannel` only moves bytes between the manager's region files and a peer's registered
+//! memory. RDMA implementations split a transfer into 1 MiB pieces.
 
 use std::io;
 
@@ -15,9 +15,6 @@ pub mod channel;
 
 #[path = "rdma.rs"]
 pub mod rdma;
-
-#[path = "stream.rs"]
-pub mod stream;
 
 /// Maximum payload bytes in one piece.
 pub const PIECE_BYTES: usize = 1 << 20;
@@ -80,14 +77,8 @@ pub trait RegionAccess: Send + Sync {
     ) -> io::Result<()>;
 }
 
-/// The live windows a peer may write to or read from.
-pub trait GrantTable: Send + Sync {
-    /// `(region, offset, length)` of the live grant for one session and direction, or `None`
-    /// when it is unknown, belongs to another session or has the wrong direction.
-    fn window(&self, session: u64, key: GrantKey, put: bool) -> Option<(Region, u64, u64)>;
-}
-
-/// A manager-to-manager byte channel. Implementations are used from one peer thread only.
+/// A byte channel between the manager's regions and a peer's. Implementations are used from one
+/// handler only.
 pub trait DataChannel: Send {
     /// Copy `len` bytes at local (`region`, `offset`) to the peer at
     /// (`remote_region`, `remote_offset`). Completion arrives through `poll`.
