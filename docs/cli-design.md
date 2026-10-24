@@ -928,6 +928,13 @@ disabled unless configured. The memory setting includes registered checkpoint
 slabs and ordinary retained CPU inputs; bounded transfer, preprocessing, and
 decoded-source windows are accounted for separately at startup.
 
+`--prefix-cache-pool ADDRESS` (`unix:PATH` or `HOST:PORT`) and
+`--prefix-cache-pool-tenant NAME` share checkpoints with other instances
+through a pool manager. The tenant is optional and defaults to the pool's default scope;
+it requires the pool flag. Neither affects an instance that omits them. They are command-line
+options, forwarded to every rank like the other prefix cache settings, with no
+configuration-file key. See [the pool section](prefix-cache-offload.md#215-sharing-through-a-pool).
+
 ## 4. Derived settings
 
 | Setting | Derived from |
