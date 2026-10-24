@@ -27,8 +27,9 @@ use crate::{
 };
 
 use super::{
-    announce::IndexEntry,
+    announce::{Announcer, IndexEntry},
     client::PoolClient,
+    exporter::HostPin,
     lookup::{LookupState, LookupTicket},
     shared::{FetchPart, PoolEvent, PoolFetch},
     types::{HeldRange, PoolCandidate, SourceRef, Tier},
@@ -44,6 +45,8 @@ pub trait PoolPort {
     fn saved(&self, entry: IndexEntry);
     fn evicted(&self, key: PrefixKey, tier: Tier, generation: u64, heir: Option<IndexEntry>);
     fn evictions_lost(&self);
+    fn announcer(&self) -> Announcer;
+    fn host_pinned(&mut self, export: ExportId, pin: Box<dyn HostPin>);
     fn export_pinned(&mut self, export: ExportId, chain: ExportChain);
     fn export_refused(&mut self, export: ExportId, reason: ExportRefusal);
     fn close(&mut self) -> Result<()>;
@@ -70,6 +73,12 @@ impl PoolPort for PoolClient {
     }
     fn evictions_lost(&self) {
         PoolClient::evictions_lost(self)
+    }
+    fn announcer(&self) -> Announcer {
+        PoolClient::announcer(self)
+    }
+    fn host_pinned(&mut self, export: ExportId, pin: Box<dyn HostPin>) {
+        PoolClient::host_pinned(self, export, pin)
     }
     fn export_pinned(&mut self, export: ExportId, chain: ExportChain) {
         PoolClient::export_pinned(self, export, chain)
@@ -157,7 +166,6 @@ impl<S: HostStore> PooledStore<S, PoolClient> {
         config: super::client::PoolConfig,
         copier: crate::SharedCopier,
         registrar: std::sync::Arc<dyn crate::HostRegistrar + Send + Sync>,
-        exporter: Option<std::sync::Arc<dyn super::exporter::HostExporter>>,
     ) -> Result<Self> {
         let layout = copier.lock().unwrap().layout().clone();
         let identity = Identity {
@@ -165,13 +173,14 @@ impl<S: HostStore> PooledStore<S, PoolClient> {
             model: config.scope.model_identity,
             layout: config.scope.layout_fingerprint,
         };
-        let pool = PoolClient::start(config, copier, registrar, exporter)?;
+        let pool = PoolClient::start(config, copier, registrar)?;
         Ok(Self::new(inner, pool, identity, &layout))
     }
 }
 
 impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
-    pub fn new(inner: S, pool: P, identity: Identity, layout: &crate::Layout) -> Self {
+    pub fn new(mut inner: S, pool: P, identity: Identity, layout: &crate::Layout) -> Self {
+        inner.announce_to(pool.announcer());
         Self {
             inner,
             pool,
@@ -613,14 +622,27 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
         let pool = PoolPort::poll(&mut self.pool, &mut pool_events);
         for event in pool_events.drain(..) {
             match event {
-                PoolEvent::Export(request) => events.push(StoreEvent::ExportRequested {
-                    export: request.export,
-                    key: request.key,
-                    generation: request.generation,
-                    begin_tokens: request.begin_tokens,
-                    want_row: request.want_row,
-                    reserved_bytes: request.reserved_bytes,
-                }),
+                PoolEvent::Export(request) if request.tier == Tier::Gpu => {
+                    events.push(StoreEvent::ExportRequested {
+                        export: request.export,
+                        key: request.key,
+                        generation: request.generation,
+                        begin_tokens: request.begin_tokens,
+                        want_row: request.want_row,
+                        reserved_bytes: request.reserved_bytes,
+                    })
+                }
+                // A host tier is this store's to pin; the model worker is not involved.
+                PoolEvent::Export(request) => match self.inner.pin_export(
+                    request.tier,
+                    request.key,
+                    request.generation,
+                    request.begin_tokens,
+                    request.want_row,
+                ) {
+                    Ok(pin) => PoolPort::host_pinned(&mut self.pool, request.export, pin),
+                    Err(reason) => PoolPort::export_refused(&mut self.pool, request.export, reason),
+                },
                 PoolEvent::ExportEnded { export } => {
                     events.push(StoreEvent::ExportEnded { export })
                 }
@@ -718,6 +740,9 @@ mod tests {
         fetches: Vec<(HostHit, InboundTicket)>,
         events: Vec<StoreEvent>,
         reject_fetch: bool,
+        pinned: Vec<(Tier, PrefixKey)>,
+        refuse_pin: Option<ExportRefusal>,
+        announced: bool,
     }
 
     #[derive(Clone, Default)]
@@ -753,10 +778,44 @@ mod tests {
         fn close(&mut self) -> Result<()> {
             Ok(())
         }
+        fn announce_to(&mut self, _: Announcer) {
+            self.0.lock().unwrap().announced = true;
+        }
+        fn pin_export(
+            &mut self,
+            tier: Tier,
+            key: PrefixKey,
+            _: u64,
+            _: u64,
+            _: bool,
+        ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
+            let mut state = self.0.lock().unwrap();
+            state.pinned.push((tier, key));
+            match state.refuse_pin {
+                Some(reason) => Err(reason),
+                None => Ok(Box::new(NoPin(key))),
+            }
+        }
+    }
+
+    struct NoPin(PrefixKey);
+    impl HostPin for NoPin {
+        fn chain(&self) -> &crate::pool::HostChain {
+            unreachable!("the fake pool never reads it {:?}", self.0)
+        }
+        fn read(
+            &mut self,
+            _: &crate::pool::HostWindow,
+            _: &mut [u8],
+        ) -> Result<crate::pool::Checksums> {
+            unreachable!()
+        }
     }
 
     #[derive(Default)]
     struct PoolState {
+        host_pinned: Vec<ExportId>,
+        refused: Vec<(ExportId, ExportRefusal)>,
         answer: Option<Arc<Answer>>,
         held: Vec<Vec<HeldRange>>,
         fetches: Vec<PoolFetch>,
@@ -768,7 +827,7 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct FakePool(Arc<Mutex<PoolState>>, Ranking);
+    struct FakePool(Arc<Mutex<PoolState>>, Ranking, Announcer);
 
     impl PoolPort for FakePool {
         fn begin_lookup(&self, _: &dyn History, held: Vec<HeldRange>) -> LookupTicket {
@@ -807,8 +866,16 @@ mod tests {
         fn evictions_lost(&self) {
             self.0.lock().unwrap().lost += 1;
         }
+        fn announcer(&self) -> Announcer {
+            self.2.clone()
+        }
+        fn host_pinned(&mut self, export: ExportId, _: Box<dyn HostPin>) {
+            self.0.lock().unwrap().host_pinned.push(export);
+        }
         fn export_pinned(&mut self, _: ExportId, _: ExportChain) {}
-        fn export_refused(&mut self, _: ExportId, _: ExportRefusal) {}
+        fn export_refused(&mut self, export: ExportId, reason: ExportRefusal) {
+            self.0.lock().unwrap().refused.push((export, reason));
+        }
         fn close(&mut self) -> Result<()> {
             Ok(())
         }
@@ -836,7 +903,11 @@ mod tests {
         Rig {
             store: PooledStore::new(
                 local.clone(),
-                FakePool(pool.clone(), ranking),
+                FakePool(
+                    pool.clone(),
+                    ranking,
+                    Announcer::new(Arc::new(tokio::sync::Notify::new())),
+                ),
                 identity(),
                 &layout(),
             ),
@@ -1312,6 +1383,7 @@ mod tests {
                 want_row: true,
                 deadline: Instant::now(),
                 reserved_bytes: 1,
+                tier: Tier::Gpu,
             },
         ));
         rig.pool
@@ -1324,5 +1396,43 @@ mod tests {
             matches!(events[0], StoreEvent::ExportRequested { export: e, generation: 3, .. } if e == export)
         );
         assert!(matches!(events[1], StoreEvent::ExportEnded { export: e } if e == export));
+    }
+
+    #[test]
+    fn host_tier_exports_are_pinned_by_the_store_and_never_reach_the_worker() {
+        let mut rig = rig();
+        assert!(
+            rig.local.0.lock().unwrap().announced,
+            "the store announces its tiers"
+        );
+        let key = rig.key(800);
+        let request = |export: u64, tier: Tier| {
+            PoolEvent::Export(super::super::shared::ExportRequest {
+                export: ExportId(export),
+                tier,
+                key,
+                generation: 3,
+                begin_tokens: 0,
+                want_row: true,
+                deadline: Instant::now(),
+                reserved_bytes: 0,
+            })
+        };
+        let events = vec![request(1, Tier::Dram), request(2, Tier::Nvme)];
+        rig.pool.lock().unwrap().events.extend(events);
+        assert!(rig.poll().is_empty());
+        {
+            let state = rig.pool.lock().unwrap();
+            assert_eq!(state.host_pinned, [ExportId(1), ExportId(2)]);
+        }
+        assert_eq!(rig.local.0.lock().unwrap().pinned[1].0, Tier::Nvme);
+        rig.local.0.lock().unwrap().refuse_pin = Some(ExportRefusal::NotFound);
+        let refused = request(3, Tier::Dram);
+        rig.pool.lock().unwrap().events.push(refused);
+        assert!(rig.poll().is_empty());
+        assert_eq!(
+            rig.pool.lock().unwrap().refused,
+            [(ExportId(3), ExportRefusal::NotFound)]
+        );
     }
 }

@@ -1,8 +1,6 @@
-//! The seam through which the host tiers serve exports to other instances.
+//! What a host tier pins for an export: a chain of records that fills windows.
 
-use crate::{ExportRefusal, PrefixKey, Result};
-
-use super::types::Tier;
+use crate::{PrefixKey, Result};
 
 /// One record of a pinned host chain.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,18 +45,4 @@ pub trait HostPin: Send {
     /// Copy the span into `dst` (page records, then the row) and return its
     /// persisted checksums. May block on a device: it runs on a copy thread.
     fn read(&mut self, window: &HostWindow, dst: &mut [u8]) -> Result<Checksums>;
-}
-
-/// The host tiers of this instance, as a source of exports.
-pub trait HostExporter: Send + Sync {
-    /// Pin the chain ending at `key` from the page holding `begin_tokens`. The
-    /// refusal names why nothing was pinned.
-    fn pin(
-        &self,
-        tier: Tier,
-        key: PrefixKey,
-        generation: u64,
-        begin_tokens: u64,
-        want_row: bool,
-    ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal>;
 }

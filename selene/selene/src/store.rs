@@ -1,7 +1,8 @@
 //! What a host tier is asked to do and what it reports back.
 
 use crate::{
-    CheckpointId, History, PageId, PrefixKey, Result, StateSlotId, index, pool::LookupTicket,
+    CheckpointId, History, PageId, PrefixKey, Result, StateSlotId, index,
+    pool::{Announcer, HostPin, LookupTicket, Tier as PoolTier},
 };
 
 /// Identifies one transfer or disk job issued by a store. Memory and disk
@@ -229,6 +230,22 @@ pub trait HostStore {
     /// worker delivered them, so the announced holdings may be stale and must be
     /// announced again in full.
     fn evictions_lost(&mut self) {}
+    /// Announce what this store's tiers hold, now and as they change, through
+    /// `announcer`, and serve them as exports. Nothing is recorded before this.
+    fn announce_to(&mut self, _announcer: Announcer) {}
+    /// Pin the chain a manager asked for from the DRAM or NVMe tier. The pin
+    /// holds the records in place until it is dropped; the store releases them
+    /// on its own thread. Refused when this store does not hold the chain.
+    fn pin_export(
+        &mut self,
+        _tier: PoolTier,
+        _key: PrefixKey,
+        _generation: u64,
+        _begin_tokens: u64,
+        _want_row: bool,
+    ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
+        Err(ExportRefusal::NotFound)
+    }
     /// Start looking for pool candidates for a request that just queued. `None`
     /// when no lookup is wanted or possible.
     fn begin_lookup(&mut self, _history: &dyn History) -> Option<LookupTicket> {

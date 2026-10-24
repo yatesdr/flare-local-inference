@@ -20,7 +20,7 @@ use super::{
     announce::{Announcer, IndexEntry},
     conn,
     engine::{Engine, Settings},
-    exporter::HostExporter,
+    exporter::HostPin,
     identity::{self, Scope},
     lookup::{LookupState, LookupTicket},
     shared::{Command, PoolEvent, PoolFetch, PoolStatus, Shared},
@@ -69,13 +69,10 @@ pub struct PoolClient {
 
 impl PoolClient {
     /// Spawn the I/O thread and return at once, in [`PoolStatus::Connecting`].
-    /// `exporter` serves exports of the host tiers; without it only GPU
-    /// exports are answered.
     pub fn start(
         config: PoolConfig,
         copier: SharedCopier,
         registrar: Arc<dyn HostRegistrar + Send + Sync>,
-        exporter: Option<Arc<dyn HostExporter>>,
     ) -> Result<PoolClient> {
         let geometry = &config.scope.geometry;
         {
@@ -144,7 +141,6 @@ impl PoolClient {
             announce.clone(),
             copier,
             registrar,
-            exporter,
         );
         let stop = Arc::new(AtomicBool::new(false));
         let link = conn::Link {
@@ -254,6 +250,12 @@ impl PoolClient {
     pub fn export_pinned(&mut self, export: ExportId, chain: ExportChain) {
         self.shared
             .push_command(Command::ExportPinned { export, chain }, true);
+    }
+
+    /// A host tier pinned a record chain for `export`.
+    pub fn host_pinned(&mut self, export: ExportId, pin: Box<dyn HostPin>) {
+        self.shared
+            .push_command(Command::HostPinned { export, pin }, true);
     }
 
     /// The worker did not pin the checkpoint for `export`.
