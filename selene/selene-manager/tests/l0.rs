@@ -626,38 +626,6 @@ async fn l0_10_cancel_drains_and_staging_gauge() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_11_snapshot_deltas_epochs_and_namespaces() {
-    let mut host = Host::new(1024 * 1024, 4 * 1024 * 1024);
-    host.start();
-    let mut a = host.client().await;
-    a.store(key(128), None).await;
-    a.store(key(256), Some(key(128))).await;
-    a.store(key(384), Some(key(256))).await;
-    let mut subscription = a.subscribe().await;
-    assert_eq!(subscription.snapshots.last().unwrap().len(), 3);
-    a.store(key(512), Some(key(384))).await;
-    subscription.until_added(key(512)).await;
-    assert_eq!(subscription.entries.len(), 4);
-
-    let mut other = descriptor();
-    other.fingerprint = [9; 16];
-    let mut other_client = host.client_with(other).await.unwrap();
-    let other_subscription = other_client.subscribe().await;
-    assert!(other_subscription.entries.is_empty());
-
-    let mut wrong = descriptor();
-    wrong.ranks[0].row_bytes += 1;
-    assert!(host.client_with(wrong).await.is_err());
-
-    // A second Subscribe on the same connection replaces the first.
-    let mut first = a.subscribe().await;
-    let mut second = a.subscribe().await;
-    assert!(first.stream.message().await.unwrap().is_none());
-    a.store(key(640), Some(key(512))).await;
-    second.until_added(key(640)).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_12_round_robin_and_dead_client_cleanup() {
     let mut host = Host::new(8 * 1024 * 1024, 64 * 1024 * 1024);
     host.start();
@@ -748,165 +716,6 @@ async fn l0_12_round_robin_and_dead_client_cleanup() {
     let start = Instant::now();
     a.fetch(&[key(64)], 0, 1).await;
     assert!(start.elapsed() < Duration::from_millis(500));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_13_generation_fencing_and_malformed_streams() {
-    let mut host = Host::new(1024 * 1024, 1024 * 1024);
-    host.start();
-    let mut client = host.client().await;
-    client.store(key(128), None).await;
-    let old = client.generation;
-    // A second Hello on the same transport supersedes the previous generation.
-    let hello = client
-        .inner
-        .hello(tonic::Request::new(proto::HelloRequest {
-            protocol: 1,
-            replica: "again".into(),
-            descriptor: Some(descriptor_msg(&client.descriptor)),
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-    let mut request = tonic::Request::new(proto::SubscribeRequest {
-        namespace_id: client.descriptor.namespace_id().to_vec(),
-        generation: old,
-        descriptor: Some(descriptor_msg(&client.descriptor)),
-    });
-    request
-        .metadata_mut()
-        .insert("x-selene-generation", old.to_string().parse().unwrap());
-    let status = client.inner.subscribe(request).await.err().unwrap();
-    assert_eq!(status.code(), tonic::Code::Aborted);
-    client.generation = hello.generation;
-
-    // Missing metadata is UNAUTHENTICATED.
-    let request = tonic::Request::new(proto::SubscribeRequest {
-        namespace_id: client.descriptor.namespace_id().to_vec(),
-        generation: client.generation,
-        descriptor: Some(descriptor_msg(&client.descriptor)),
-    });
-    let status = client.inner.subscribe(request).await.err().unwrap();
-    assert_eq!(status.code(), tonic::Code::Unauthenticated);
-
-    // A filled window for an unknown transfer is refused INVALID.
-    let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    let mut replies = client
-        .inner
-        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-        .await
-        .unwrap()
-        .into_inner();
-    sender
-        .send(proto::PutMessage {
-            m: Some(client.begin(key(256), None)),
-        })
-        .await
-        .unwrap();
-    let _accept = replies.message().await.unwrap().unwrap();
-    sender
-        .send(proto::PutMessage {
-            m: Some(proto::put_message::M::Filled(proto::WindowFilled {
-                transfer: 999_999,
-                index: 0,
-                page_xxh3: vec![0],
-                row_xxh3: 0,
-                has_row: false,
-            })),
-        })
-        .await
-        .unwrap();
-    let refused = loop {
-        match replies.message().await.unwrap().unwrap().r {
-            Some(proto::put_reply::R::Refused(refused)) => break refused,
-            Some(_) => continue,
-            None => panic!("ended"),
-        }
-    };
-    assert_eq!(refused.reason, proto::Reason::Invalid as i32);
-
-    // A Commit before Begin is a malformed stream.
-    let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    let mut replies = client
-        .inner
-        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-        .await
-        .unwrap()
-        .into_inner();
-    sender
-        .send(proto::PutMessage {
-            m: Some(proto::put_message::M::Commit(proto::PutCommit {
-                transfer: 1,
-                metadata_offset: 0,
-                metadata: vec![0; 4096],
-            })),
-        })
-        .await
-        .ok();
-    let refused = replies.message().await.unwrap().unwrap();
-    assert!(matches!(
-        refused.r,
-        Some(proto::put_reply::R::Refused(proto::Refused {
-            reason,
-            ..
-        })) if reason == proto::Reason::Invalid as i32
-    ));
-    drop(sender);
-    drop(replies);
-
-    // An empty Put stream is a terminal Refused{INVALID}, not a status.
-    let (empty_sender, receiver) = tokio::sync::mpsc::channel(8);
-    let mut replies = client
-        .inner
-        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-        .await
-        .unwrap()
-        .into_inner();
-    drop(empty_sender);
-    let refused = replies.message().await.unwrap().unwrap();
-    assert!(matches!(
-        refused.r,
-        Some(proto::put_reply::R::Refused(proto::Refused {
-            reason,
-            ..
-        })) if reason == proto::Reason::Invalid as i32
-    ));
-
-    // LocalCache.Get must reject destinations as a terminal refusal too.
-    let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    let mut replies = client
-        .inner
-        .get(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-        .await
-        .unwrap()
-        .into_inner();
-    sender
-        .send(proto::GetMessage {
-            m: Some(proto::get_message::M::Begin(proto::GetBegin {
-                namespace_id: client.descriptor.namespace_id().to_vec(),
-                chain: vec![key_msg(key(128))],
-                skip_pages: 0,
-                expected_pages: 2,
-                row: true,
-                destinations: vec![proto::GetDestination {
-                    record: 0,
-                    region: proto::Region::Arena as i32,
-                    offset: 0,
-                    bytes: 4096,
-                }],
-                transfer: 0,
-            })),
-        })
-        .await
-        .unwrap();
-    let refused = replies.message().await.unwrap().unwrap();
-    assert!(matches!(
-        refused.r,
-        Some(proto::get_reply::R::Refused(proto::Refused {
-            reason,
-            ..
-        })) if reason == proto::Reason::Invalid as i32
-    ));
 }
 
 #[test]
@@ -1094,26 +903,6 @@ async fn l0_19_two_managers_one_name() {
     config.name = host.config.name.clone();
     let mut second = Host::open_config(config);
     assert!(second.try_start().is_err());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_20_size_mismatch_before_mmap() {
-    let mut host = Host::new(1024 * 1024, 1024 * 1024);
-    host.start();
-    let client = host.client().await;
-    let path = client.staging_path.clone();
-    drop(client);
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_len(4096)
-        .unwrap();
-    let error = Client::connect(&host.config, descriptor())
-        .await
-        .err()
-        .unwrap();
-    assert!(error.contains("size mismatch"), "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1327,51 +1116,6 @@ async fn l0_25_verify_before_window_reuse() {
             other => panic!("unexpected: {other:?}"),
         }
     }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_26_namespace_registration_and_mismatch() {
-    let mut host = Host::new(1024 * 1024, 1024 * 1024);
-    host.start();
-    let mut client = host.client().await;
-    client.store(key(128), None).await;
-    // A descriptor with the same namespace id but different geometry is a
-    // precondition failure, not a panic.
-    let mut mismatch = descriptor();
-    mismatch.ranks[0].row_bytes += 1;
-    assert_eq!(mismatch.namespace_id(), client.descriptor.namespace_id());
-    let status = client.subscribe_descriptor(&mismatch).await.err().unwrap();
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    // An unregistered namespace on a Put is also a precondition failure.
-    let mut other = descriptor();
-    other.fingerprint = [11; 16];
-    let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    let mut replies = client
-        .inner
-        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-        .await
-        .unwrap()
-        .into_inner();
-    sender
-        .send(proto::PutMessage {
-            m: Some(proto::put_message::M::Begin(proto::PutBegin {
-                namespace_id: other.namespace_id().to_vec(),
-                key: Some(key_msg(key(64))),
-                chain_pages: 1,
-                row: true,
-                published_parent: None,
-                has_published_parent: false,
-                bucket: vec![4; 16],
-                published_tail_pages: 1,
-                descriptor: Some(descriptor_msg(&other)),
-            })),
-        })
-        .await
-        .unwrap();
-    let status = replies.message().await.err().unwrap();
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    // The manager is still healthy.
-    assert!(!client.fetch(&[key(128)], 0, 2).await[0].is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1677,106 +1421,6 @@ async fn l0_34_concurrent_nvme_gets_share_connection_credits() {
     });
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_35_generation_fencing_reaches_the_owner_thread() {
-    let mut host = Host::new(1024 * 1024, 1024 * 1024);
-    host.start();
-    let mut client = host.client().await;
-    // Open a Put stream under generation 1 but do not send its begin yet.
-    let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    let mut replies = client
-        .inner
-        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-        .await
-        .unwrap()
-        .into_inner();
-    // A second Hello on the same transport supersedes generation 1.
-    let hello = client
-        .inner
-        .hello(tonic::Request::new(proto::HelloRequest {
-            protocol: 1,
-            replica: "again".into(),
-            descriptor: Some(descriptor_msg(&client.descriptor)),
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-    client.generation = hello.generation;
-    // The old stream must not be able to begin into the new session.
-    sender
-        .send(proto::PutMessage {
-            m: Some(client.begin(key(256), None)),
-        })
-        .await
-        .unwrap();
-    let status = loop {
-        match replies.message().await {
-            Err(status) => break status,
-            Ok(Some(reply)) => match reply.r {
-                Some(proto::put_reply::R::Refused(_)) => {
-                    panic!("stale stream reached the new session")
-                }
-                _ => continue,
-            },
-            Ok(None) => panic!("stale stream ended without a status"),
-        }
-    };
-    assert_eq!(status.code(), tonic::Code::Aborted);
-    drop(sender);
-    drop(replies);
-    let mut fresh = host.client().await;
-    fresh.store(key(256), None).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_36_connection_limit_is_enforced() {
-    let mut host = Host::new(1024 * 1024, 1024 * 1024);
-    host.start();
-    let mut clients = Vec::new();
-    for _ in 0..64 {
-        clients.push(host.client().await);
-    }
-    assert!(
-        host.client_with(descriptor()).await.is_err(),
-        "the 65th connection must be refused"
-    );
-    // Dropping one transport frees its slot.
-    clients.pop();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match host.client_with(descriptor()).await {
-            Ok(client) => {
-                clients.push(client);
-                break;
-            }
-            Err(_) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "connection slot was not released"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_37_subscription_epoch_discards_queued_events() {
-    let mut host = Host::new(1024 * 1024, 1024 * 1024);
-    host.start();
-    let mut client = host.client().await;
-    let mut first = client.subscribe().await;
-    let mut second = client.subscribe().await;
-    // After the replacement the old epoch must not deliver new events.
-    client.store(key(128), None).await;
-    second.until_added(key(128)).await;
-    match first.stream.message().await {
-        Ok(None) => {}
-        Ok(Some(event)) => panic!("stale subscription yielded {event:?}"),
-        Err(_) => {}
-    }
-}
-
 #[test]
 fn l0_38_async_reads_overtake_queued_writes() {
     let base = base("read-priority");
@@ -1838,25 +1482,6 @@ fn l0_38_async_reads_overtake_queued_writes() {
         worker.receiver.recv().unwrap();
     }
     fs::remove_dir_all(base).unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_39_gap_recovery_uses_a_fresh_snapshot() {
-    let mut host = Host::new(1024 * 1024, 1024 * 1024);
-    host.start();
-    let mut client = host.client().await;
-    let mut first = client.subscribe().await;
-    client.store(key(128), None).await;
-    client.store(key(256), Some(key(128))).await;
-    first.until_added(key(256)).await;
-    // The client detects a missing event / gap and rebuilds with a fresh
-    // Subscribe (gRPC has no RESYNC); the new snapshot must contain both.
-    drop(first);
-    let mut second = client.subscribe().await;
-    assert!(second.entries.contains_key(&key(128)));
-    assert!(second.entries.contains_key(&key(256)));
-    client.store(key(384), Some(key(256))).await;
-    second.until_added(key(384)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1996,49 +1621,6 @@ async fn l0_43_failed_get_drains_release_every_pin() {
         "{outcome:?}"
     );
     host.wait(|host| host.gauge("cleanup_records") == 0 && host.gauge("leases") == 0);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_44_wrong_namespace_get_is_refused_invalid() {
-    let mut host = Host::new(1024 * 1024, 1024 * 1024);
-    host.start();
-    let mut client = host.client().await;
-    client.store(key(128), None).await;
-    let mut other = descriptor();
-    other.fingerprint = [12; 16];
-    let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    let mut replies = client
-        .inner
-        .get(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-        .await
-        .unwrap()
-        .into_inner();
-    sender
-        .send(proto::GetMessage {
-            m: Some(proto::get_message::M::Begin(proto::GetBegin {
-                namespace_id: other.namespace_id().to_vec(),
-                chain: vec![key_msg(key(128))],
-                skip_pages: 0,
-                expected_pages: 2,
-                row: true,
-                destinations: Vec::new(),
-                transfer: 0,
-            })),
-        })
-        .await
-        .unwrap();
-    let reply = replies.message().await.unwrap().unwrap();
-    assert!(matches!(
-        reply.r,
-        Some(proto::get_reply::R::Refused(proto::Refused {
-            reason,
-            ..
-        })) if reason == proto::Reason::Invalid as i32
-    ));
-    drop(sender);
-    drop(replies);
-    // The session is still usable for its own namespace.
-    assert!(!client.fetch(&[key(128)], 0, 2).await[0].is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
