@@ -48,6 +48,10 @@ impl TicketInner {
         })
     }
 
+    pub(crate) fn set(&self, state: LookupState) {
+        *self.state.lock().unwrap() = state;
+    }
+
     pub(crate) fn get(&self) -> LookupState {
         self.state.lock().unwrap().clone()
     }
@@ -62,6 +66,13 @@ pub struct LookupTicket {
 }
 
 impl LookupTicket {
+    pub(crate) fn new(inner: Arc<TicketInner>, withdraw: Box<dyn FnOnce() + Send>) -> Self {
+        Self {
+            inner,
+            withdraw: Some(withdraw),
+        }
+    }
+
     /// A ticket that will never have an answer and owns nothing.
     pub fn none() -> Self {
         Self {
