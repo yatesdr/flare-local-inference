@@ -7,7 +7,7 @@ use std::{io, net::SocketAddr, path::PathBuf, time::Duration};
 
 pub const DEFAULT_NAME: &str = "default";
 pub const DEFAULT_MEMORY: u64 = 1 << 30;
-pub const DEFAULT_STAGING: u64 = 256 << 20;
+pub const DEFAULT_STAGING: u64 = 4 << 30;
 pub const DEFAULT_SOURCE_WAIT: Duration = Duration::from_secs(10);
 pub const DEFAULT_INSTANCE_RETENTION: Duration = Duration::from_secs(7 * 86_400);
 pub const MIN_MEMORY: u64 = 4096;
@@ -197,7 +197,7 @@ pub fn help_text() -> String {
      --root PATH                     NVMe directory, owned by this manager alone\n\
      --memory BYTES                  shared arena, default 1G\n\
      --nvme BYTES                    NVMe budget; required with --root\n\
-     --staging BYTES                 shared staging, default 256M\n\
+     --staging BYTES                 shared staging, default 4G\n\
      --write-budget BYTES/s          per-process write rate; 0 = unlimited\n\
      --listen ADDR:PORT              serve instances on other hosts\n\
      --listen-data ADDR:PORT         where they copy bytes, default --listen's next port\n\
@@ -508,7 +508,7 @@ mod tests {
         assert_eq!(config.name, "default");
         assert_eq!(config.socket, PathBuf::from("/run/selene/default.sock"));
         assert_eq!(config.memory, 1 << 30);
-        assert_eq!(config.staging, 256 << 20);
+        assert_eq!(config.staging, 4 << 30);
         assert_eq!(config.source_wait, Duration::from_secs(10));
         assert_eq!(config.instance_retention, Duration::from_secs(7 * 86_400));
         assert!(config.listen.is_none() && !config.rdma);
