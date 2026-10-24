@@ -985,6 +985,7 @@ fn a_claim_whose_row_has_not_arrived_is_not_covered_until_its_window_does() {
     let (_, claim) = granted_single(&mut rig);
     let w0 = ready(&rig, claim, window(0, 0, 0, 2, false, 0), 1);
     rig.send(In::WindowReady(w0));
+    // The pages are all in, without the row: the claim is not covered yet.
     let w1 = ready(&rig, claim, window(1, 1, 0, 1, false, 2 * PAGE), 2);
     rig.send(In::WindowReady(w1));
     let out = rig.drain_copies();
@@ -999,6 +1000,27 @@ fn a_claim_whose_row_has_not_arrived_is_not_covered_until_its_window_does() {
     assert_eq!(
         pick!(out, CopyResult)[0].outcome,
         wire::CopyOutcome::CopyOk as i32
+    );
+}
+
+#[test]
+fn a_window_that_repeats_a_page_is_not_a_row_of_its_own() {
+    let mut rig = Rig::new();
+    rig.open();
+    let (_, claim) = granted_single(&mut rig);
+    for spec in [
+        window(0, 0, 0, 2, false, 0),
+        window(1, 1, 0, 1, false, 2 * PAGE),
+    ] {
+        let ready = ready(&rig, claim, spec, 1);
+        rig.send(In::WindowReady(ready));
+    }
+    let wrong = ready(&rig, claim, window(2, 1, 0, 1, true, 3 * PAGE), 3);
+    rig.send(In::WindowReady(wrong));
+    let out = rig.drain_copies();
+    assert_eq!(
+        pick!(out, CopyResult)[0].outcome,
+        wire::CopyOutcome::CopyErrorOutcome as i32
     );
 }
 

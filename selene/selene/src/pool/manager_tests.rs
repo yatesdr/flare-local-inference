@@ -312,9 +312,13 @@ impl Instance {
 }
 
 fn history() -> TestHistory {
+    history_of(4000)
+}
+
+fn history_of(tokens: u32) -> TestHistory {
     let mut history = TestHistory::new([7; 32]);
     history
-        .append(&(0..4000).collect::<Vec<u32>>(), &[])
+        .append(&(0..tokens).collect::<Vec<u32>>(), &[])
         .unwrap();
     history
 }
@@ -1337,4 +1341,36 @@ fn instances_on_other_hosts_come_back_and_copy_after_the_manager_restarts() {
     restore(&mut requester, &history, 3, &[400, 401, 402]);
     writer.client.close().unwrap();
     requester.client.close().unwrap();
+}
+
+/// Pages that fill the manager's window exactly leave the row to a window of its own.
+fn a_window_of_pages_with_the_row_alone(manager: &Manager) {
+    let mut writer = instance(manager, "writer", 1);
+    let mut requester = instance(manager, "requester", 2);
+    writer.ready();
+    requester.ready();
+    // The manager's windows hold 4 MiB: 512 pages of 8 KiB fill one, and the row follows alone.
+    let pages = 512usize;
+    let history = history_of(pages as u32 * PT as u32 + 64);
+    let (request, _) = put_request(&history, pages);
+    writer.client.put(request).unwrap();
+    let outcome = writer.event("the put", |e| match e {
+        PoolEvent::Put { outcome, .. } => Some(format!("{outcome:?}")),
+        _ => None,
+    });
+    assert!(outcome.starts_with("Stored"), "{outcome}");
+    let scratch: Vec<u32> = (1000..1000 + pages as u32).collect();
+    restore(&mut requester, &history, pages, &scratch);
+    writer.client.close().unwrap();
+    requester.client.close().unwrap();
+}
+
+#[test]
+fn a_row_in_a_window_of_its_own_is_put_and_restored_over_tcp() {
+    a_window_of_pages_with_the_row_alone(&Manager::start_network(false));
+}
+
+#[test]
+fn a_row_in_a_window_of_its_own_is_put_and_restored_through_shared_memory() {
+    a_window_of_pages_with_the_row_alone(&Manager::start());
 }
