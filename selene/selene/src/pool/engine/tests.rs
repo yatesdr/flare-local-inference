@@ -1701,6 +1701,347 @@ fn a_host_pin_the_export_cannot_use_is_dropped() {
     assert!(*dropped.lock().unwrap());
 }
 
+// ---- puts ---------------------------------------------------------------------
+
+/// Bytes for a host-sourced put whose persisted checksums are given, not computed.
+struct Bytes {
+    data: Vec<u8>,
+    sums: Vec<u64>,
+    row: u64,
+}
+
+impl crate::pool::PutBytes for Bytes {
+    fn fill(
+        &mut self,
+        first_page: u64,
+        page_count: u32,
+        row: bool,
+        dst: &mut [u8],
+    ) -> Result<crate::pool::Checksums> {
+        let from = first_page as usize * PAGE as usize;
+        let n = page_count as usize * PAGE as usize;
+        dst[..n].copy_from_slice(&self.data[from..from + n]);
+        if row {
+            dst[n..].copy_from_slice(&self.data[self.data.len() - ROW as usize..]);
+        }
+        Ok(crate::pool::Checksums {
+            pages: self.sums[first_page as usize..][..page_count as usize].to_vec(),
+            row: row.then_some(self.row),
+        })
+    }
+}
+
+fn gpu_put(parent: Option<PrefixKey>) -> crate::pool::PutRequest {
+    crate::pool::PutRequest {
+        key: key(192, 2),
+        parent,
+        bucket: [4; 16],
+        chain_pages: 3,
+        tail_pages: 3,
+        row: true,
+        generation: 4,
+        source: crate::pool::PutSource::Gpu {
+            pages: vec![PageId(20), PageId(21), PageId(22)],
+            slot: StateSlotId(5),
+        },
+    }
+}
+
+/// The record length the manager expects for `pages` pages and a row.
+fn record_len(pages: u64) -> u64 {
+    4096 + 4096 + pages * PAGE + ROW
+}
+
+fn accept(put: u64, first_page: u64, record_bytes: u64) -> In {
+    In::PutAccept(wire::PutAccept {
+        put_id: put,
+        first_page,
+        has_parent: false,
+        parent: None,
+        record_bytes,
+        channel: None,
+    })
+}
+
+fn grant_put(put: u64, spec: wire::WindowSpec) -> In {
+    In::PutGrant(wire::PutGrant {
+        put_id: put,
+        window: Some(spec),
+    })
+}
+
+fn puts(events: &[PoolEvent]) -> Vec<(u64, String)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            PoolEvent::Put { id, outcome } => Some((*id, format!("{outcome:?}"))),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_gpu_record_is_put_through_a_window_committed_with_its_checksums_and_stored() {
+    let mut rig = Rig::new();
+    rig.open();
+    gpu_with_chain(&rig);
+    let out = rig.command(Command::Put {
+        id: 7,
+        request: gpu_put(None),
+    });
+    let begin = pick!(out, PutBegin);
+    assert_eq!(begin.len(), 1);
+    assert_eq!(
+        (begin[0].put_id, begin[0].chain_pages, begin[0].row),
+        (7, 3, true)
+    );
+    assert_eq!(begin[0].published_tail_pages, 3);
+    assert_eq!(begin[0].mode, wire::CopyMode::SharedWindows as i32);
+    rig.send(accept(7, 0, record_len(3)));
+    let out = rig.send(grant_put(7, window(0, 0, 0, 3, true, 0)));
+    assert!(
+        pick!(out, PutFilled).is_empty(),
+        "nothing is reported before the copy drained"
+    );
+    assert!(
+        rig.copier
+            .lock()
+            .unwrap()
+            .submitted
+            .iter()
+            .all(|j| j.direction == Direction::Out)
+    );
+    let out = rig.drain_copies();
+    let filled = pick!(out, PutFilled);
+    assert_eq!(filled.len(), 1);
+    let window_bytes = rig
+        .regions
+        .staging
+        .bytes(0, 3 * PAGE + ROW)
+        .unwrap()
+        .to_vec();
+    assert_eq!(
+        window_bytes[..PAGE as usize],
+        pattern(20, PAGE as usize)[..]
+    );
+    assert_eq!(
+        filled[0].page_xxh3[1],
+        checksum(&window_bytes[PAGE as usize..2 * PAGE as usize])
+    );
+    assert_eq!(
+        filled[0].row_xxh3,
+        checksum(&window_bytes[3 * PAGE as usize..])
+    );
+    let commit = pick!(out, PutCommit);
+    assert_eq!(commit.len(), 1, "committed once every window is filled");
+    let metadata = &commit[0].metadata;
+    assert_eq!(metadata.len() as u64, 4096 + 4096);
+    let header = crate::record::Header::decode(&metadata[..4096]).unwrap();
+    assert_eq!(
+        (header.key, header.tail_pages, header.parent),
+        (key(192, 2), 3, None)
+    );
+    assert_eq!(header.row_checksum, filled[0].row_xxh3);
+    assert_eq!(header.identity, [1; 32]);
+    for page in 0..3 {
+        let stored = u64::from_le_bytes(
+            metadata[4096 + page * 8..4096 + page * 8 + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(stored, filled[0].page_xxh3[page]);
+    }
+    assert!(puts(&rig.events()).is_empty());
+    let out = rig.send(In::Stored(wire::Stored {
+        put_id: 7,
+        bytes: record_len(3),
+    }));
+    assert!(
+        pick!(out, FenceAck).is_empty(),
+        "a stored put leaves nothing leased"
+    );
+    let ended = puts(&rig.events());
+    assert_eq!(ended.len(), 1);
+    assert!(ended[0].1.starts_with("Stored"));
+}
+
+#[test]
+fn a_refusal_ends_the_put_and_present_is_a_success() {
+    let mut rig = Rig::new();
+    rig.open();
+    gpu_with_chain(&rig);
+    rig.command(Command::Put {
+        id: 1,
+        request: gpu_put(None),
+    });
+    rig.send(In::PutRefused(wire::PutRefused {
+        put_id: 1,
+        reason: wire::Reason::Present as i32,
+        detail: String::new(),
+    }));
+    assert_eq!(puts(&rig.events()), [(1, "Present".to_string())]);
+    // Windows were granted and left unfilled: the manager keeps them leased
+    // until the fence, which follows the drain of what was running.
+    rig.command(Command::Put {
+        id: 2,
+        request: gpu_put(None),
+    });
+    rig.send(accept(2, 0, record_len(3)));
+    rig.send(grant_put(2, window(0, 0, 0, 3, true, 0)));
+    let out = rig.send(In::PutRefused(wire::PutRefused {
+        put_id: 2,
+        reason: wire::Reason::Budget as i32,
+        detail: String::new(),
+    }));
+    assert!(
+        pick!(out, FenceAck).is_empty(),
+        "the copy into the window is still running"
+    );
+    assert!(puts(&rig.events()).is_empty());
+    let out = rig.drain_copies();
+    assert_eq!(pick!(out, FenceAck).len(), 1);
+    assert!(pick!(out, PutFilled).is_empty() && pick!(out, PutCommit).is_empty());
+    assert_eq!(puts(&rig.events())[0].1, "Refused(Budget)");
+}
+
+#[test]
+fn a_cancel_before_the_commit_withdraws_the_put_and_fences_after_the_drain() {
+    let mut rig = Rig::new();
+    rig.open();
+    gpu_with_chain(&rig);
+    rig.command(Command::Put {
+        id: 3,
+        request: gpu_put(None),
+    });
+    rig.send(accept(3, 0, record_len(3)));
+    rig.send(grant_put(3, window(0, 0, 0, 3, true, 0)));
+    let out = rig.command(Command::PutCancel(3));
+    assert_eq!(pick!(out, PutCancel).len(), 1);
+    assert!(puts(&rig.events()).is_empty(), "the copy has not drained");
+    let out = rig.drain_copies();
+    assert_eq!(pick!(out, FenceAck).len(), 1);
+    assert!(
+        pick!(out, PutFilled).is_empty(),
+        "a cancelled put reports no window"
+    );
+    assert_eq!(puts(&rig.events())[0].1, "Cancelled");
+    // A grant that arrives afterwards finds nothing to fill.
+    assert!(
+        rig.send(grant_put(3, window(1, 0, 0, 1, false, 0)))
+            .is_empty()
+    );
+}
+
+#[test]
+fn bytes_a_store_supplies_are_committed_with_the_checksums_it_persists() {
+    let mut rig = Rig::new();
+    rig.open();
+    let data = pattern(9, 3 * PAGE as usize + ROW as usize);
+    // The persisted sums differ from the bytes' own: the writer passes them on.
+    let source = Bytes {
+        data,
+        sums: vec![101, 102, 103],
+        row: 104,
+    };
+    let mut request = gpu_put(None);
+    request.source = crate::pool::PutSource::Host(Box::new(source));
+    rig.command(Command::Put { id: 4, request });
+    rig.send(accept(4, 0, record_len(3)));
+    rig.send(grant_put(4, window(0, 0, 0, 3, true, 0)));
+    let mut out = Vec::new();
+    for _ in 0..200 {
+        std::thread::sleep(Duration::from_millis(5));
+        out.extend(rig.tick(Duration::ZERO));
+        if !pick!(out, PutCommit).is_empty() {
+            break;
+        }
+    }
+    let filled = pick!(out, PutFilled);
+    assert_eq!(filled[0].page_xxh3, [101, 102, 103]);
+    assert_eq!(filled[0].row_xxh3, 104);
+    let commit = pick!(out, PutCommit);
+    let header = crate::record::Header::decode(&commit[0].metadata[..4096]).unwrap();
+    assert_eq!(header.row_checksum, 104);
+    assert_eq!(
+        u64::from_le_bytes(commit[0].metadata[4096 + 8..4096 + 16].try_into().unwrap()),
+        102
+    );
+}
+
+#[test]
+fn a_record_the_manager_sizes_differently_or_a_window_out_of_order_fails_the_put() {
+    let mut rig = Rig::new();
+    rig.open();
+    gpu_with_chain(&rig);
+    rig.command(Command::Put {
+        id: 5,
+        request: gpu_put(None),
+    });
+    let out = rig.send(accept(5, 0, record_len(3) + 4096));
+    assert_eq!(pick!(out, PutCancel).len(), 1);
+    let ended = puts(&rig.events());
+    assert!(ended[0].1.starts_with("Failed"), "{ended:?}");
+    rig.command(Command::Put {
+        id: 6,
+        request: gpu_put(None),
+    });
+    rig.send(accept(6, 0, record_len(3)));
+    let out = rig.send(grant_put(6, window(1, 0, 0, 3, true, 0)));
+    assert_eq!(pick!(out, PutCancel).len(), 1);
+    assert!(rig.copier.lock().unwrap().submitted.is_empty());
+    assert!(puts(&rig.events())[0].1.starts_with("Failed"));
+    // Accepting from a later first page writes only the rest of the chain.
+    rig.command(Command::Put {
+        id: 8,
+        request: gpu_put(None),
+    });
+    // The manager chose a parent one page up the chain, so two pages are needed.
+    rig.send(In::PutAccept(wire::PutAccept {
+        put_id: 8,
+        first_page: 1,
+        has_parent: true,
+        parent: Some(super::super::codec::key_to(key(64, 7))),
+        record_bytes: record_len(2),
+        channel: None,
+    }));
+    rig.send(grant_put(8, window(0, 0, 0, 2, true, 0)));
+    let jobs = rig.copier.lock().unwrap().submitted.clone();
+    assert_eq!(
+        jobs[0].pages.iter().map(|(p, _)| p.0).collect::<Vec<_>>(),
+        [21, 22]
+    );
+}
+
+#[test]
+fn losing_the_session_mid_put_fails_it_after_the_drain_and_owes_the_fence() {
+    let mut rig = Rig::new();
+    rig.open();
+    gpu_with_chain(&rig);
+    rig.command(Command::Put {
+        id: 9,
+        request: gpu_put(None),
+    });
+    rig.send(accept(9, 0, record_len(3)));
+    rig.send(grant_put(9, window(0, 0, 0, 3, true, 0)));
+    rig.engine.session_lost(rig.now);
+    assert!(
+        puts(&rig.events()).is_empty(),
+        "the copy still reads the GPU pages"
+    );
+    rig.copier.lock().unwrap().complete_all();
+    rig.engine.tick(rig.now);
+    assert!(puts(&rig.events())[0].1.starts_with("Failed"));
+    let out = rig.open_session(Some(rig.regions.clone()));
+    assert_eq!(pick!(out, FenceAck).len(), 1);
+    // And a put started with no session is refused with one failure.
+    let mut rig = Rig::new();
+    rig.command(Command::Put {
+        id: 1,
+        request: gpu_put(None),
+    });
+    assert!(puts(&rig.events())[0].1.starts_with("Failed"));
+}
+
 // ---- expected records -------------------------------------------------------
 
 #[test]

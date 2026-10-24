@@ -27,7 +27,7 @@ use super::{
     },
     Engine, Owner,
     coverage::Coverage,
-    hostfill::{FillDone, FillJob, HostFiller},
+    hostfill::{FillDone, FillJob, FillOwner},
     requester::ExpectedRecord,
 };
 
@@ -62,7 +62,6 @@ struct Export {
 #[derive(Default)]
 pub(crate) struct State {
     exports: HashMap<u64, Export>,
-    filler: Option<HostFiller>,
 }
 
 impl State {
@@ -391,32 +390,20 @@ impl Engine {
                     let pin = pin.clone();
                     run.jobs_outstanding += 1;
                     run.windows.insert(spec.index, spec);
-                    if self.source.filler.is_none() {
-                        match HostFiller::start(self.shared.wake.clone()) {
-                            Ok(filler) => self.source.filler = Some(filler),
-                            Err(_) => {
-                                let run = self.source.exports.get_mut(&id).expect("present");
-                                run.jobs_outstanding -= 1;
-                                run.failed = true;
-                                self.fill_failed(id, spec.index);
-                                break;
-                            }
-                        }
-                    }
+                    let span = HostWindow {
+                        record: spec.record,
+                        first_page: spec.first_page,
+                        page_count: spec.page_count,
+                        row: spec.row,
+                    };
                     let job = FillJob {
-                        export: id,
+                        owner: FillOwner::Export(id),
                         window: spec.index,
-                        pin,
-                        span: HostWindow {
-                            record: spec.record,
-                            first_page: spec.first_page,
-                            page_count: spec.page_count,
-                            row: spec.row,
-                        },
                         address,
                         length: spec.length as usize,
+                        work: Box::new(move |dst| pin.lock().unwrap().read(&span, dst)),
                     };
-                    if !self.source.filler.as_ref().expect("started").submit(job) {
+                    if !self.submit_fill(job) {
                         let run = self.source.exports.get_mut(&id).expect("present");
                         run.jobs_outstanding -= 1;
                         run.failed = true;
@@ -551,16 +538,16 @@ impl Engine {
     /// Collect finished host fills and answer export requests the worker
     /// missed the deadline on.
     pub(crate) fn source_tick(&mut self, now: Instant) {
-        let mut done = Vec::new();
-        if let Some(filler) = &self.source.filler {
-            filler.collect(&mut done);
-        }
         for FillDone {
-            export,
+            owner,
             window,
             result,
-        } in done
+        } in self.collect_fills()
         {
+            let FillOwner::Export(export) = owner else {
+                self.on_put_fill(owner, window, result);
+                continue;
+            };
             let Some(run) = self.source.exports.get_mut(&export) else {
                 continue;
             };

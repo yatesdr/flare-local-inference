@@ -29,11 +29,14 @@ mod types;
 
 pub use announce::{Announcer, IndexEntry, Notice, Snapshot};
 pub use client::{PoolAddress, PoolClient, PoolConfig};
-pub use exporter::{Checksums, HostChain, HostPin, HostRecord, HostWindow};
+pub use exporter::{Checksums, HostChain, HostPin, HostRecord, HostWindow, PutBytes};
 pub use identity::{Geometry, RankPlanes, Scope, instance_id, process_nonce, scope_id};
 pub use lookup::{Answer, LookupState, LookupTicket};
 pub use pins::{FilePin, MemoryPin};
-pub use shared::{ExportRequest, FetchFailure, FetchPart, PoolEvent, PoolFetch, PoolStatus};
+pub use shared::{
+    ExportRequest, FetchFailure, FetchPart, PoolEvent, PoolFetch, PoolStatus, PutOutcome,
+    PutRefusal, PutRequest, PutSource,
+};
 pub use store::{PoolPort, PooledStore};
 pub use tiers::{Releases, TierView};
 pub use types::{HeldRange, PoolCandidate, SourceRef, Tier};
