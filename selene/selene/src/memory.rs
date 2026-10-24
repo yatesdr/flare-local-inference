@@ -45,7 +45,7 @@ use crate::{
 
 use super::{
     HostHit, HostStore, INITIAL_MEMORY_RATE, InboundTicket, JobId, Layout, PublishedCheckpoint,
-    StoreEvent, StoreOutcome, StoreReason, StoreStats, Tier,
+    Retirement, Retiring, StoreEvent, StoreOutcome, StoreReason, StoreStats, Tier,
     copier::{CLOSE_TIMEOUT, Direction, Job, Reply, SharedCopier},
     geometry::invalid,
     index::{Eviction, Index, Match},
@@ -173,6 +173,17 @@ struct Core {
     outbound_rate: Rate,
     inbound_rate: Rate,
     next_job: u64,
+    /// Eviction hands records to the pool's manager instead of dropping them.
+    spill: bool,
+    /// Records chosen for the manager and not yet taken by the pool store.
+    retiring: Vec<Retiring>,
+    /// Records held in place until their move ends: their pages and whether
+    /// they hold a row slab.
+    held: HashMap<PrefixKey, (usize, bool)>,
+    /// Records whose moves ended and that leave once nothing reads them.
+    finishing: Vec<PrefixKey>,
+    /// The generation announced for each announced record.
+    generations: HashMap<PrefixKey, u64>,
 }
 
 impl Core {
@@ -190,6 +201,11 @@ impl Core {
             outbound_rate: Rate(INITIAL_MEMORY_RATE),
             inbound_rate: Rate(INITIAL_MEMORY_RATE),
             next_job: 1,
+            spill: false,
+            retiring: Vec::new(),
+            held: HashMap::new(),
+            finishing: Vec::new(),
+            generations: HashMap::new(),
         }
     }
 
@@ -350,6 +366,9 @@ impl Core {
         if tail_pages > self.pool.page_count() || (row && self.pool.row_count() == 0) {
             return Ok(None);
         }
+        if self.spill && self.retire_for(tail_pages, row) {
+            return Ok(None);
+        }
         while self.pool.free_pages() < tail_pages || (row && self.pool.free_rows() == 0) {
             let need_row =
                 row && self.pool.free_rows() == 0 && self.pool.free_pages() >= tail_pages;
@@ -411,6 +430,77 @@ impl Core {
         }
         self.index.pin(&key)?;
         Ok(Some(record))
+    }
+
+    /// Choose the coldest announced leaves to hand on until the records now
+    /// held cover what a new record lacks, and keep them in place. True when
+    /// some are held, so the caller waits for their moves instead of dropping
+    /// a record the next tier does not have.
+    fn retire_for(&mut self, tail_pages: usize, row: bool) -> bool {
+        let want_pages = tail_pages.saturating_sub(self.pool.free_pages());
+        let want_row = row && self.pool.free_rows() == 0;
+        if want_pages == 0 && !want_row {
+            return false;
+        }
+        let mut pages: usize = self.held.values().map(|(pages, _)| pages).sum();
+        let mut rows = self.held.values().any(|(_, row)| *row);
+        while pages < want_pages || (want_row && !rows) {
+            let generations = &self.generations;
+            let Some(key) = self.index.candidate(false, |node| {
+                node.location.durable && generations.contains_key(&node.key)
+            }) else {
+                break;
+            };
+            let Some(node) = self.index.node(&key) else {
+                break;
+            };
+            let (held_pages, held_row) = (node.location.pages.len(), node.location.row.is_some());
+            let retiring = Retiring {
+                tier: PoolTier::Dram,
+                key,
+                generation: self.generations[&key],
+                parent: node.parent,
+                bucket: node.bucket,
+                tail_pages: node.tail_pages,
+                row: node.row,
+            };
+            if self.index.pin(&key).is_err() {
+                break;
+            }
+            pages += held_pages;
+            rows |= held_row;
+            self.held.insert(key, (held_pages, held_row));
+            self.retiring.push(retiring);
+        }
+        !self.held.is_empty()
+    }
+
+    /// The move of a held record ended: drop it, or let it be offered again.
+    fn retired(&mut self, key: &PrefixKey, how: Retirement) {
+        if self.held.remove(key).is_none() {
+            return;
+        }
+        let _ = self.index.unpin(key);
+        if how != Retirement::Failed {
+            self.finishing.push(*key);
+            self.finish_retired();
+        }
+    }
+
+    /// Remove the records whose moves ended, once no export pin still reads
+    /// them. A record that gained a child meanwhile stays.
+    fn finish_retired(&mut self) {
+        let mut finishing = std::mem::take(&mut self.finishing);
+        finishing.retain(|key| {
+            if self.index.node(key).is_some_and(|node| node.pinned()) {
+                return true;
+            }
+            if self.remove_record(key).is_ok() {
+                self.stats.progress += 1;
+            }
+            false
+        });
+        self.finishing = finishing;
     }
 
     fn release(&mut self, record: &MemoryRecord) {
@@ -1155,6 +1245,9 @@ impl MemoryStore {
                 a.sums.insert(done.key, Arc::new(done.sums));
                 a.view
                     .announce(&notice, parent_of(&notice.key, notice.parent));
+                if let Some(generation) = a.view.generation(&done.key) {
+                    self.core.generations.insert(done.key, generation);
+                }
             }
         }
         for notice in a.view.drain() {
@@ -1191,6 +1284,7 @@ impl MemoryStore {
                 NodeEvent::Gone => {
                     a.hashing.remove(&key);
                     a.sums.remove(&key);
+                    self.core.generations.remove(&key);
                     a.view.retire(&key);
                 }
                 NodeEvent::RowDropped => {
@@ -1200,6 +1294,7 @@ impl MemoryStore {
                 }
             }
         }
+        self.core.finish_retired();
     }
 
     /// Pin the resident records `keys` (ascending, the last the endpoint) for an
@@ -1389,6 +1484,20 @@ impl HostStore for MemoryStore {
     fn announce_to(&mut self, announcer: Announcer) {
         if let Err(error) = self.announce_records(announcer) {
             eprintln!("warning: host memory records will not be shared: {error}");
+        }
+    }
+
+    fn set_spill(&mut self, enabled: bool) {
+        self.core.spill = enabled && !self.core.flat && self.announce.is_some();
+    }
+
+    fn take_retiring(&mut self) -> Vec<Retiring> {
+        std::mem::take(&mut self.core.retiring)
+    }
+
+    fn retired(&mut self, key: PrefixKey, tier: PoolTier, how: Retirement) {
+        if tier == PoolTier::Dram {
+            self.core.retired(&key, how);
         }
     }
 
@@ -2321,5 +2430,97 @@ mod tests {
         assert!((rate.0 - 1200.0).abs() < 1e-9);
         rate.observe(2000, Duration::from_secs(1));
         assert!((rate.0 - 1360.0).abs() < 1e-9);
+    }
+
+    /// Marks every resident record as announced, as the hasher would have.
+    fn announce_all(core: &mut Core) {
+        let keys: Vec<_> = core.index.nodes().map(|node| node.key).collect();
+        for (generation, key) in keys.into_iter().enumerate() {
+            core.generations.insert(key, generation as u64 + 1);
+        }
+    }
+
+    #[test]
+    fn a_spilling_store_holds_the_coldest_announced_leaf_until_its_move_ends() {
+        let mut core = store_core(4, 4, false);
+        let (one, two, three) = (history(600, 1), history(600, 2), history(600, 3));
+        let cold = published(&one, 128, None, 0, 1);
+        let warm = published(&two, 128, None, 10, 2);
+        for checkpoint in [&cold, &warm] {
+            assert!(core.store(checkpoint).unwrap());
+            finish(&mut core);
+        }
+        announce_all(&mut core);
+        core.spill = true;
+        let wanted = published(&three, 128, None, 20, 3);
+
+        // The pool is full: the coldest leaf is held, and nothing is evicted.
+        assert!(!core.store(&wanted).unwrap());
+        assert_eq!(core.held.len(), 1);
+        let retiring = std::mem::take(&mut core.retiring);
+        assert_eq!(retiring.len(), 1);
+        assert_eq!(
+            (retiring[0].key, retiring[0].tier, retiring[0].tail_pages),
+            (cold.key, PoolTier::Dram, 2)
+        );
+        assert_eq!(retiring[0].generation, core.generations[&cold.key]);
+        assert!(core.index.contains(&cold.key));
+
+        // A second attempt finds the held leaf covers it: nothing more is chosen.
+        assert!(!core.store(&wanted).unwrap());
+        assert!(core.retiring.is_empty());
+
+        // A failed move releases the leaf, which is offered again.
+        core.retired(&cold.key, Retirement::Failed);
+        assert!(core.index.contains(&cold.key) && core.held.is_empty());
+        assert!(!core.store(&wanted).unwrap());
+        assert_eq!(core.retiring.len(), 1);
+        core.retiring.clear();
+
+        // Once moved, its slabs are free for the new record.
+        core.retired(&cold.key, Retirement::Moved);
+        assert!(!core.index.contains(&cold.key));
+        assert!(core.index.contains(&warm.key));
+        assert!(core.store(&wanted).unwrap());
+    }
+
+    #[test]
+    fn records_not_yet_announced_are_evicted_in_place_as_before() {
+        let mut core = store_core(4, 4, false);
+        let (one, two, three) = (history(600, 1), history(600, 2), history(600, 3));
+        let cold = published(&one, 128, None, 0, 1);
+        let warm = published(&two, 128, None, 10, 2);
+        for checkpoint in [&cold, &warm] {
+            assert!(core.store(checkpoint).unwrap());
+            finish(&mut core);
+        }
+        core.spill = true;
+        // Nothing was announced, so nothing can be handed on.
+        assert!(core.store(&published(&three, 128, None, 20, 3)).unwrap());
+        assert!(core.retiring.is_empty() && core.held.is_empty());
+        assert!(!core.index.contains(&cold.key));
+    }
+
+    #[test]
+    fn a_moved_record_stays_until_its_export_pin_is_released() {
+        let mut core = store_core(4, 4, false);
+        let (one, two, three) = (history(600, 1), history(600, 2), history(600, 3));
+        let cold = published(&one, 128, None, 0, 1);
+        let warm = published(&two, 128, None, 10, 2);
+        for checkpoint in [&cold, &warm] {
+            assert!(core.store(checkpoint).unwrap());
+            finish(&mut core);
+        }
+        announce_all(&mut core);
+        core.spill = true;
+        assert!(!core.store(&published(&three, 128, None, 20, 3)).unwrap());
+        assert!(core.held.contains_key(&cold.key));
+        // An export reads the slabs.
+        core.index.pin(&cold.key).unwrap();
+        core.retired(&cold.key, Retirement::Moved);
+        assert!(core.index.contains(&cold.key));
+        core.index.unpin(&cold.key).unwrap();
+        core.finish_retired();
+        assert!(!core.index.contains(&cold.key));
     }
 }
