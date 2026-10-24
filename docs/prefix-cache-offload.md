@@ -851,9 +851,12 @@ before any request is admitted, and again later if the store reports that the
 topology changed (a manager joined or left) and the worker is idle. It lends the
 probe 64 idle page ids and one state slot from the free lists and takes them back
 afterwards, so it allocates nothing on the GPU. The probe blocks the worker for
-a bounded time; a request that arrives meanwhile waits for it. Too few free ids
-skip the measurement and keep the default order, and a failed probe stops the
-worker, because copies may still be using the ids. The result is logged once.
+a bounded time, which the log line reports; a request that arrives meanwhile
+waits for it. A probe never stops serving. Too few free ids skip the
+measurement, and a failed one leaves the default order; neither is retried.
+If the pool's copier still has copies in flight a second after the probe, the
+ids and the state slot are never returned to the free lists, are counted as
+quarantined capacity in the scheduler's statistics, and the log says how many.
 
 A pooled instance supports a single host. A multi-host package keeps disk-only
 retention, and startup refuses a pool for it.

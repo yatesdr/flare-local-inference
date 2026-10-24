@@ -761,8 +761,15 @@ fn attach_pool(
         level_order: None,
         registration_context,
     };
-    let store = PooledStore::connect(adapter::Tiers::new(local), config, copier, registrar)?;
-    Ok(Box::new(adapter::Host::new(Box::new(store), true)))
+    let store = PooledStore::connect(
+        adapter::Tiers::new(local),
+        config,
+        copier.clone(),
+        registrar,
+    )?;
+    Ok(Box::new(
+        adapter::Host::new(Box::new(store), true).with_pool_copier(copier),
+    ))
 }
 
 /// Completion of work a store accepted earlier.
@@ -862,6 +869,11 @@ pub trait PrefixStore {
     fn evicted(&mut self, _key: PrefixKey, _generation: u64, _heir: Option<&PublishedCheckpoint>) {}
     /// Eviction notices were dropped before delivery; announce holdings again.
     fn evictions_lost(&mut self) {}
+    /// Whether every copy the pool's own copier accepted has stopped. A store
+    /// with no such copier has none to wait for.
+    fn copies_drained(&self) -> bool {
+        true
+    }
     /// Whether the pool's copy levels should be measured (again).
     fn needs_characterization(&self) -> bool {
         false

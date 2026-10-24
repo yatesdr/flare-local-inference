@@ -15,15 +15,23 @@ use crate::{
 pub(super) struct Host {
     store: Box<dyn HostStore>,
     pooled: bool,
+    /// The pool's dedicated copier, whose in-flight jobs bound when scratch ids are idle.
+    pool_copier: Option<flare_selene::SharedCopier>,
     /// Event scratch reused across polls.
     events: Vec<flare_selene::StoreEvent>,
 }
 
 impl Host {
+    pub(super) fn with_pool_copier(mut self, copier: flare_selene::SharedCopier) -> Self {
+        self.pool_copier = Some(copier);
+        self
+    }
+
     pub(super) fn new(store: Box<dyn HostStore>, pooled: bool) -> Self {
         Self {
             store,
             pooled,
+            pool_copier: None,
             events: Vec::new(),
         }
     }
@@ -113,6 +121,15 @@ impl PrefixStore for Host {
 
     fn evictions_lost(&mut self) {
         self.store.evictions_lost();
+    }
+
+    fn copies_drained(&self) -> bool {
+        self.pool_copier.as_ref().is_none_or(|copier| {
+            copier
+                .lock()
+                .map(|copier| copier.in_flight() == 0)
+                .unwrap_or(false)
+        })
     }
 
     fn needs_characterization(&self) -> bool {
