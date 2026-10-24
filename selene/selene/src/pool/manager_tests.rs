@@ -106,6 +106,11 @@ impl Manager {
 
     /// A manager reached over TCP, with TLS when `tls`.
     fn start_network(tls: bool) -> Self {
+        Self::start_network_with(tls, false)
+    }
+
+    /// As [`Manager::start_network`], also offering RDMA when `rdma`.
+    fn start_network_with(tls: bool, rdma: bool) -> Self {
         let mut manager = Self::start();
         manager.stop();
         let _ = std::fs::remove_file(&manager.socket);
@@ -120,6 +125,8 @@ impl Manager {
         net.memory = 16 << 20;
         net.listen = Some(free());
         net.listen_data = Some(free());
+        net.metrics = Some(free());
+        net.rdma = rdma;
         let mut ca = None;
         if tls {
             let generated =
@@ -137,6 +144,33 @@ impl Manager {
         manager.network = Some(Network { config: net, ca });
         manager.run();
         manager
+    }
+
+    /// What the data channel has moved so far, as `(windows, bytes)` by carrier, read from the
+    /// manager's metrics.
+    fn moved(&self, carrier: &str) -> (u64, u64) {
+        use std::io::{Read, Write};
+        let address = self.network.as_ref().unwrap().config.metrics.unwrap();
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut text = String::new();
+        stream.read_to_string(&mut text).unwrap();
+        let value = |name: &str| {
+            text.lines()
+                .find_map(|line| {
+                    line.strip_prefix(&format!(
+                        "cm_pool_channel_{name}_total{{carrier=\"{carrier}\"}} "
+                    ))
+                })
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0)
+        };
+        (value("windows"), value("bytes"))
     }
 
     /// Where an instance on another host reaches the manager, and the CA it trusts.
@@ -1154,7 +1188,7 @@ fn a_record_cascades_from_memory_to_the_disk_tier_to_the_manager_store() {
 
 /// Put a record through `writer`, restore it through `requester`, and check the level
 /// the lookup gave it.
-fn put_then_restore(manager: &Manager) {
+fn put_then_restore(manager: &Manager, carrier: &str) {
     let mut writer = instance(manager, "writer", 1);
     let mut requester = instance(manager, "requester", 2);
     writer.ready();
@@ -1205,18 +1239,38 @@ fn put_then_restore(manager: &Manager) {
     restore(&mut requester, &history, 5, &[300, 301, 302, 303, 304]);
     writer.client.close().unwrap();
     requester.client.close().unwrap();
+    // One put and two restores of five pages and a row went by this carrier and no other.
+    let (windows, bytes) = manager.moved(carrier);
+    assert!(windows >= 3, "{carrier}: {windows} windows");
+    assert!(
+        bytes >= 3 * (5 * PAGE + ROW) as u64,
+        "{carrier}: {bytes} bytes"
+    );
+    let other = if carrier == "stream" {
+        "rdma"
+    } else {
+        "stream"
+    };
+    assert_eq!(manager.moved(other), (0, 0), "nothing went by {other}");
 }
 
 #[test]
 fn a_record_put_into_a_manager_on_another_host_is_restored_over_tcp() {
     let manager = Manager::start_network(false);
-    put_then_restore(&manager);
+    put_then_restore(&manager, "stream");
 }
 
 #[test]
 fn a_record_put_into_a_manager_on_another_host_is_restored_over_tls() {
     let manager = Manager::start_network(true);
-    put_then_restore(&manager);
+    put_then_restore(&manager, "stream");
+}
+
+#[cfg(feature = "rdma")]
+#[test]
+fn a_record_put_into_a_manager_on_another_host_is_restored_over_rdma() {
+    let manager = Manager::start_network_with(false, true);
+    put_then_restore(&manager, "rdma");
 }
 
 #[test]

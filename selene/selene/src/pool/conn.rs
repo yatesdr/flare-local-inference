@@ -374,7 +374,15 @@ async fn establish(engine: &mut Engine, link: &Link) -> std::result::Result<Esta
     // manager's data channel, if it offers one.
     let dial = match (&regions, &link.address) {
         (None, PoolAddress::Tcp(address)) if !hello.data_transports.is_empty() => {
-            match net_dial(engine, link, address, limits_or_default(hello.limits)) {
+            match net_dial(
+                engine,
+                link,
+                address,
+                limits_or_default(hello.limits),
+                hello
+                    .data_transports
+                    .contains(&(wire::DataTransport::Rdma as i32)),
+            ) {
                 Ok(dial) => Some(dial),
                 Err(error) => {
                     eprintln!(
@@ -463,6 +471,7 @@ fn net_dial(
     link: &Link,
     address: &str,
     limits: wire::Limits,
+    rdma_offered: bool,
 ) -> Result<Arc<dyn Dial>> {
     let host = address
         .rsplit_once(':')
@@ -478,6 +487,8 @@ fn net_dial(
         tls,
         staging,
         events: engine.net_events.clone(),
+        rdma_offered,
+        rdma_broken: engine.rdma_broken.clone(),
     }))
 }
 

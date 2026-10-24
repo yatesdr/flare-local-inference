@@ -26,6 +26,21 @@ use index::{Bucket, Entry, Tier};
 pub use self::core::{Core, PoolConfig, Shared};
 pub use self::service::PoolService;
 
+/// What a grant names for a data-channel transfer: where to connect, the token, and the
+/// carrier the manager prefers (the instance may still ask for the stream).
+pub(crate) fn channel_ref(hub: &crate::data::channel::Hub, token: &[u8]) -> v2::DataChannelRef {
+    v2::DataChannelRef {
+        transport: if hub.offers_rdma() {
+            v2::DataTransport::Rdma
+        } else {
+            v2::DataTransport::Tcp
+        } as i32,
+        address: hub.address().to_string(),
+        token: token.to_vec(),
+        rdma: Vec::new(),
+    }
+}
+
 /// A violation of the protocol by the peer. The session is closed.
 #[derive(Debug)]
 pub struct Violation(pub String);

@@ -667,17 +667,11 @@ impl Core {
                 claim.granted_at = Some(now);
                 claim.last_progress = now;
                 claim.requester_fence = Party::Pending;
-                let channel =
-                    claim
-                        .channel
-                        .as_ref()
-                        .zip(self.cfg.channel.as_ref())
-                        .map(|(open, hub)| v2::DataChannelRef {
-                            transport: v2::DataTransport::Tcp as i32,
-                            address: hub.address().to_string(),
-                            token: open.token.to_vec(),
-                            rdma: Vec::new(),
-                        });
+                let channel = claim
+                    .channel
+                    .as_ref()
+                    .zip(self.cfg.channel.as_ref())
+                    .map(|(open, hub)| super::channel_ref(hub, &open.token));
                 let granted = v2::ClaimGranted {
                     claim_id: key.2,
                     records: claim.records.clone(),
@@ -2008,6 +2002,7 @@ mod tests {
             regions,
             None,
             64,
+            None,
         )
         .unwrap();
         hub.delay_closed(Duration::from_secs(60));

@@ -891,6 +891,15 @@ impl Core {
         for ((name, label), value) in &self.counters {
             text.push_str(&format!("cm_pool_{name}{{{label}}} {value}\n"));
         }
+        if let Some(hub) = &self.cfg.channel {
+            let moved = hub.moved();
+            for (index, carrier) in ["stream", "rdma"].into_iter().enumerate() {
+                text.push_str(&format!(
+                    "cm_pool_channel_windows_total{{carrier=\"{carrier}\"}} {}\ncm_pool_channel_bytes_total{{carrier=\"{carrier}\"}} {}\n",
+                    moved.windows[index], moved.bytes[index]
+                ));
+            }
+        }
         *self.shared.metrics.lock().unwrap() = text;
     }
 

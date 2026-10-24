@@ -341,6 +341,27 @@ impl ToManager {
     /// Read one frame. A filled window's payload is left unread on the reader.
     pub async fn read<R: AsyncRead + Unpin>(reader: &mut R, max_pages: u32) -> io::Result<Self> {
         let kind = reader.read_u8().await?;
+        Self::read_body(kind, reader, max_pages).await
+    }
+
+    /// As [`ToManager::read`], but `None` when the instance closed the connection
+    /// between frames.
+    pub async fn read_or_end<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        max_pages: u32,
+    ) -> io::Result<Option<Self>> {
+        let mut kind = [0u8; 1];
+        if reader.read(&mut kind).await? == 0 {
+            return Ok(None);
+        }
+        Self::read_body(kind[0], reader, max_pages).await.map(Some)
+    }
+
+    async fn read_body<R: AsyncRead + Unpin>(
+        kind: u8,
+        reader: &mut R,
+        max_pages: u32,
+    ) -> io::Result<Self> {
         match kind {
             HELLO => match reader.read_u8().await? {
                 1 => Ok(ToManager::Hello(Carrier::Stream)),

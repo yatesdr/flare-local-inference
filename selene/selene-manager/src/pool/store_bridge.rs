@@ -501,16 +501,11 @@ impl Core {
         match answer {
             Ok(PutAnswer::Accept(accept)) => {
                 rec.accepted = Some((accept.parent, accept.first_page));
-                let channel =
-                    rec.channel
-                        .as_ref()
-                        .zip(self.cfg.channel.as_ref())
-                        .map(|(open, hub)| v2::DataChannelRef {
-                            transport: v2::DataTransport::Tcp as i32,
-                            address: hub.address().to_string(),
-                            token: open.token.to_vec(),
-                            rdma: Vec::new(),
-                        });
+                let channel = rec
+                    .channel
+                    .as_ref()
+                    .zip(self.cfg.channel.as_ref())
+                    .map(|(open, hub)| super::channel_ref(hub, &open.token));
                 self.send(
                     sid,
                     M::PutAccept(v2::PutAccept {
