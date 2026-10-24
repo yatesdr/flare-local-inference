@@ -134,6 +134,9 @@ impl Drop for Generation {
     }
 }
 
+/// The longest a request waits for its pool lookup before it is admitted with what it has.
+const POOL_LOOKUP_GRACE_NS: u64 = 25_000_000;
+
 /// Idle page ids the pool's characterization probes copy into.
 const CHARACTERIZATION_PAGES: usize = 64;
 /// Longest wait for a probe's copies to be reaped before they count as undrained.
@@ -163,8 +166,23 @@ struct Incoming {
     /// it when the request is admitted, which withdraws a lookup still on the
     /// wire; a cancelled or failed request drops it with the `Incoming`.
     pool_lookup: Option<crate::offload::LookupTicket>,
+    /// When that lookup started, on the observation clock, so a request waits for its
+    /// answer for a bounded time only.
+    pool_lookup_ns: u64,
 }
 impl Incoming {
+    /// Whether the request is still giving its pool lookup a short head start. A lookup
+    /// is asked when the request arrives, and an idle worker would otherwise admit the
+    /// request before any answer could come back, so no pool source could ever be used.
+    /// Only this request waits, for at most POOL_LOOKUP_GRACE_NS, and only while the lookup
+    /// is pending; an answer, no answer, or the end of the grace admits it.
+    fn awaits_pool(&self, now_ns: u64) -> bool {
+        self.pool_lookup.as_ref().is_some_and(|ticket| {
+            matches!(ticket.state(), flare_selene::pool::LookupState::Pending)
+                && now_ns.saturating_sub(self.pool_lookup_ns) < POOL_LOOKUP_GRACE_NS
+        })
+    }
+
     fn prompt_score_range(&self, start: usize, tokens: usize) -> std::ops::Range<usize> {
         let first = (if start == 0 { 0 } else { start + 1 }).max(self.prompt_scored);
         first..(start + tokens + 1).min(self.prompt_score_end)
@@ -708,6 +726,7 @@ impl ModelRuntime {
                 readmitted: false,
                 blocked: None,
                 pool_lookup: None,
+                pool_lookup_ns: 0,
             };
             let enqueue_ns = observation
                 .filter(|timestamps| *timestamps)
@@ -1065,6 +1084,7 @@ impl<'a> Worker<'a> {
                 .is_ok()
             {
                 incoming.pool_lookup = store.begin_lookup(&history);
+                incoming.pool_lookup_ns = super::observation::monotonic_ns();
             }
         }
     }
@@ -1189,7 +1209,10 @@ impl<'a> Worker<'a> {
                 stats.free_snapshots,
                 stats.free_slots,
             );
-            let eligible = |incoming: &Incoming| incoming.blocked != Some(resources);
+            let now_ns = super::observation::monotonic_ns();
+            let eligible = |incoming: &Incoming| {
+                incoming.blocked != Some(resources) && !incoming.awaits_pool(now_ns)
+            };
             let parked = self
                 .parked
                 .iter()
@@ -2748,6 +2771,7 @@ mod tests {
             prompt_scored: 0,
             blocked: None,
             pool_lookup: None,
+            pool_lookup_ns: 0,
         };
         (
             incoming,
