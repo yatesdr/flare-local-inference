@@ -321,6 +321,11 @@ pub trait HostStore {
     ) -> Result<Option<std::time::Duration>> {
         Ok(None)
     }
+    /// The host tier a publication is copied into first: memory when there is
+    /// a memory tier, otherwise disk.
+    fn closest_tier(&self) -> Option<Tier> {
+        None
+    }
     /// Join a pool: from now on a tier gives up a record only after the next
     /// tier holds a committed copy, instead of writing every publication
     /// through to the disk tier. Called once, before the first store.

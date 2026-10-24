@@ -1424,7 +1424,13 @@ impl HostStore for MemoryStore {
         self.core.lookup(history, resident, before)
     }
 
-    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+    /// A publication is only noted: the worker asks for the copy with
+    /// `write_back` when it expects to evict the checkpoint.
+    fn store(&mut self, _checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+        Ok(StoreOutcome::Noted)
+    }
+
+    fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
         if self.core.copying_out(&checkpoint.key) {
             self.core.stats.store_skipped += 1;
             return Ok(StoreOutcome::Retry(StoreReason::Inflight));
@@ -1496,6 +1502,10 @@ impl HostStore for MemoryStore {
             return Ok(None);
         }
         self.probe_restore(scratch, pages).map(Some)
+    }
+
+    fn closest_tier(&self) -> Option<Tier> {
+        Some(Tier::Memory)
     }
 
     fn announce_to(&mut self, announcer: Announcer) {
