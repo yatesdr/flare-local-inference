@@ -118,7 +118,10 @@ fn saved(notices: &[Notice]) -> Vec<(u64, u64, bool, Tier)> {
 fn a_stored_record_is_announced_once_hashed_and_served_with_those_checksums() {
     let mut rig = rig(8);
     let checkpoint = rig.publish(3, 100);
-    assert_eq!(rig.store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
+    assert_eq!(
+        rig.store.write_back(&checkpoint).unwrap(),
+        StoreOutcome::Queued
+    );
     let mut announced = Vec::new();
     rig.poll_until(|rig| {
         announced.extend(rig.notices());
@@ -200,7 +203,7 @@ fn a_stored_record_is_announced_once_hashed_and_served_with_those_checksums() {
 fn a_pinned_record_survives_pressure_until_the_pin_is_dropped_and_its_eviction_is_announced() {
     let mut rig = rig(3);
     let first = rig.publish(3, 100);
-    assert_eq!(rig.store.store(&first).unwrap(), StoreOutcome::Queued);
+    assert_eq!(rig.store.write_back(&first).unwrap(), StoreOutcome::Queued);
     let mut announced = Vec::new();
     rig.poll_until(|rig| {
         announced.extend(rig.notices());
@@ -213,12 +216,12 @@ fn a_pinned_record_survives_pressure_until_the_pin_is_dropped_and_its_eviction_i
         .unwrap();
     // The pool is full, and the only record is pinned: nothing can be stored.
     let second = rig.publish(2, 200);
-    assert_ne!(rig.store.store(&second).unwrap(), StoreOutcome::Queued);
+    assert_ne!(rig.store.write_back(&second).unwrap(), StoreOutcome::Queued);
     rig.poll();
     assert!(rig.notices().is_empty());
     drop(pin);
     rig.poll();
-    assert_eq!(rig.store.store(&second).unwrap(), StoreOutcome::Queued);
+    assert_eq!(rig.store.write_back(&second).unwrap(), StoreOutcome::Queued);
     let mut after = Vec::new();
     rig.poll_until(|rig| {
         after.extend(rig.notices());
@@ -391,9 +394,42 @@ fn a_store_dropped_while_its_records_are_being_hashed_frees_no_slab_under_the_ha
     for _ in 0..300 {
         let mut rig = rig(8);
         let checkpoint = rig.publish(3, 100);
-        assert_eq!(rig.store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
+        assert_eq!(
+            rig.store.write_back(&checkpoint).unwrap(),
+            StoreOutcome::Queued
+        );
         rig.poll();
         rig.poll();
         drop(rig);
     }
+}
+
+#[test]
+fn a_publication_is_noted_and_the_memory_copy_waits_for_write_back() {
+    let mut rig = rig(8);
+    let checkpoint = rig.publish(3, 100);
+    assert_eq!(rig.store.store(&checkpoint).unwrap(), StoreOutcome::Noted);
+    assert!(rig.poll().is_empty());
+    assert_eq!(rig.store.stats().outbound_in_flight, 0);
+    assert!(rig.store.lookup(&rig.history, 0, u64::MAX).is_none());
+    assert_eq!(
+        rig.store.write_back(&checkpoint).unwrap(),
+        StoreOutcome::Queued
+    );
+    let mut stored = Vec::new();
+    for _ in 0..2000 {
+        stored.extend(rig.poll());
+        if !stored.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(matches!(
+        stored.as_slice(),
+        [StoreEvent::Stored { result: Ok(_), .. }]
+    ));
+    assert_eq!(
+        rig.store.write_back(&checkpoint).unwrap(),
+        StoreOutcome::Present
+    );
 }

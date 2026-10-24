@@ -861,6 +861,13 @@ model worker thread and none waiting on the network.
   the first host tier, using the same policy in local and pool modes. A dirty
   GPU eviction drops the checkpoint and sends the existing eviction notice;
   it never waits for a host copy.
+- **What write-back copies.** A store answers `write_back` with a copy into
+  the first host tier only when restoring the checkpoint would beat
+  recomputing it (the `worth_transfer` arithmetic at that tier's measured
+  rate, or its first estimate), no recent lookup showed a host tier of the pool
+  already holding it, and the tier's copy queue has room. It answers `Present`
+  when the pool already holds it, `Oversize` when it is not worth keeping, and
+  `Retry` when the queue or slabs are short.
 - **Two sources.** A restore reads at most two parts: the longest prefix held
   at the closest level, then one farther source from exactly where that part
   ends, with the endpoint's row from whichever ends last. The parts are planned

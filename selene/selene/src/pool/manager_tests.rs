@@ -1103,10 +1103,11 @@ fn publication(gpu: &GpuMemory, salt: u32, pages: usize) -> (PublishedCheckpoint
     (checkpoint, history)
 }
 
-/// Publish as the model worker does: store, poll until the copy-out is
+/// Publish as the model worker does: note the publication, write it back, poll until the copy-out is
 /// reported, and try again after a refusal or a deferral. The device cache
 /// then evicts the checkpoint, as it does under pressure.
 fn publish<S: HostStore>(store: &mut S, checkpoint: &PublishedCheckpoint) {
+    assert_eq!(store.store(checkpoint).unwrap(), StoreOutcome::Noted);
     store_and_wait(store, checkpoint);
     store.evicted(checkpoint.key, checkpoint.id.value(), None);
 }
@@ -1114,7 +1115,7 @@ fn publish<S: HostStore>(store: &mut S, checkpoint: &PublishedCheckpoint) {
 fn store_and_wait<S: HostStore>(store: &mut S, checkpoint: &PublishedCheckpoint) {
     let deadline = Instant::now() + Duration::from_secs(20);
     'attempt: loop {
-        let outcome = store.store(checkpoint).unwrap();
+        let outcome = store.write_back(checkpoint).unwrap();
         if outcome == StoreOutcome::Present {
             return;
         }
