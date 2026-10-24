@@ -8,7 +8,10 @@ use std::{
 use clap::{Args, Parser, Subcommand, builder::PossibleValuesParser, builder::TypedValueParser};
 use flare_helios::{
     engram::Storage,
-    offload::{PrefixCacheOffload, Transport, parse_size},
+    offload::{
+        PoolOptions, PrefixCacheOffload, Transport, parse_pool_address, parse_pool_tenant,
+        parse_size,
+    },
     runtime_package::{KvCacheLimit, LoadOptions, MemoryLimit},
 };
 
@@ -733,6 +736,16 @@ pub struct ServingOptions {
         value_parser = PossibleValuesParser::new(["staged", "direct"])
             .map(|value| if value == "staged" { Transport::Staged } else { Transport::Direct }))]
     pub prefix_cache_disk_transport: Option<Transport>,
+
+    /// Share prefix checkpoints through a pool manager at `unix:PATH` or `HOST:PORT` [default: not shared].
+    #[arg(long, value_name = "ADDRESS", value_parser = parse_pool_address,
+        help_heading = "Prefix cache options")]
+    pub prefix_cache_pool: Option<String>,
+
+    /// Tenant that scopes the pool; checkpoints are never shared across tenants [default: the pool's default scope].
+    #[arg(long, value_name = "NAME", value_parser = parse_pool_tenant,
+        requires = "prefix_cache_pool", help_heading = "Prefix cache options")]
+    pub prefix_cache_pool_tenant: Option<String>,
 }
 
 fn served_model_name(value: &str) -> Result<String, String> {
@@ -868,6 +881,12 @@ impl ServingOptions {
                 .into(),
             ]);
         }
+        if let Some(address) = &self.prefix_cache_pool {
+            options.extend(["--prefix-cache-pool".into(), address.clone()]);
+        }
+        if let Some(tenant) = &self.prefix_cache_pool_tenant {
+            options.extend(["--prefix-cache-pool-tenant".into(), tenant.clone()]);
+        }
         options
     }
 
@@ -907,6 +926,10 @@ impl ServingOptions {
                 disk: self.prefix_cache_disk.clone(),
                 disk_limit: self.prefix_cache_disk_limit,
                 transport: self.prefix_cache_disk_transport,
+                pool: self.prefix_cache_pool.clone().map(|address| PoolOptions {
+                    address,
+                    tenant: self.prefix_cache_pool_tenant.clone().unwrap_or_default(),
+                }),
             },
             cluster_rank,
         }
@@ -1227,6 +1250,7 @@ mod tests {
                 disk: Some(PathBuf::from("prefixes")),
                 disk_limit: Some(0),
                 transport: Some(Transport::Direct),
+                pool: None,
             }
         );
     }
@@ -1503,6 +1527,90 @@ mod tests {
             let Command::Run(peer) = Cli::try_parse_from(forwarded).unwrap().command else { panic!() };
             assert_eq!(peer.load_options().embedding_table_cache_bytes, Some(bytes));
         }
+    }
+
+    #[test]
+    fn the_tenant_needs_a_pool_and_defaults_to_empty() {
+        let rejected = |arguments: &[&str]| {
+            let mut all = vec!["flare", "run", "model.safetensors"];
+            all.extend(arguments);
+            Cli::try_parse_from(all).is_err()
+        };
+        assert!(rejected(&["--prefix-cache-pool-tenant", "acme"]));
+        let single = run(&[
+            "flare",
+            "run",
+            "model.safetensors",
+            "--prefix-cache-pool",
+            "unix:/run/selene.sock",
+        ]);
+        assert_eq!(
+            single.load_options().prefix_cache.pool,
+            Some(PoolOptions {
+                address: "unix:/run/selene.sock".into(),
+                tenant: String::new()
+            })
+        );
+        assert_eq!(
+            single.rank_options(),
+            ["--prefix-cache-pool", "unix:/run/selene.sock"]
+        );
+        assert!(rejected(&[
+            "--prefix-cache-pool",
+            "unix:/run/selene.sock",
+            "--prefix-cache-pool-tenant",
+            ""
+        ]));
+        for bad in [
+            "",
+            "unix:",
+            "host",
+            "host:0",
+            "host:70000",
+            ":9000",
+            "a b:9000",
+        ] {
+            assert!(
+                rejected(&[
+                    "--prefix-cache-pool",
+                    bad,
+                    "--prefix-cache-pool-tenant",
+                    "acme"
+                ]),
+                "{bad}"
+            );
+        }
+        for address in ["unix:/run/selene.sock", "10.0.0.5:7000", "selene.local:7000"] {
+            let args = run(&[
+                "flare",
+                "run",
+                "model.safetensors",
+                "--prefix-cache-pool",
+                address,
+                "--prefix-cache-pool-tenant",
+                "acme",
+            ]);
+            assert_eq!(
+                args.load_options().prefix_cache.pool,
+                Some(PoolOptions {
+                    address: address.into(),
+                    tenant: "acme".into()
+                })
+            );
+            // Every rank receives the same pool settings.
+            assert_eq!(
+                args.rank_options(),
+                [
+                    "--prefix-cache-pool",
+                    address,
+                    "--prefix-cache-pool-tenant",
+                    "acme"
+                ]
+            );
+        }
+        let unset = run(&["flare", "run", "model.safetensors"]);
+        assert!(unset.load_options().prefix_cache.pool.is_none());
+        assert!(!unset.load_options().prefix_cache.enabled());
     }
 
     #[test]
