@@ -6,7 +6,7 @@ use super::{
     content_for, descriptor,
     pool::{Damage, PutResult, Session},
 };
-use flare_selene::pool::frame::{Carrier, ToInstance, ToManager, Window};
+use flare_selene::pool::frame::{Carrier, NO_SLOT, ToInstance, ToManager, Window};
 use selene_manager::{
     Key,
     proto::v2::{self, client_message as c, server_message::M},
@@ -62,7 +62,7 @@ pub async fn dial(reference: &v2::DataChannelRef, security: &Security) -> Conn {
         ),
     };
     conn.write_all(&reference.token).await.unwrap();
-    ToManager::Hello(Carrier::Tcp)
+    ToManager::Hello(Carrier::Stream)
         .write(&mut conn)
         .await
         .unwrap();
@@ -103,7 +103,7 @@ pub async fn read_windows(conn: &mut Conn) -> (Vec<Received>, Ended) {
             }
             ToInstance::End => return (received, Ended::End),
             ToInstance::Abort(text) => return (received, Ended::Abort(text)),
-            ToInstance::Grant(_) => return (received, Ended::Broken),
+            _ => return (received, Ended::Broken),
         }
     }
 }
@@ -216,6 +216,7 @@ pub async fn put_record(
             index: shape.index,
             row_xxh3: row_hash,
             page_xxh3: hashes,
+            slot: NO_SLOT,
         }
         .write(&mut conn)
         .await
