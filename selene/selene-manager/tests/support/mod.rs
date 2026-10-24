@@ -32,6 +32,7 @@ use tonic::{
     transport::{Channel, Endpoint, Uri},
 };
 
+pub mod compat;
 pub mod pool;
 
 static SERIAL: AtomicU64 = AtomicU64::new(0);
