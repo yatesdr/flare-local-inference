@@ -142,6 +142,11 @@ impl RequestScheduler {
             } else if end <= start {
                 continue;
             }
+            // A checkpoint that ends in the page its parent ended in holds no page of
+            // its own; only the endpoint, which carries the row, is kept without one.
+            if checkpoint.tail_pages().is_empty() && node != id {
+                continue;
+            }
             if nodes.is_empty() {
                 skip_pages = start.saturating_sub(first) as u32;
             }
@@ -413,6 +418,27 @@ mod tests {
         assert_eq!((row_only.nodes.len(), row_only.skip_pages), (1, 1));
         assert!(s.export_chain(c, 256, false).is_none());
         assert!(s.export_chain(c, 320, true).is_none());
+    }
+
+    #[test]
+    fn a_checkpoint_that_holds_no_page_is_left_out_of_the_export_chain() {
+        let mut s = scheduler(2, 16, 4);
+        let h = history(4);
+        let a = publish(&mut s, &h, None, 64, &[0], 0);
+        // Ends in the page `a` ended in, so it holds none.
+        let mut inside = PrefixHistory::new([9; 32]);
+        inside.append(&(0..70).collect::<Vec<_>>(), &[]).unwrap();
+        let hollow = publish(&mut s, &inside, Some(a), 70, &[], 0);
+        let c = publish(&mut s, &h, Some(hollow), 192, &[1, 2], 0);
+        let chain = s.export_chain(c, 0, true).unwrap();
+        assert_eq!(
+            chain.nodes.iter().map(|n| n.generation).collect::<Vec<_>>(),
+            [a.value(), c.value()]
+        );
+        // The endpoint is kept even with no page of its own: its row is the claim.
+        let row_only = s.export_chain(hollow, 64, true).unwrap();
+        assert_eq!(row_only.nodes.len(), 1);
+        assert_eq!(row_only.nodes[0].generation, hollow.value());
     }
 
     /// Builds the scarce-page tree used by the headroom tests: a chain `a` -> `b`
