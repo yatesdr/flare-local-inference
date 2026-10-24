@@ -1058,3 +1058,62 @@ fn projection_counts_running_pins_and_leaves_the_cache_untouched() {
     assert_eq!(cache.stats().owned_pages, 3);
     assert!(cache.reclaimable_if_pinned(CheckpointId::new(99)).is_err());
 }
+
+#[test]
+fn eviction_prefers_clean_checkpoints_and_keeps_leaf_and_compaction_rules() {
+    let mut cache = cache();
+    let h = history(3, 0);
+    let parent = created(&mut cache, &h, &proposal(None, 64, &[0], 0, 0));
+    let child = created(&mut cache, &h, &proposal(Some(parent), 128, &[1], 1, 0));
+    let clean = created(
+        &mut cache,
+        &history(1, 1000),
+        &proposal(None, 64, &[2], 2, 0),
+    );
+    cache.mark_host_clean(clean).unwrap();
+    cache.pin(child).unwrap();
+    assert_eq!(cache.dirty_eviction_candidates(), [parent]);
+    let target = EvictionTarget {
+        pages: 0,
+        snapshots: 1,
+    };
+    assert_eq!(cache.evict(target).retired[0].checkpoint, clean);
+    cache.pin(parent).unwrap();
+    assert!(cache.evict(target).retired.is_empty());
+    cache.unpin(parent).unwrap();
+    let compacted = cache.evict(target).retired;
+    assert_eq!(compacted[0].checkpoint, parent);
+    assert_eq!(compacted[0].heir, Some(child));
+    assert_eq!(cache.page_chain(child).unwrap(), [PageId(0), PageId(1)]);
+    assert!(!cache.checkpoint(child).unwrap().host_clean());
+    cache.unpin(child).unwrap();
+    cache.mark_host_clean(child).unwrap();
+    assert_eq!(cache.clean_reclaimable().pages, [PageId(0), PageId(1)]);
+}
+
+#[test]
+fn clean_reclamation_excludes_pins_branches_and_unready_checkpoints() {
+    let mut cache = cache();
+    let h = history(3, 0);
+    let a = created(&mut cache, &h, &proposal(None, 64, &[0], 0, 0));
+    let b = created(&mut cache, &h, &proposal(Some(a), 128, &[1], 1, 0));
+    let mut fork = history(1, 0);
+    fork.append(&[99; 64], &[]).unwrap();
+    let c = created(&mut cache, &fork, &proposal(Some(a), 128, &[2], 2, 0));
+    let pending = created(
+        &mut cache,
+        &history(1, 1000),
+        &proposal(None, 64, &[3], 3, 1),
+    );
+    for id in [a, b, c, pending] {
+        cache.mark_host_clean(id).unwrap();
+    }
+    cache.pin(b).unwrap();
+    let reclaimed = cache.clean_reclaimable();
+    assert_eq!(reclaimed.pages, [PageId(2)]);
+    assert!(reclaimed.snapshots.contains(&SnapshotId(0))); // Compacting a retains its pages in b.
+    cache.unpin(b).unwrap();
+    let mut reclaimed = cache.clean_reclaimable().pages;
+    reclaimed.sort();
+    assert_eq!(reclaimed, [PageId(0), PageId(1), PageId(2)]);
+}

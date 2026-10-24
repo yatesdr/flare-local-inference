@@ -2,7 +2,7 @@
 //!
 //! A GPU prefix checkpoint owns its tail pages, the complete cache pages since its
 //! parent, and one continuation-state row. The host store copies those bytes out
-//! when the scheduler publishes a checkpoint and copies them back into free GPU
+//! under GPU cache pressure and copies them back into free GPU
 //! ids when a later request matches a checkpoint the GPU no longer holds. The
 //! restored bytes are published as an ordinary GPU checkpoint, so the model
 //! worker, the scheduler, and the recipes see no difference between a checkpoint
@@ -12,7 +12,8 @@
 //! in registered host memory, [`disk_store::DiskStore`] retains record files, and
 //! [`composite::CompositeStore`] composes the two with write-through and
 //! read-through. Every store is driven from the model worker thread and never
-//! blocks it: `store` and `fetch` enqueue work, `poll` drains completions.
+//! blocks it: `store` notes publications, `write_back` and `fetch` enqueue work,
+//! and `poll` drains completions.
 
 mod adapter;
 #[cfg(all(test, feature = "runtime-package"))]
@@ -862,7 +863,7 @@ pub trait PrefixStore {
     fn close(&mut self) -> Result<()>;
 
     /// Whether this store shares prefixes through a pool. When it does not, the
-    /// worker builds no lookup history, tracks no evictions and sees no exports.
+    /// worker builds no pool lookup history and sees no exports.
     fn pooled(&self) -> bool {
         false
     }
