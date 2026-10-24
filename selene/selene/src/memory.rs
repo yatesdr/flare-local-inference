@@ -1054,6 +1054,15 @@ impl MemoryStore {
         self.core.mark_durable(key)
     }
 
+    /// A copy-out that landed in a composite is not durable until its file
+    /// commits; tests that allocate records directly say so with this.
+    #[cfg(test)]
+    pub(crate) fn mark_volatile(&mut self, key: &PrefixKey) {
+        if let Some(node) = self.core.index.node_mut(key) {
+            node.location.durable = false;
+        }
+    }
+
     /// The slabs of a ready record.
     pub fn record(&self, key: &PrefixKey) -> Option<&MemoryRecord> {
         self.core.record(key)
