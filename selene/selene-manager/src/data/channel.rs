@@ -375,7 +375,7 @@ async fn serve(inner: Arc<Inner>, stream: TcpStream) {
         Ok::<_, io::Error>((conn, token))
     })
     .await;
-    let Ok(Ok((conn, token))) = accepted else {
+    let Ok(Ok((mut conn, token))) = accepted else {
         return;
     };
     // Look the token up and attach in one critical section with `stop`, so a
@@ -397,11 +397,13 @@ async fn serve(inner: Arc<Inner>, stream: TcpStream) {
     };
     let mut stopped = entry.stopped.subscribe();
     let result = tokio::select! {
-        result = run(&inner, transfer, &entry, conn) => result,
+        result = run(&inner, transfer, &entry, &mut conn) => result,
         _ = async { let _ = stopped.wait_for(|stop| *stop).await; } => End::Stopped,
     };
-    // `run` owned the connection and dropped it with its future, whichever branch
-    // won; only now is the transfer's memory quiet.
+    // Say goodbye if the peer will listen (a TLS peer needs the close notice to tell an
+    // end from a cut), then drop the connection: only now is the transfer's memory quiet.
+    let _ = timeout(GOODBYE, conn.shutdown()).await;
+    drop(conn);
     entry.queues.lock().unwrap().attached = false;
     if let End::Failed(reason) = result {
         let _ = inner.events.send(Event::Failed { transfer, reason });
@@ -414,8 +416,8 @@ async fn serve(inner: Arc<Inner>, stream: TcpStream) {
     let _ = inner.events.send(Event::Closed { transfer });
 }
 
-async fn run(inner: &Inner, transfer: u64, entry: &Transfer, mut conn: Box<dyn Conn>) -> End {
-    let hello = match timeout(IO_TIMEOUT, ToManager::read(&mut conn, inner.max_pages)).await {
+async fn run(inner: &Inner, transfer: u64, entry: &Transfer, conn: &mut Box<dyn Conn>) -> End {
+    let hello = match timeout(IO_TIMEOUT, ToManager::read(&mut *conn, inner.max_pages)).await {
         Ok(Ok(frame)) => frame,
         Ok(Err(error)) => return failure(error),
         Err(_) => return End::Failed("the instance sent no hello".into()),
@@ -424,7 +426,7 @@ async fn run(inner: &Inner, transfer: u64, entry: &Transfer, mut conn: Box<dyn C
         return End::Failed("the instance did not ask for the stream carrier".into());
     }
     let result = match entry.kind {
-        Kind::Get => send_windows(inner, transfer, entry, &mut conn).await,
+        Kind::Get => send_windows(inner, transfer, entry, conn).await,
         Kind::Put => receive_windows(inner, transfer, entry, conn).await,
     };
     match result {
@@ -520,7 +522,7 @@ async fn receive_windows(
     inner: &Inner,
     transfer: u64,
     entry: &Transfer,
-    conn: Box<dyn Conn>,
+    conn: &mut Box<dyn Conn>,
 ) -> io::Result<()> {
     let (mut reader, mut writer) = tokio::io::split(conn);
     let (expect, mut expected) = mpsc::unbounded_channel::<GrantOut>();
