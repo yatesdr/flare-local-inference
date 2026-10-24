@@ -179,6 +179,11 @@ impl PoolClient {
         self.announce.saved(entry);
     }
 
+    /// Eviction notices were lost: forget the GPU holdings and resync.
+    pub fn evictions_lost(&self) {
+        self.announce.forget_gpu();
+    }
+
     pub fn spilled(&self, to: IndexEntry, from: (Tier, u64)) {
         self.announce.spilled(to, from);
     }
