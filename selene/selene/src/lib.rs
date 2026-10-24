@@ -11,6 +11,7 @@
 //! read-through. Every store is driven from the model worker thread and never
 //! blocks it: `store` and `fetch` enqueue work, `poll` drains completions.
 
+pub mod characterize;
 pub mod composite;
 pub mod copier;
 pub mod disk;
