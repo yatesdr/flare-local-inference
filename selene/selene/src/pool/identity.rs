@@ -1,0 +1,180 @@
+//! Identities both ends of the pool protocol derive and compare: the scope
+//! id, the instance id and the process nonce.
+//!
+//! The byte layouts below are the contract. They are written out here, not
+//! derived from a message encoder, so the manager and every instance hash the
+//! same bytes. All integers are little-endian.
+
+use blake2::{
+    Blake2b, Digest,
+    digest::consts::{U16, U32},
+};
+
+use crate::{Error, Result};
+
+/// Bytes per page and per state row for one rank, as a record holds them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RankPlanes {
+    pub plane_bytes: Vec<u64>,
+    pub row_bytes: u64,
+}
+
+/// The record geometry of one model package on one rank layout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Geometry {
+    pub page_tokens: u64,
+    pub ranks: Vec<RankPlanes>,
+    pub page_record_bytes: u64,
+    pub row_record_bytes: u64,
+}
+
+/// What a session may share. Records are shared only between identical scopes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Scope {
+    pub tenant: String,
+    pub model_identity: [u8; 32],
+    pub layout_fingerprint: [u8; 16],
+    pub geometry: Geometry,
+}
+
+impl Geometry {
+    /// Canonical bytes: `page_tokens u64`, `page_record_bytes u64`,
+    /// `row_record_bytes u64`, `rank count u32`, then per rank
+    /// `plane count u32`, each `plane_bytes u64`, and `row_bytes u64`.
+    pub fn canonical(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(self.page_tokens.to_le_bytes());
+        bytes.extend(self.page_record_bytes.to_le_bytes());
+        bytes.extend(self.row_record_bytes.to_le_bytes());
+        bytes.extend((self.ranks.len() as u32).to_le_bytes());
+        for rank in &self.ranks {
+            bytes.extend((rank.plane_bytes.len() as u32).to_le_bytes());
+            for plane in &rank.plane_bytes {
+                bytes.extend(plane.to_le_bytes());
+            }
+            bytes.extend(rank.row_bytes.to_le_bytes());
+        }
+        bytes
+    }
+}
+
+/// The scope id: BLAKE2b-256 over `"selene-scope-v2"`, the model identity (32
+/// bytes), the layout fingerprint (16 bytes), the tenant as one length byte
+/// then its bytes, and [`Geometry::canonical`]. Fails for a tenant longer
+/// than 255 bytes.
+pub fn scope_id(
+    tenant: &str,
+    model_identity: &[u8; 32],
+    layout_fingerprint: &[u8; 16],
+    geometry: &Geometry,
+) -> Result<[u8; 32]> {
+    let length =
+        u8::try_from(tenant.len()).map_err(|_| Error::new("tenant longer than 255 bytes"))?;
+    let mut hash = Blake2b::<U32>::new();
+    hash.update(b"selene-scope-v2");
+    hash.update(model_identity);
+    hash.update(layout_fingerprint);
+    hash.update([length]);
+    hash.update(tenant.as_bytes());
+    hash.update(geometry.canonical());
+    Ok(hash.finalize().into())
+}
+
+/// The instance id: BLAKE2b-128 over `"selene-instance-v2"`, then each of the
+/// tenant, the model identity, the layout fingerprint and the GPU UUIDs in
+/// ascending byte order, every one preceded by its length as `u32`. Stable
+/// across restarts; the order the UUIDs are given in does not matter.
+pub fn instance_id(
+    tenant: &str,
+    model_identity: &[u8; 32],
+    layout_fingerprint: &[u8; 16],
+    gpu_uuids: &[[u8; 16]],
+) -> [u8; 16] {
+    let mut hash = Blake2b::<U16>::new();
+    hash.update(b"selene-instance-v2");
+    let mut field = |bytes: &[u8]| {
+        hash.update((bytes.len() as u32).to_le_bytes());
+        hash.update(bytes);
+    };
+    field(tenant.as_bytes());
+    field(model_identity);
+    field(layout_fingerprint);
+    let mut uuids = gpu_uuids.to_vec();
+    uuids.sort_unstable();
+    for uuid in &uuids {
+        field(uuid);
+    }
+    hash.finalize().into()
+}
+
+/// 16 fresh random bytes naming this process; unchanged across reconnects.
+pub fn process_nonce() -> Result<[u8; 16]> {
+    use std::io::Read;
+    let mut nonce = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut nonce))
+        .map_err(|error| Error::caused_by("cannot draw a process nonce", error))?;
+    Ok(nonce)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn geometry() -> Geometry {
+        Geometry {
+            page_tokens: 64,
+            ranks: vec![
+                RankPlanes {
+                    plane_bytes: vec![8192, 4096],
+                    row_bytes: 4096,
+                };
+                2
+            ],
+            page_record_bytes: 24576,
+            row_record_bytes: 8192,
+        }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn the_scope_id_hashes_the_documented_bytes() {
+        let id = scope_id("acme", &[1; 32], &[2; 16], &geometry()).unwrap();
+        // Computed independently from the layout documented on `scope_id`.
+        assert_eq!(
+            hex(&id),
+            "0028b18b4224d30575d052bfac0e389ae3dd4c24fca7d3866944e0a20159911a"
+        );
+        assert_ne!(
+            id,
+            scope_id("acme2", &[1; 32], &[2; 16], &geometry()).unwrap()
+        );
+        let mut wider = geometry();
+        wider.ranks.push(wider.ranks[0].clone());
+        assert_ne!(id, scope_id("acme", &[1; 32], &[2; 16], &wider).unwrap());
+        assert!(scope_id(&"t".repeat(256), &[1; 32], &[2; 16], &geometry()).is_err());
+    }
+
+    #[test]
+    fn the_instance_id_is_stable_and_depends_on_every_element() {
+        let a = [[1u8; 16], [2u8; 16]];
+        let b = [[2u8; 16], [1u8; 16]];
+        let id = instance_id("acme", &[1; 32], &[2; 16], &a);
+        assert_eq!(id, instance_id("acme", &[1; 32], &[2; 16], &b));
+        assert_eq!(hex(&id), "2d1aae5bc9c940dfb6703b820dbb28d8");
+        assert_ne!(id, instance_id("acme", &[1; 32], &[2; 16], &a[..1]));
+        assert_ne!(id, instance_id("other", &[1; 32], &[2; 16], &a));
+        assert_ne!(id, instance_id("acme", &[9; 32], &[2; 16], &a));
+        assert_ne!(id, instance_id("acme", &[1; 32], &[9; 16], &a));
+        let disjoint = [[3u8; 16], [4u8; 16]];
+        assert_ne!(id, instance_id("acme", &[1; 32], &[2; 16], &disjoint));
+    }
+
+    #[test]
+    fn nonces_differ() {
+        assert_ne!(process_nonce().unwrap(), process_nonce().unwrap());
+    }
+}

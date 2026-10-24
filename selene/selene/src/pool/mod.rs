@@ -4,8 +4,10 @@
 //! one no pool type is constructed, so there is no thread, connection, mapping
 //! or allocation.
 
+mod identity;
 mod lookup;
 mod types;
 
+pub use identity::{Geometry, RankPlanes, Scope, instance_id, process_nonce, scope_id};
 pub use lookup::{Answer, LookupState, LookupTicket};
 pub use types::{Candidate, ChainNode, HeldRange, Level, SourceRef, Tier};
