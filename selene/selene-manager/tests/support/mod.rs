@@ -377,7 +377,20 @@ impl Host {
 impl Drop for Host {
     fn drop(&mut self) {
         self.stop();
-        let _ = fs::remove_dir_all(&self.base);
+        // The fixture owns only directories it was given for itself: removing a shared
+        // parent (/dev/shm, a scratch root) would delete other managers' live files.
+        let own = self
+            .base
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("selene-"));
+        if own {
+            let _ = fs::remove_dir_all(&self.base);
+        } else {
+            eprintln!(
+                "fixture: not removing {}: it is not private to this test",
+                self.base.display()
+            );
+        }
         let _ = fs::remove_dir_all(self.shm_directory());
     }
 }
