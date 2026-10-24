@@ -426,7 +426,7 @@ async fn r6_a_stalled_source_leg_expires_the_claim_and_the_manager_closes_it() {
     assert_eq!(terminal.reason, v2::ClaimReason::NoProgress as i32);
     // The manager stopped the leg: the quiet source finds its connection closed.
     // Grants already sent are still in the socket; then the connection ends.
-    timeout(Duration::from_secs(5), async {
+    let ended = timeout(Duration::from_secs(5), async {
         loop {
             match ToInstance::read_or_end(&mut conn, MAX_PAGES).await {
                 Ok(Some(ToInstance::Grant(_))) => continue,
@@ -435,10 +435,11 @@ async fn r6_a_stalled_source_leg_expires_the_claim_and_the_manager_closes_it() {
         }
     })
     .await
-    .expect("the manager closed the stalled leg")
-    .ok()
-    .flatten()
-    .map_or((), |frame| panic!("unexpected frame {frame:?}"));
+    .expect("the manager closed the stalled leg");
+    assert!(
+        !matches!(ended, Ok(Some(_))),
+        "the stalled leg ended with {ended:?}"
+    );
     // A window the requester held is released, then everything is fenced.
     w.requester.fence(1, v2::FenceOutcome::Drained).await;
     w.source.export_cancel().await;
