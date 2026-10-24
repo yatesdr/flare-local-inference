@@ -14,6 +14,8 @@ mod exporter;
 mod host_tests;
 mod identity;
 mod lookup;
+#[cfg(test)]
+mod manager_tests;
 pub(crate) mod pins;
 mod probe;
 mod shared;
