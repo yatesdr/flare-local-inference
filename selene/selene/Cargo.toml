@@ -35,3 +35,8 @@ io-uring = "0.7"
 
 [build-dependencies]
 tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "tls-ring", "router"] }

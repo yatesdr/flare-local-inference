@@ -39,6 +39,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(5);
 const BUSY_TICK: Duration = Duration::from_millis(1);
 const IDLE_TICK: Duration = Duration::from_millis(20);
 const OUTBOUND: usize = 4096;
+const GOODBYE_WAIT: Duration = Duration::from_millis(500);
 
 /// Limits the manager left unstated take the protocol's defaults.
 pub(crate) fn limits_or_default(stated: Option<wire::Limits>) -> wire::Limits {
@@ -155,6 +156,10 @@ async fn serve(engine: &mut Engine, link: &Link) -> Result<()> {
         if !drain(engine, link, Some(backoff)).await {
             break;
         }
+        if engine.quarantined() {
+            idle_until_stop(engine, link).await;
+            break;
+        }
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
     shutdown(engine, link).await
@@ -265,11 +270,53 @@ async fn connect(link: &Link) -> std::result::Result<(Channel, wire::Encryption)
     }
 }
 
+/// Resolves once the owner asked to stop.
+async fn stop_requested(link: &Link) {
+    while !link.stop.load(Ordering::SeqCst) {
+        let _ = tokio::time::timeout(Duration::from_millis(50), link.wake.notified()).await;
+    }
+}
+
+/// An open session, ready to hand to the engine.
+struct Established {
+    hello: wire::HelloReply,
+    opened: wire::SessionOpened,
+    regions: Option<Arc<Regions>>,
+    stream: tonic::Streaming<wire::ServerMessage>,
+    tx: mpsc::Sender<wire::ClientMessage>,
+}
+
 async fn attempt(engine: &mut Engine, link: &Link) -> Attempt {
     engine.shared.set_status(PoolStatus::Connecting);
+    // Stopping interrupts connecting; once a session is open the engine owns it.
+    let established = tokio::select! {
+        result = establish(engine, link) => result,
+        _ = stop_requested(link) => return Attempt::Ended,
+    };
+    let Established {
+        hello,
+        opened,
+        regions,
+        mut stream,
+        tx,
+    } = match established {
+        Ok(established) => established,
+        Err(attempt) => return attempt,
+    };
+    engine.session_opened(
+        hello.manager_incarnation,
+        &opened,
+        limits_or_default(hello.limits),
+        regions,
+    );
+    run_session(engine, link, &mut stream, tx).await;
+    Attempt::Ended
+}
+
+async fn establish(engine: &Engine, link: &Link) -> std::result::Result<Established, Attempt> {
     let (channel, connected_with) = match connect(link).await {
         Ok(connected) => connected,
-        Err(why) => return Attempt::Retry(why),
+        Err(why) => return Err(Attempt::Retry(why)),
     };
     let mut client = wire::pool_client::PoolClient::new(channel);
     let hello = tokio::time::timeout(
@@ -283,11 +330,11 @@ async fn attempt(engine: &mut Engine, link: &Link) -> Attempt {
     .await;
     let hello = match hello {
         Ok(Ok(reply)) => reply.into_inner(),
-        Ok(Err(status)) => return Attempt::Retry(format!("Hello failed: {status}")),
-        Err(_) => return Attempt::Retry("Hello timed out".into()),
+        Ok(Err(status)) => return Err(Attempt::Retry(format!("Hello failed: {status}"))),
+        Err(_) => return Err(Attempt::Retry("Hello timed out".into())),
     };
     if let Err(reason) = check_hello(&hello, connected_with) {
-        return Attempt::Disabled(reason);
+        return Err(Attempt::Disabled(reason));
     }
     let regions = match hello.shared_memory.as_ref() {
         Some(shared) => match map_regions(engine, shared) {
@@ -326,41 +373,44 @@ async fn attempt(engine: &mut Engine, link: &Link) -> Attempt {
         tokio::time::timeout(OPEN_TIMEOUT, client.session(ReceiverStream::new(rx))).await;
     let mut stream = match response {
         Ok(Ok(response)) => response.into_inner(),
-        Ok(Err(status)) => return Attempt::Retry(format!("session failed: {status}")),
-        Err(_) => return Attempt::Retry("opening the session timed out".into()),
+        Ok(Err(status)) => return Err(Attempt::Retry(format!("session failed: {status}"))),
+        Err(_) => return Err(Attempt::Retry("opening the session timed out".into())),
     };
     let opened = match tokio::time::timeout(OPEN_TIMEOUT, stream.message()).await {
         Ok(Ok(Some(wire::ServerMessage {
             m: Some(In::Opened(opened)),
             ..
         }))) => opened,
-        Ok(Ok(_)) => return Attempt::Retry("the manager did not open the session".into()),
-        Ok(Err(status)) => return Attempt::Retry(format!("session failed: {status}")),
-        Err(_) => return Attempt::Retry("opening the session timed out".into()),
+        Ok(Ok(_)) => {
+            return Err(Attempt::Retry(
+                "the manager did not open the session".into(),
+            ));
+        }
+        Ok(Err(status)) => return Err(Attempt::Retry(format!("session failed: {status}"))),
+        Err(_) => return Err(Attempt::Retry("opening the session timed out".into())),
     };
     match wire::OpenStatus::try_from(opened.status) {
         Ok(wire::OpenStatus::OpenOk) => {}
         Ok(wire::OpenStatus::InvalidScope) => {
-            return Attempt::Disabled(
+            return Err(Attempt::Disabled(
                 "the pool manager refused this instance's scope; using local tiers only".into(),
-            );
+            ));
         }
-        other => return Attempt::Retry(format!("session not opened ({other:?})")),
+        other => return Err(Attempt::Retry(format!("session not opened ({other:?})"))),
     }
     if opened.scope_id != st.scope_id {
-        return Attempt::Disabled(
+        return Err(Attempt::Disabled(
             "the pool manager and this instance disagree on the scope id; using local tiers only"
                 .into(),
-        );
+        ));
     }
-    engine.session_opened(
-        hello.manager_incarnation,
-        &opened,
-        limits_or_default(hello.limits),
+    Ok(Established {
+        hello,
+        opened,
         regions,
-    );
-    run_session(engine, link, &mut stream, tx).await;
-    Attempt::Ended
+        stream,
+        tx,
+    })
 }
 
 fn map_regions(engine: &Engine, shared: &wire::SharedMemory) -> Result<Regions> {
@@ -378,6 +428,8 @@ async fn run_session(
     tx: mpsc::Sender<wire::ClientMessage>,
 ) {
     let mut closing = false;
+    let mut close_started = None;
+    let mut said_goodbye = false;
     loop {
         let now = Instant::now();
         if !flush(engine, &tx) {
@@ -385,12 +437,17 @@ async fn run_session(
         }
         if link.stop.load(Ordering::SeqCst) && !closing {
             closing = true;
+            close_started = Some(now);
             engine.begin_close(now);
             continue;
+        }
+        if close_started.is_some_and(|started| now.duration_since(started) > CLOSE_TIMEOUT) {
+            break;
         }
         if closing && engine.quiet() {
             engine.goodbye();
             flush(engine, &tx);
+            said_goodbye = true;
             break;
         }
         if engine.pump(now) {
@@ -422,6 +479,14 @@ async fn run_session(
         }
     }
     drop(tx);
+    if said_goodbye {
+        // Let the transport deliver Goodbye: the manager ends its side of the
+        // stream when ours ends.
+        let _ = tokio::time::timeout(GOODBYE_WAIT, async {
+            while let Ok(Some(_)) = stream.message().await {}
+        })
+        .await;
+    }
     engine.session_lost(Instant::now());
 }
 

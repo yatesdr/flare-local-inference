@@ -14,6 +14,8 @@ mod identity;
 mod lookup;
 mod shared;
 mod shm;
+#[cfg(test)]
+mod smoke_tests;
 #[allow(clippy::all, dead_code)]
 pub(crate) mod wire {
     tonic::include_proto!("selene.v2");
