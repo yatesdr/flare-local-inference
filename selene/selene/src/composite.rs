@@ -12,6 +12,13 @@
 //! Memory eviction takes only durable records, and a record unlinked from disk
 //! loses its memory copy, so memory contents remain a subset of disk contents.
 //!
+//! In a pool (see [`HostStore::cascade`]) nothing is written through at
+//! publication. The disk record is reserved when the memory copy lands, which
+//! keeps the tree and the disk budget, but the file is written only when memory
+//! needs the room: the memory copy then becomes durable and evictable when the
+//! file commits. A failed write is tried once more at the next pass; the
+//! second failure drops the record.
+//!
 //! The memory store is flat: its index holds no parent links, and the disk
 //! index owns the tree. Records and restore chains that cannot fit available
 //! memory stream through the disk transport's bounded staging pool without
@@ -39,7 +46,7 @@ use crate::{
 
 use super::{
     HostHit, HostStore, INITIAL_STAGED_DISK_RATE, InboundTicket, JobId, PublishedCheckpoint,
-    StoreEvent, StoreOutcome, StoreReason, StoreStats, Tier,
+    Retirement, Retiring, StoreEvent, StoreOutcome, StoreReason, StoreStats, Tier,
     copier::CLOSE_TIMEOUT,
     disk_store::{DiskStore, Staged, TransportEvent},
     geometry::invalid,
@@ -110,6 +117,21 @@ struct Inbound {
     uploading: bool,
 }
 
+/// Disk writes started for parked records at once; beyond them the coldest
+/// parked leaf is dropped instead of queued.
+const MAX_SPILLS: usize = 8;
+
+/// A record whose memory copy landed in a pool and whose file is reserved but
+/// not yet written.
+struct Parked {
+    header: Header,
+    temporary: PathBuf,
+    path: PathBuf,
+    /// Write failures so far.
+    failures: u8,
+    writing: bool,
+}
+
 /// The composite's jobs on the staged transport, by the ids it issued.
 #[derive(Clone, Copy)]
 enum DiskJob {
@@ -129,6 +151,10 @@ pub struct CompositeStore {
     stale: Vec<PrefixKey>,
     disk_outbound_rate: Rate,
     disk_inbound_rate: Rate,
+    /// Joined a pool: records are written to disk when memory needs the room.
+    pooled: bool,
+    /// Records in a pool whose memory copy landed, by key.
+    parked: HashMap<PrefixKey, Parked>,
     /// Scratch reused across polls.
     memory_events: Vec<StoreEvent>,
     transport_events: Vec<TransportEvent>,
@@ -197,6 +223,8 @@ impl CompositeStore {
             stale: Vec::new(),
             disk_outbound_rate: Rate(INITIAL_STAGED_DISK_RATE),
             disk_inbound_rate: Rate(INITIAL_STAGED_DISK_RATE),
+            pooled: false,
+            parked: HashMap::new(),
             memory_events: Vec::new(),
             transport_events: Vec::new(),
         })
@@ -452,6 +480,25 @@ impl CompositeStore {
                 return;
             }
         };
+        if self.pooled {
+            self.parked.insert(
+                key,
+                Parked {
+                    header,
+                    temporary,
+                    path,
+                    failures: 0,
+                    writing: false,
+                },
+            );
+            self.outbound.insert(key, outbound);
+            events.push(StoreEvent::Stored {
+                checkpoint,
+                key,
+                result: Ok(bytes),
+            });
+            return;
+        }
         match self.start_write(key, header, temporary, path) {
             Ok(job) => {
                 outbound.write = Some((job, Instant::now()));
@@ -502,6 +549,25 @@ impl CompositeStore {
         let Some(outbound) = self.outbound.remove(&key) else {
             return;
         };
+        let result = match self.parked.get_mut(&key) {
+            Some(parked) if result.is_err() && parked.failures == 0 => {
+                // Tried once more at the next pass, with the memory copy kept.
+                parked.failures = 1;
+                parked.writing = false;
+                self.outbound.insert(
+                    key,
+                    Outbound {
+                        write: None,
+                        ..outbound
+                    },
+                );
+                return;
+            }
+            _ => {
+                self.parked.remove(&key);
+                result
+            }
+        };
         match result {
             Ok(bytes) => {
                 if let Some((_, started)) = outbound.write {
@@ -526,6 +592,113 @@ impl CompositeStore {
                 let _ = self.disk.commit_record(key, Err(error));
                 self.remove_copy(key);
                 self.stats.store_failed += 1;
+            }
+        }
+    }
+
+    /// Memory slabs the parked and writing records give back once their files
+    /// commit.
+    fn spillable_slabs(&self) -> (usize, usize) {
+        self.parked
+            .keys()
+            .filter_map(|key| self.memory.record(key))
+            .fold((0, 0), |(pages, rows), record| {
+                (
+                    pages + record.pages.len(),
+                    rows + usize::from(record.row.is_some()),
+                )
+            })
+    }
+
+    /// Start the file write of a parked record.
+    fn spill(&mut self, key: PrefixKey) {
+        let Some(parked) = self.parked.get(&key) else {
+            return;
+        };
+        let (header, temporary, path) = (
+            parked.header.clone(),
+            parked.temporary.clone(),
+            parked.path.clone(),
+        );
+        match self.start_write(key, header, temporary, path) {
+            Ok(job) => {
+                if let Some(outbound) = self.outbound.get_mut(&key) {
+                    outbound.write = Some((job, Instant::now()));
+                }
+                if let Some(parked) = self.parked.get_mut(&key) {
+                    parked.writing = true;
+                }
+            }
+            Err(error) => {
+                let failures = self.parked.get_mut(&key).map(|parked| {
+                    parked.failures += 1;
+                    parked.failures
+                });
+                if failures.is_none_or(|failures| failures > 1) {
+                    self.give_up(key, error);
+                }
+            }
+        }
+    }
+
+    /// A parked record that cannot be written leaves memory and the disk index.
+    fn give_up(&mut self, key: PrefixKey, error: Error) {
+        self.parked.remove(&key);
+        self.outbound.remove(&key);
+        self.fail_children(key);
+        let _ = self.disk.commit_record(key, Err(error));
+        self.remove_copy(key);
+        self.stats.store_failed += 1;
+    }
+
+    /// Free memory for a record of `need_pages` pages: write the coldest
+    /// parked records so their copies become evictable, and when the write
+    /// queue is full, drop the coldest parked leaf instead.
+    fn spill_parked(&mut self, need_pages: usize) {
+        let mut waiting: Vec<(u64, PrefixKey)> = self
+            .parked
+            .iter()
+            .filter(|(_, parked)| !parked.writing)
+            .filter_map(|(key, _)| {
+                self.memory
+                    .index()
+                    .node(key)
+                    .map(|node| (node.accessed(), *key))
+            })
+            .collect();
+        waiting.sort_by_key(|(accessed, key)| (*accessed, key.consumed_tokens));
+        let pages_of = |store: &Self, key: &PrefixKey| {
+            store
+                .memory
+                .record(key)
+                .map_or(0, |record| record.pages.len())
+        };
+        let mut writing = self.parked.values().filter(|parked| parked.writing).count();
+        let mut covered: usize = self
+            .parked
+            .iter()
+            .filter(|(_, parked)| parked.writing)
+            .map(|(key, _)| pages_of(self, key))
+            .sum();
+        for (_, key) in waiting {
+            if covered >= need_pages {
+                break;
+            }
+            let pages = pages_of(self, &key);
+            if writing < MAX_SPILLS {
+                self.spill(key);
+                if self.parked.get(&key).is_some_and(|parked| parked.writing) {
+                    writing += 1;
+                    covered += pages;
+                }
+            } else if self
+                .disk
+                .index()
+                .node(&key)
+                .is_some_and(|node| node.children() == 0)
+            {
+                self.give_up(key, invalid("dropped: the write queue was full"));
+                covered += pages;
             }
         }
     }
@@ -816,8 +989,12 @@ impl HostStore for CompositeStore {
             )));
         }
         let key = checkpoint.key;
-        if self.outbound.contains_key(&key) {
+        if let Some(outbound) = self.outbound.get(&key) {
             self.stats.store_skipped += 1;
+            // A parked record already has its complete memory copy.
+            if self.parked.contains_key(&key) && self.resident(&key, outbound.tail_pages, true) {
+                return Ok(StoreOutcome::Present);
+            }
             return Ok(StoreOutcome::Retry(StoreReason::Inflight));
         }
         if let Some(outcome) = self.disk.store_status(checkpoint)? {
@@ -842,7 +1019,13 @@ impl HostStore for CompositeStore {
             return Ok(StoreOutcome::Retry(StoreReason::Inflight));
         }
         let (parent, tail) = self.disk.plan_record(checkpoint);
-        let (pages, rows) = self.memory.reclaimable_slabs();
+        let (mut pages, mut rows) = self.memory.reclaimable_slabs();
+        if self.pooled {
+            // Parked records free their slabs once written.
+            let (spillable_pages, spillable_rows) = self.spillable_slabs();
+            pages += spillable_pages;
+            rows += spillable_rows;
+        }
         if tail.len() > pages || rows == 0 {
             let result = self.disk.store(checkpoint);
             match &result {
@@ -868,6 +1051,9 @@ impl HostStore for CompositeStore {
                     let _ = self.disk.index_mut().unpin(parent);
                 }
                 self.stats.store_skipped += 1;
+                if self.pooled {
+                    self.spill_parked(tail.len());
+                }
                 return Ok(StoreOutcome::Retry(StoreReason::Slabs));
             }
             Err(error) => {
@@ -1071,6 +1257,22 @@ impl HostStore for CompositeStore {
         }
     }
 
+    fn cascade(&mut self) {
+        self.pooled = true;
+    }
+
+    fn set_spill(&mut self, enabled: bool) {
+        self.disk.set_spill(enabled);
+    }
+
+    fn take_retiring(&mut self) -> Vec<Retiring> {
+        self.disk.take_retiring()
+    }
+
+    fn retired(&mut self, key: PrefixKey, tier: PoolTier, how: Retirement) {
+        self.disk.retired(key, tier, how);
+    }
+
     fn announce_to(&mut self, announcer: Announcer) {
         if let Err(error) = self.memory.announce_records(announcer.clone()) {
             eprintln!("warning: host memory records will not be shared: {error}");
@@ -1143,6 +1345,16 @@ impl HostStore for CompositeStore {
     fn close(&mut self) -> Result<()> {
         let deadline = Instant::now() + CLOSE_TIMEOUT;
         let mut events = Vec::new();
+        // Records parked in memory reach disk before the process ends.
+        let parked: Vec<PrefixKey> = self
+            .parked
+            .iter()
+            .filter(|(_, parked)| !parked.writing)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in parked {
+            self.spill(key);
+        }
         while Instant::now() < deadline {
             let stats = self.stats();
             if stats.outbound_in_flight == 0 && stats.inbound_in_flight == 0 {
@@ -1155,6 +1367,7 @@ impl HostStore for CompositeStore {
         self.disk.close()?;
         self.memory.close()?;
         self.outbound.clear();
+        self.parked.clear();
         self.inbound.clear();
         self.jobs.clear();
         self.stale.clear();
@@ -2457,5 +2670,242 @@ mod tests {
         store.close().unwrap();
         drop(store);
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A record of `tokens` tokens in its own history (a root), landed in
+    /// memory and parked behind its disk reservation.
+    fn parked_root(
+        store: &mut CompositeStore,
+        ids: &mut Ids,
+        salt: u32,
+        tokens: u64,
+    ) -> PublishedCheckpoint {
+        let mut history = PrefixHistory::new(IDENTITY);
+        let list: Vec<u32> = (0..tokens as u32)
+            .map(|t| t.wrapping_mul(2654435761).wrapping_add(salt))
+            .collect();
+        history.append(&list, &[]).unwrap();
+        let pages = (tokens / PAGE_TOKENS) as u32;
+        let root = checkpoint(
+            ids,
+            &history,
+            tokens,
+            None,
+            self::pages(0..pages),
+            pages as usize,
+            StateSlotId(salt),
+        );
+        let (_, bytes) = copy_landed(store, &root, None, u64::from(salt));
+        // A copy-out is not durable until its file commits.
+        store.memory.mark_volatile(&root.key);
+        let mut events = Vec::new();
+        store.memory_stored(root.id, root.key, Ok(bytes), &mut events);
+        assert!(matches!(
+            events.as_slice(),
+            [StoreEvent::Stored { result: Ok(_), .. }]
+        ));
+        root
+    }
+
+    #[test]
+    fn a_pooled_record_waits_in_memory_and_is_written_when_memory_needs_the_room() {
+        let Some(directory) = test_directory("pooled-parked") else {
+            return;
+        };
+        let mut store = composite(&directory, 12, 4, 1 << 30);
+        store.cascade();
+        let mut ids = Ids::new();
+        let root = parked_root(&mut store, &mut ids, 1, 640);
+
+        // The copy landed and the file is reserved, but nothing is written.
+        let node = store.disk.index().node(&root.key).unwrap();
+        assert!(!node.ready && node.pinned() && node.row);
+        assert!(store.outbound[&root.key].write.is_none());
+        assert!(store.jobs.is_empty());
+        assert!(!store.memory.record(&root.key).unwrap().durable);
+        let mut events = Vec::new();
+        store.poll(&mut events).unwrap();
+        assert!(!directory.join(record::file_name(&root.key)).exists());
+        // It serves lookups from memory, and a republication finds it present.
+        let mut history = PrefixHistory::new(IDENTITY);
+        let list: Vec<u32> = (0..640u32)
+            .map(|t| t.wrapping_mul(2654435761).wrapping_add(1))
+            .collect();
+        history.append(&list, &[]).unwrap();
+        let hit = store.lookup(&history, 0, u64::MAX).unwrap();
+        assert_eq!((hit.key, hit.tier), (root.key, Tier::Memory));
+        assert_eq!(store.store(&root).unwrap(), StoreOutcome::Present);
+
+        // A record that cannot fit beside it makes memory write it.
+        let mut other_history = PrefixHistory::new(IDENTITY);
+        let list: Vec<u32> = (0..640u32)
+            .map(|t| t.wrapping_mul(2654435761).wrapping_add(2))
+            .collect();
+        other_history.append(&list, &[]).unwrap();
+        let other = checkpoint(
+            &mut ids,
+            &other_history,
+            640,
+            None,
+            pages(0..10),
+            10,
+            StateSlotId(2),
+        );
+        assert_eq!(
+            store.store(&other).unwrap(),
+            StoreOutcome::Retry(StoreReason::Slabs)
+        );
+        assert!(store.parked[&root.key].writing);
+        assert_eq!(store.jobs.len(), 1);
+        poll_until(&mut store, &mut events, |store| store.outbound.is_empty());
+        let node = store.disk.index().node(&root.key).unwrap();
+        assert!(node.ready && !node.pinned());
+        assert!(store.memory.record(&root.key).unwrap().durable);
+        assert!(store.parked.is_empty());
+        assert_eq!(store.stats().stored, 1);
+
+        // Written once, its memory copy now gives way to the new record.
+        assert_eq!(store.store(&other).unwrap(), StoreOutcome::Queued);
+        assert!(store.memory.record(&root.key).is_none());
+        assert!(store.disk.index().node(&root.key).unwrap().ready);
+        assert_eq!(store.stats().stored, 1);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn a_failed_write_is_tried_once_more_and_then_the_record_is_dropped() {
+        let Some(directory) = test_directory("pooled-failed-write") else {
+            return;
+        };
+        for recovers in [true, false] {
+            let mut store = composite(&directory, 12, 4, 1 << 30);
+            store.cascade();
+            let mut ids = Ids::new();
+            let root = parked_root(&mut store, &mut ids, 1, 640);
+            let mut events = Vec::new();
+
+            // The directory disappears under the first write.
+            fs::remove_dir_all(&directory).unwrap();
+            store.spill_parked(10);
+            poll_until(&mut store, &mut events, |store| {
+                store.parked.get(&root.key).is_some_and(|p| !p.writing)
+            });
+            // The record stays, reserved and in memory, for the next pass.
+            assert_eq!(store.parked[&root.key].failures, 1);
+            assert!(store.outbound[&root.key].write.is_none());
+            assert!(store.memory.record(&root.key).is_some());
+            let node = store.disk.index().node(&root.key).unwrap();
+            assert!(!node.ready && node.pinned());
+            assert_eq!(store.stats().store_failed, 0);
+
+            if recovers {
+                fs::create_dir_all(&directory).unwrap();
+            }
+            store.spill_parked(10);
+            poll_until(&mut store, &mut events, |store| store.outbound.is_empty());
+            if recovers {
+                assert!(store.disk.index().node(&root.key).unwrap().ready);
+                assert!(store.memory.record(&root.key).unwrap().durable);
+                assert_eq!(store.stats().store_failed, 0);
+            } else {
+                // The second failure drops it from memory and the disk index.
+                assert!(store.memory.record(&root.key).is_none());
+                assert!(!store.disk.index().contains(&root.key));
+                assert!(store.parked.is_empty());
+                assert_eq!(store.stats().store_failed, 1);
+                fs::create_dir_all(&directory).unwrap();
+            }
+            drop(store);
+            let _ = fs::remove_dir_all(&directory);
+            fs::create_dir_all(&directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_full_write_queue_drops_the_coldest_parked_leaves_instead_of_queueing() {
+        let Some(directory) = test_directory("pooled-queue-full") else {
+            return;
+        };
+        let mut store = composite(&directory, 16, 16, 1 << 30);
+        store.cascade();
+        let mut ids = Ids::new();
+        let roots: Vec<_> = (1..=MAX_SPILLS as u32 + 2)
+            .map(|salt| parked_root(&mut store, &mut ids, salt, 64))
+            .collect();
+        // Warm the most recent two so the coldest are the first ten.
+        store.spill_parked(roots.len());
+        let writing = store.parked.values().filter(|p| p.writing).count();
+        assert_eq!(writing, MAX_SPILLS);
+        // The two beyond the queue were the next coldest: they were dropped.
+        let dropped: Vec<_> = roots
+            .iter()
+            .filter(|root| store.memory.record(&root.key).is_none())
+            .map(|root| root.key)
+            .collect();
+        assert_eq!(dropped, [roots[8].key, roots[9].key]);
+        assert!(dropped.iter().all(|key| !store.disk.index().contains(key)));
+        assert_eq!(store.parked.len(), MAX_SPILLS);
+        let mut events = Vec::new();
+        poll_until(&mut store, &mut events, |store| store.outbound.is_empty());
+        assert_eq!(store.stats().stored, MAX_SPILLS as u64);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn a_full_disk_holds_its_coldest_file_for_the_manager_and_drops_it_once_moved() {
+        let Some(directory) = test_directory("pooled-disk-full") else {
+            return;
+        };
+        let record_bytes = PAGE_RECORD + ROW_RECORD;
+        // Room for one one-page record's file beside the header overhead.
+        let limit = 2 * (record_bytes + 4096 * 3);
+        let mut store = composite(&directory, 16, 16, limit);
+        store.cascade();
+        let announcer =
+            crate::pool::Announcer::new(std::sync::Arc::new(tokio::sync::Notify::new()));
+        announcer.begin_session();
+        store.announce_to(announcer);
+        let mut ids = Ids::new();
+        let mut events = Vec::new();
+        let mut roots = Vec::new();
+        for salt in 1..=2u32 {
+            roots.push(parked_root(&mut store, &mut ids, salt, 64));
+            store.spill_parked(1);
+            poll_until(&mut store, &mut events, |store| store.outbound.is_empty());
+        }
+        store.set_spill(true);
+        assert!(store.disk.used() * 2 > limit, "the disk is nearly full");
+
+        // The next record needs file room: the coldest file is held for the
+        // manager, and the new record waits for it.
+        let mut history = PrefixHistory::new(IDENTITY);
+        let list: Vec<u32> = (0..64u32)
+            .map(|t| t.wrapping_mul(2654435761).wrapping_add(9))
+            .collect();
+        history.append(&list, &[]).unwrap();
+        let wanted = checkpoint(&mut ids, &history, 64, None, pages(0..1), 1, StateSlotId(9));
+        let (_, bytes) = copy_landed(&mut store, &wanted, None, 9);
+        let mut landed_events = Vec::new();
+        store.memory_stored(wanted.id, wanted.key, Ok(bytes), &mut landed_events);
+        assert!(matches!(
+            landed_events.as_slice(),
+            [StoreEvent::Deferred { .. }]
+        ));
+        store.poll(&mut events).unwrap();
+        let retiring = store.take_retiring();
+        assert_eq!(retiring.len(), 1);
+        assert_eq!(retiring[0].key, roots[0].key);
+        assert_eq!(retiring[0].tier, PoolTier::Nvme);
+        assert!(store.disk.index().contains(&roots[0].key));
+
+        // When the manager holds it, the file and its memory copy go.
+        store.retired(roots[0].key, PoolTier::Nvme, Retirement::Moved);
+        store.poll(&mut events).unwrap();
+        assert!(!store.disk.index().contains(&roots[0].key));
+        poll_until(&mut store, &mut events, |store| {
+            store.memory.record(&roots[0].key).is_none()
+        });
+        assert!(store.disk.index().contains(&roots[1].key));
+        store.close().unwrap();
     }
 }
