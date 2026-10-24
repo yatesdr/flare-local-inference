@@ -26,7 +26,7 @@ use crate::{
     index::NodeEvent,
     pool::{
         Announcer, FilePin, HostPin, IndexEntry, Releases, Tier as PoolTier, TierView,
-        pins::{FileSpan, host_chain},
+        pins::{FileSpan, host_chain_kept},
     },
 };
 
@@ -1816,10 +1816,13 @@ impl DiskStore {
         keys.reverse();
         nodes.reverse();
         spans.reverse();
-        let chain = host_chain(page_tokens, begin_tokens, want_row, &nodes);
+        let (chain, kept) = host_chain_kept(page_tokens, begin_tokens, want_row, &nodes);
         if chain.total_pages != (key.consumed_tokens / page_tokens).saturating_sub(start_page) {
             return Err(ExportRefusal::ChainGap);
         }
+        // Windows name records by their place in the chain, which leaves out nodes with no page.
+        let mut spans: Vec<Option<FileSpan>> = spans.into_iter().map(Some).collect();
+        let spans: Vec<FileSpan> = kept.iter().filter_map(|&i| spans[i].take()).collect();
         for (position, key) in keys.iter().enumerate() {
             if self.index.pin(key).is_err() {
                 for pinned in &keys[..position] {
