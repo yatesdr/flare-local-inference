@@ -2,8 +2,8 @@
 //!
 //! A GPU export is answered by the model worker, which pins the checkpoint;
 //! this module then fills the manager's windows by D2H copies through the page
-//! copier. A host-tier export pins the record chain through the host exporter
-//! and fills windows on a copy thread, serving the checksums persisted with the
+//! copier. A host-tier export is pinned by the store on the worker thread and
+//! fills windows on a copy thread, serving the checksums persisted with the
 //! records. In both, the pin is released only after every copy that reads it
 //! has drained, and the export ends with exactly one `ExportEnd`.
 
@@ -23,7 +23,6 @@ use super::{
         codec,
         exporter::{Checksums, HostPin, HostWindow},
         shared::{ExportRequest, PoolEvent},
-        types::Tier,
         wire::{self, client_message::M as Out},
     },
     Engine, Owner,
@@ -124,7 +123,7 @@ impl Engine {
         ) else {
             return self.pin_refused(id, wire::ClaimReason::InvalidClaim);
         };
-        let mut export = Export {
+        let export = Export {
             phase: Phase::AtWorker,
             pin: None,
             want_row: request.want_row,
@@ -138,121 +137,101 @@ impl Engine {
             jobs_outstanding: 0,
             windows: HashMap::new(),
         };
-        match tier {
-            Tier::Gpu => {
-                self.source.exports.insert(id, export);
-                self.event(PoolEvent::Export(ExportRequest {
-                    export: ExportId(id),
-                    key,
-                    generation: request.generation,
-                    begin_tokens: request.begin_tokens,
-                    want_row: request.want_row,
-                    deadline,
-                    reserved_bytes: request.reserved_bytes,
-                }));
-            }
-            Tier::Dram | Tier::Nvme => {
-                let Some(exporter) = self.exporter.clone() else {
-                    return self.pin_refused(id, wire::ClaimReason::NotFound);
-                };
-                match exporter.pin(
-                    tier,
-                    key,
-                    request.generation,
-                    request.begin_tokens,
-                    request.want_row,
-                ) {
-                    Err(refusal) => self.pin_refused(id, reason(refusal)),
-                    Ok(pin) => {
-                        let chain = pin.chain().clone();
-                        let bytes = chain.total_pages * self.st.page_record_bytes()
-                            + if chain.row {
-                                self.st.row_record_bytes()
-                            } else {
-                                0
-                            };
-                        if request.reserved_bytes != 0 && bytes > request.reserved_bytes {
-                            return self.pin_refused(id, wire::ClaimReason::NoWindows);
-                        }
-                        let expected: Vec<ExpectedRecord> = chain
-                            .records
-                            .iter()
-                            .map(|r| ExpectedRecord {
-                                key: r.key,
-                                first_page: r.first_page,
-                                pages: r.pages,
-                                row: r.row,
-                            })
-                            .collect();
-                        let records = chain
-                            .records
-                            .iter()
-                            .map(|r| wire::Record {
-                                key: Some(codec::key_to(r.key)),
-                                generation: r.generation,
-                                first_page: r.first_page,
-                                pages: r.pages,
-                                row: r.row,
-                            })
-                            .collect();
-                        export.phase = Phase::Pinned;
-                        export.pin = Some(Pin::Host(Arc::new(Mutex::new(pin))));
-                        export.coverage = Some(Coverage::new(expected));
-                        self.source.exports.insert(id, export);
-                        self.emit(Out::PinAck(wire::PinAck {
-                            export_id: id,
-                            result: wire::PinResult::Pinned as i32,
-                            refusal: 0,
-                            records,
-                            total_pages: chain.total_pages,
-                            row: chain.row,
-                        }));
-                    }
-                }
-            }
-        }
+        self.source.exports.insert(id, export);
+        self.event(PoolEvent::Export(ExportRequest {
+            export: ExportId(id),
+            tier,
+            key,
+            generation: request.generation,
+            begin_tokens: request.begin_tokens,
+            want_row: request.want_row,
+            deadline,
+            reserved_bytes: request.reserved_bytes,
+        }));
     }
 
     /// The worker pinned the checkpoint and describes its chain.
     pub(crate) fn on_export_pinned(&mut self, export: ExportId, chain: ExportChain) {
+        let last = chain.nodes.len().saturating_sub(1);
+        let records: Vec<ExpectedRecord> = chain
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| {
+                let first = if index == 0 { chain.skip_pages } else { 0 };
+                ExpectedRecord {
+                    key: node.key,
+                    first_page: first,
+                    pages: (node.pages.len() as u32).saturating_sub(first),
+                    row: index == last && chain.row.is_some(),
+                }
+            })
+            .collect();
+        let generations: Vec<u64> = chain.nodes.iter().map(|n| n.generation).collect();
+        let row = chain.row.is_some();
+        self.pinned(export, records, generations, row, Pin::Gpu(chain));
+    }
+
+    /// The store pinned a host-tier chain for the export.
+    pub(crate) fn on_host_pinned(&mut self, export: ExportId, pin: Box<dyn HostPin>) {
+        let chain = pin.chain().clone();
+        let records = chain
+            .records
+            .iter()
+            .map(|r| ExpectedRecord {
+                key: r.key,
+                first_page: r.first_page,
+                pages: r.pages,
+                row: r.row,
+            })
+            .collect();
+        let generations = chain.records.iter().map(|r| r.generation).collect();
+        self.pinned(
+            export,
+            records,
+            generations,
+            chain.row,
+            Pin::Host(Arc::new(Mutex::new(pin))),
+        );
+    }
+
+    /// Answer an export request with the chain that was pinned for it, or
+    /// release the pin if the export can no longer use it.
+    fn pinned(
+        &mut self,
+        export: ExportId,
+        expected: Vec<ExpectedRecord>,
+        generations: Vec<u64>,
+        row: bool,
+        pin: Pin,
+    ) {
         let id = export.0;
+        let release = |engine: &Engine, pin: Pin| {
+            // A GPU pin is the worker's to release; a host pin releases on drop.
+            if matches!(pin, Pin::Gpu(_)) {
+                engine.event(PoolEvent::ExportEnded { export });
+            }
+        };
         let Some(run) = self.source.exports.get_mut(&id) else {
             // Nothing waits for this pin any more.
-            self.event(PoolEvent::ExportEnded { export });
-            return;
+            return release(self, pin);
         };
         if !matches!(run.phase, Phase::AtWorker) {
             return;
         }
         let (page_bytes, row_bytes) = (self.st.page_record_bytes(), self.st.row_record_bytes());
-        let last = chain.nodes.len().saturating_sub(1);
-        let mut expected = Vec::new();
-        let mut records = Vec::new();
-        for (index, node) in chain.nodes.iter().enumerate() {
-            let first = if index == 0 { chain.skip_pages } else { 0 };
-            let pages = (node.pages.len() as u32).saturating_sub(first);
-            let row = index == last && chain.row.is_some();
-            expected.push(ExpectedRecord {
-                key: node.key,
-                first_page: first,
-                pages,
-                row,
-            });
-            records.push(wire::Record {
-                key: Some(codec::key_to(node.key)),
-                generation: node.generation,
-                first_page: first,
-                pages,
-                row,
-            });
-        }
         let total: u64 = expected.iter().map(|r| u64::from(r.pages)).sum();
-        let bytes = total * page_bytes + if chain.row.is_some() { row_bytes } else { 0 };
-        let valid = !expected.is_empty() && chain.row.is_some() == run.want_row;
-        let release = run.cancelled || run.lost || run.answered;
-        if release || !valid || bytes > run.reserved {
-            let answered = run.answered;
-            let cancelled = run.cancelled;
+        let bytes = total * page_bytes + if row { row_bytes } else { 0 };
+        let valid = !expected.is_empty() && row == run.want_row;
+        // A GPU export always has its staging reserved; a host export with none
+        // reserved streams.
+        let over = if matches!(pin, Pin::Gpu(_)) {
+            bytes > run.reserved
+        } else {
+            run.reserved != 0 && bytes > run.reserved
+        };
+        if run.cancelled || run.lost || run.answered || !valid || over {
+            let (answered, cancelled) = (run.answered, run.cancelled);
             self.source.exports.remove(&id);
             if !answered {
                 let why = if cancelled {
@@ -264,13 +243,22 @@ impl Engine {
                 };
                 self.pin_refused(id, why);
             }
-            self.event(PoolEvent::ExportEnded { export });
-            return;
+            return release(self, pin);
         }
+        let records = expected
+            .iter()
+            .zip(generations)
+            .map(|(r, generation)| wire::Record {
+                key: Some(codec::key_to(r.key)),
+                generation,
+                first_page: r.first_page,
+                pages: r.pages,
+                row: r.row,
+            })
+            .collect();
         run.phase = Phase::Pinned;
         run.coverage = Some(Coverage::new(expected));
-        run.pin = Some(Pin::Gpu(chain));
-        let row = run.want_row;
+        run.pin = Some(pin);
         self.emit(Out::PinAck(wire::PinAck {
             export_id: id,
             result: wire::PinResult::Pinned as i32,

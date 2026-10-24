@@ -164,3 +164,98 @@ impl PageCopier for StoppedCopier {
         Ok(())
     }
 }
+
+/// The device pages and state rows a [`SimulatedGpu`] copies to and from, by id.
+#[derive(Clone, Default)]
+pub struct GpuMemory {
+    pub pages: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Vec<u8>>>>,
+    pub rows: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Vec<u8>>>>,
+}
+
+/// A copier that moves bytes between host slabs and an in-memory stand-in for
+/// the GPU as soon as a job is submitted, and reports the job on the next poll.
+pub struct SimulatedGpu {
+    layout: Layout,
+    memory: GpuMemory,
+    replies: Vec<Reply>,
+}
+
+impl SimulatedGpu {
+    pub fn new(geometry: &[CacheGeometry]) -> Result<(Self, GpuMemory)> {
+        let memory = GpuMemory::default();
+        Ok((
+            Self {
+                layout: Layout::new(geometry)?,
+                memory: memory.clone(),
+                replies: Vec::new(),
+            },
+            memory,
+        ))
+    }
+
+    pub fn shared(geometry: &[CacheGeometry]) -> Result<(crate::SharedCopier, GpuMemory)> {
+        let (copier, memory) = Self::new(geometry)?;
+        Ok((std::sync::Arc::new(std::sync::Mutex::new(copier)), memory))
+    }
+}
+
+impl PageCopier for SimulatedGpu {
+    fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    fn submit(&mut self, job: Job) -> Result<()> {
+        let (page, row) = (
+            self.layout.page_record_bytes as usize,
+            self.layout.row_record_bytes as usize,
+        );
+        let (mut pages, mut rows) = (
+            self.memory.pages.lock().unwrap(),
+            self.memory.rows.lock().unwrap(),
+        );
+        for (id, address) in &job.pages {
+            // The host address names a slab the caller keeps mapped for the job.
+            let host = unsafe { std::slice::from_raw_parts_mut(*address as *mut u8, page) };
+            match job.direction {
+                crate::Direction::Out => {
+                    host.copy_from_slice(pages.get(&id.0).map_or(&vec![0; page], |p| p));
+                }
+                crate::Direction::In => {
+                    pages.insert(id.0, host.to_vec());
+                }
+            }
+        }
+        if let Some((slot, address)) = job.row {
+            let host = unsafe { std::slice::from_raw_parts_mut(address as *mut u8, row) };
+            match job.direction {
+                crate::Direction::Out => {
+                    host.copy_from_slice(rows.get(&slot.0).map_or(&vec![0; row], |p| p));
+                }
+                crate::Direction::In => {
+                    rows.insert(slot.0, host.to_vec());
+                }
+            }
+        }
+        self.replies.push(Reply {
+            id: job.id,
+            window: job.window,
+            direction: job.direction,
+            result: Ok(()),
+            bytes: 0,
+            elapsed: std::time::Duration::from_micros(1),
+        });
+        Ok(())
+    }
+
+    fn poll(&mut self, replies: &mut Vec<Reply>) {
+        replies.append(&mut self.replies);
+    }
+
+    fn in_flight(&self) -> usize {
+        self.replies.len()
+    }
+
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}

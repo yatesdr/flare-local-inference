@@ -236,7 +236,7 @@ fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
 fn a_client_connects_opens_a_session_syncs_announces_and_says_goodbye() {
     let server = serve("ok", hello(2, wire::HelloStatus::HelloOk));
     let (config, copier) = config(&server.path);
-    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar), None).unwrap();
+    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar)).unwrap();
     wait_for("Ready", || client.status() == PoolStatus::Ready);
     client.saved(IndexEntry {
         key: PrefixKey {
@@ -293,7 +293,7 @@ fn a_client_connects_opens_a_session_syncs_announces_and_says_goodbye() {
 fn a_protocol_mismatch_disables_the_pool_without_opening_a_session() {
     let server = serve("mismatch", hello(1, wire::HelloStatus::VersionMismatch));
     let (config, copier) = config(&server.path);
-    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar), None).unwrap();
+    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar)).unwrap();
     wait_for("Disabled", || {
         matches!(client.status(), PoolStatus::Disabled(_))
     });
@@ -308,7 +308,7 @@ fn an_unreachable_manager_leaves_the_client_local_and_close_returns() {
     let path = std::env::temp_dir().join(format!("selene-smoke-none-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let (config, copier) = config(&path);
-    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar), None).unwrap();
+    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar)).unwrap();
     std::thread::sleep(Duration::from_millis(300));
     assert_ne!(client.status(), PoolStatus::Ready);
     let mut events = Vec::new();
@@ -320,7 +320,7 @@ fn an_unreachable_manager_leaves_the_client_local_and_close_returns() {
 fn a_scope_id_the_manager_computes_differently_disables_the_pool() {
     let server = serve_with("scope", hello(2, wire::HelloStatus::HelloOk), true);
     let (config, copier) = config(&server.path);
-    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar), None).unwrap();
+    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar)).unwrap();
     wait_for("Disabled", || {
         matches!(client.status(), PoolStatus::Disabled(_))
     });
@@ -426,7 +426,7 @@ fn a_client_with_a_ca_requires_tls_and_connects_to_a_tls_manager() {
     let pki = pki();
     let (server, port) = serve_tcp(tls_hello(), Some(&pki));
     let (config, copier) = tcp_config(port, Some(&pki), &std::env::temp_dir());
-    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar), None).unwrap();
+    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar)).unwrap();
     wait_for("Ready over TLS", || client.status() == PoolStatus::Ready);
     assert_eq!(*server.opened.lock().unwrap(), 1);
     client.close().unwrap();
@@ -437,7 +437,7 @@ fn a_client_without_a_ca_never_gets_a_session_from_a_tls_manager() {
     let pki = pki();
     let (server, port) = serve_tcp(tls_hello(), Some(&pki));
     let (config, copier) = tcp_config(port, None, &std::env::temp_dir());
-    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar), None).unwrap();
+    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar)).unwrap();
     std::thread::sleep(Duration::from_millis(500));
     assert_ne!(client.status(), PoolStatus::Ready);
     assert_eq!(*server.opened.lock().unwrap(), 0);
@@ -449,7 +449,7 @@ fn a_client_with_a_ca_never_downgrades_to_a_plaintext_manager() {
     let pki = pki();
     let (server, port) = serve_tcp(hello(2, wire::HelloStatus::HelloOk), None);
     let (config, copier) = tcp_config(port, Some(&pki), &std::env::temp_dir());
-    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar), None).unwrap();
+    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar)).unwrap();
     std::thread::sleep(Duration::from_millis(500));
     assert_ne!(client.status(), PoolStatus::Ready);
     assert_eq!(*server.opened.lock().unwrap(), 0);

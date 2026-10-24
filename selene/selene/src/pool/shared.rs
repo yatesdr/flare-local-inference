@@ -18,6 +18,7 @@ use crate::{
 };
 
 use super::{
+    exporter::HostPin,
     lookup::{Answer, LookupState, LookupTicket, TicketInner},
     types::{HeldRange, PoolCandidate, SourceRef, Tier},
 };
@@ -43,6 +44,9 @@ pub enum PoolStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExportRequest {
     pub export: ExportId,
+    /// The tier asked to serve it: the GPU's is answered by the model worker,
+    /// a host tier's by the store.
+    pub tier: Tier,
     pub key: PrefixKey,
     pub generation: u64,
     pub begin_tokens: u64,
@@ -118,6 +122,10 @@ pub(crate) enum Command {
     ExportPinned {
         export: ExportId,
         chain: ExportChain,
+    },
+    HostPinned {
+        export: ExportId,
+        pin: Box<dyn HostPin>,
     },
     ExportRefused {
         export: ExportId,

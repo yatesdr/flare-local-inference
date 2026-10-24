@@ -32,7 +32,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{CheckpointId, Error, History, PrefixKey, Result};
+use crate::{
+    CheckpointId, Error, ExportRefusal, History, PrefixKey, Result,
+    pool::{Announcer, HostPin, Tier as PoolTier},
+};
 
 use super::{
     HostHit, HostStore, INITIAL_STAGED_DISK_RATE, InboundTicket, JobId, PublishedCheckpoint,
@@ -1047,7 +1050,62 @@ impl HostStore for CompositeStore {
         }
         self.drop_evicted_copies();
         self.retry_stale();
+        // The flat memory records are announced under their parents in the disk index.
+        let disk = &self.disk;
+        self.memory
+            .flush_announcements(&|key, _| disk.index().node(key).and_then(|node| node.parent));
+        self.disk.flush_announcements();
         polled
+    }
+
+    fn announce_to(&mut self, announcer: Announcer) {
+        if let Err(error) = self.memory.announce_records(announcer.clone()) {
+            eprintln!("warning: host memory records will not be shared: {error}");
+        }
+        self.disk.announce_records(announcer);
+    }
+
+    fn pin_export(
+        &mut self,
+        tier: PoolTier,
+        key: PrefixKey,
+        generation: u64,
+        begin_tokens: u64,
+        want_row: bool,
+    ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
+        if tier == PoolTier::Nvme {
+            return self
+                .disk
+                .pin_export_files(key, generation, begin_tokens, want_row);
+        }
+        // The memory records are flat: the disk index supplies the chain, and
+        // each record on it must be resident with all its pages (and the row,
+        // at the endpoint when wanted).
+        let page_tokens = self.disk.layout().page_tokens;
+        let start_page = begin_tokens / page_tokens;
+        let mut chain = Vec::new();
+        let mut cursor = key;
+        loop {
+            let node = self
+                .disk
+                .index()
+                .node(&cursor)
+                .ok_or(ExportRefusal::NotFound)?;
+            let row = want_row && cursor == key;
+            if !self.resident(&cursor, node.tail_pages, row) {
+                return Err(ExportRefusal::ChainGap);
+            }
+            chain.push(cursor);
+            let start =
+                (cursor.consumed_tokens / page_tokens).saturating_sub(node.tail_pages as u64);
+            if start <= start_page {
+                break;
+            }
+            cursor = node.parent.ok_or(ExportRefusal::ChainGap)?;
+        }
+        chain.reverse();
+        self.memory
+            .pin_export_chain(&chain, generation, begin_tokens, want_row)
     }
 
     fn stats(&self) -> StoreStats {
@@ -2294,6 +2352,96 @@ mod tests {
         // The closed store still answers: the key is indexed, so it is skipped.
         assert_ne!(store.store(&root).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().store_skipped, 1);
+        drop(store);
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn memory_and_disk_records_are_announced_under_the_disk_parents_and_exported_per_tier() {
+        use crate::pool::{Announcer, HostWindow, Notice, Tier as PoolTier};
+        let Some(directory) = test_directory("announce") else {
+            return;
+        };
+        let full = history(2000);
+        let mut ids = Ids::new();
+        let root = checkpoint(&mut ids, &full, 700, None, pages(0..10), 10, StateSlotId(1));
+        let child = checkpoint(
+            &mut ids,
+            &full,
+            1300,
+            Some(700),
+            pages(0..20),
+            10,
+            StateSlotId(2),
+        );
+        let mut store = composite(&directory, 32, 4, 1 << 30);
+        let announcer = Announcer::new(std::sync::Arc::new(tokio::sync::Notify::new()));
+        announcer.begin_session();
+        store.announce_to(announcer.clone());
+        let (_, root_bytes) = written(&mut store, &root, None, 1);
+        written(&mut store, &child, Some(root.key), 2);
+        // Memory records are hashed before they are announced.
+        let mut notices = Vec::new();
+        let mut events = Vec::new();
+        poll_until(&mut store, &mut events, |store| {
+            let _ = store;
+            if let Some((_, batch)) = announcer.take_batch(100) {
+                notices.extend(batch);
+            }
+            notices
+                .iter()
+                .filter(|n| matches!(n, Notice::Saved(e) if e.tier == PoolTier::Dram))
+                .count()
+                == 2
+        });
+        let entry = |key: PrefixKey, tier: PoolTier| {
+            notices
+                .iter()
+                .find_map(|n| match n {
+                    Notice::Saved(e) if e.key == key && e.tier == tier => Some(e.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        for tier in [PoolTier::Dram, PoolTier::Nvme] {
+            assert_eq!(entry(child.key, tier).parent, Some(root.key));
+            assert_eq!(entry(root.key, tier).parent, None);
+        }
+        // DRAM serves the resident copy, NVMe the file; both with committed checksums.
+        let mut pins = Vec::new();
+        for tier in [PoolTier::Dram, PoolTier::Nvme] {
+            let generation = entry(child.key, tier).generation;
+            let mut pin = store
+                .pin_export(tier, child.key, generation, 0, true)
+                .unwrap();
+            assert_eq!(pin.chain().total_pages, 20);
+            let mut dst = vec![0u8; (PAGE_RECORD + ROW_RECORD) as usize];
+            let window = HostWindow {
+                record: 1,
+                first_page: 9,
+                page_count: 1,
+                row: true,
+            };
+            let sums = pin.read(&window, &mut dst).unwrap();
+            assert_eq!(
+                sums.pages[0],
+                crate::record::checksum(&dst[..PAGE_RECORD as usize])
+            );
+            assert_eq!(
+                sums.row,
+                Some(crate::record::checksum(&dst[PAGE_RECORD as usize..]))
+            );
+            pins.push((tier, dst));
+        }
+        assert_eq!(pins[0].1, pins[1].1, "both tiers serve the same bytes");
+        let _ = root_bytes;
+        // Releasing happens when the pins go.
+        drop(pins);
+        let mut events = Vec::new();
+        store.poll(&mut events).unwrap();
+        assert!(store.memory.index().nodes().all(|n| !n.pinned()));
+        assert!(store.disk.index().nodes().all(|n| !n.pinned()));
+        store.close().unwrap();
         drop(store);
         fs::remove_dir_all(&directory).unwrap();
     }

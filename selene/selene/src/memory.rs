@@ -28,12 +28,20 @@
 //! store answers no lookups of its own.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
-    sync::PoisonError,
+    collections::{BTreeMap, HashMap, VecDeque},
+    sync::{Arc, PoisonError},
     time::{Duration, Instant},
 };
 
-use crate::{CheckpointId, Error, History, PageId, PrefixKey, Result, StateSlotId};
+use crate::{
+    CheckpointId, Error, ExportRefusal, History, PageId, PrefixKey, Result, StateSlotId,
+    index::{NodeEvent, NodeNotice},
+    pool::{
+        Announcer, HostPin, MemoryPin, Releases, Tier as PoolTier, TierView,
+        pins::{MemorySpan, host_chain},
+        tiers::{HashJob, Hasher, RecordSums},
+    },
+};
 
 use super::{
     HostHit, HostStore, INITIAL_MEMORY_RATE, InboundTicket, JobId, Layout, PublishedCheckpoint,
@@ -801,8 +809,20 @@ fn windows(
     queued
 }
 
+/// What a memory store keeps to announce its records and serve them as exports.
+struct Announce {
+    view: TierView,
+    hasher: Hasher,
+    /// Ready records being hashed, pinned until the result is collected.
+    hashing: HashMap<PrefixKey, NodeNotice>,
+    /// The checksums committed with each announced record.
+    sums: HashMap<PrefixKey, Arc<RecordSums>>,
+    releases: Releases,
+}
+
 pub struct MemoryStore {
     core: Core,
+    announce: Option<Announce>,
     transfers: SharedCopier,
     /// Reply scratch reused across polls.
     replies: Vec<Reply>,
@@ -846,6 +866,7 @@ impl MemoryStore {
         }
         Ok(Self {
             core: Core::new(identity, pool, layout, flat),
+            announce: None,
             transfers,
             replies: Vec::new(),
             events: Vec::new(),
@@ -971,6 +992,195 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Announce this store's records through `announcer` and serve them as
+    /// exports. Records get their checksums on a thread of their own before they
+    /// are announced. A pool split by rank is not readable by the CPU and
+    /// announces nothing.
+    pub fn announce_records(&mut self, announcer: Announcer) -> Result<()> {
+        if self.announce.is_some() || self.core.pool.rank_parts().is_some() {
+            return Ok(());
+        }
+        let view = TierView::new(announcer, PoolTier::Dram, &self.core.layout);
+        self.core.index.observe(view.sink());
+        // What is resident already counts as newly ready.
+        view.sink()
+            .lock()
+            .unwrap()
+            .extend(self.core.index.ready_notices());
+        self.announce = Some(Announce {
+            view,
+            hasher: Hasher::start()?,
+            hashing: HashMap::new(),
+            sums: HashMap::new(),
+            releases: Releases::default(),
+        });
+        Ok(())
+    }
+
+    /// Release finished exports' pins, collect checksums and announce what
+    /// changed. `parent_of` gives the parent to announce a record under, from
+    /// the record's own and its key; a flat store's records have none of their
+    /// own.
+    pub fn flush_announcements(
+        &mut self,
+        parent_of: &dyn Fn(&PrefixKey, Option<PrefixKey>) -> Option<PrefixKey>,
+    ) {
+        let Some(a) = self.announce.as_mut() else {
+            return;
+        };
+        for key in a.releases.drain() {
+            let _ = self.core.index.unpin(&key);
+        }
+        for done in a.hasher.collect() {
+            let Some(notice) = a.hashing.remove(&done.key) else {
+                continue;
+            };
+            let _ = self.core.index.unpin(&done.key);
+            if self.core.index.node(&done.key).is_some_and(|n| n.ready) {
+                a.sums.insert(done.key, Arc::new(done.sums));
+                a.view
+                    .announce(&notice, parent_of(&notice.key, notice.parent));
+            }
+        }
+        for notice in a.view.drain() {
+            let key = notice.key;
+            match notice.event {
+                NodeEvent::Ready => {
+                    if a.hashing.contains_key(&key) {
+                        continue;
+                    }
+                    let Some(node) = self.core.index.node(&key).filter(|n| n.ready) else {
+                        continue;
+                    };
+                    let pool = &self.core.pool;
+                    let job = HashJob {
+                        key,
+                        pages: node
+                            .location
+                            .pages
+                            .iter()
+                            .map(|slab| pool.page_address(*slab))
+                            .collect(),
+                        page_bytes: pool.page_bytes(),
+                        row: node.location.row.map(|slab| pool.row_address(slab)),
+                        row_bytes: pool.row_bytes(),
+                    };
+                    if self.core.index.pin(&key).is_ok() {
+                        if a.hasher.submit(job) {
+                            a.hashing.insert(key, notice);
+                        } else {
+                            let _ = self.core.index.unpin(&key);
+                        }
+                    }
+                }
+                NodeEvent::Gone => {
+                    a.hashing.remove(&key);
+                    a.sums.remove(&key);
+                    a.view.retire(&key);
+                }
+                NodeEvent::RowDropped => {
+                    if a.sums.contains_key(&key) {
+                        a.view.announce(&notice, parent_of(&key, notice.parent));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pin the resident records `keys` (ascending, the last the endpoint) for an
+    /// export from `begin_tokens`, serving the checksums committed with them.
+    pub fn pin_export_chain(
+        &mut self,
+        keys: &[PrefixKey],
+        generation: u64,
+        begin_tokens: u64,
+        want_row: bool,
+    ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
+        let (Some(a), Some(endpoint)) = (self.announce.as_ref(), keys.last()) else {
+            return Err(ExportRefusal::NotFound);
+        };
+        match a.view.generation(endpoint) {
+            Some(held) if held == generation => {}
+            Some(_) => return Err(ExportRefusal::GenerationChanged),
+            None => return Err(ExportRefusal::NotFound),
+        }
+        let pool = &self.core.pool;
+        let mut nodes = Vec::with_capacity(keys.len());
+        let mut spans = Vec::with_capacity(keys.len());
+        for (position, key) in keys.iter().enumerate() {
+            let node = self
+                .core
+                .index
+                .node(key)
+                .filter(|node| node.ready)
+                .ok_or(ExportRefusal::ChainGap)?;
+            let (Some(sums), Some(held)) = (a.sums.get(key), a.view.generation(key)) else {
+                return Err(ExportRefusal::ChainGap);
+            };
+            if want_row && position + 1 == keys.len() && node.location.row.is_none() {
+                return Err(ExportRefusal::ChainGap);
+            }
+            nodes.push((*key, held, node.location.pages.len()));
+            spans.push(MemorySpan {
+                pages: node
+                    .location
+                    .pages
+                    .iter()
+                    .map(|slab| pool.page_address(*slab))
+                    .collect(),
+                row: node.location.row.map(|slab| pool.row_address(slab)),
+                sums: sums.clone(),
+            });
+        }
+        let page_tokens = self.core.layout.page_tokens;
+        let chain = host_chain(page_tokens, begin_tokens, want_row, &nodes);
+        if chain.total_pages
+            != (endpoint.consumed_tokens / page_tokens).saturating_sub(begin_tokens / page_tokens)
+        {
+            return Err(ExportRefusal::ChainGap);
+        }
+        for (position, key) in keys.iter().enumerate() {
+            if self.core.index.pin(key).is_err() {
+                for pinned in &keys[..position] {
+                    let _ = self.core.index.unpin(pinned);
+                }
+                return Err(ExportRefusal::NotFound);
+            }
+        }
+        Ok(Box::new(MemoryPin {
+            chain,
+            spans,
+            page_bytes: pool.page_bytes(),
+            row_bytes: pool.row_bytes(),
+            keys: keys.to_vec(),
+            releases: a.releases.clone(),
+        }))
+    }
+
+    /// The keys from the record holding the page that contains `begin_tokens` up
+    /// to `endpoint`, ascending, following this store's own parent links.
+    fn export_chain(
+        &self,
+        endpoint: &PrefixKey,
+        begin_tokens: u64,
+    ) -> std::result::Result<Vec<PrefixKey>, ExportRefusal> {
+        let page_tokens = self.core.layout.page_tokens;
+        let start_page = begin_tokens / page_tokens;
+        let mut chain = Vec::new();
+        let mut key = *endpoint;
+        loop {
+            let node = self.core.index.node(&key).ok_or(ExportRefusal::NotFound)?;
+            chain.push(key);
+            let start = (key.consumed_tokens / page_tokens).saturating_sub(node.tail_pages as u64);
+            if start <= start_page {
+                break;
+            }
+            key = node.parent.ok_or(ExportRefusal::ChainGap)?;
+        }
+        chain.reverse();
+        Ok(chain)
+    }
+
     fn pump(&mut self) {
         let mut transfers = self
             .transfers
@@ -1041,7 +1251,32 @@ impl HostStore for MemoryStore {
         self.core.settle(events);
         self.pump();
         events.append(&mut self.events);
+        // Inside a composite the disk index supplies parents, so it flushes.
+        if !self.core.flat {
+            self.flush_announcements(&|_, parent| parent);
+        }
         Ok(())
+    }
+
+    fn announce_to(&mut self, announcer: Announcer) {
+        if let Err(error) = self.announce_records(announcer) {
+            eprintln!("warning: host memory records will not be shared: {error}");
+        }
+    }
+
+    fn pin_export(
+        &mut self,
+        tier: PoolTier,
+        key: PrefixKey,
+        generation: u64,
+        begin_tokens: u64,
+        want_row: bool,
+    ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
+        if tier != PoolTier::Dram || self.core.flat {
+            return Err(ExportRefusal::NotFound);
+        }
+        let chain = self.export_chain(&key, begin_tokens)?;
+        self.pin_export_chain(&chain, generation, begin_tokens, want_row)
     }
 
     fn stats(&self) -> StoreStats {

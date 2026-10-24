@@ -21,7 +21,14 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use crate::{CheckpointId, Error, History, PageId, PrefixKey, Result, StateSlotId};
+use crate::{
+    CheckpointId, Error, ExportRefusal, History, PageId, PrefixKey, Result, StateSlotId,
+    index::NodeEvent,
+    pool::{
+        Announcer, FilePin, HostPin, Releases, Tier as PoolTier, TierView,
+        pins::{FileSpan, host_chain},
+    },
+};
 
 use super::{
     CacheGeometry, HostHit, HostStore, INITIAL_DIRECT_DISK_RATE, INITIAL_STAGED_DISK_RATE,
@@ -1446,7 +1453,14 @@ pub struct DiskStore {
     evicted: Vec<PrefixKey>,
     outbound_rate: Rate,
     inbound_rate: Rate,
+    announce: Option<Announce>,
     pub directory_lock: record::DirectoryLock,
+}
+
+/// What a disk store keeps to announce its records and serve them as exports.
+struct Announce {
+    view: TierView,
+    releases: Releases,
 }
 
 impl DiskStore {
@@ -1509,8 +1523,114 @@ impl DiskStore {
             evicted: Vec::new(),
             outbound_rate: Rate(rate),
             inbound_rate: Rate(rate),
+            announce: None,
             directory_lock,
         })
+    }
+
+    /// Announce this store's records through `announcer` and serve them as
+    /// exports. The records on disk now count as newly ready.
+    pub fn announce_records(&mut self, announcer: Announcer) {
+        if self.announce.is_some() {
+            return;
+        }
+        let view = TierView::new(announcer, PoolTier::Nvme, &self.layout);
+        self.index.observe(view.sink());
+        view.sink()
+            .lock()
+            .unwrap()
+            .extend(self.index.ready_notices());
+        self.announce = Some(Announce {
+            view,
+            releases: Releases::default(),
+        });
+    }
+
+    /// Release finished exports' pins and announce what changed.
+    pub fn flush_announcements(&mut self) {
+        let Some(a) = self.announce.as_mut() else {
+            return;
+        };
+        for key in a.releases.drain() {
+            let _ = self.index.unpin(&key);
+        }
+        for notice in a.view.drain() {
+            match notice.event {
+                NodeEvent::Ready | NodeEvent::RowDropped => a.view.announce(&notice, notice.parent),
+                NodeEvent::Gone => a.view.retire(&notice.key),
+            }
+        }
+    }
+
+    /// Pin the chain of complete record files ending at `key` for an export
+    /// from `begin_tokens`. The files' own checksums are what is served.
+    pub fn pin_export_files(
+        &mut self,
+        key: PrefixKey,
+        generation: u64,
+        begin_tokens: u64,
+        want_row: bool,
+    ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
+        let Some(a) = self.announce.as_ref() else {
+            return Err(ExportRefusal::NotFound);
+        };
+        match a.view.generation(&key) {
+            Some(held) if held == generation => {}
+            Some(_) => return Err(ExportRefusal::GenerationChanged),
+            None => return Err(ExportRefusal::NotFound),
+        }
+        let page_tokens = self.layout.page_tokens;
+        let start_page = begin_tokens / page_tokens;
+        let mut keys = Vec::new();
+        let mut nodes = Vec::new();
+        let mut spans = Vec::new();
+        let mut cursor = key;
+        loop {
+            let node = self
+                .index
+                .node(&cursor)
+                .filter(|node| node.ready)
+                .ok_or(ExportRefusal::ChainGap)?;
+            let held = a.view.generation(&cursor).ok_or(ExportRefusal::ChainGap)?;
+            if want_row && cursor == key && !node.row {
+                return Err(ExportRefusal::ChainGap);
+            }
+            keys.push(cursor);
+            nodes.push((cursor, held, node.tail_pages));
+            spans.push(FileSpan {
+                path: node.location.path.clone(),
+                header: node.location.header.clone(),
+            });
+            let start =
+                (cursor.consumed_tokens / page_tokens).saturating_sub(node.tail_pages as u64);
+            if start <= start_page {
+                break;
+            }
+            cursor = node.parent.ok_or(ExportRefusal::ChainGap)?;
+        }
+        keys.reverse();
+        nodes.reverse();
+        spans.reverse();
+        let chain = host_chain(page_tokens, begin_tokens, want_row, &nodes);
+        if chain.total_pages != (key.consumed_tokens / page_tokens).saturating_sub(start_page) {
+            return Err(ExportRefusal::ChainGap);
+        }
+        for (position, key) in keys.iter().enumerate() {
+            if self.index.pin(key).is_err() {
+                for pinned in &keys[..position] {
+                    let _ = self.index.unpin(pinned);
+                }
+                return Err(ExportRefusal::NotFound);
+            }
+        }
+        Ok(Box::new(FilePin {
+            chain,
+            spans,
+            page_bytes: self.layout.page_record_bytes,
+            row_bytes: self.layout.row_record_bytes,
+            keys,
+            releases: a.releases.clone(),
+        }))
     }
 
     pub fn share_budget(&mut self, budget: Arc<super::input::DiskBudget>) {
@@ -2189,7 +2309,26 @@ impl HostStore for DiskStore {
         for event in completed {
             self.apply(event, events);
         }
+        self.flush_announcements();
         polled
+    }
+
+    fn announce_to(&mut self, announcer: Announcer) {
+        self.announce_records(announcer);
+    }
+
+    fn pin_export(
+        &mut self,
+        tier: PoolTier,
+        key: PrefixKey,
+        generation: u64,
+        begin_tokens: u64,
+        want_row: bool,
+    ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
+        if tier != PoolTier::Nvme {
+            return Err(ExportRefusal::NotFound);
+        }
+        self.pin_export_files(key, generation, begin_tokens, want_row)
     }
 
     fn stats(&self) -> StoreStats {
@@ -4656,5 +4795,144 @@ mod tests {
         );
         staged.close().unwrap();
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Write the record file of `header` with known pages, their checksums and a
+    /// row; returns the pages and the row.
+    fn write_record(directory: &Path, header: &mut Header, seed: u8) -> (Vec<Vec<u8>>, Vec<u8>) {
+        let tail = header.tail_pages as usize;
+        let pages: Vec<Vec<u8>> = (0..tail)
+            .map(|p| {
+                (0..PAGE_RECORD as usize)
+                    .map(|i| (i * 3 + p + seed as usize) as u8)
+                    .collect()
+            })
+            .collect();
+        let row: Vec<u8> = (0..ROW_RECORD as usize)
+            .map(|i| (i + seed as usize) as u8)
+            .collect();
+        header.row_checksum = record::checksum(&row);
+        let mut file = vec![0u8; header.length_with_row() as usize];
+        file[..record::HEADER_BYTES].copy_from_slice(&header.encode().unwrap());
+        for (index, page) in pages.iter().enumerate() {
+            let at = header.page_segment as usize + index * PAGE_RECORD as usize;
+            file[at..at + page.len()].copy_from_slice(page);
+            let sum = header.checksum_segment() as usize + index * 8;
+            file[sum..sum + 8].copy_from_slice(&record::checksum(page).to_le_bytes());
+        }
+        let at = header.row_segment as usize;
+        file[at..at + row.len()].copy_from_slice(&row);
+        fs::write(directory.join(record::file_name(&header.key)), file).unwrap();
+        (pages, row)
+    }
+
+    #[test]
+    fn records_on_disk_are_announced_and_exported_with_the_checksums_their_files_persist() {
+        use crate::pool::{Announcer, HostWindow, Notice, Tier as PoolTier};
+        let geometry = geometry();
+        let directory = directory();
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let full = history(2000);
+        let mut root = header(&geometry, &full, 700, None);
+        let mut leaf = header(&geometry, &full, 1300, Some(700));
+        let (root_pages, _) = write_record(&directory, &mut root, 1);
+        let (leaf_pages, leaf_row) = write_record(&directory, &mut leaf, 2);
+        let records = vec![
+            scanned(&directory, root.clone(), 0, true),
+            scanned(&directory, leaf.clone(), 1, true),
+        ];
+        let (mut store, _log) = store_with(records, 1 << 30);
+        let announcer = Announcer::new(Arc::new(tokio::sync::Notify::new()));
+        announcer.begin_session();
+        store.announce_to(announcer.clone());
+        store.flush_announcements();
+        let (_, notices) = announcer.take_batch(10).unwrap();
+        let generation = |key: &PrefixKey| {
+            notices.iter().find_map(|n| match n {
+                Notice::Saved(e) if e.key == *key => {
+                    assert_eq!(e.tier, PoolTier::Nvme);
+                    Some(e.generation)
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(notices.len(), 2, "what the files hold is announced at once");
+        let (root_generation, leaf_generation) = (
+            generation(&root.key).unwrap(),
+            generation(&leaf.key).unwrap(),
+        );
+        assert_ne!(root_generation, leaf_generation);
+        // Wrong generation, wrong tier, unknown key.
+        assert_eq!(
+            store
+                .pin_export(PoolTier::Nvme, leaf.key, leaf_generation + 5, 0, true)
+                .err(),
+            Some(ExportRefusal::GenerationChanged)
+        );
+        assert_eq!(
+            store
+                .pin_export(PoolTier::Dram, leaf.key, leaf_generation, 0, true)
+                .err(),
+            Some(ExportRefusal::NotFound)
+        );
+        let mut pin = store
+            .pin_export(PoolTier::Nvme, leaf.key, leaf_generation, 0, true)
+            .unwrap();
+        let chain = pin.chain().clone();
+        assert_eq!(chain.records.len(), 2);
+        assert_eq!(chain.total_pages, 20);
+        assert_eq!(chain.records[0].generation, root_generation);
+        assert!(store.index.nodes().all(|node| node.pinned()));
+        // Pages and checksums come from the files.
+        let window = HostWindow {
+            record: 0,
+            first_page: 2,
+            page_count: 3,
+            row: false,
+        };
+        let mut dst = vec![0u8; 3 * PAGE_RECORD as usize];
+        let sums = pin.read(&window, &mut dst).unwrap();
+        assert_eq!(dst[..PAGE_RECORD as usize], root_pages[2][..]);
+        assert_eq!(sums.pages[0], record::checksum(&root_pages[2]));
+        let window = HostWindow {
+            record: 1,
+            first_page: 9,
+            page_count: 1,
+            row: true,
+        };
+        let mut dst = vec![0u8; (PAGE_RECORD + ROW_RECORD) as usize];
+        let sums = pin.read(&window, &mut dst).unwrap();
+        assert_eq!(dst[PAGE_RECORD as usize..], leaf_row[..]);
+        assert_eq!(sums.row, Some(record::checksum(&leaf_row)));
+        // A page that rotted on disk is served as it is, with the checksum it
+        // was written with, so the requester's check fails.
+        let path = directory.join(record::file_name(&leaf.key));
+        let mut file = fs::read(&path).unwrap();
+        file[leaf.page_segment as usize + 5] ^= 1;
+        fs::write(&path, file).unwrap();
+        let window = HostWindow {
+            record: 1,
+            first_page: 0,
+            page_count: 1,
+            row: false,
+        };
+        let mut dst = vec![0u8; PAGE_RECORD as usize];
+        let sums = pin.read(&window, &mut dst).unwrap();
+        assert_ne!(record::checksum(&dst), sums.pages[0]);
+        assert_eq!(sums.pages[0], record::checksum(&leaf_pages[0]));
+        // Starting inside the leaf needs only the leaf.
+        let suffix = store
+            .pin_export(PoolTier::Nvme, leaf.key, leaf_generation, 700 + 640, false)
+            .unwrap();
+        assert_eq!(suffix.chain().records.len(), 1);
+        drop(suffix);
+        // Dropping the pins releases the records at the next flush.
+        drop(pin);
+        store.flush_announcements();
+        assert!(store.index.nodes().all(|node| !node.pinned()));
+        // Nothing further changed, so nothing further is announced.
+        store.flush_announcements();
+        assert!(announcer.take_batch(10).is_none());
     }
 }
