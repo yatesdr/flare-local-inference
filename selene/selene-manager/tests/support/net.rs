@@ -25,9 +25,20 @@ pub struct Net {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+/// A loopback address nobody listens on. Taken from below the ephemeral range and handed out
+/// once, so concurrent tests never share one or meet a connection's own port.
 pub fn free_address() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    loop {
+        let port = 20_000
+            + (std::process::id() % 2_000) * 4
+            + NEXT.fetch_add(1, Ordering::Relaxed) % 4_000;
+        let address = SocketAddr::from(([127, 0, 0, 1], port as u16));
+        if TcpListener::bind(address).is_ok() {
+            return address;
+        }
+    }
 }
 
 impl Net {

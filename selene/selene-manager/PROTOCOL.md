@@ -28,10 +28,12 @@ the instance side (`flare-selene`, `selene::pool`) implements the other.
    `data_transports` when the manager is TLS.
 4. **Same host is proven by the socket; levels.** `shared_memory` is
    returned only on a Unix-domain socket whose peer uid and gid match the
-   manager's. A session without it uses `DATA_CHANNEL` only and may not be an
-   export source (`export_slots` forced to 0). Instance-sourced candidates
+   manager's. A session without it uses `DATA_CHANNEL` only. It may be an
+   export source when the manager serves a data channel: its windows are relayed
+   through the manager (section 7.5). Instance-sourced candidates
    (neighbour GPU = level 2, neighbour DRAM = 3, neighbour NVMe = 4) are offered
-   only between two shared-memory sessions. Manager-store candidates are offered
+   to every session, whether the copy goes through shared windows or through the
+   manager's relay. Manager-store candidates are offered
    to every session: a same-host manager's DRAM is level 3 and its NVMe level 4; a
    remote manager's records (DRAM or NVMe) are level 5. The manager computes the
    level from the requester's perspective.
@@ -472,6 +474,15 @@ release the export slot.
 If the source sees its session lost it releases pins itself after draining and
 reports `ExportEnd` on the next session.
 
+A source without shared memory (a TCP session) is asked the same way, and the request also
+carries `channel`: a data-channel reference for this export. After `PINNED` the source connects to
+it and writes the windows there, in the direction of a put (section 7.5). The manager sends it no
+`ExportFill` and expects no `WindowFilled`: each window is granted on the channel, the source copies
+it (GPU: D2H into a slot of its own registered staging; host: the persisted bytes) and writes it
+with the checksums it states, and `ExportEnd` follows as for any source. The pin is released once
+every copy has drained, exactly as before; the manager's windows are written only by its own
+handler, so they are not the source's to fence.
+
 ## 7. Copy, ownership and fencing
 
 ### 7.1 Logical invalidation and physical fencing are different
@@ -573,6 +584,34 @@ The manager's windows are read or written only by its own handler, so its exit i
 fence for them (the requester's `FenceAck` is accepted and idempotent, but no window waits for it).
 A handler that is not seen to exit within five seconds of the stop quarantines its windows, counted
 in `ReadinessInfo.quarantined_bytes`; seeing the exit later releases them.
+
+**Relay.** A claim whose source has no shared memory, or whose requester asks for
+`DATA_CHANNEL`, goes through the manager's staging in both cases; the two legs are independent
+transfers on the data channel (or shared windows for a local end):
+
+- *Source leg.* The manager opens a transfer for the export and names it in `ExportRequest.channel`.
+  The source connects after `PINNED`; the manager `GRANT`s each window it issues (retained staging
+  for a GPU source, reserved before the pin, as for any export; credits otherwise) and the source
+  answers with `FILLED` and the payload. Checksums are the source's: persisted ones for a host record,
+  computed over the bytes it wrote for a GPU checkpoint. The manager passes a window on only after
+  its `FILLED` and payload arrived whole, and never trusts a count: a window that does not match the
+  pinned chain's plan fails the claim.
+- *Requester leg.* A filled window goes to the requester as `WindowReady` (shared windows) or on its
+  own channel as `WINDOW` (`ClaimGranted.channel`). On the channel the window is free once written;
+  otherwise when the requester releases it. The manager, not the source, ends the requester's
+  transfer (`END`) once every window has gone.
+- *Coverage and verdict.* Exact coverage is checked by the requester as for any claim and by the
+  manager at `COPY_OK`. A source that ends its connection before every window arrived fails the claim
+  (`SOURCE_LOST`); a requester that does fails it (`COPY_ERROR`) and the source is sent `ExportCancel`.
+- *Fencing.* A window being filled is the source leg handler's to write, so the handler's exit is
+  the fence for it, not the source's `ExportEnd`; a window being read by a remote requester is that
+  leg's handler's. Each leg is stopped when the claim ends. A handler not seen to exit within five
+  seconds of the stop quarantines the windows it may touch, counted in
+  `ReadinessInfo.quarantined_bytes`, until its exit is seen. A source whose session ends is fenced
+  by that: its claims fail, its export is released, and nothing waits for an `ExportEnd` it cannot
+  send.
+- *Levels.* A relayed copy keeps the source's tier level (neighbour GPU, host DRAM, host NVMe); the
+  requester's characterization measures what the path really costs.
 
 ### 7.6 Flare's view
 
@@ -800,9 +839,11 @@ What the manager serves, and where it is narrower than the contract above.
   `shared_memory` is returned only to a Unix-socket peer with the manager's uid and gid.
 - **The data channel.** A session without shared memory can open, resynchronise, look up, see
   level-5 candidates (the manager's own records), claim them and put into the manager's store,
-  with the bytes on the data channel (`--listen-data`; section 7.5). Only the manager's own store
-  is a source on this path; a `DATA_CHANNEL` claim naming an instance is `INVALID_CLAIM`. On a
-  manager with no network listener `DATA_CHANNEL` is refused (`INVALID_CLAIM`;
+  with the bytes on the data channel (`--listen-data`; section 7.5). An instance may be the source
+  too: a session without shared memory serves exports (`export_slots` as asked, up to the limit)
+  and the manager relays its windows; two instances on other hosts, or one on each side, copy
+  through the manager's staging. On a manager with no network listener `DATA_CHANNEL` is refused
+  (`INVALID_CLAIM`;
   `PutRefused{INVALID}` saying so). A remote instance has no pid, so the store gives it a
   peer-style connection; it is told apart by its session, not watched, and no window is ever
   leased to it.

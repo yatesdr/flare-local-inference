@@ -28,6 +28,8 @@ use tokio::sync::{mpsc, oneshot};
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ChanOwner {
     Claim(ClaimKey),
+    /// The source leg of a claim relayed through the manager.
+    Source(ClaimKey),
     Put(PutKey),
 }
 
@@ -525,7 +527,8 @@ impl Core {
         };
         let limits = &self.cfg.limits;
         let shm = peer.unix && peer.uid == self.euid && peer.gid == self.egid;
-        let export_slots = if shm {
+        // A session without shared memory serves exports over the data channel.
+        let export_slots = if shm || self.cfg.channel.is_some() {
             open.export_slots.min(limits.max_export_slots)
         } else {
             0

@@ -314,7 +314,12 @@ impl Core {
                 }
                 let sid = self.instances.get(&id)?.current?;
                 let source_session = self.sessions.get(&sid)?;
-                if !requester_shm || !source_session.shm || source_session.export_slots == 0 {
+                if source_session.export_slots == 0 {
+                    return None;
+                }
+                // Without shared memory on either end the bytes go through the manager's
+                // data channel; a manager with none cannot relay.
+                if (!requester_shm || !source_session.shm) && self.cfg.channel.is_none() {
                     return None;
                 }
                 let level = match tier {
