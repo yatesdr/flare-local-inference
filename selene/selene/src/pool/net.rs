@@ -633,7 +633,7 @@ const CREDIT_DEPTH: usize = 2;
 /// destroyed first: no write for a lent slot can land after the slot is given back.
 struct Lent {
     /// Held for its drop.
-    _pair: rdma::Pair,
+    _pair: Option<rdma::Pair>,
     slots: VecDeque<Held>,
 }
 
@@ -659,14 +659,30 @@ async fn receive_rdma(
     pair: rdma::Pair,
 ) -> io::Result<()> {
     let mut lent = Lent {
-        _pair: pair,
+        _pair: Some(pair),
         slots: VecDeque::new(),
     };
+    receive_lent(target, claim, &mut conn, &mut lent).await
+}
+
+async fn receive_lent(
+    target: &Target,
+    claim: u64,
+    conn: &mut Box<dyn Conn>,
+    lent: &mut Lent,
+) -> io::Result<()> {
+    // A manager that has said all it will say closes the connection after END, possibly
+    // before the slot lent for a window that never comes: a credit that cannot be written
+    // only ends the lending. What the manager did is read from the connection next.
+    let mut lending = true;
     for _ in 0..CREDIT_DEPTH {
-        lend(target, &mut conn, &mut lent).await?;
+        if lend(target, conn, lent).await.is_err() {
+            lending = false;
+            break;
+        }
     }
     loop {
-        let frame = timeout(IDLE_TIMEOUT, ToInstance::read(&mut conn, MAX_PAGES))
+        let frame = timeout(IDLE_TIMEOUT, ToInstance::read(conn, MAX_PAGES))
             .await
             .map_err(|_| timed_out("the manager sent nothing"))??;
         match frame {
@@ -692,7 +708,9 @@ async fn receive_rdma(
                     window,
                     slot: held.give(),
                 });
-                lend(target, &mut conn, &mut lent).await?;
+                if lending && lend(target, conn, lent).await.is_err() {
+                    lending = false;
+                }
             }
             ToInstance::End => {
                 target.events.push(Event::End { claim });
@@ -1006,6 +1024,56 @@ mod tests {
         }
         assert_eq!(rig.staging.free_slots(), 4);
         drop(channel);
+    }
+
+    #[tokio::test]
+    async fn a_manager_that_closes_after_its_last_window_does_not_fail_the_claim() {
+        let rig = rig(4, None);
+        let (client, mut manager) = tokio::io::duplex(1 << 16);
+        let target = Target {
+            host: "127.0.0.1".into(),
+            address: String::new(),
+            tls: None,
+            token: [0; TOKEN_BYTES],
+            staging: rig.staging.clone(),
+            events: rig.events.clone(),
+            rdma: true,
+            rdma_broken: Arc::default(),
+        };
+        let mut conn: Box<dyn Conn> = Box::new(client);
+        let mut lent = Lent {
+            _pair: None,
+            slots: VecDeque::new(),
+        };
+        let manager = async {
+            // Two slots are lent; the manager names the first and ends, then goes away.
+            let ToManager::Credit { offset, .. } =
+                ToManager::read(&mut manager, MAX_PAGES).await.unwrap()
+            else {
+                panic!("expected a credit");
+            };
+            let _ = ToManager::read(&mut manager, MAX_PAGES).await.unwrap();
+            ToInstance::Window(Window {
+                shape: shape(0, 1, false),
+                page_xxh3: vec![0],
+                row_xxh3: 0,
+                slot: offset,
+            })
+            .write(&mut manager)
+            .await
+            .unwrap();
+            ToInstance::End.write(&mut manager).await.unwrap();
+            drop(manager);
+        };
+        let (result, ()) = tokio::join!(receive_lent(&target, 9, &mut conn, &mut lent), manager);
+        result.unwrap();
+        let events = rig.events.take();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Window { claim: 9, .. }))
+        );
+        assert!(events.iter().any(|e| matches!(e, Event::End { claim: 9 })));
     }
 
     #[tokio::test]

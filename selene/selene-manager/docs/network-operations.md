@@ -90,8 +90,12 @@ The manager does every RDMA transfer, one-sided, on a queue pair made for the tr
 a claim's windows into slots the instance lends (`CREDIT`) and reads a put's windows out of the
 slots the instance fills (`FILLED`, released with `TAKEN`). The instance must be built with the
 `rdma` feature and have a device; otherwise, or after one RDMA transfer fails, it asks for the
-stream carrier on its connection, so a mixed pool works. Both ends use GID index 0 and a path MTU
-of 1024. For a Soft-RoCE test host:
+stream carrier on its connection, so a mixed pool works. Each end advertises a RoCE v2 GID, preferring
+a routable (IPv4-mapped or global) one over a link-local one, because two ends must use the same RoCE
+version and a device's GID index 0 is v1 on some NICs and v2 on others (Soft-RoCE); the path MTU is
+1024. Hardware RoCE and Soft-RoCE interoperate on that basis, but a Soft-RoCE end that receives writes
+from a hardware NIC drops packets it cannot keep up with and the transfer collapses to a few MiB/s;
+use Soft-RoCE only for functional tests, or as the sending end. For a Soft-RoCE test host:
 
 ```sh
 sudo modprobe rdma_rxe

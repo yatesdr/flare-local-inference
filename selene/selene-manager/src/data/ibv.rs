@@ -65,6 +65,8 @@ pub struct Device {
     staging: *mut ffi::ibv_mr,
     lid: u16,
     gid: [u8; 16],
+    /// The index of `gid` in the port's table, the source GID of every pair.
+    gid_index: u32,
     bases: (u64, u64),
 }
 
@@ -133,14 +135,14 @@ impl Device {
             release_device(pd, arena_mr, ptr::null_mut());
             return Err(error);
         }
-        let mut gid = unsafe { mem::zeroed::<ffi::ibv_gid>() };
-        // SAFETY: the context and port are valid; GID index 0 is queried by libibverbs.
-        let status = unsafe { ffi::ibv_query_gid(context, PORT, 0, &mut gid) };
-        if status != 0 {
-            let error = io::Error::last_os_error();
-            release_device(pd, arena_mr, staging_mr);
-            return Err(error);
-        }
+        // SAFETY: the context is open.
+        let (gid_index, gid) = match unsafe { flare_selene::pool::rdma::pick_gid(context, PORT) } {
+            Ok(picked) => picked,
+            Err(error) => {
+                release_device(pd, arena_mr, staging_mr);
+                return Err(error);
+            }
+        };
         Ok(Self {
             _regions: regions,
             sizes: (arena.1 as u64, staging.1 as u64),
@@ -149,8 +151,8 @@ impl Device {
             arena: arena_mr,
             staging: staging_mr,
             lid,
-            // SAFETY: the union was zeroed and filled by `ibv_query_gid`.
-            gid: unsafe { gid.raw },
+            gid,
+            gid_index,
             bases: (arena.0 as u64, staging.0 as u64),
         })
     }
@@ -358,8 +360,8 @@ impl IbvVerbs {
                 is_global: u8::from(peer.gid != [0; 16]),
                 grh: ffi::ibv_global_route {
                     dgid: ffi::ibv_gid { raw: peer.gid },
-                    sgid_index: 0,
-                    hop_limit: 1,
+                    sgid_index: self.device.gid_index as u8,
+                    hop_limit: 64,
                     ..Default::default()
                 },
                 ..Default::default()

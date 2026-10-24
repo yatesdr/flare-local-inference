@@ -299,7 +299,7 @@ impl Pool {
         let moved = result.unwrap_or_else(|f| panic!("restore {record} failed: {}", f.error));
         assert_eq!(
             moved,
-            (o.pages * (o.page_kib as usize) << 10) as u64 + ROW as u64
+            ((o.pages * (o.page_kib as usize)) << 10) as u64 + ROW as u64
         );
         (lookup, began.elapsed().as_secs_f64())
     }
