@@ -201,6 +201,12 @@ impl PoolClient {
         self.shared.ranking()
     }
 
+    /// Identifies the manager and link of the current session (zero before any
+    /// session opened); a change means the copy levels may cost something else.
+    pub fn topology(&self) -> crate::characterize::Topology {
+        crate::characterize::Topology(self.shared.topology())
+    }
+
     pub fn set_ranking(&self, ranking: Ranking) {
         self.shared.set_ranking(ranking);
     }

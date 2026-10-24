@@ -235,6 +235,7 @@ pub(crate) struct Shared {
     commands: Mutex<VecDeque<Command>>,
     registry: Mutex<Registry>,
     ranking: Mutex<Ranking>,
+    topology: std::sync::atomic::AtomicU64,
     /// Lookups the manager accepts at once; 0 until the manager states it.
     max_lookups: AtomicU32,
     /// No lookups start before this instant after a refusal or timeout.
@@ -251,6 +252,7 @@ impl Shared {
             commands: Mutex::new(VecDeque::new()),
             registry: Mutex::new(Registry::default()),
             ranking: Mutex::new(Ranking::default()),
+            topology: std::sync::atomic::AtomicU64::new(0),
             max_lookups: AtomicU32::new(0),
             paused_until: Mutex::new(None),
             quarantined: std::sync::atomic::AtomicBool::new(false),
@@ -311,6 +313,15 @@ impl Shared {
 
     pub(crate) fn set_ranking(&self, ranking: Ranking) {
         *self.ranking.lock().unwrap() = ranking;
+    }
+
+    /// Identifies the manager and link the session runs over; 0 until one opened.
+    pub(crate) fn topology(&self) -> u64 {
+        self.topology.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_topology(&self, topology: u64) {
+        self.topology.store(topology, Ordering::Relaxed);
     }
 
     pub(crate) fn set_max_lookups(&self, max: u32) {
