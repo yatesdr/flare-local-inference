@@ -12,6 +12,23 @@ use crate::{
 };
 use std::collections::VecDeque;
 
+/// A source's running cost as microseconds and pages, each decayed by 7/8 per claim.
+pub(super) type Estimate = (u64, u64);
+
+/// Add a finished claim to a source's running cost.
+pub(super) fn blend_estimate(estimate: &mut Estimate, micros: u64, pages: u64) {
+    *estimate = (estimate.0 * 7 / 8 + micros, estimate.1 * 7 / 8 + pages);
+}
+
+/// The running cost per page, or 0 when nothing is known. Weighted by pages, so a claim of
+/// a few pages, which is mostly fixed cost, cannot dominate one of hundreds.
+pub(super) fn estimate_us_per_page(estimate: Estimate) -> u32 {
+    if estimate.1 == 0 {
+        return 0;
+    }
+    (estimate.0 / estimate.1).clamp(1, u64::from(u32::MAX)) as u32
+}
+
 /// Entries scanned per lookup at most, so one lookup cannot hold the actor.
 const SCAN_BUDGET: usize = 65_536;
 /// Lookups answered per pass of the clock.
@@ -249,7 +266,10 @@ impl Core {
                 ) else {
                     continue;
                 };
-                let estimate = self.estimates.get(&source).copied().unwrap_or(0);
+                let estimate = self
+                    .estimates
+                    .get(&source)
+                    .map_or(0, |e| estimate_us_per_page(*e));
                 found.push((
                     closer,
                     estimate == 0,
@@ -363,3 +383,25 @@ type Ranked = (
 );
 
 pub(super) type LookupQueue = VecDeque<Queued>;
+
+#[cfg(test)]
+mod estimate_tests {
+    use super::*;
+
+    #[test]
+    fn a_long_claim_outweighs_the_fixed_cost_of_short_ones() {
+        let mut estimate = Estimate::default();
+        assert_eq!(estimate_us_per_page(estimate), 0);
+        // Probe claims: a few pages at mostly fixed cost, 4.25 ms a page.
+        for _ in 0..9 {
+            blend_estimate(&mut estimate, 8_500, 2);
+        }
+        assert!(estimate_us_per_page(estimate) >= 4_000);
+        // Real restores of hundreds of pages at 0.9 ms a page.
+        for _ in 0..4 {
+            blend_estimate(&mut estimate, 470_000, 520);
+        }
+        let per_page = estimate_us_per_page(estimate);
+        assert!((850..=1_000).contains(&per_page), "{per_page}");
+    }
+}

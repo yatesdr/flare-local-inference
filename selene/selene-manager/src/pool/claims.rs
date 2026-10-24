@@ -1382,11 +1382,10 @@ impl Core {
             // Update the source's cost estimate.
             if let (Some(granted), pages) = (claim.granted_at, claim.total_pages) {
                 if pages > 0 {
-                    let micros = (now.duration_since(granted).as_micros() as u64 / pages).max(1);
-                    let sample = micros.min(u64::from(u32::MAX)) as u32;
+                    let micros = now.duration_since(granted).as_micros() as u64;
                     let source = claim.source;
-                    let entry = self.estimates.entry(source).or_insert(sample);
-                    *entry = ((u64::from(*entry) * 7 + u64::from(sample)) / 8).max(1) as u32;
+                    let entry = self.estimates.entry(source).or_default();
+                    super::lookup::blend_estimate(entry, micros, pages);
                 }
             }
         }

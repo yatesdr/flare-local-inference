@@ -225,7 +225,10 @@ pub struct Core {
     pub(super) exports: HashMap<u64, super::claims::ClaimKey>,
     pub(super) next_export: u64,
     /// Smoothed microseconds per page by source, from completed claims.
-    pub(super) estimates: HashMap<SourceId, u32>,
+    /// Per source: microseconds and pages of its recent claims, each decayed by 7/8 per claim,
+    /// so the estimate is weighted by pages and a claim of a few pages, which is mostly fixed
+    /// cost, cannot dominate one of hundreds.
+    pub(super) estimates: HashMap<SourceId, super::lookup::Estimate>,
     pub(super) live_lookups: usize,
     /// Counters by metric name and label, for the metrics text.
     pub(super) counters: std::collections::BTreeMap<(&'static str, String), u64>,
@@ -366,7 +369,8 @@ impl Core {
                 staging,
                 geometry.page_bytes,
                 geometry.row_bytes,
-                REFERENCE_CONTEXT_TOKENS.div_ceil(geometry.page_tokens.max(1)) * geometry.page_bytes
+                REFERENCE_CONTEXT_TOKENS.div_ceil(geometry.page_tokens.max(1))
+                    * geometry.page_bytes
                     + geometry.row_bytes,
             );
         }
