@@ -27,12 +27,6 @@ static CLIENTS: AtomicU64 = AtomicU64::new(0);
 /// How long a put or claim may wait for the manager's next message. The tests that
 /// pause the manager's disk work hold a put open for several seconds.
 const WAIT: Duration = Duration::from_secs(30);
-
-/// A restore's `CopyResult{COPY_OK}` sent in the same instant as the last
-/// `WindowReleased` can overtake the manager's own completion of the read and be
-/// judged a copy error, so the client lets the manager finish first.
-pub const SETTLE: Duration = Duration::from_millis(60);
-
 /// The bucket digest `content_for` writes into every record.
 pub const BUCKET: [u8; 16] = [4; 16];
 
@@ -762,7 +756,6 @@ impl Client {
         self.session.released(id, window.index).await;
         if run.received == run.expected && !run.finished {
             run.finished = true;
-            tokio::time::sleep(SETTLE).await;
             self.session.copy_result(id, v2::CopyOutcome::CopyOk).await;
         }
     }
@@ -822,7 +815,6 @@ impl Client {
             received += window.length;
             self.session.released(id, window.index).await;
         }
-        tokio::time::sleep(SETTLE).await;
         self.session.copy_result(id, v2::CopyOutcome::CopyOk).await;
         let terminal = self.session.claim_terminal(id).await;
         assert_eq!(

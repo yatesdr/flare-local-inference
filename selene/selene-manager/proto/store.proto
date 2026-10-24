@@ -1,0 +1,50 @@
+// The vocabulary the store keeps internally: refusal reasons, tiers, regions, the
+// catalog events its subscribers consume and the namespace descriptor file. It is not a wire contract. Nothing is
+// served from this file (no service is generated); the pool protocol, selene.v2 in
+// selene.proto, is the only protocol the manager speaks.
+
+syntax = "proto3";
+package selene.store;
+
+message Key { uint64 consumed_tokens = 1; bytes digest = 2; }        // digest exactly 16
+
+// The descriptor file every namespace directory keeps on disk. The encoding is the
+// on-disk format of existing stores and does not change.
+message RankPlanes { repeated uint64 plane_bytes = 1; uint64 row_bytes = 2; }
+message Descriptor {
+  bytes identity = 1; bytes fingerprint = 2; uint64 page_tokens = 3;
+  repeated RankPlanes ranks = 4; uint64 page_record_bytes = 5;
+  uint64 row_record_bytes = 6; string tenant = 7;
+}
+
+enum Region { REGION_UNSPECIFIED = 0; ARENA = 1; STAGING = 2; }
+
+enum Reason { REASON_UNSPECIFIED = 0; PRESENT = 1; INFLIGHT = 2; BUDGET = 3; OVERSIZE = 4; QUOTA = 5; INVALID = 6; QUEUE = 7; IO = 8; }
+
+enum Tier { TIER_UNSPECIFIED = 0; DRAM = 1; NVME = 2; REMOTE = 3; }
+
+message CatalogEntry {
+  Key key = 1; Key parent = 2; bool has_parent = 3;
+  bytes bucket = 4;                 // exactly 16
+  uint64 tail_pages = 5; bool row = 6;
+  Tier tier = 7; bool durable = 8;
+  uint64 bytes = 9;                 // envelope-inclusive
+  bool unreadable = 10;             // true only for a retained ancestry anchor
+}
+
+message SnapshotBegin { uint64 seq0 = 1; }
+message SnapshotEnd {}
+message Room { uint64 bytes = 1; }
+
+message CatalogEvent {
+  uint64 sequence = 1;              // +1 per emitted event in this stream
+  oneof event {
+    SnapshotBegin snapshot_begin = 2;
+    CatalogEntry entry = 3;         // snapshot entries, parents before children
+    SnapshotEnd snapshot_end = 4;
+    CatalogEntry added = 5;
+    CatalogEntry changed = 6;       // tier/durable/row/unreadable; never geometry
+    Key removed = 7;                // exactly one node, never cascaded
+    Room room = 8;                  // this connection's armed reservation fits
+  }
+}

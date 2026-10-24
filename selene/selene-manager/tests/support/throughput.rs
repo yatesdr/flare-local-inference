@@ -111,8 +111,7 @@ async fn benchmark(enforce: bool, profile: &Profile) {
             let put = started.elapsed().as_secs_f64();
             let started = Instant::now();
             let actual = client.fetch(&[sample_key], 0, profile.pages).await;
-            // A restore ends with the client's settle delay, which is not transfer time.
-            let get = (started.elapsed() - SETTLE).as_secs_f64();
+            let get = started.elapsed().as_secs_f64();
             assert_eq!(actual[0], value);
             polls.push(get);
             if sample == 0 {
