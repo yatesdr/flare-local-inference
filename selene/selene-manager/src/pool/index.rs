@@ -218,12 +218,16 @@ pub fn walk_chain(
         if end_of(parent.key) != first || nodes.len() >= max_nodes {
             return None;
         }
-        nodes.push(ChainStep {
-            key: parent.key,
-            tail_pages: parent.tail_pages,
-            generation: parent.generation,
-            row: parent.row,
-        });
+        // A checkpoint that ends in the page its parent ended in holds no page of its
+        // own, and a record with no page and no row is not part of a claim.
+        if parent.tail_pages > 0 {
+            nodes.push(ChainStep {
+                key: parent.key,
+                tail_pages: parent.tail_pages,
+                generation: parent.generation,
+                row: parent.row,
+            });
+        }
         current = parent.clone();
     }
     nodes.reverse();
@@ -353,6 +357,31 @@ mod tests {
         let walk = walk_chain(&index, SOURCE, &endpoint, 64, 6, 100).unwrap();
         assert_eq!(walk.nodes.len(), 1);
         assert_eq!((walk.skip_pages, walk.pages), (2, 0));
+    }
+
+    #[test]
+    fn a_checkpoint_that_holds_no_page_is_not_a_record_of_the_walk() {
+        let mut index = ScopeIndex::default();
+        // Root = pages [0, 2); a checkpoint at 150 tokens ends in the same page and
+        // holds none; the endpoint at 256 tokens holds [2, 4).
+        index.upsert(SOURCE, entry(128, 1, None, 2, Tier::Dram));
+        index.upsert(SOURCE, entry(150, 2, Some((128, 1)), 0, Tier::Dram));
+        let endpoint = entry(256, 3, Some((150, 2)), 2, Tier::Dram);
+        index.upsert(SOURCE, endpoint.clone());
+        let walk = walk_chain(&index, SOURCE, &endpoint, 64, 0, 100).unwrap();
+        let keys: Vec<_> = walk.nodes.iter().map(|node| node.key).collect();
+        assert_eq!(keys, [key(128, 1), key(256, 3)]);
+        assert_eq!((walk.skip_pages, walk.pages), (0, 4));
+        // Starting where the empty checkpoint ends needs only the endpoint.
+        let walk = walk_chain(&index, SOURCE, &endpoint, 64, 2, 100).unwrap();
+        assert_eq!(walk.nodes.len(), 1);
+        assert_eq!((walk.skip_pages, walk.pages), (0, 2));
+        // The endpoint stays even when it holds no page: its row is the claim.
+        let tail = entry(160, 4, Some((150, 2)), 0, Tier::Dram);
+        index.upsert(SOURCE, tail.clone());
+        let walk = walk_chain(&index, SOURCE, &tail, 64, 2, 100).unwrap();
+        assert_eq!(walk.nodes.len(), 1);
+        assert_eq!(walk.pages, 0);
     }
 
     #[test]
