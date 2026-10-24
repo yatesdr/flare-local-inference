@@ -7,7 +7,10 @@
 //! pins, access order, and the bucket map that makes lookup cost proportional
 //! to the tokens a request adds beyond its resident GPU checkpoint.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use crate::{HASH_BLOCK_TOKENS, History, PrefixKey, Result};
 
@@ -57,6 +60,31 @@ pub struct Match {
     pub pages: usize,
 }
 
+/// What happened to a node that an observer of the index should hear about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeEvent {
+    /// The node is complete and readable: new, or ready again, or its row was refilled.
+    Ready,
+    /// The node left the index or stopped being readable.
+    Gone,
+    /// The node keeps its pages and lost its row.
+    RowDropped,
+}
+
+/// A node as it was when `event` happened to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeNotice {
+    pub event: NodeEvent,
+    pub key: PrefixKey,
+    pub parent: Option<PrefixKey>,
+    pub bucket: [u8; 16],
+    pub tail_pages: usize,
+    pub row: bool,
+}
+
+/// Where an index records its nodes' events, for a pool that announces them.
+pub type NodeNotices = Arc<Mutex<Vec<NodeNotice>>>;
+
 #[derive(Debug)]
 pub enum Eviction<L> {
     /// Removed leaves, deepest first; page-only ancestors left childless follow their child.
@@ -70,6 +98,7 @@ pub struct Index<L> {
     nodes: HashMap<PrefixKey, Node<L>>,
     buckets: HashMap<[u8; 16], Vec<PrefixKey>>,
     clock: u64,
+    notices: Option<NodeNotices>,
 }
 
 impl<L> Index<L> {
@@ -79,6 +108,71 @@ impl<L> Index<L> {
             nodes: HashMap::new(),
             buckets: HashMap::new(),
             clock: 0,
+            notices: None,
+        }
+    }
+
+    /// Record the events of nodes from now on in `sink`. Nodes already ready
+    /// are not replayed; see [`Index::ready_notices`].
+    pub fn observe(&mut self, sink: NodeNotices) {
+        self.notices = Some(sink);
+    }
+
+    /// One `Ready` notice for every node that is ready now.
+    pub fn ready_notices(&self) -> Vec<NodeNotice> {
+        self.nodes
+            .values()
+            .filter(|node| node.ready)
+            .map(|node| Self::notice(NodeEvent::Ready, node))
+            .collect()
+    }
+
+    fn notice(event: NodeEvent, node: &Node<L>) -> NodeNotice {
+        NodeNotice {
+            event,
+            key: node.key,
+            parent: node.parent,
+            bucket: node.bucket,
+            tail_pages: node.tail_pages,
+            row: node.row,
+        }
+    }
+
+    fn notify(&self, event: NodeEvent, node: &Node<L>) {
+        if let Some(sink) = &self.notices {
+            sink.lock().unwrap().push(Self::notice(event, node));
+        }
+    }
+
+    /// Mark a node readable or not, reporting the change.
+    pub fn set_ready(&mut self, key: &PrefixKey, ready: bool) -> Result<()> {
+        let node = self
+            .nodes
+            .get_mut(key)
+            .ok_or_else(|| invalid("cannot change the readiness of an unindexed host record"))?;
+        if node.ready != ready {
+            node.ready = ready;
+            let node = &self.nodes[key];
+            self.notify(
+                if ready {
+                    NodeEvent::Ready
+                } else {
+                    NodeEvent::Gone
+                },
+                node,
+            );
+        }
+        Ok(())
+    }
+
+    /// Drop a node's row, keeping its pages; reports the change.
+    pub fn drop_row(&mut self, key: &PrefixKey) {
+        if let Some(node) = self.nodes.get_mut(key)
+            && node.row
+        {
+            node.row = false;
+            let node = &self.nodes[key];
+            self.notify(NodeEvent::RowDropped, node);
         }
     }
 
@@ -168,6 +262,9 @@ impl<L> Index<L> {
                 accessed,
             },
         );
+        if ready {
+            self.notify(NodeEvent::Ready, &self.nodes[&key]);
+        }
         Ok(())
     }
 
@@ -329,6 +426,7 @@ impl<L> Index<L> {
                     next = Some(parent);
                 }
             }
+            self.notify(NodeEvent::Gone, &node);
             removed.push(node);
         }
         Ok(removed)
@@ -354,7 +452,7 @@ impl<L> Index<L> {
         if self.nodes[&candidate].children == 0 {
             return self.remove(&candidate).ok().map(Eviction::Leaves);
         }
-        self.nodes.get_mut(&candidate).unwrap().row = false;
+        self.drop_row(&candidate);
         Some(Eviction::Compacted(candidate))
     }
 }
@@ -646,5 +744,66 @@ mod tests {
         let third = index.lookup_below(&full, 0, 710, |n| n.ready).unwrap();
         assert_eq!(third.consumed_tokens, 701);
         assert!(index.lookup_below(&full, 0, 701, |n| n.ready).is_none());
+    }
+
+    #[test]
+    fn an_observed_index_reports_ready_gone_and_dropped_rows_and_only_those() {
+        let sink: NodeNotices = Default::default();
+        let mut index = Index::new(64);
+        index.observe(sink.clone());
+        let full = history(2000);
+        insert(&mut index, &full, 700, None);
+        insert(&mut index, &full, 1300, Some(700));
+        let events = |sink: &NodeNotices| {
+            sink.lock()
+                .unwrap()
+                .drain(..)
+                .map(|n| (n.event, n.key.consumed_tokens, n.row))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            events(&sink),
+            [
+                (NodeEvent::Ready, 700, true),
+                (NodeEvent::Ready, 1300, true)
+            ]
+        );
+        let child = full.key_at(1300).unwrap();
+        // Readiness reports changes only.
+        index.set_ready(&child, true).unwrap();
+        assert!(events(&sink).is_empty());
+        index.set_ready(&child, false).unwrap();
+        index.set_ready(&child, true).unwrap();
+        assert_eq!(
+            events(&sink),
+            [
+                (NodeEvent::Gone, 1300, true),
+                (NodeEvent::Ready, 1300, true)
+            ]
+        );
+        index.drop_row(&child);
+        index.drop_row(&child);
+        assert_eq!(events(&sink), [(NodeEvent::RowDropped, 1300, false)]);
+        // The older parent compacts first, then the leaf goes and takes the
+        // page-only parent with it.
+        assert!(matches!(
+            index.evict(true, |_| true),
+            Some(Eviction::Compacted(_))
+        ));
+        assert_eq!(events(&sink), [(NodeEvent::RowDropped, 700, false)]);
+        let Some(Eviction::Leaves(leaves)) = index.evict(true, |_| true) else {
+            panic!("the leaf is evicted");
+        };
+        assert_eq!(leaves.len(), 2);
+        assert_eq!(
+            events(&sink),
+            [
+                (NodeEvent::Gone, 1300, false),
+                (NodeEvent::Gone, 700, false)
+            ]
+        );
+        assert!(index.ready_notices().is_empty());
+        insert(&mut index, &full, 700, None);
+        assert_eq!(index.ready_notices().len(), 1);
     }
 }

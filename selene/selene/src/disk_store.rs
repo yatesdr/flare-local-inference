@@ -1755,9 +1755,8 @@ impl DiskStore {
         };
         if let Some(old) = replacement {
             self.replacements.insert(key, old);
-            let node = self.index.node_mut(&key).unwrap();
-            node.location = location;
-            node.ready = false;
+            self.index.node_mut(&key).unwrap().location = location;
+            self.index.set_ready(&key, false)?;
         } else {
             self.index
                 .insert(key, parent, bucket, tail_pages, true, false, location)?;
@@ -1781,27 +1780,28 @@ impl DiskStore {
     ) -> Result<()> {
         if let Some(old) = self.replacements.remove(&key) {
             let node = self.index.node_mut(&key).unwrap();
-            if result.is_ok() {
+            let ready = if result.is_ok() {
                 self.used -= old.bytes;
                 node.row = true;
-                node.ready = true;
                 self.stats.row_refills += 1;
                 self.stats.stored += 1;
                 self.stats.bytes_out += result.as_ref().copied().unwrap();
                 self.evicted.push(key);
+                true
             } else {
+                self.stats.store_failed += 1;
                 if prior_readable {
                     self.used -= node.location.bytes;
                     node.location = old;
-                    node.ready = true;
+                    true
                 } else {
                     // A failed cleanup can leave a complete replacement on one rank.
                     self.used -= old.bytes;
-                    node.ready = false;
                     node.row = false;
+                    false
                 }
-                self.stats.store_failed += 1;
-            }
+            };
+            self.index.set_ready(&key, ready)?;
             self.index.unpin(&key)?;
             if !prior_readable {
                 self.evicted.push(key);
@@ -1816,11 +1816,10 @@ impl DiskStore {
         }
         match result {
             Ok(bytes) => {
-                let node = self
-                    .index
-                    .node_mut(&key)
-                    .ok_or_else(|| invalid("cannot commit an unindexed host record"))?;
-                node.ready = true;
+                if !self.index.contains(&key) {
+                    return Err(invalid("cannot commit an unindexed host record"));
+                }
+                self.index.set_ready(&key, true)?;
                 self.index.unpin(&key)?;
                 self.stats.stored += 1;
                 self.stats.bytes_out += bytes;
@@ -1943,7 +1942,7 @@ impl DiskStore {
                 self.unlink(removed)?;
             }
         } else {
-            node.row = false;
+            self.index.drop_row(key);
         }
         self.sync_budget();
         Ok(())
@@ -2036,10 +2035,8 @@ impl DiskStore {
                         // again. Its pages stay in the index for descendants
                         // that hold it as an ancestor; only its row, which
                         // makes it a lookup match, is dropped.
-                        if let Some(endpoint) = job.nodes.last()
-                            && let Some(node) = self.index.node_mut(endpoint)
-                        {
-                            node.row = false;
+                        if let Some(endpoint) = job.nodes.last() {
+                            self.index.drop_row(endpoint);
                         }
                     }
                 }
