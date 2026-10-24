@@ -29,6 +29,16 @@ use crate::{
 
 use selene_manager::{control, store::Config};
 
+use crate::{
+    CacheGeometry, CheckpointId, HostStore, Layout, PublishedCheckpoint,
+    composite::CompositeStore,
+    disk::DiskThread,
+    disk_store::{DiskStore, Staged},
+    memory::MemoryStore,
+    record,
+    slab::SlabPool,
+};
+
 const PT: u64 = 16;
 const PAGE: usize = 8192;
 const ROW: usize = 4096;
@@ -61,13 +71,18 @@ struct Manager {
 
 impl Manager {
     fn start() -> Self {
+        Self::with_memory(16 << 20)
+    }
+
+    /// A manager whose store holds `memory` bytes.
+    fn with_memory(memory: usize) -> Self {
         let id = SERIAL.fetch_add(1, Ordering::Relaxed);
         let base =
             std::env::temp_dir().join(format!("selene-client-it-{}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("run")).unwrap();
         let socket = base.join("run/m.sock");
-        let mut config = Config::dram_only(socket.clone(), 16 << 20);
+        let mut config = Config::dram_only(socket.clone(), memory);
         config.name = format!("selene-client-it-{}-{id}", std::process::id());
         let mut manager = Self {
             socket,
@@ -655,4 +670,408 @@ fn a_store_with_no_tiers_of_its_own_times_the_manager_level_through_a_real_claim
     );
     assert!(!store.needs_characterization());
     crate::HostStore::close(&mut store).unwrap();
+}
+
+// ---- the eviction cascade against the real manager ----
+
+/// A history of its own: every record published from one is a root.
+fn salted(salt: u32) -> TestHistory {
+    let mut history = TestHistory::new([7; 32]);
+    let tokens: Vec<u32> = (0..4000u32)
+        .map(|t| t.wrapping_mul(2654435761).wrapping_add(salt))
+        .collect();
+    history.append(&tokens, &[]).unwrap();
+    history
+}
+
+fn salted_page(salt: u32, page: usize) -> Vec<u8> {
+    (0..PAGE)
+        .map(|i| ((i * 13 + page * 7 + salt as usize * 31 + 5) % 251) as u8)
+        .collect()
+}
+
+fn salted_row(salt: u32) -> Vec<u8> {
+    (0..ROW)
+        .map(|i| ((i * 11 + salt as usize * 17 + 3) % 251) as u8)
+        .collect()
+}
+
+/// The checkpoint of `pages` pages that record `salt` publishes, with its
+/// bytes placed in the simulated device first.
+fn publication(gpu: &GpuMemory, salt: u32, pages: usize) -> (PublishedCheckpoint, TestHistory) {
+    let history = salted(salt);
+    let base = salt * 100;
+    for page in 0..pages {
+        gpu.pages
+            .lock()
+            .unwrap()
+            .insert(base + page as u32, salted_page(salt, page));
+    }
+    gpu.rows.lock().unwrap().insert(salt, salted_row(salt));
+    let key = history.key_at(pages as u64 * PT).unwrap();
+    let checkpoint = PublishedCheckpoint {
+        id: CheckpointId::new(u64::from(salt)),
+        key,
+        parent: None,
+        bucket: history.bucket_at(key.consumed_tokens).unwrap(),
+        chain_pages: (base..base + pages as u32).map(PageId).collect(),
+        tail_pages: pages,
+        slot: StateSlotId(salt),
+    };
+    (checkpoint, history)
+}
+
+/// Publish as the model worker does: store, poll until the copy-out is
+/// reported, and try again after a refusal or a deferral. The device cache
+/// then evicts the checkpoint, as it does under pressure.
+fn publish<S: HostStore>(store: &mut S, checkpoint: &PublishedCheckpoint) {
+    store_and_wait(store, checkpoint);
+    store.evicted(checkpoint.key, checkpoint.id.value(), None);
+}
+
+fn store_and_wait<S: HostStore>(store: &mut S, checkpoint: &PublishedCheckpoint) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    'attempt: loop {
+        let outcome = store.store(checkpoint).unwrap();
+        if outcome == StoreOutcome::Present {
+            return;
+        }
+        assert_ne!(outcome, StoreOutcome::Oversize);
+        let mut events = Vec::new();
+        while Instant::now() < deadline {
+            store.poll(&mut events).unwrap();
+            let mut retry = outcome != StoreOutcome::Queued;
+            for event in events.drain(..) {
+                match event {
+                    StoreEvent::Stored { key, result, .. } if key == checkpoint.key => {
+                        result.unwrap();
+                        if outcome == StoreOutcome::Queued {
+                            return;
+                        }
+                    }
+                    StoreEvent::Deferred { checkpoint: id } if id == checkpoint.id => retry = true,
+                    _ => {}
+                }
+            }
+            thread::sleep(Duration::from_millis(2));
+            if retry {
+                continue 'attempt;
+            }
+        }
+        panic!("timed out publishing {:?}", checkpoint.key);
+    }
+}
+
+/// Poll `store` until `done`.
+fn drive<S: HostStore>(store: &mut S, what: &str, mut done: impl FnMut(&mut S) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut events = Vec::new();
+    while !done(store) {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        store.poll(&mut events).unwrap();
+        events.clear();
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn offered(requester: &Instance, history: &TestHistory) -> bool {
+    let ticket = requester.client.begin_lookup(history, Vec::new());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while matches!(ticket.state(), LookupState::Pending) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(2));
+    }
+    matches!(ticket.state(), LookupState::Ready(a) if !a.candidates.is_empty())
+}
+
+/// Restore the record `salt` of `pages` pages from the manager's store into
+/// the requester and check every byte.
+fn restore_salted(
+    requester: &mut Instance,
+    history: &TestHistory,
+    salt: u32,
+    pages: usize,
+    evictor: &mut impl HostStore,
+) {
+    // The evictor's own notices must reach the manager first; it is polled
+    // as the worker would.
+    wait("the manager's store to be the only source", || {
+        evictor.poll(&mut Vec::new()).unwrap();
+        let ticket = requester.client.begin_lookup(history, Vec::new());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while matches!(ticket.state(), LookupState::Pending) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        let key = history.key_at(pages as u64 * PT).unwrap();
+        matches!(ticket.state(), LookupState::Ready(a)
+            if a.candidates.iter().any(|c| c.plan.key == key && c.source.instance.is_empty())
+                && a.candidates.iter().all(|c| c.plan.key != key || c.source.instance.is_empty()))
+    });
+    let scratch: Vec<u32> = (0..pages as u32).map(|p| 700 + salt * 10 + p).collect();
+    let fetch = fetch_for(requester, history, pages, &scratch);
+    requester.client.fetch(fetch).unwrap();
+    let result = requester.event("the restore", |e| match e {
+        PoolEvent::Fetched { result, .. } => {
+            Some(result.as_ref().map(|b| *b).map_err(|f| f.error.to_string()))
+        }
+        _ => None,
+    });
+    assert_eq!(result, Ok((pages * PAGE + ROW) as u64));
+    let gpu = requester.gpu.pages.lock().unwrap();
+    for (page, id) in scratch.iter().enumerate() {
+        assert_eq!(
+            gpu[id],
+            salted_page(salt, page),
+            "record {salt} page {page}"
+        );
+    }
+    drop(gpu);
+    assert_eq!(requester.gpu.rows.lock().unwrap()[&9], salted_row(salt));
+}
+
+/// A pooled store over a standalone memory store of `pages` pages, with its
+/// own simulated device.
+fn memory_instance(manager: &Manager, pages: usize) -> (PooledStore<MemoryStore>, GpuMemory) {
+    let (transfers, gpu) = SimulatedGpu::shared(&geo()).unwrap();
+    let pool = SlabPool::new(PAGE as u64, pages, ROW as u64, pages, true).unwrap();
+    let memory = MemoryStore::new([7; 32], pool, transfers).unwrap();
+    let (copier, _unused) = SimulatedGpu::shared(&geo()).unwrap();
+    let store = PooledStore::connect(
+        memory,
+        config(manager, "evictor", 1),
+        copier,
+        Arc::new(OkRegistrar),
+    )
+    .unwrap();
+    wait("Ready", || store.pool().status() == PoolStatus::Ready);
+    (store, gpu)
+}
+
+#[test]
+fn an_evicted_dram_record_reaches_the_manager_store_and_is_restored_by_another_instance() {
+    let manager = Manager::start();
+    let mut requester = instance(&manager, "requester", 2);
+    requester.ready();
+    let (mut store, gpu) = memory_instance(&manager, 8);
+    let (first, first_history) = publication(&gpu, 1, 4);
+    let (second, second_history) = publication(&gpu, 2, 4);
+    let (third, third_history) = publication(&gpu, 3, 4);
+    publish(&mut store, &first);
+    publish(&mut store, &second);
+    // The manager hears of both once their checksums are done.
+    drive(&mut store, "the records to be announced", |_| {
+        offered(&requester, &first_history) && offered(&requester, &second_history)
+    });
+
+    // The third needs the room: the coldest record moves to the manager first.
+    publish(&mut store, &third);
+    drive(&mut store, "the first record to leave", |store| {
+        store.lookup(&first_history, 0, u64::MAX).is_none()
+    });
+    assert!(store.lookup(&second_history, 0, u64::MAX).is_some());
+    assert!(store.lookup(&third_history, 0, u64::MAX).is_some());
+    // Another instance restores it from the manager's store.
+    restore_salted(&mut requester, &first_history, 1, 4, &mut store);
+    crate::HostStore::close(&mut store).unwrap();
+}
+
+#[test]
+fn a_record_the_manager_already_holds_is_released_without_waiting_for_a_copy() {
+    let manager = Manager::start();
+    let mut writer = instance(&manager, "writer", 3);
+    writer.ready();
+    let (mut store, gpu) = memory_instance(&manager, 8);
+    let (first, first_history) = publication(&gpu, 1, 4);
+    let (second, second_history) = publication(&gpu, 2, 4);
+    let (third, _) = publication(&gpu, 3, 4);
+
+    // Another instance already put the very record into the manager's store.
+    let data: Vec<u8> = (0..4)
+        .flat_map(|page| salted_page(1, page))
+        .chain(salted_row(1))
+        .collect();
+    let sums = (0..4)
+        .map(|p| checksum(&data[p * PAGE..(p + 1) * PAGE]))
+        .collect();
+    let row = checksum(&data[4 * PAGE..]);
+    writer
+        .client
+        .put(PutRequest {
+            key: first.key,
+            parent: None,
+            bucket: first.bucket,
+            chain_pages: 4,
+            tail_pages: 4,
+            row: true,
+            generation: 1,
+            source: PutSource::Host(Box::new(Bytes { data, sums, row })),
+        })
+        .unwrap();
+    let outcome = writer.event("the put", |e| match e {
+        PoolEvent::Put { outcome, .. } => Some(format!("{outcome:?}")),
+        _ => None,
+    });
+    assert!(outcome.starts_with("Stored"), "{outcome}");
+
+    publish(&mut store, &first);
+    publish(&mut store, &second);
+    drive(&mut store, "the records to be announced", |_| {
+        offered(&writer, &second_history)
+    });
+    publish(&mut store, &third);
+    drive(&mut store, "the first record to leave", |store| {
+        store.lookup(&first_history, 0, u64::MAX).is_none()
+    });
+    crate::HostStore::close(&mut store).unwrap();
+}
+
+#[test]
+fn a_record_the_manager_refuses_is_dropped_and_not_retried() {
+    // A manager whose store cannot hold a 20-page record at all.
+    let manager = Manager::with_memory(160 * 1024);
+    let mut requester = instance(&manager, "requester", 2);
+    requester.ready();
+    let (mut store, gpu) = memory_instance(&manager, 24);
+    let (big, big_history) = publication(&gpu, 1, 20);
+    let (small, small_history) = publication(&gpu, 2, 4);
+    let (third, _) = publication(&gpu, 3, 4);
+    publish(&mut store, &big);
+    publish(&mut store, &small);
+    drive(&mut store, "the records to be announced", |_| {
+        offered(&requester, &big_history) && offered(&requester, &small_history)
+    });
+    // The pool is full: the coldest record, the big one, is offered to the
+    // manager, which refuses it. It is dropped here and the publication goes on.
+    publish(&mut store, &third);
+    drive(&mut store, "the big record to leave", |store| {
+        store.lookup(&big_history, 0, u64::MAX).is_none()
+    });
+    assert!(store.lookup(&small_history, 0, u64::MAX).is_some());
+    drive(&mut store, "the big record to be forgotten", |_| {
+        !offered(&requester, &big_history)
+    });
+    crate::HostStore::close(&mut store).unwrap();
+}
+
+#[test]
+fn without_a_manager_the_tier_evicts_by_itself_and_publication_goes_on() {
+    let mut manager = Manager::start();
+    let (mut store, gpu) = memory_instance(&manager, 8);
+    let records: Vec<_> = (1..=4).map(|salt| publication(&gpu, salt, 4)).collect();
+    publish(&mut store, &records[0].0);
+    publish(&mut store, &records[1].0);
+    manager.stop();
+    drive(&mut store, "the pool to be lost", |store| {
+        store.pool().status() != PoolStatus::Ready
+    });
+    // The pool is full and the manager is gone: nothing waits for a copy.
+    publish(&mut store, &records[2].0);
+    publish(&mut store, &records[3].0);
+    assert!(store.lookup(&records[0].1, 0, u64::MAX).is_none());
+    assert!(store.lookup(&records[3].1, 0, u64::MAX).is_some());
+    crate::HostStore::close(&mut store).unwrap();
+}
+
+/// A directory for the disk tier that takes direct I/O, or `None`.
+fn offload_directory(test: &str) -> Option<PathBuf> {
+    let base = std::env::var_os("FLARE_OFFLOAD_TEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let directory = base.join(format!(
+        "flare-offload-cascade-{test}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let probe = directory.join(".probe");
+    match crate::os::direct_file(&probe, true) {
+        Ok(_) => {
+            std::fs::remove_file(&probe).unwrap();
+            Some(directory)
+        }
+        Err(error) if cfg!(unix) && error.raw_os_error() == Some(libc::EINVAL) => {
+            eprintln!(
+                "skipping {test}: {} refuses direct I/O",
+                directory.display()
+            );
+            std::fs::remove_dir_all(&directory).unwrap();
+            None
+        }
+        Err(error) => panic!("probe {}: {error}", probe.display()),
+    }
+}
+
+#[test]
+fn a_record_cascades_from_memory_to_the_disk_tier_to_the_manager_store() {
+    let Some(directory) = offload_directory("composite") else {
+        return;
+    };
+    let manager = Manager::start();
+    let mut requester = instance(&manager, "requester", 2);
+    requester.ready();
+    let geometry: Vec<CacheGeometry> = geo();
+    let layout = Layout::new(&geometry).unwrap();
+    let fingerprint = fingerprint(&geometry);
+    // Memory holds two records of two pages; the disk tier, two files.
+    let (memory_transfers, gpu) = SimulatedGpu::shared(&geometry).unwrap();
+    let pool = SlabPool::new(PAGE as u64, 4, ROW as u64, 4, true).unwrap();
+    let memory = MemoryStore::new_flat([7; 32], pool, memory_transfers).unwrap();
+    let lock = record::DirectoryLock::acquire(&directory).unwrap();
+    let scanned = record::scan(&lock, &[7; 32], &fingerprint, &geometry).unwrap();
+    let file_bytes = record::Header::new(
+        &geometry,
+        [7; 32],
+        fingerprint,
+        salted(1).key_at(2 * PT).unwrap(),
+        None,
+        [0; 16],
+        2,
+        std::time::SystemTime::now(),
+    )
+    .unwrap()
+    .length_with_row();
+    let (disk_transfers, _) = SimulatedGpu::shared(&geometry).unwrap();
+    let disk = DiskStore::new(
+        lock,
+        [7; 32],
+        fingerprint,
+        2 * file_bytes + file_bytes / 2,
+        geometry,
+        scanned,
+        Box::new(Staged::new(
+            Some(SlabPool::staging(&layout).unwrap()),
+            disk_transfers,
+            DiskThread::start("cascade-test-disk").unwrap(),
+        )),
+    )
+    .unwrap();
+    let composite = CompositeStore::new(memory, disk).unwrap();
+    let (copier, _unused) = SimulatedGpu::shared(&geo()).unwrap();
+    let mut store = PooledStore::connect(
+        composite,
+        config(&manager, "evictor", 1),
+        copier,
+        Arc::new(OkRegistrar),
+    )
+    .unwrap();
+    wait("Ready", || store.pool().status() == PoolStatus::Ready);
+
+    let (first, first_history) = publication(&gpu, 1, 2);
+    let (second, _) = publication(&gpu, 2, 2);
+    let (third, _) = publication(&gpu, 3, 2);
+    let (fourth, _) = publication(&gpu, 4, 2);
+    // Memory and the disk tier fill: nothing is written until memory needs room.
+    publish(&mut store, &first);
+    publish(&mut store, &second);
+    assert!(!directory.join(record::file_name(&first.key)).exists());
+    // The third pushes the first to disk; the fourth finds the disk tier full
+    // and pushes the coldest file on to the manager.
+    publish(&mut store, &third);
+    publish(&mut store, &fourth);
+    drive(&mut store, "the first record's file to go", |store| {
+        !directory.join(record::file_name(&first.key)).exists()
+    });
+    restore_salted(&mut requester, &first_history, 1, 2, &mut store);
+    crate::HostStore::close(&mut store).unwrap();
+    drop(store);
+    let _ = std::fs::remove_dir_all(&directory);
 }
