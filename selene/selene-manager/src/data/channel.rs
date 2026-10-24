@@ -44,8 +44,6 @@ const IO_TIMEOUT: Duration = Duration::from_secs(20);
 /// The most a closing connection may take to say goodbye.
 const GOODBYE: Duration = Duration::from_millis(200);
 const SOCKET_BUFFER: u64 = 16 << 20;
-/// Pages are multiples of this, so a window holds at most `max_window / PAGE_FLOOR` of them.
-const PAGE_FLOOR: u64 = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -118,12 +116,14 @@ struct Inner {
     address: String,
     regions: Arc<dyn RegionAccess>,
     acceptor: Option<TlsAcceptor>,
-    max_window: u64,
     max_pages: u32,
     events: mpsc::UnboundedSender<Event>,
     state: Mutex<State>,
     next: AtomicU64,
     handle: Handle,
+    /// Tests hold back `Closed` to play a handler whose exit cannot be observed.
+    #[cfg(test)]
+    closed_delay: Mutex<Duration>,
 }
 
 /// The listener's state and the transfers it serves. Cheap to clone.
@@ -141,15 +141,14 @@ fn random_token() -> io::Result<[u8; TOKEN_BYTES]> {
 }
 
 impl Hub {
-    /// Serve the data channel on `listener`. `max_window` bounds a window's
-    /// payload, and with it the pages a window may name. Without `tls` the
-    /// connection is plaintext.
+    /// Serve the data channel on `listener`. `max_pages` bounds the checksum
+    /// table a window may announce. Without `tls` the connection is plaintext.
     pub fn start(
         handle: &Handle,
         listener: std::net::TcpListener,
         regions: Arc<dyn RegionAccess>,
         tls: Option<Arc<rustls::ServerConfig>>,
-        max_window: u64,
+        max_pages: u32,
     ) -> io::Result<(Hub, mpsc::UnboundedReceiver<Event>)> {
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?.to_string();
@@ -159,10 +158,7 @@ impl Hub {
             address,
             regions,
             acceptor: tls.map(TlsAcceptor::from),
-            max_window,
-            max_pages: u32::try_from(max_window / PAGE_FLOOR)
-                .unwrap_or(u32::MAX)
-                .max(1),
+            max_pages,
             events,
             state: Mutex::new(State {
                 open: true,
@@ -170,6 +166,8 @@ impl Hub {
             }),
             next: AtomicU64::new(1),
             handle: handle.clone(),
+            #[cfg(test)]
+            closed_delay: Mutex::new(Duration::ZERO),
         });
         let accepting = inner.clone();
         let listener = {
@@ -284,6 +282,12 @@ impl Hub {
             let _ = entry.stopped.send(true);
         }
         let _ = self.closing.send(true);
+    }
+
+    /// Hold back every later `Closed` by `delay`, as if the handler could not be seen to exit.
+    #[cfg(test)]
+    pub fn delay_closed(&self, delay: Duration) {
+        *self.inner.closed_delay.lock().unwrap() = delay;
     }
 
     /// Transfers with a live handler, for tests and metrics.
@@ -402,6 +406,11 @@ async fn serve(inner: Arc<Inner>, stream: TcpStream) {
     if let End::Failed(reason) = result {
         let _ = inner.events.send(Event::Failed { transfer, reason });
     }
+    #[cfg(test)]
+    {
+        let delay = *inner.closed_delay.lock().unwrap();
+        tokio::time::sleep(delay).await;
+    }
     let _ = inner.events.send(Event::Closed { transfer });
 }
 
@@ -479,9 +488,6 @@ async fn send_windows(
             let _ = timeout(GOODBYE, conn.shutdown()).await;
             return Ok(());
         };
-        if window.shape.length > inner.max_window {
-            return Err(invalid("a window is larger than the window limit"));
-        }
         // SAFETY: see `window_bytes`; the slice is only read.
         let payload = unsafe {
             window_bytes(
@@ -526,9 +532,6 @@ async fn receive_windows(
                 continue;
             }
             for grant in grants {
-                if grant.shape.length > inner.max_window {
-                    return Err(invalid("a window is larger than the window limit"));
-                }
                 // Tell the reader first: the instance may answer before this write returns.
                 let _ = expect.send(grant);
                 timeout(IO_TIMEOUT, async {
@@ -638,8 +641,7 @@ mod tests {
         tls: Option<Arc<rustls::ServerConfig>>,
     ) -> (Hub, mpsc::UnboundedReceiver<Event>, String) {
         let listener = StdListener::bind("127.0.0.1:0").unwrap();
-        let (hub, events) =
-            Hub::start(&Handle::current(), listener, regions, tls, 1 << 20).unwrap();
+        let (hub, events) = Hub::start(&Handle::current(), listener, regions, tls, 64).unwrap();
         let address = hub.address().to_string();
         (hub, events, address)
     }

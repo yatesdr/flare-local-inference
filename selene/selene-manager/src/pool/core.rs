@@ -3,7 +3,7 @@
 use super::{
     Violation,
     barrier::Remembered,
-    claims::Claim,
+    claims::{Claim, ClaimKey},
     index::{InstanceId, ScopeIndex, SourceId, Staged},
     limits::Limits,
     store_bridge::{CatalogFeed, Link, PutKey, PutRec, StoreHandle},
@@ -11,6 +11,7 @@ use super::{
 };
 use crate::{
     arena::Arena,
+    data::channel::{self, Hub},
     local::{Pidfd, open_pidfd, pidfd_exited},
     proto::v2::{self, server_message::M},
 };
@@ -22,6 +23,13 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::{mpsc, oneshot};
+
+/// What a data-channel transfer belongs to.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ChanOwner {
+    Claim(ClaimKey),
+    Put(PutKey),
+}
 
 pub type Nonce = [u8; 16];
 pub type ProcKey = (InstanceId, Nonce);
@@ -39,6 +47,9 @@ pub struct PoolConfig {
     pub store_directory: Option<PathBuf>,
     pub encryption: v2::Encryption,
     pub transports: Vec<v2::DataTransport>,
+    /// The data channel instances without shared memory copy through, when the
+    /// manager listens for other hosts.
+    pub channel: Option<Hub>,
 }
 
 impl Default for PoolConfig {
@@ -51,6 +62,7 @@ impl Default for PoolConfig {
             store_directory: None,
             encryption: v2::Encryption::Plaintext,
             transports: vec![v2::DataTransport::Tcp],
+            channel: None,
         }
     }
 }
@@ -107,6 +119,8 @@ pub enum Event {
         scope: ScopeId,
         event: crate::proto::CatalogEvent,
     },
+    /// A data-channel handler reported.
+    Channel(channel::Event),
     Shutdown {
         done: oneshot::Sender<()>,
     },
@@ -170,6 +184,8 @@ pub struct Core {
     pub(super) store: Option<StoreHandle>,
     pub(super) self_tx: mpsc::Sender<Event>,
     pub(super) puts: HashMap<PutKey, PutRec>,
+    /// Open data-channel transfers by id.
+    pub(super) channels: HashMap<u64, ChanOwner>,
     pub(super) catalogs: HashMap<ScopeId, CatalogFeed>,
     pub(super) shared: Arc<Shared>,
     pub(super) incarnation: u64,
@@ -271,6 +287,7 @@ impl Core {
             }),
             self_tx: events.clone(),
             puts: HashMap::new(),
+            channels: HashMap::new(),
             catalogs: HashMap::new(),
             shared: shared.clone(),
             incarnation,
@@ -343,6 +360,7 @@ impl Core {
             } => self.put_answer(process, put_id, answer),
             Event::GetAnswer { key, answer } => self.get_answer(key, answer),
             Event::Catalog { scope, event } => self.catalog_event(scope, event),
+            Event::Channel(event) => self.channel_event(event),
             Event::Shutdown { done } => self.begin_shutdown(done),
         }
         self.flush_overflowed();
@@ -794,17 +812,35 @@ impl Core {
             .chain(self.puts.keys().map(|key| (key.0, key.1)))
             .collect();
         let now = Instant::now();
-        self.procs.retain(|key, proc| {
+        let mut forget = Vec::new();
+        let mut unlink = Vec::new();
+        for (key, proc) in &self.procs {
             if referenced.contains(key) {
-                return true;
+                continue;
             }
-            if proc.pidfd.is_some() || proc.pid.is_some() {
-                return !proc.exited;
+            let watched = proc.pidfd.is_some() || proc.pid.is_some();
+            if !watched && proc.link.is_some() {
+                // A remote process's store connection has nothing left on it.
+                unlink.push(*key);
             }
-            // A remote process cannot be watched; forget it after an hour of silence.
-            proc.idle_since
-                .is_none_or(|since| now.duration_since(since) < Duration::from_secs(3600))
-        });
+            let keep = if watched {
+                !proc.exited
+            } else {
+                // A remote process cannot be watched; forget it after an hour of silence.
+                proc.idle_since
+                    .is_none_or(|since| now.duration_since(since) < Duration::from_secs(3600))
+            };
+            if !keep {
+                forget.push(*key);
+            }
+        }
+        for key in unlink {
+            self.drop_link(key);
+        }
+        for key in forget {
+            self.drop_link(key);
+            self.procs.remove(&key);
+        }
     }
 
     fn poll_exits(&mut self) {
@@ -866,10 +902,13 @@ impl Core {
     }
 
     fn drained(&self) -> bool {
-        self.claims.values().all(|claim| claim.is_terminal())
+        self.claims.values().all(|claim| claim.is_terminal()) && self.channels.is_empty()
     }
 
     fn finish_shutdown(&mut self) {
+        if let Some(hub) = &self.cfg.channel {
+            hub.shutdown();
+        }
         let processes: Vec<ProcKey> = self.procs.keys().copied().collect();
         for process in processes {
             self.drop_link(process);
