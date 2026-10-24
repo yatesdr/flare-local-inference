@@ -106,6 +106,40 @@ impl Config {
         PathBuf::from(format!("/run/selene/{name}.sock"))
     }
 
+    /// Whether this build and configuration may select RDMA for peer transfers.
+    pub fn rdma_enabled(&self) -> bool {
+        cfg!(feature = "rdma") && !matches!(self.peer_transport, PeerTransport::Stream)
+    }
+
+    fn tls_configured(&self) -> bool {
+        self.tls_cert.is_some() || self.tls_key.is_some() || self.tls_ca.is_some()
+    }
+
+    /// One line per opt-in that widens the manager's exposure, printed once at startup.
+    pub fn startup_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.listen_peer.is_some() || self.listen_data.is_some() || self.listen_admin.is_some() {
+            let mut listeners = Vec::new();
+            for (label, address) in [
+                ("peer", self.listen_peer),
+                ("data", self.listen_data),
+                ("admin", self.listen_admin),
+            ] {
+                if let Some(address) = address {
+                    listeners.push(format!("{label} {address}"));
+                }
+            }
+            warnings.push(format!(
+                "selene: warning: network listening enabled ({})",
+                listeners.join(", ")
+            ));
+        }
+        if self.rdma_enabled() {
+            warnings.push("selene: warning: RDMA enabled (experimental)".to_string());
+        }
+        warnings
+    }
+
     /// Validate every configuration rule.
     pub fn validate(&self) -> io::Result<()> {
         if !valid_name(&self.name) {
@@ -161,6 +195,12 @@ impl Config {
         if matches!(self.peer_transport, PeerTransport::Rdma) && !cfg!(feature = "rdma") {
             return Err(invalid(
                 "--peer-transport rdma requires a build with the `rdma` feature",
+            ));
+        }
+        if self.rdma_enabled() && self.tls_configured() {
+            return Err(invalid(
+                "RDMA transfers are not encrypted, so RDMA cannot be combined with --tls-*; \
+                 pass --peer-transport stream to keep TLS, or remove the TLS options to use RDMA",
             ));
         }
         let mut names = std::collections::BTreeSet::new();
@@ -760,6 +800,8 @@ mod tests {
     #[test]
     fn listen_peer_accepts_a_complete_tls_configuration() {
         let config = run(&[
+            "--peer-transport",
+            "stream",
             "--listen-peer",
             "127.0.0.1:9000",
             "--listen-data",
@@ -794,5 +836,47 @@ mod tests {
         assert_eq!(run(&[]).write_budget, 0);
         assert_eq!(run(&["--write-budget", "0"]).write_budget, 0);
         assert_eq!(run(&["--write-budget", "1G"]).write_budget, 1 << 30);
+    }
+
+    #[test]
+    fn network_listeners_are_named_in_a_startup_warning() {
+        let mut config = Config::defaults();
+        config.peer_transport = PeerTransport::Stream;
+        assert!(config.startup_warnings().is_empty());
+        config.listen_peer = Some("127.0.0.1:9200".parse().unwrap());
+        config.listen_data = Some("127.0.0.1:9201".parse().unwrap());
+        let warnings = config.startup_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("network listening enabled"));
+        assert!(warnings[0].contains("peer 127.0.0.1:9200"));
+        assert!(warnings[0].contains("data 127.0.0.1:9201"));
+        assert!(!warnings[0].contains("admin"));
+    }
+
+    #[test]
+    fn rdma_is_experimental_and_never_combined_with_tls() {
+        let mut config = Config::defaults();
+        config.tls_cert = Some("/c".into());
+        config.tls_key = Some("/k".into());
+        config.tls_ca = Some("/a".into());
+        config.peer_transport = PeerTransport::Stream;
+        assert!(!config.rdma_enabled());
+        config.validate().unwrap();
+        assert!(config.startup_warnings().is_empty());
+        config.peer_transport = PeerTransport::Auto;
+        if cfg!(feature = "rdma") {
+            assert!(config.rdma_enabled());
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("not encrypted"), "{error}");
+            config.tls_cert = None;
+            config.tls_key = None;
+            config.tls_ca = None;
+            config.validate().unwrap();
+            let warnings = config.startup_warnings();
+            assert_eq!(warnings, ["selene: warning: RDMA enabled (experimental)"]);
+        } else {
+            assert!(!config.rdma_enabled());
+            config.validate().unwrap();
+        }
     }
 }
