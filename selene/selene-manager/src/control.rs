@@ -386,8 +386,13 @@ pub fn serve(
             Some(listener) => {
                 let listener = tokio::net::TcpListener::from_std(listener)?;
                 let incoming = TcpListenerStream::new(listener).map(move |stream| {
+                    let stream = stream?;
+                    // The session carries small messages in both directions; Nagle's
+                    // algorithm with the peer's delayed acknowledgments holds them for tens
+                    // of milliseconds.
+                    stream.set_nodelay(true)?;
                     Ok::<_, io::Error>(PeerStream {
-                        inner: stream?,
+                        inner: stream,
                         info: PeerInfo {
                             connection: counter.fetch_add(1, Ordering::Relaxed),
                             unix: false,
