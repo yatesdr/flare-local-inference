@@ -314,11 +314,26 @@ impl Core {
             return Ok(());
         }
         let mode = v2::CopyMode::try_from(m.mode).unwrap_or(v2::CopyMode::Unspecified);
-        let (Ok(record_key), true) = (
-            key_from(m.key.as_ref()),
-            mode == v2::CopyMode::SharedWindows && shm,
-        ) else {
-            self.put_refusal(sid, put_id, v2::Reason::Invalid, "bad key or mode");
+        if mode == v2::CopyMode::DataChannel {
+            self.put_refusal(
+                sid,
+                put_id,
+                v2::Reason::Invalid,
+                "the data channel is not served by this build",
+            );
+            return Ok(());
+        }
+        if mode != v2::CopyMode::SharedWindows || !shm {
+            self.put_refusal(
+                sid,
+                put_id,
+                v2::Reason::Invalid,
+                "shared windows need a Unix-socket session of the manager's own user",
+            );
+            return Ok(());
+        }
+        let Ok(record_key) = key_from(m.key.as_ref()) else {
+            self.put_refusal(sid, put_id, v2::Reason::Invalid, "bad key");
             return Ok(());
         };
         let parent = if m.has_published_parent {
@@ -345,7 +360,12 @@ impl Core {
         };
         let pid = self.sessions[&sid].pid;
         let Some(link) = self.link_for(process, scope, pid) else {
-            self.put_refusal(sid, put_id, v2::Reason::Io, "no store connection");
+            let detail = if pid == 0 {
+                "the peer's process id is not visible; share a PID namespace with the manager"
+            } else {
+                "no connection to the manager's store"
+            };
+            self.put_refusal(sid, put_id, v2::Reason::Io, detail);
             return Ok(());
         };
         let descriptor = self.scopes[&scope].valid.descriptor.clone();

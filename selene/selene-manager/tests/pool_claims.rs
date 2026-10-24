@@ -1295,3 +1295,56 @@ async fn r10_a_killed_source_fails_its_claims_and_frees_its_windows() {
     let reply = requester.lookup(500, 1024, vec![]).await;
     assert!(reply.candidates.is_empty());
 }
+
+// ---------------------------------------------------------------- deadlines and sizes
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn x5_a_deadline_is_clamped_to_the_managers_limit() {
+    let mut w = world_with(v2::Tier::Gpu, &[1024], |host| {
+        host.config.pool.limits.max_claim_deadline_ms = 400;
+        host.config.pool.limits.pin_deadline_ms = 10_000;
+    })
+    .await;
+    let candidate = w.candidate(1, 1024).await;
+    let mut claim = w.requester.claim_for(1, &candidate, 0, true);
+    claim.deadline_ms = 600_000;
+    let began = std::time::Instant::now();
+    w.requester.claim(claim).await;
+    w.source.export_request().await;
+    let terminal = w.requester.claim_terminal(1).await;
+    assert_eq!(terminal.state, v2::ClaimState::Expired as i32);
+    assert_eq!(terminal.reason, v2::ClaimReason::Deadline as i32);
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        began.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a21_a_pin_larger_than_the_reservation_fails_no_windows() {
+    let mut w = world(v2::Tier::Gpu, &[1024]).await;
+    w.claim(1, 1024, 0, true).await;
+    let request = w.source.export_request().await;
+    // The chain grew: the source reports more pages than were reserved.
+    let records = vec![v2::Record {
+        key: Some(pool::pkey(1024)),
+        generation: GENERATION,
+        first_page: 0,
+        pages: 40,
+        row: true,
+    }];
+    w.source.pin_ok(&request, records, true).await;
+    let terminal = w.requester.claim_terminal(1).await;
+    assert_eq!(terminal.reason, v2::ClaimReason::NoWindows as i32);
+    let cancel = w.source.export_cancel().await;
+    assert_eq!(cancel.export_id, request.export_id);
+    w.source
+        .export_end(
+            request.export_id,
+            v2::ExportEndStatus::ExportReleased,
+            v2::FenceOutcome::Drained,
+        )
+        .await;
+    w.staging_settles_at(0).await;
+}

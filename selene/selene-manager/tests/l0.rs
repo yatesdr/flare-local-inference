@@ -2295,11 +2295,10 @@ fn l0_68_a_tls_error_starts_nothing() {
     local.nvme = 64 << 20;
     local.tls_cert = Some(base.join("missing-cert.pem"));
     local.tls_key = Some(base.join("missing-key.pem"));
-    local.tls_ca = Some(base.join("missing-ca.pem"));
-    local.peer_transport = selene_manager::config::PeerTransport::Stream;
+    local.listen = Some("127.0.0.1:0".parse().unwrap());
     let mut store = Config::new(base.join("records"), socket.clone(), 65536, 64 << 20);
     store.name = local.name.clone();
-    let error = control::run_peer(local, store, Arc::new(AtomicBool::new(false)))
+    let error = control::serve(local, store, Arc::new(AtomicBool::new(false)))
         .expect_err("a missing certificate must fail the start");
     assert_eq!(
         error.kind(),
@@ -2313,10 +2312,8 @@ fn l0_68_a_tls_error_starts_nothing() {
     let other = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let cert = base.join("cert.pem");
     let key = base.join("key.pem");
-    let ca = base.join("ca.pem");
     fs::write(&cert, good.cert.pem()).unwrap();
     fs::write(&key, other.signing_key.serialize_pem()).unwrap();
-    fs::write(&ca, good.cert.pem()).unwrap();
     let mut local = selene_manager::config::Config::defaults();
     local.name = instance_name("tls-mismatch");
     local.socket = socket.clone();
@@ -2327,11 +2324,10 @@ fn l0_68_a_tls_error_starts_nothing() {
     local.nvme = 64 << 20;
     local.tls_cert = Some(cert);
     local.tls_key = Some(key);
-    local.tls_ca = Some(ca);
-    local.peer_transport = selene_manager::config::PeerTransport::Stream;
+    local.listen = Some("127.0.0.1:0".parse().unwrap());
     let mut store = Config::new(base.join("records"), socket.clone(), 65536, 64 << 20);
     store.name = local.name.clone();
-    let error = control::run_peer(local, store, Arc::new(AtomicBool::new(false)))
+    let error = control::serve(local, store, Arc::new(AtomicBool::new(false)))
         .expect_err("a key that does not match the certificate must fail the start");
     assert!(
         error.to_string().contains("TLS"),

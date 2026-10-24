@@ -17,7 +17,34 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-pub const MAX_CONNECTIONS: usize = 64;
+fn key_to_proto(key: &Key) -> proto::Key {
+    proto::Key {
+        consumed_tokens: key.consumed_tokens,
+        digest: key.digest.to_vec(),
+    }
+}
+
+fn entry_to_proto(entry: &EntryData) -> proto::CatalogEntry {
+    proto::CatalogEntry {
+        key: Some(key_to_proto(&entry.key)),
+        parent: entry.parent.map(|parent| key_to_proto(&parent)),
+        has_parent: entry.parent.is_some(),
+        bucket: entry.bucket.to_vec(),
+        tail_pages: u64::from(entry.tail_pages),
+        row: entry.row,
+        tier: match entry.tier {
+            0 => proto::Tier::Dram as i32,
+            2 => proto::Tier::Remote as i32,
+            _ => proto::Tier::Nvme as i32,
+        },
+        durable: entry.durable,
+        bytes: entry.bytes,
+        unreadable: entry.unreadable,
+    }
+}
+
+/// Store connections: one per instance process, plus one catalog link per scope.
+pub const MAX_CONNECTIONS: usize = 1024;
 pub const OPEN_PUTS: usize = 4;
 pub const OPEN_GETS: usize = 4;
 pub const WINDOW_CREDITS: u32 = 2;
@@ -6671,9 +6698,9 @@ impl Store {
                         while let Some(entry) = queue.pop_front() {
                             let value = proto::CatalogEvent {
                                 sequence: subscription.sequence,
-                                event: Some(proto::catalog_event::Event::Entry(
-                                    crate::control::entry_to_proto(&entry),
-                                )),
+                                event: Some(proto::catalog_event::Event::Entry(entry_to_proto(
+                                    &entry,
+                                ))),
                             };
                             match subscription.sender.try_send(value) {
                                 Ok(()) => subscription.sequence += 1,
@@ -7191,10 +7218,10 @@ fn live_event(live: &LiveEvent, sequence: u64) -> Option<proto::CatalogEvent> {
             kind, key, entry, ..
         } => {
             let event = if *kind == 2 {
-                proto::catalog_event::Event::Removed(crate::control::key_to_proto(key))
+                proto::catalog_event::Event::Removed(key_to_proto(key))
             } else {
                 let entry = entry.as_ref()?;
-                let proto = crate::control::entry_to_proto(entry);
+                let proto = entry_to_proto(entry);
                 if *kind == 0 {
                     proto::catalog_event::Event::Added(proto)
                 } else {
@@ -9040,8 +9067,8 @@ mod tests {
             digest: [2; 16],
         };
         let entry = |key, parent: Option<Key>, tail: u64| proto::CatalogEntry {
-            key: Some(crate::control::key_to_proto(&key)),
-            parent: parent.map(|parent| crate::control::key_to_proto(&parent)),
+            key: Some(key_to_proto(&key)),
+            parent: parent.map(|parent| key_to_proto(&parent)),
             has_parent: parent.is_some(),
             bucket: vec![0; 16],
             tail_pages: tail,
@@ -10999,8 +11026,8 @@ mod tests {
             digest: [15; 16],
         };
         let entry = |key, parent: Option<Key>, tail: u64| proto::CatalogEntry {
-            key: Some(crate::control::key_to_proto(&key)),
-            parent: parent.map(|parent| crate::control::key_to_proto(&parent)),
+            key: Some(key_to_proto(&key)),
+            parent: parent.map(|parent| key_to_proto(&parent)),
             has_parent: parent.is_some(),
             bucket: vec![0; 16],
             tail_pages: tail,
@@ -11027,11 +11054,7 @@ mod tests {
             store.namespaces[&id].tree.node(&child).is_none(),
             "the child waits for its parent"
         );
-        send(
-            &mut store,
-            2,
-            Event::Removed(crate::control::key_to_proto(&child)),
-        );
+        send(&mut store, 2, Event::Removed(key_to_proto(&child)));
         send(&mut store, 3, Event::Added(entry(parent, None, 1)));
         assert!(
             store.namespaces[&id].tree.node(&child).is_none(),
@@ -11317,7 +11340,7 @@ mod tests {
             digest: [7; 16],
         };
         let entry = proto::CatalogEntry {
-            key: Some(crate::control::key_to_proto(&key)),
+            key: Some(key_to_proto(&key)),
             parent: None,
             has_parent: false,
             bucket: vec![0; 16],
@@ -11351,7 +11374,7 @@ mod tests {
         store.handle(StoreCommand::Peer(PeerEvent::Catalog {
             node: "upstream".into(),
             namespace: id,
-            event: event(4, Event::Removed(crate::control::key_to_proto(&key))),
+            event: event(4, Event::Removed(key_to_proto(&key))),
         }));
         assert!(store.namespaces[&id].tree.node(&key).is_none());
         drop(store);
