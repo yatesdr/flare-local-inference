@@ -193,7 +193,8 @@ pub struct PooledStore<S: HostStore, P: PoolPort = PoolClient> {
     cascade: Cascade,
     characterizer: Option<Characterizer>,
     characterized_for: Option<crate::characterize::Topology>,
-    model: [u8; 32],
+    /// What the synthetic probe records are keyed by: the model and, once connected, this instance.
+    probe_model: [u8; 32],
     /// Restores that were wholly from the pool, which the local tiers did not count.
     pool_fetched: u64,
     /// Restores that failed in the pool part.
@@ -219,8 +220,20 @@ impl<S: HostStore> PooledStore<S, PoolClient> {
             layout: config.scope.layout_fingerprint,
         };
         let order = config.level_order;
+        // Two instances probing at once must not write or time each other's records.
+        let probe_model = super::probe::instance_probe_model(
+            &config.scope.model_identity,
+            &super::identity::instance_id(
+                &config.scope.tenant,
+                &config.scope.model_identity,
+                &config.scope.layout_fingerprint,
+                &config.gpu_uuids,
+            ),
+        );
         let pool = PoolClient::start(config, copier, registrar)?;
-        Self::new(inner, pool, identity, &layout).with_pinned_order(order)
+        let mut store = Self::new(inner, pool, identity, &layout);
+        store.probe_model = probe_model;
+        store.with_pinned_order(order)
     }
 }
 
@@ -246,7 +259,7 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             cascade: Cascade::new(layout),
             characterizer: Characterizer::new(PROBE_PAGES, None).ok(),
             characterized_for: None,
-            model: identity_model,
+            probe_model: identity_model,
             pool_fetched: 0,
             pool_fetch_failed: 0,
             pool_bytes_in: 0,
@@ -291,7 +304,7 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
                 inner: &mut self.inner,
                 pool: &mut self.pool,
                 scratch,
-                model: self.model,
+                model: self.probe_model,
                 page_tokens: self.page_tokens,
                 page_bytes: self.page_record_bytes as usize,
                 row_bytes: self.row_record_bytes as usize,

@@ -6,13 +6,16 @@
 //! manager's store and claimed back through the real path (lookup, claim,
 //! shared window, checksum, upload). The synthetic records carry keys derived
 //! with a fixed probe label, so no real request can ever name them; there is
-//! one per probed size and a repeat finds it already stored. A level that
+//! one per instance and probed size, and a repeat finds it already stored. A level that
 //! cannot be timed (a neighbour's GPU, or a manager that does not serve it
 //! here) fails, and the characterizer leaves it at its default position.
 
 use std::time::{Duration, Instant};
 
-use blake2::{Blake2b, Digest, digest::consts::U16};
+use blake2::{
+    Blake2b, Digest,
+    digest::consts::{U16, U32},
+};
 
 use crate::{
     Error, History, HostStore, PrefixKey, Result, Scratch, Tier as Local,
@@ -30,6 +33,16 @@ use super::{
 
 /// How long any one step of a manager probe may take.
 const STEP: Duration = Duration::from_secs(3);
+
+/// The model identity the probe keys are made from for one instance, so that two
+/// instances of one model never share a probe record.
+pub(crate) fn instance_probe_model(model: &[u8; 32], instance: &[u8; 16]) -> [u8; 32] {
+    let mut hash = Blake2b::<U32>::new();
+    hash.update(b"selene-probe-instance-v1");
+    hash.update(model);
+    hash.update(instance);
+    hash.finalize().into()
+}
 
 /// The key of the synthetic record of `pages` pages, which no real history
 /// can produce.
@@ -268,5 +281,25 @@ impl<S: HostStore, P: PoolPort> Probe for StoreProbe<'_, S, P> {
             return Ok(elapsed);
         }
         self.through_manager(level, pages)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_instances_of_one_model_never_share_a_probe_record() {
+        let model = [7u8; 32];
+        let one = instance_probe_model(&model, &[1; 16]);
+        let other = instance_probe_model(&model, &[2; 16]);
+        assert_ne!(one, other);
+        assert_ne!(one, model);
+        assert_eq!(one, instance_probe_model(&model, &[1; 16]));
+        for pages in [2, 16, 64] {
+            assert_ne!(probe_key(&one, pages, 64), probe_key(&other, pages, 64));
+        }
+        // The same instance asks for the same record after a restart.
+        assert_eq!(probe_key(&one, 16, 64), probe_key(&one, 16, 64));
     }
 }
