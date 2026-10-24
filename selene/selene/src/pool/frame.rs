@@ -191,6 +191,27 @@ impl ToInstance {
     /// `max_pages` bounds the checksum table a window may announce.
     pub async fn read<R: AsyncRead + Unpin>(reader: &mut R, max_pages: u32) -> io::Result<Self> {
         let kind = reader.read_u8().await?;
+        Self::read_body(kind, reader, max_pages).await
+    }
+
+    /// As [`ToInstance::read`], but `None` when the peer closed the connection between
+    /// frames, which is how a manager ends a transfer it has no more to say about.
+    pub async fn read_or_end<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        max_pages: u32,
+    ) -> io::Result<Option<Self>> {
+        let mut kind = [0u8; 1];
+        if reader.read(&mut kind).await? == 0 {
+            return Ok(None);
+        }
+        Self::read_body(kind[0], reader, max_pages).await.map(Some)
+    }
+
+    async fn read_body<R: AsyncRead + Unpin>(
+        kind: u8,
+        reader: &mut R,
+        max_pages: u32,
+    ) -> io::Result<Self> {
         match kind {
             WINDOW => {
                 let mut shape = [0u8; SHAPE_BYTES];
