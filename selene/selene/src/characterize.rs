@@ -137,6 +137,22 @@ impl Default for Ranking {
 }
 
 impl Ranking {
+    /// An order with typical-size costs, for tests of code that consumes a ranking.
+    #[cfg(test)]
+    pub(crate) fn for_test(order: [Level; 5], us_per_page: &[(Level, f64)]) -> Self {
+        let mut ranking = Self {
+            order,
+            ..Self::default()
+        };
+        for (level, us) in us_per_page {
+            ranking.measured[level.index()].typical = Some(Cost {
+                us_per_page: *us,
+                spread: 0.0,
+            });
+        }
+        ranking
+    }
+
     /// Levels from closest to farthest.
     pub fn order(&self) -> &[Level; 5] {
         &self.order

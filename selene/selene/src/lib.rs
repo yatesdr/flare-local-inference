@@ -22,6 +22,7 @@ pub mod index;
 pub mod input;
 pub mod memory;
 pub mod os;
+pub mod plan;
 pub mod record;
 pub mod registrar;
 pub mod slab;
@@ -37,6 +38,6 @@ pub use registrar::{HostRegistrar, Registration, SplitMapping};
 pub use store::{
     HostHit, HostStore, INITIAL_DIRECT_DISK_RATE, INITIAL_MEMORY_RATE, INITIAL_PREFILL_RATE,
     INITIAL_STAGED_DISK_RATE, InboundTicket, JobId, PublishedCheckpoint, StoreEvent, StoreOutcome,
-    StoreReason, StoreStats, Tier, Transport, worth_fetching,
+    StoreReason, StoreStats, Tier, Transport, worth_fetching, worth_transfer,
 };
 pub use vocab::{CheckpointId, HASH_BLOCK_TOKENS, History, PageId, PrefixKey, StateSlotId};
