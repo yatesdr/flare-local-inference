@@ -1,158 +1,1178 @@
+// Selene pool protocol, version 2 (package selene.v2).
+//
+// The wire contract between an instance's in-process pool client (crate `selene`)
+// and `selene-manager`. PROTOCOL.md defines the state machines; this file is
+// normative for field numbers, field meaning and the invariants stated in the
+// comments. A field comment that says "must" is checked by the receiver and a
+// violation fails the message (see each message) rather than being repaired.
+//
+// Shape of the contract
+//   * `Hello` (unary) is the stateless first call: protocol version, the
+//     manager's declared encryption, readiness, limits, incarnation.
+//   * `Session` (one bidirectional stream per instance process and scope) carries
+//     everything else. The stream gives a total order in each direction; every
+//     other ordering rule below is stated on top of it.
+//   * An instance plays up to three roles on its one session: SOURCE (publishes
+//     index notices and serves export requests), REQUESTER (looks up, claims and
+//     copies) and WRITER (spills records into the manager's store with Put).
+//   * The manager never holds document content in its index. Payload moves only
+//     through manager-granted shared-memory windows (same host) or the data
+//     channel (other hosts); never in gRPC messages.
+//
+// Identifiers
+//   manager_incarnation  64-bit, random and nonzero, chosen once per manager
+//                        process start. Clients compare for equality only.
+//   session_incarnation  64-bit, assigned by the manager in SessionOpened from a
+//                        counter that never repeats within one manager
+//                        incarnation. A new Session by the same instance_id
+//                        supersedes the old one (newer incarnation wins).
+//   instance_id          16 bytes, STABLE across restarts. Derived by
+//                        `selene::pool::instance_id` (crate `flare-selene`,
+//                        src/pool/identity.rs), which documents the byte layout:
+//                        BLAKE2b-128 over "selene-instance-v2", then the tenant,
+//                        the model identity, the layout fingerprint and the GPU
+//                        UUIDs in ascending byte order, each preceded by its
+//                        length as a little-endian u32. Instances on one host use
+//                        disjoint GPUs, so it is unique per host; a restarted
+//                        instance gets the same id. The manager only compares it;
+//                        it never recomputes it.
+//   process_nonce        16 random bytes chosen by the client at process start
+//                        (OpenSession.process_nonce). Tells two processes with
+//                        one instance_id apart; unchanged across a reconnect of
+//                        the same process.
+//   claim_id / put_id    chosen by the requester/writer, strictly increasing and
+//                        never reused within one (instance_id, process_nonce).
+//                        A claim is named (instance_id, process_nonce, claim_id)
+//                        so that fencing acknowledgments still resolve after the
+//                        session that created the claim was replaced by a
+//                        reconnect of the SAME process. A new process (new
+//                        nonce) starts its counters afresh and can attest
+//                        nothing for its predecessor.
+//   export_id            assigned by the manager, unique within one manager
+//                        incarnation. One export request per claim.
+//   generation           64-bit, assigned by the source for each (key, tier)
+//                        holding when that holding is created. Strictly
+//                        increasing per (instance, process, tier): the GPU cache and
+//                        each host tier allocate independently, so values are
+//                        compared only between entries of the same instance and
+//                        tier. For the GPU tier it is `CheckpointId::value()`. A
+//                        key that is evicted and later saved again in the same
+//                        tier has a larger generation. Never reused within an
+//                        (instance_id, process_nonce, tier). A restarted process
+//                        starts over; generations of different processes are
+//                        never compared because a new session's snapshot replaces
+//                        its predecessor's entries wholesale.
+
 syntax = "proto3";
-package selene.v1;
+package selene.v2;
 
-service LocalCache {
+service Pool {
+  // Stateless. Safe to retry. Never changes manager state.
   rpc Hello(HelloRequest) returns (HelloReply);
-  rpc Subscribe(SubscribeRequest) returns (stream CatalogEvent);
-  rpc Put(stream PutMessage) returns (stream PutReply);
-  rpc Get(stream GetMessage) returns (stream GetReply);
-  rpc Locate(LocateRequest) returns (LocateReply);   // returns UNIMPLEMENTED
+  // Exactly one live Session per instance_id per manager incarnation. The first
+  // ClientMessage must be `open`; the first ServerMessage is `opened`.
+  rpc Session(stream ClientMessage) returns (stream ServerMessage);
 }
 
-service PeerCache {
-  rpc PeerHello(PeerHelloRequest) returns (PeerHelloReply);
-  rpc Subscribe(SubscribeRequest) returns (stream CatalogEvent);
-  rpc Put(stream PutMessage) returns (stream PutReply);
-  rpc Get(stream GetMessage) returns (stream GetReply);
+// ---------------------------------------------------------------------------
+// Vocabulary shared with the v1 contract
+// ---------------------------------------------------------------------------
+
+// A prefix identity: the number of tokens consumed and the 16-byte digest of
+// the token and conditioning history up to that point. Same meaning as Flare's
+// `PrefixKey`. `digest` must be exactly 16 bytes.
+message PrefixKey {
+  uint64 consumed_tokens = 1;
+  bytes digest = 2;
 }
 
-service Admin {                                      // operator API
-  rpc Stats(StatsRequest) returns (StatsReply);
-  rpc Pin(PinRequest) returns (PinReply);
-  rpc Purge(PurgeRequest) returns (PurgeReply);
-  rpc SetQuota(QuotaRequest) returns (QuotaReply);
+// Bytes per page and per state row for one rank. Same meaning as v1.
+message RankPlanes {
+  repeated uint64 plane_bytes = 1;
+  uint64 row_bytes = 2;
 }
 
-message Key { uint64 consumed_tokens = 1; bytes digest = 2; }        // digest exactly 16
-message RankPlanes { repeated uint64 plane_bytes = 1; uint64 row_bytes = 2; }
-message Descriptor {
-  bytes identity = 1; bytes fingerprint = 2; uint64 page_tokens = 3;
-  repeated RankPlanes ranks = 4; uint64 page_record_bytes = 5;
-  uint64 row_record_bytes = 6; string tenant = 7;
+// The record geometry of one model package on one rank layout.
+message Geometry {
+  // Tokens per KV page. Nonzero.
+  uint64 page_tokens = 1;
+  // One entry per tensor-parallel rank, in rank order. A different rank count
+  // or per-rank plane list is a different geometry and a different scope.
+  repeated RankPlanes ranks = 2;
+  // Bytes of one page record (all ranks) and of one row record (all ranks).
+  // Both must be nonzero multiples of 4096, so every window length is too.
+  uint64 page_record_bytes = 3;
+  uint64 row_record_bytes = 4;
 }
 
-message HelloRequest { uint32 protocol = 1; string replica = 2; Descriptor descriptor = 3; }
-message HelloReply {
-  bytes namespace_id = 1; uint64 generation = 2;
-  string arena_path = 3; uint64 arena_bytes = 4;
-  string staging_path = 5; uint64 staging_bytes = 6;
-  uint32 max_open_puts = 7; uint32 max_open_gets = 8;
-  uint64 max_window_bytes = 9; uint32 window_credits = 10;
+// What a session may share. Records are only ever shared between sessions with
+// byte-identical scopes. A manager keeps one index per scope_id.
+message Scope {
+  // The organisation or deployment partition. Non-empty. Nothing crosses tenants.
+  string tenant = 1;
+  // 32-byte model package identity (weights, recipe and tokenizer).
+  bytes model_identity = 2;
+  // 16-byte fingerprint of the cache layout (page size, plane order, dtype).
+  bytes layout_fingerprint = 3;
+  // Rank geometry. Checked against `layout_fingerprint` only for internal
+  // consistency of page_record_bytes and row_record_bytes; the manager does not
+  // interpret layouts.
+  Geometry geometry = 4;
+}
+// scope_id is derived by `selene::pool::scope_id` (crate `flare-selene`,
+// src/pool/identity.rs), which documents the byte layout: BLAKE2b-256 over
+// "selene-scope-v2", the model identity, the layout fingerprint, the tenant as one
+// length byte then its bytes, and the canonical bytes of `geometry` (all integers
+// little-endian). The manager calls that function from the same crate and
+// SessionOpened echoes its value; the client must compare it with its own.
+
+// Where a copy of a record lives, from the source's point of view.
+enum Tier {
+  TIER_UNSPECIFIED = 0;
+  GPU = 1;    // an instance's GPU checkpoint cache. Exportable only by that instance.
+  DRAM = 2;   // an instance's or the manager's host DRAM.
+  NVME = 3;   // an instance's or the manager's NVMe.
 }
 
-message SubscribeRequest {
-  bytes namespace_id = 1; uint64 generation = 2; Descriptor descriptor = 3;
+// The copy-priority level of a candidate from the requester's perspective
+// (design table "Tier priority for copies"). The numbering is the default
+// order; the order in use is carried by LookupRequest.level_order.
+enum Level {
+  LEVEL_UNSPECIFIED = 0;
+  THIS_GPU = 1;        // never offered as a candidate; appears only in HeldRange.
+  NEIGHBOUR_GPU = 2;   // Tier GPU in another instance on the same host.
+  HOST_DRAM = 3;       // Tier DRAM: own, a neighbour's, or a same-host manager's (its DRAM is level 3).
+  HOST_NVME = 4;       // Tier NVME: own, a neighbour's, or a same-host manager's.
+  REMOTE_NVME = 5;     // Anything a manager on another host serves (its NVMe, and its DRAM too).
 }
-message CatalogEntry {
-  Key key = 1; Key parent = 2; bool has_parent = 3;
-  bytes bucket = 4;                 // exactly 16
-  uint64 tail_pages = 5; bool row = 6;
-  Tier tier = 7; bool durable = 8;
-  uint64 bytes = 9;                 // envelope-inclusive, as in v1
-  bool unreadable = 10;             // true only for a retained ancestry anchor
-}
-enum Tier { TIER_UNSPECIFIED = 0; DRAM = 1; NVME = 2; REMOTE = 3; }
-message CatalogEvent {
-  uint64 sequence = 1;              // +1 per emitted event in this stream
-  oneof event {
-    SnapshotBegin snapshot_begin = 2;
-    CatalogEntry entry = 3;         // snapshot entries, parents before children
-    SnapshotEnd snapshot_end = 4;
-    CatalogEntry added = 5;
-    CatalogEntry changed = 6;       // tier/durable/row/unreadable; never geometry
-    Key removed = 7;                // exactly one node, never cascaded
-    Room room = 8;                  // this connection's armed reservation fits
-  }
-}
-message SnapshotBegin { uint64 seq0 = 1; }
-message SnapshotEnd {}
-message Room { uint64 bytes = 1; }
 
-message WindowRef { Region region = 1; uint64 offset = 2; uint64 length = 3; }
-message WindowGrant {
-  uint64 transfer = 1; uint32 index = 2;   // index: window ordinal within the call, from 0
-  uint32 record = 3;
-  uint64 record_offset = 4;         // record-relative, multiple of 4096
-  uint64 length = 5;                // multiple of 4096, 1..=64 whole pages and/or the row
-  WindowRef memory = 6;
-  uint64 page_first = 7;            // page index within the chain (the key's full page span); row grants: 0
-  uint32 page_count = 8;            // 0 only for a row-only grant
-  bool row = 9;                     // this grant carries the whole row
+enum Encryption {
+  ENCRYPTION_UNSPECIFIED = 0;
+  PLAINTEXT = 1;
+  TLS = 2;
 }
+
+enum DataTransport {
+  DATA_TRANSPORT_UNSPECIFIED = 0;
+  TCP = 1;
+  RDMA = 2;
+}
+
+// Where payload for a claim or a put moves.
+enum CopyMode {
+  COPY_MODE_UNSPECIFIED = 0;
+  // Through manager-granted windows in the shared-memory regions. Only valid on
+  // a session whose `shared_memory` was given in HelloReply (same host).
+  SHARED_WINDOWS = 1;
+  // Through the data channel named in the grant. Valid on any session; required
+  // when the session has no shared memory.
+  DATA_CHANNEL = 2;
+}
+
 enum Region { REGION_UNSPECIFIED = 0; ARENA = 1; STAGING = 2; }
 
-message PutMessage {
-  oneof m { PutBegin begin = 1; WindowFilled filled = 2; PutCommit commit = 3; Cancel cancel = 4; }
+// ---------------------------------------------------------------------------
+// Hello
+// ---------------------------------------------------------------------------
+
+message HelloRequest {
+  // The client's protocol version. This contract is 2.
+  uint32 protocol = 1;
+  // Free text for the manager's log (the selene crate version). Not interpreted.
+  string client_version = 2;
+  // The mode the client connected with: TLS if it was configured with a CA and
+  // completed the handshake, otherwise PLAINTEXT. For the manager's log only.
+  Encryption connected_with = 3;
 }
-message PutBegin {
-  bytes namespace_id = 1; Key key = 2; uint64 chain_pages = 3; bool row = 4;
-  Key published_parent = 5; bool has_published_parent = 6;
-  bytes bucket = 7;                 // exactly 16
-  uint64 published_tail_pages = 8;
-  Descriptor descriptor = 9;        // required on both services; checked against Hello
+
+enum HelloStatus {
+  HELLO_STATUS_UNSPECIFIED = 0;
+  HELLO_OK = 1;
+  // The manager does not speak `protocol`. Only `status` and `protocol` of the
+  // reply are meaningful. The client logs one warning and uses local tiers only;
+  // it does not retry until restarted.
+  VERSION_MISMATCH = 2;
 }
+
+message HelloReply {
+  HelloStatus status = 1;
+  // The manager's protocol version.
+  uint32 protocol = 2;
+  // See the header. A client that sees a different value on a later Hello or in
+  // a ServerMessage header knows the manager restarted: it must treat every
+  // claim, export, window and session from the old incarnation as lost (the
+  // fencing rules in PROTOCOL.md apply) and open a new session.
+  uint64 manager_incarnation = 3;
+  // The encryption the manager was launched with. The client must require
+  // `declared == connected_with`; any other result disables the pool for this
+  // process. A client with a CA configured never accepts PLAINTEXT, so a
+  // downgrade is refused before any Session starts.
+  Encryption encryption = 4;
+  ReadinessInfo readiness = 5;
+  // Offered data channels. RDMA is never offered when encryption is TLS.
+  repeated DataTransport data_transports = 6;
+  Limits limits = 7;
+  // Present only when the connection is a Unix-domain socket whose peer
+  // credentials match the manager's (same host, same uid and gid). Absent
+  // otherwise, and the client must then use DATA_CHANNEL for every copy.
+  SharedMemory shared_memory = 8;
+  // 16 bytes identifying the manager's host. An instance-sourced candidate is
+  // offered to a requester only if both sessions have `shared_memory`.
+  bytes host_id = 9;
+}
+
+// Every limit is enforced by the manager. A request beyond a limit is refused
+// with the reason named on that request, or fails the session if the limit is
+// structural (batch sizes). All counts are per session unless stated.
+message Limits {
+  uint32 max_concurrent_lookups = 1;    // default 8
+  uint32 max_candidates = 2;            // per LookupReply; default 8
+  uint32 max_chain_nodes = 3;           // per candidate and per Record list; default 4096
+  uint32 max_boundaries = 4;            // per LookupRequest; default 8192
+  uint32 max_notices_per_batch = 5;     // default 256
+  uint32 max_unacked_notices = 6;       // sent but not covered by NoticeAck; default 16384
+  uint32 max_resync_chunk_entries = 7;  // default 1024
+  uint32 max_resync_entries = 8;        // per session snapshot; default 4 million
+  uint32 max_resync_buffered_notices = 9;  // deltas held while a snapshot streams; default 65536
+  uint32 max_claims_in_flight = 10;     // per requester; default 2 (design: per-GPU export limit)
+  uint32 max_export_slots = 11;         // upper bound on OpenSession.export_slots; default 2
+  uint32 window_credits = 12;           // unreleased windows per claim or put; default 2
+  uint64 max_window_bytes = 13;         // a window is whole pages and/or the row; default 4 MiB.
+                                        // A single page or the row may exceed it as a window of its own.
+  uint32 max_claim_deadline_ms = 14;    // clamp on Claim.deadline_ms; default 30000
+  uint32 pin_deadline_ms = 15;          // how long a source has to answer ExportRequest; default 250
+  uint32 progress_timeout_ms = 16;      // no window fill/release for this long expires a claim; default 3000
+  uint32 max_open_puts = 17;            // per writer; default 4
+  uint32 resync_timeout_ms = 18;        // ResyncBegin to installed; default 5000
+}
+
+// Mapped MAP_SHARED by the client at these paths. Region file names embed the
+// manager incarnation, so a mapping from a dead incarnation can never alias a
+// new window. The client must not create, truncate or unlink these files.
+message SharedMemory {
+  string arena_path = 1;
+  uint64 arena_bytes = 2;
+  string staging_path = 3;
+  uint64 staging_bytes = 4;
+}
+
+enum ReadinessState {
+  READINESS_UNSPECIFIED = 0;
+  // Disk recovery of the manager's own NVMe records is running.
+  RECOVERING = 1;
+  // Recovery is done; the expected-source barrier is still open: some expected
+  // source has neither installed a snapshot nor used up its bounded wait.
+  AWAITING_SOURCES = 2;
+  // Lookups, claims and puts are served.
+  READY = 3;
+  // The manager is shutting down: new lookups, claims and puts are refused with
+  // NOT_READY; claims in flight run to a terminal state.
+  DRAINING = 4;
+}
+
+message ReadinessInfo {
+  ReadinessState state = 1;
+  bool disk_recovered = 2;
+  uint64 recovered_records = 3;
+  uint32 sources_connected = 4;
+  // Connected sources whose current snapshot is installed.
+  uint32 sources_synced = 5;
+  // Time left in the expected-source barrier's bounded wait; 0 once it has
+  // elapsed or the barrier is satisfied.
+  uint32 barrier_remaining_ms = 6;
+  // Instances the manager remembered serving (persisted in its store directory,
+  // last-seen within the retention period) and still waits for.
+  uint32 sources_expected = 8;
+  // Bytes of staging and arena the manager will not reuse until a process exits
+  // or the manager restarts (see quarantine in PROTOCOL.md). Exposed so
+  // operators see degradation.
+  uint64 quarantined_bytes = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Session envelope
+// ---------------------------------------------------------------------------
+
+// Carried on every message after `open`/`opened`. The receiver rejects a message
+// whose manager_incarnation differs from its own. The manager additionally
+// rejects (and closes the stream for) a message whose session_incarnation is not
+// the instance's current session, except for the fence-class messages listed in
+// PROTOCOL.md (FenceAck, ExportEnd, WindowReleased, ClaimRelease), which are
+// resolved by (instance_id, process_nonce, id) and accepted from any current
+// session of that same process. A session of a different process never attests
+// for another process's accesses.
+message Header {
+  uint64 manager_incarnation = 1;
+  uint64 session_incarnation = 2;
+}
+
+message ClientMessage {
+  Header header = 1;   // unset only on `open`.
+  oneof m {
+    OpenSession open = 2;
+    Goodbye goodbye = 3;
+    ReadinessQuery readiness_query = 4;
+
+    // Source role: index.
+    ResyncBegin resync_begin = 10;
+    ResyncChunk resync_chunk = 11;
+    ResyncEnd resync_end = 12;
+    NoticeBatch notices = 13;
+
+    // Requester role.
+    LookupRequest lookup = 20;
+    LookupCancel lookup_cancel = 21;
+    Claim claim = 22;
+    ClaimRelease claim_release = 23;
+    WindowReleased window_released = 24;
+    CopyResult copy_result = 25;
+    FenceAck fence_ack = 26;
+
+    // Source role: exports.
+    PinAck pin_ack = 30;
+    WindowFilled window_filled = 31;
+    ExportEnd export_end = 32;
+
+    // Writer role.
+    PutBegin put_begin = 40;
+    PutFilled put_filled = 41;
+    PutCommit put_commit = 42;
+    PutCancel put_cancel = 43;
+  }
+}
+
+message ServerMessage {
+  Header header = 1;
+  oneof m {
+    SessionOpened opened = 2;
+    SessionClosing closing = 3;
+    ReadinessInfo readiness = 4;     // reply to ReadinessQuery and pushed on every state change.
+
+    // Index.
+    ResyncRequired resync_required = 10;
+    ResyncInstalled resync_installed = 11;
+    NoticeAck notice_ack = 12;
+
+    // Requester role.
+    LookupReply lookup_reply = 20;
+    ClaimGranted claim_granted = 21;
+    WindowReady window_ready = 22;
+    ClaimTerminal claim_terminal = 23;
+
+    // Source role.
+    ExportRequest export_request = 30;
+    ExportFill export_fill = 31;
+    ExportCancel export_cancel = 32;
+
+    // Writer role.
+    PutAccept put_accept = 40;
+    PutGrant put_grant = 41;
+    Stored stored = 42;
+    PutRefused put_refused = 43;
+    Room room = 44;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Session open and close
+// ---------------------------------------------------------------------------
+
+message OpenSession {
+  // From the HelloReply the client just read. If it no longer matches the
+  // manager's, the reply is STALE_MANAGER and the client redoes Hello.
+  uint64 manager_incarnation = 1;
+  // 16 bytes, stable across restarts, derived as described in the header. A Session
+  // whose instance_id already has a live session replaces it: the newer
+  // incarnation wins and the older session is fenced (SessionClosing SUPERSEDED;
+  // its claims fail, its windows stay quarantined until its process is confirmed
+  // exited, its pins are not attestable). The older session's entries are not
+  // offered from that moment and are replaced atomically when the newer session's
+  // snapshot installs.
+  bytes instance_id = 2;
+  // Free text for logs and metrics labels. Not an identity.
+  string instance_name = 3;
+  Scope scope = 4;
+  // 16 random bytes, fresh per process, constant across reconnects of the same
+  // process. Same nonce on a second Session = reconnect of one process (fence-class
+  // messages of the old stream stay valid); a different nonce = another process.
+  bytes process_nonce = 7;
+  // How many exports this instance can serve at once: the per-GPU export count
+  // (default 2). 0 means this instance serves no exports (it publishes no GPU
+  // or host entries as exportable and is requester/writer only). The manager
+  // grants min(this, Limits.max_export_slots) and never has more exports
+  // outstanding to the instance than that.
+  uint32 export_slots = 5;
+  // How many claims this instance wants in flight; granted as
+  // min(this, Limits.max_claims_in_flight). 0 means requester role off.
+  uint32 claim_slots = 6;
+}
+
+enum OpenStatus {
+  OPEN_STATUS_UNSPECIFIED = 0;
+  OPEN_OK = 1;
+  STALE_MANAGER = 2;     // manager_incarnation does not match.
+  INVALID_SCOPE = 3;     // malformed scope or geometry (sizes not multiples of 4096, empty tenant).
+  SHUTTING_DOWN = 4;
+}
+
+message SessionOpened {
+  OpenStatus status = 1;
+  // Fresh for this session. Messages that carry an older value are stale.
+  uint64 session_incarnation = 2;
+  bytes scope_id = 3;
+  uint32 export_slots = 4;
+  uint32 claim_slots = 5;
+  ReadinessInfo readiness = 6;
+  // Always true after OPEN_OK: the manager holds no entries for this instance
+  // until it completes a resync, even an empty one, and rejects NoticeBatch until
+  // then. Lookups, claims and puts are served normally (a restarted requester
+  // asks the manager directly and needs no index of its own).
+  bool resync_required = 7;
+}
+
+// Orderly close from the client. After sending it the client sends nothing more.
+message Goodbye {
+  // True only if every window, GPU pin, staging buffer and data-channel
+  // registration THIS session used has provably stopped being accessed by this
+  // process (the fencing rules of PROTOCOL.md). It clears only this party's
+  // obligations: a window the opposite party (requester or source of the same
+  // claim) may still access is reclaimed only after that party has drained too.
+  // False: the manager treats the close like a disconnect (quarantine until the
+  // process is confirmed gone). A source must have sent ExportEnd for every
+  // export before Goodbye{quiesced=true}; a quarantined export keeps its pin
+  // and makes quiesced false.
+  bool quiesced = 1;
+}
+
+enum ClosingReason {
+  CLOSING_REASON_UNSPECIFIED = 0;
+  CLOSING_SUPERSEDED = 1;   // the same instance_id opened a newer session (reconnect or another process; the newer wins).
+  CLOSING_SHUTDOWN = 2;
+  CLOSING_PROTOCOL_VIOLATION = 3;
+  CLOSING_STALE_SESSION = 4;
+}
+
+// The manager is closing this stream. Everything this session owned is treated
+// as in PROTOCOL.md "Session loss". The client stops submitting, drains, then
+// reconnects (new Hello, new Session, resync).
+message SessionClosing {
+  ClosingReason reason = 1;
+  string detail = 2;
+}
+
+message ReadinessQuery {}
+
+// ---------------------------------------------------------------------------
+// Index: entries, notices, resync
+// ---------------------------------------------------------------------------
+
+// One (key, tier) holding in a source. Entries are hints: every claim is
+// revalidated at the source.
+message IndexEntry {
+  PrefixKey key = 1;
+  bool has_parent = 2;
+  // The key of the previous record in the source's chain at this tier. Absent
+  // at the root. After a compaction the heir's parent is the compacted node's
+  // parent.
+  PrefixKey parent = 3;
+  // 16 bytes: digest of the aligned hash-block boundary at or below `key`.
+  bytes bucket = 4;
+  // Pages this record owns (its tail), not the whole chain.
+  uint32 tail_pages = 5;
+  // The record carries the state row, so it can end a restore.
+  bool row = 6;
+  Tier tier = 7;
+  // See the header. For the same (key, tier) in one session, a larger generation
+  // replaces a smaller one; an equal generation replaces the entry (used for a
+  // compaction heir); a smaller generation is ignored.
+  uint64 generation = 8;
+  // Payload bytes of this record, excluding any envelope.
+  uint64 bytes = 9;
+}
+
+message Notice {
+  oneof kind {
+    Saved saved = 1;
+    Spilled spilled = 2;
+    Evicted evicted = 3;
+  }
+}
+
+// A holding appeared (publication to the GPU cache, a host write completing).
+// Idempotent upsert by (key, tier, generation). A record whose write has not
+// completed must not be announced.
+message Saved { IndexEntry entry = 1; }
+
+// A holding moved down the eviction cascade atomically: `to` is added and the
+// holding at `from_tier` with `from_generation` is removed, so the manager never
+// sees a moment with neither. `to.tier` must be a tier below `from_tier`.
+message Spilled {
+  IndexEntry to = 1;
+  Tier from_tier = 2;
+  uint64 from_generation = 3;
+}
+
+enum EvictKind {
+  EVICT_KIND_UNSPECIFIED = 0;
+  // The node left the cache (a leaf). Page-only ancestors that left with it are
+  // separate Evicted notices, one per node; the manager never cascades.
+  REMOVED = 1;
+  // The node stopped being an endpoint but its pages live on in its single
+  // child. `heir` is the child's updated entry (same key and generation, new
+  // parent and tail_pages).
+  COMPACTED = 2;
+}
+
+// Logical removal. Removes the (key, tier) entry only if its generation is <=
+// `generation`: an eviction of an old holding never removes a newer one.
+message Evicted {
+  PrefixKey key = 1;
+  Tier tier = 2;
+  uint64 generation = 3;
+  EvictKind kind = 4;
+  IndexEntry heir = 5;   // present iff kind == COMPACTED.
+}
+
+// notices[i] has sequence first_sequence + i. Sequences start at 1 in each
+// session and rise by one per notice, across batches and across resyncs (a
+// resync does not renumber). A batch has at most Limits.max_notices_per_batch
+// entries; a larger batch fails the session. The manager applies a batch only
+// if first_sequence <= expected_next, skipping notices below expected_next;
+// first_sequence > expected_next is a gap (ResyncRequired). Notices are rejected
+// until the first resync completes.
+message NoticeBatch {
+  uint64 first_sequence = 1;
+  repeated Notice notices = 2;
+}
+
+// Highest sequence the manager has applied without a gap. The client may have at
+// most Limits.max_unacked_notices notices beyond this outstanding; when it would
+// exceed that (or its own queue bound), it drops its unsent queue and starts a
+// resync instead of blocking.
+message NoticeAck { uint64 applied_through = 1; }
+
+// Snapshot: begin, chunks, end, all on the ordered stream. `watermark` W means
+// the snapshot reflects exactly the notices with sequence <= W and none above.
+// Notices with sequence > W may be sent while the snapshot streams; the manager
+// buffers them (bounded by max_resync_buffered_notices) and, at ResyncEnd,
+// replaces the session's entries with the snapshot and applies the buffered
+// notices in order, as one atomic step with respect to lookups. The buffered
+// notices must begin at exactly W + 1 (or be empty) or the resync fails with
+// ResyncRequired{RESYNC_GAP}. After the install the session's expected_next is
+// W + 1 + the number of buffered notices applied. The whole exchange must finish
+// within Limits.resync_timeout_ms of ResyncBegin or the staged data is dropped
+// with RESYNC_TIMEOUT, so a stalled resync cannot hold the scope. The snapshot
+// the client sends covers every announced holding (GPU and host tiers) as of one
+// cut taken under the same lock that assigns sequences (client-api.md section 2).
+// A second ResyncBegin abandons the first. A client-
+// initiated resync is always legal; the manager also demands one.
+message ResyncBegin {
+  uint64 resync_id = 1;
+  uint64 watermark = 2;
+}
+// Entries are unique by (key, tier); parents need not precede children. At most
+// Limits.max_resync_chunk_entries per chunk and Limits.max_resync_entries per snapshot.
+message ResyncChunk {
+  uint64 resync_id = 1;
+  uint32 chunk_index = 2;   // 0, 1, 2, ... without holes.
+  repeated IndexEntry entries = 3;
+}
+message ResyncEnd {
+  uint64 resync_id = 1;
+  uint32 chunks = 2;
+  uint64 entries = 3;       // total, for the manager to check it saw all of them.
+}
+
+enum ResyncReason {
+  RESYNC_REASON_UNSPECIFIED = 0;
+  RESYNC_STATE_LOST = 1;   // the manager dropped this session's entries (internal fault).
+  RESYNC_GAP = 2;          // a notice batch or the buffered deltas skipped a sequence.
+  RESYNC_OVERFLOW = 3;     // the manager's per-session bounds were exceeded.
+  RESYNC_BAD = 4;          // chunk hole, count mismatch, or unknown resync_id.
+  RESYNC_TIMEOUT = 5;      // ResyncBegin to ResyncEnd exceeded Limits.resync_timeout_ms.
+}
+
+// The manager discarded this session's pending notices and (for RESYNC_GAP and
+// RESYNC_OVERFLOW) kept the last installed snapshot's entries as stale until the new
+// snapshot installs. The client must send a new snapshot. `applied_through` is
+// informational.
+message ResyncRequired {
+  ResyncReason reason = 1;
+  uint64 applied_through = 2;
+}
+
+message ResyncInstalled {
+  uint64 resync_id = 1;
+  uint64 watermark = 2;
+  uint64 entries = 3;
+  // Highest sequence applied after installing the snapshot and the buffered notices.
+  uint64 applied_through = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Lookup
+// ---------------------------------------------------------------------------
+
+// What the requester already holds closer. `end` is the deepest committed,
+// validated record the requester holds at `level` for this history; coverage is
+// the whole prefix from token 0 to end.consumed_tokens. "Committed" means a
+// complete, checksummed copy; an index entry pointing elsewhere does not count.
+message HeldRange {
+  Level level = 1;
+  PrefixKey end = 2;
+}
+
+message LookupRequest {
+  // Unique per session among live lookups; chosen by the client.
+  uint64 lookup_id = 1;
+  // The aligned hash-block boundary keys of the history, ascending by
+  // consumed_tokens, starting with the root key (consumed_tokens 0 is allowed).
+  // At most Limits.max_boundaries: if the history has more, the client sends the
+  // root and the deepest boundaries. The manager probes buckets by digest.
+  repeated PrefixKey boundaries = 2;
+  // Candidates must end strictly below this many tokens (the same meaning as
+  // `before` in Flare's lookup, capped at the history length).
+  uint64 before_tokens = 3;
+  repeated HeldRange held = 4;
+  // The order in use for this requester, closest first, containing each of
+  // NEIGHBOUR_GPU, HOST_DRAM, HOST_NVME, REMOTE_NVME exactly once (THIS_GPU
+  // may appear and is ignored). Reply ordering and rule 5 use it.
+  repeated Level level_order = 5;
+  // At most Limits.max_candidates; 0 means the limit.
+  uint32 max_candidates = 6;
+}
+
+message LookupCancel { uint64 lookup_id = 1; }
+
+enum LookupStatus {
+  LOOKUP_STATUS_UNSPECIFIED = 0;
+  LOOKUP_OK = 1;          // possibly with no candidates.
+  LOOKUP_NOT_READY = 2;   // readiness is not READY; retry_after_ms hints when.
+  LOOKUP_OVERLOADED = 3;  // max_concurrent_lookups or the manager's lookup work bound hit.
+  LOOKUP_INVALID = 4;     // limits exceeded, boundaries not ascending, bad level_order.
+}
+
+message ChainNode {
+  PrefixKey key = 1;
+  uint32 tail_pages = 2;
+  uint64 generation = 3;
+  bool row = 4;
+}
+
+// One place the requester could restore from. Rules the manager applies
+// (design "Rules" 1, 3 and 5):
+//  * the requester's own instance is never a source;
+//  * a candidate at level L is trimmed to begin at the largest end among `held`
+//    ranges at levels closer than L (in level_order), rounded down to a page
+//    boundary, and dropped if it then supplies no page and no row beyond that;
+//  * replies are ordered by level (level_order), then lower est_us_per_page,
+//    then longer match (larger key.consumed_tokens).
+// Everything here is a hint. The client re-checks every node against its own
+// history (`key == history.key_at(key.consumed_tokens)`) and drops a candidate
+// that fails.
+message Candidate {
+  Level level = 1;
+  Tier tier = 2;
+  SourceRef source = 3;
+  // The endpoint (the deepest record) and its generation.
+  PrefixKey key = 4;
+  uint64 generation = 5;
+  // First token this candidate supplies after trimming: the exact consumed_tokens
+  // of the largest held end that trimmed it (not necessarily a page boundary),
+  // or 0. The physical start is its floor to a page: page_tokens * (begin_tokens
+  // / page_tokens), the same flooring Flare's Match uses (pages = endpoint
+  // pages - resident pages).
+  uint64 begin_tokens = 6;
+  // Pages and bytes the candidate supplies from begin_tokens to the endpoint,
+  // and whether it supplies the endpoint row.
+  uint64 pages = 7;
+  uint64 bytes = 8;
+  bool row = 9;
+  // Records from the one containing begin_tokens up to the endpoint, ascending.
+  // At most Limits.max_chain_nodes.
+  repeated ChainNode nodes = 10;
+  // Pages of nodes[0]'s tail that precede the physical start (Match.skip_pages).
+  uint32 skip_pages = 11;
+  // The manager's running estimate of the source's per-page copy time from
+  // completed claims; 0 when unknown. Used only for ordering within a level.
+  uint32 est_us_per_page = 12;
+}
+
+// A source is an instance (instance_id non-empty) or the manager's own store
+// (instance_id empty).
+message SourceRef {
+  bytes instance_id = 1;
+  // Session the entry was announced in. A claim naming a session that is no
+  // longer the instance's current one is refused STALE_SOURCE.
+  uint64 session_incarnation = 2;
+}
+
+message LookupReply {
+  uint64 lookup_id = 1;
+  LookupStatus status = 2;
+  // At most the requested max_candidates, in the order stated on Candidate.
+  repeated Candidate candidates = 3;
+  uint32 retry_after_ms = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Claim
+// ---------------------------------------------------------------------------
+
+// Part of a restore plan, for the manager's accounting and logs only. The
+// manager attaches no meaning to it: all-or-nothing is the requester's rule.
+enum PlanPart {
+  PLAN_PART_UNSPECIFIED = 0;
+  SINGLE = 1;
+  PART_A = 2;
+  PART_B = 3;
+}
+
+// Ask to restore [begin_tokens, key.consumed_tokens) of one chain from one
+// source. The manager forwards it to the source; the source (not the manager)
+// validates the chain and pins it.
+message Claim {
+  // Strictly increasing within (instance_id, process_nonce), never reused.
+  uint64 claim_id = 1;
+  Level level = 2;
+  SourceRef source = 3;
+  Tier tier = 4;
+  // Endpoint key and generation, as in the Candidate.
+  PrefixKey key = 5;
+  uint64 generation = 6;
+  // The logical split: the exact consumed_tokens up to which the requester
+  // already holds (its resident prefix, or for part B exactly the end of part A,
+  // A.key.consumed_tokens). Not required to be page-aligned and >= the
+  // candidate's begin_tokens. The source supplies the pages from
+  // floor(begin_tokens / page_tokens) to floor(key.consumed_tokens /
+  // page_tokens) and, if want_row, the endpoint row. When both floors are equal
+  // there are zero pages and only the row (a row-only tail). Both the logical
+  // split and the physical page offset are validated: begin_tokens <=
+  // key.consumed_tokens, and the chain is contiguous from the physical offset.
+  uint64 begin_tokens = 7;
+  // Whether the endpoint row is wanted. False for part A of a two-source plan
+  // (exactly one part supplies the continuation row, the one that ends last).
+  bool want_row = 8;
+  CopyMode mode = 9;
+  // Whole-claim deadline from the manager's receipt, clamped to
+  // Limits.max_claim_deadline_ms; 0 means the limit.
+  uint32 deadline_ms = 10;
+  uint64 plan_id = 11;
+  PlanPart part = 12;
+}
+
+// What the source pinned, record by record, in restore order. For a data-channel
+// copy this is also the order bytes arrive.
+message Record {
+  PrefixKey key = 1;
+  uint64 generation = 2;
+  // Record-relative page index where this claim's pages start in the record's
+  // tail (non-zero only for the first record: Match.skip_pages /
+  // FetchSegment.first_page).
+  uint32 first_page = 3;
+  // Pages this claim takes from the record (tail_pages - first_page for a full
+  // take). May be 0 only for a row-only record, which must be the last.
+  uint32 pages = 4;
+  // True only on the last record, and only if the claim wanted the row.
+  bool row = 5;
+}
+
+// The manager's single authoritative per-claim state (PROTOCOL.md). Only the
+// terminal values travel in ClaimTerminal; the others describe manager state.
+enum ClaimState {
+  CLAIM_STATE_UNSPECIFIED = 0;
+  REQUESTED = 1;       // accepted by the manager; ExportRequest sent (or internal pin started).
+  SOURCE_PINNED = 2;   // the source acknowledged the pin. The hold exists.
+  GRANTED = 3;         // grant sent to the requester. Equivalent to the hold being granted.
+  COPYING = 4;         // first window filled (or first data-channel transfer started).
+  COPIED = 5;          // terminal: the requester validated and drained its writes.
+  FAILED = 6;          // terminal.
+  EXPIRED = 7;         // terminal: whole-claim deadline or no-progress timeout.
+}
+
+enum ClaimReason {
+  CLAIM_REASON_UNSPECIFIED = 0;
+  REASON_NONE = 1;            // COPIED.
+  // Refusals at the manager, answered at once with FAILED:
+  NOT_READY = 2;
+  CLAIM_LIMIT = 3;            // the requester already has claim_slots claims in flight.
+  SOURCE_LIMIT = 4;           // the source already has export_slots exports outstanding.
+  UNKNOWN_SOURCE = 5;         // no such source or entry in the manager's index.
+  STALE_SOURCE = 6;           // the named source session is not the instance's current one.
+  INVALID_CLAIM = 7;          // malformed, begin beyond key, a reused or non-increasing claim_id, mode not allowed.
+  NO_WINDOWS = 8;             // staging exhausted or quarantined; not "no headroom at the source".
+  // Refusals at the source, relayed immediately:
+  NOT_FOUND = 9;              // the source no longer holds the key at that tier.
+  GENERATION_CHANGED = 10;    // it holds the key at another generation.
+  CHAIN_GAP = 11;             // the chain is not contiguous from begin_tokens to the endpoint.
+  NO_HEADROOM = 12;           // GPU headroom check failed (immediate; never waits).
+  SOURCE_BUSY = 13;           // the source's own export limit or pin failure.
+  SOURCE_TIMEOUT = 14;        // no PinAck within pin_deadline_ms.
+  // Failures after the pin:
+  SOURCE_LOST = 15;           // the source session ended.
+  REQUESTER_LOST = 16;        // the requester session ended.
+  CANCELLED = 17;             // the requester released the claim before COPIED.
+  COPY_ERROR = 18;            // a read, write or transport error reported by either side.
+  CHECKSUM = 19;              // the requester's end-to-end check failed.
+  CLAIM_MANAGER_SHUTDOWN = 20;
+  DEADLINE = 21;              // with state EXPIRED.
+  NO_PROGRESS = 22;           // with state EXPIRED.
+  UNKNOWN_CLAIM = 23;         // the manager has no such claim (after a manager restart, or a late release).
+}
+
+// Hold granted. Sent only after the source's PinAck (for a manager-store source,
+// after the manager's own pin). This message is the hold: from here until the
+// claim is terminal and fenced, the source copy is protected from eviction.
+// It does not protect against the source dying.
+message ClaimGranted {
+  uint64 claim_id = 1;
+  // What was pinned, in restore order. At most Limits.max_chain_nodes. The
+  // requester must verify it against its own history and plan (keys, first_page,
+  // and that the pages sum to what it expects) and abandon the claim with
+  // CopyResult{ABANDONED} otherwise.
+  repeated Record records = 2;
+  uint64 total_pages = 3;
+  bool row = 4;
+  // For SHARED_WINDOWS, windows follow as WindowReady messages. For
+  // DATA_CHANNEL, `channel` is set instead and no WindowReady is sent.
+  DataChannelRef channel = 5;
+  // Unreleased-window credit for this claim (Limits.window_credits). Meaningful
+  // only when `retained` is false, which happens only for host-tier sources.
+  uint32 window_credits = 6;
+  // True when separately retained staging for the whole claim was reserved: every
+  // window is issued at once and the source's pin ends when its last window is
+  // filled, independent of the requester's pace. ALWAYS true for a GPU-tier
+  // source: a GPU export is accepted only after staging for the whole export is
+  // reserved (by the manager before the ExportRequest, from the index's size, and
+  // checked by the source against the actual chain), else refused NO_WINDOWS at
+  // once. A host-tier source (DRAM, NVMe) may stream with credits.
+  bool retained = 7;
+}
+
+// Where a data-channel transfer is served. The byte framing of the channel is
+// the data-plane contract (not part of this file). The invariants here hold for
+// every framing: the transfer is named by (claim_id or put_id, token); the token
+// is single-use, bound to one instance_id, and expires with the claim; payload
+// arrives in the order of `records` with per-page and row xxh3 checksums the
+// requester verifies before use; the manager side ends the transfer when the
+// claim becomes terminal.
+message DataChannelRef {
+  DataTransport transport = 1;
+  string address = 2;       // host:port of the manager's data listener.
+  bytes token = 3;          // opaque, 32 bytes.
+  // RDMA only: the manager's connection parameters, opaque to this contract.
+  bytes rdma = 4;
+}
+
+// A window in a manager-owned region. All offsets and lengths are multiples of
+// 4096. Neither side may touch bytes outside [offset, offset + length), nor keep
+// using a window after releasing or filling it (see ownership in PROTOCOL.md).
+message WindowSpec {
+  uint32 index = 1;          // ordinal within the claim or put, from 0, without holes.
+  Region region = 2;
+  uint64 offset = 3;
+  uint64 length = 4;
+  uint32 record = 5;         // index into ClaimGranted.records.
+  // Record-relative first page and page count carried; the pages are the claim's
+  // pages of that record in order. page_count is 0 only for a row-only window.
+  uint32 first_page = 6;
+  uint32 page_count = 7;
+  // The window carries the row after its pages (or alone). Only in the window
+  // that completes the last record.
+  bool row = 8;
+}
+// length == page_count * Geometry.page_record_bytes + (row ? row_record_bytes : 0).
+
+// A window the source filled and the requester may now read. The checksums are
+// the source's and the requester verifies them after copying out. For a DRAM or
+// NVMe source they MUST be the checksums persisted with the record when it was
+// committed (never hashes of the bytes just read, which would legitimize at-rest
+// corruption). Only a GPU source, which has no stored checksum, computes them
+// from the bytes it wrote.
+message WindowReady {
+  uint64 claim_id = 1;
+  WindowSpec window = 2;
+  repeated uint64 page_xxh3 = 3;   // one per page, in order.
+  uint64 row_xxh3 = 4;
+  bool has_row = 5;
+}
+
+// The requester finished reading the window: every copy that read it has
+// drained (the CUDA stream or event reached, the memcpy returned). Returns one
+// credit. Idempotent. Never sent earlier than the drain.
+message WindowReleased {
+  uint64 claim_id = 1;
+  uint32 index = 2;
+}
+
+// The requester's verdict, sent once, only after every access it made has
+// drained and every page and row was verified. The only way to reach COPIED.
+// `ABANDONED` means it did not use the grant (plan failed elsewhere, mismatched
+// records). Idempotent; the first terminal transition of the claim wins.
+enum CopyOutcome {
+  COPY_OUTCOME_UNSPECIFIED = 0;
+  COPY_OK = 1;
+  COPY_CHECKSUM = 2;
+  COPY_ERROR_OUTCOME = 3;
+  COPY_ABANDONED = 4;
+}
+message CopyResult {
+  uint64 claim_id = 1;
+  CopyOutcome outcome = 2;
+}
+
+// Cancel or release, whichever applies. Idempotent. Before the claim is
+// terminal it drives FAILED{CANCELLED} (including a claim whose grant has not
+// arrived, and a late grant: PROTOCOL.md "Late grant"). After it is terminal
+// it does nothing. Unknown claim_id is answered with ClaimTerminal
+// {FAILED, UNKNOWN_CLAIM}. Resolved by (instance_id, process_nonce, claim_id), so it is
+// accepted from any current session of the same instance.
+message ClaimRelease { uint64 claim_id = 1; }
+
+// The single authoritative transition. Sent to the requester exactly once per
+// claim (plus again in answer to a later ClaimRelease for the same id). Carries
+// the end state; COPIED only follows the requester's own CopyResult{COPY_OK}.
+// `fence_required` is true when the requester may still have accesses in flight
+// that it must prove stopped with FenceAck before the manager reuses the
+// windows: every terminal state except a refusal before any grant.
+message ClaimTerminal {
+  uint64 claim_id = 1;
+  ClaimState state = 2;     // COPIED, FAILED or EXPIRED.
+  ClaimReason reason = 3;
+  bool fence_required = 4;
+}
+
+enum FenceOutcome {
+  FENCE_OUTCOME_UNSPECIFIED = 0;
+  // Every access to the memory has provably stopped (CUDA stream drained, disk
+  // completions reaped, socket shut down and handler exited, RDMA queue pair
+  // quiesced and work requests flushed). The manager may reuse the memory.
+  DRAINED = 1;
+  // The sender cannot establish that. The memory is quarantined: not reused
+  // until the sender's process is confirmed exited, or until the manager exits.
+  QUARANTINED = 2;
+}
+
+// Requester-side (or writer-side) fencing acknowledgment. Idempotent. Sent after
+// ClaimTerminal/PutRefused/PutCancel resolve, once the sender's accesses to the
+// claim's (or put's) windows or channel have stopped. Resolved by
+// (instance_id, process_nonce, id): accepted from any current session of the same process.
+message FenceAck {
+  oneof subject {
+    uint64 claim_id = 1;
+    uint64 put_id = 2;
+  }
+  FenceOutcome outcome = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Export (manager -> source, source -> manager)
+// ---------------------------------------------------------------------------
+
+// Pin this chain for a claim. For a GPU source it is delivered to the model
+// worker through poll; the worker runs the headroom check, validates and calls
+// pin_checkpoint. For a host-tier source the instance's selene takes a record
+// reference. The source answers with exactly one PinAck, even when it
+// discards the request.
+message ExportRequest {
+  uint64 export_id = 1;
+  uint64 claim_id = 2;
+  bytes requester_instance_id = 3;
+  Tier tier = 4;
+  PrefixKey key = 5;
+  uint64 generation = 6;
+  uint64 begin_tokens = 7;
+  bool want_row = 8;
+  // The manager gives up (SOURCE_TIMEOUT) after this many ms and then sends
+  // ExportCancel; a pin that completes later is released (late pin).
+  uint32 pin_deadline_ms = 9;
+  // The source session this request is bound to. A source whose current session
+  // differs discards the request and answers PinAck{REFUSED, STALE_SOURCE}.
+  uint64 session_incarnation = 10;
+  // Bytes of retained staging the manager has reserved for this export (windows
+  // and row). Always set for a GPU-tier export. The source computes the actual
+  // size of the chain before pinning and refuses NO_WINDOWS if it exceeds this.
+  // For host tiers 0 means the claim will stream.
+  uint64 reserved_bytes = 11;
+}
+
+enum PinResult {
+  PIN_RESULT_UNSPECIFIED = 0;
+  PINNED = 1;
+  REFUSED = 2;
+}
+
+// The answer to an ExportRequest. PINNED means: the whole chain from
+// begin_tokens to the endpoint, and the endpoint row if wanted, is pinned in the
+// source and will stay until the source sends ExportEnd. REFUSED carries the
+// reason (NOT_FOUND, GENERATION_CHANGED, CHAIN_GAP, NO_HEADROOM, SOURCE_BUSY,
+// INVALID_CLAIM) and means nothing is pinned. Sent at most once per export_id;
+// duplicates are ignored.
+message PinAck {
+  uint64 export_id = 1;
+  PinResult result = 2;
+  ClaimReason refusal = 3;
+  repeated Record records = 4;     // as in ClaimGranted.
+  uint64 total_pages = 5;
+  bool row = 6;
+}
+
+// Windows the source must fill, in index order. Sent only after PINNED. The
+// manager has at most Limits.window_credits windows unreleased for one claim
+// unless the claim is `retained`, in which case all windows arrive in one
+// ExportFill; otherwise ExportFill messages arrive as the requester releases windows. The
+// windows are in the STAGING region of the shared memory and are owned by the
+// source for writing until WindowFilled.
+message ExportFill {
+  uint64 export_id = 1;
+  repeated WindowSpec windows = 2;
+}
+
+// The source finished writing the window: its D2H or memcpy has drained (the
+// source's access is over) and `page_xxh3`/`row_xxh3` are the checksums (for a
+// host-tier source, the persisted ones; for a GPU source, of the bytes written). status FILL_FAILED means the source cannot continue; the manager
+// fails the claim COPY_ERROR.
+enum FillStatus { FILL_STATUS_UNSPECIFIED = 0; FILL_OK = 1; FILL_FAILED = 2; }
 message WindowFilled {
-  uint64 transfer = 1; uint32 index = 2;
-  repeated uint64 page_xxh3 = 3; uint64 row_xxh3 = 4; bool has_row = 5;
+  uint64 export_id = 1;
+  uint32 index = 2;
+  FillStatus status = 3;
+  repeated uint64 page_xxh3 = 4;
+  uint64 row_xxh3 = 5;
+  bool has_row = 6;
 }
+
+// Stop and release. Sent on any terminal state, on late pin, and when the
+// requester session ends. The source discards the request if it has not started,
+// otherwise lets in-flight copies drain (a started DMA is never revoked), drops
+// its pin and sends ExportEnd. Idempotent; an ExportCancel for an unknown
+// export_id is answered with ExportEnd{RELEASED, DRAINED}.
+message ExportCancel {
+  uint64 export_id = 1;
+  ClaimReason reason = 2;
+}
+
+enum ExportEndStatus {
+  EXPORT_END_STATUS_UNSPECIFIED = 0;
+  EXPORT_COMPLETE = 1;   // every window was filled; the pin is released.
+  EXPORT_RELEASED = 2;   // released before completion (cancel, refusal after ack, late pin).
+  EXPORT_FAILED = 3;
+}
+
+// The source's final message for an export. It clears only the SOURCE's
+// obligations, and only as `fence` says:
+//  * fence DRAINED: every source access to the windows has stopped AND the
+//    source's pin or record reference is released.
+//  * fence QUARANTINED: the source cannot prove its copies drained. It keeps the
+//    pin (a GPU checkpoint stays pinned, a host record stays referenced) until
+//    its process exits, and the manager keeps the export slot and the windows
+//    the source may still write out of service.
+// It says nothing about the requester, which may still be reading a window; the
+// manager reclaims a window only after every party that held it has drained.
+// Sent exactly once per
+// ExportRequest that was answered PINNED or discarded after being pinned. After
+// PinAck{REFUSED} the source sends no ExportEnd. Idempotent; resolved by
+// export_id and accepted from any current session of the same process.
+message ExportEnd {
+  uint64 export_id = 1;
+  ExportEndStatus status = 2;
+  FenceOutcome fence = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Put: spill a record into the manager's store (eviction to local or remote NVMe)
+// ---------------------------------------------------------------------------
+
+// Same flow and reasons as v1 Put, with windows or the data channel.
+enum Reason {
+  REASON_UNSPECIFIED = 0;
+  PRESENT = 1;     // already stored and committed: a successful deduplication.
+  INFLIGHT = 2;    // a put for the same key is running.
+  BUDGET = 3;      // out of write budget or full: the writer advances the record to the next tier now; no retry loop.
+  OVERSIZE = 4;    // can never fit; do not retry.
+  QUOTA = 5;       // reserved.
+  INVALID = 6;
+  QUEUE = 7;       // max_open_puts reached.
+  IO = 8;          // a manager device error; the manager is unhealthy.
+  PUT_NOT_READY = 9;
+}
+// BUDGET and "full" are the writer's cue to advance the record to the next
+// configured tier immediately, not to wait (PROTOCOL.md section 11).
+
+message PutBegin {
+  uint64 put_id = 1;
+  PrefixKey key = 2;
+  // Pages of the whole chain up to key, and whether the record has a row.
+  uint64 chain_pages = 3;
+  bool row = 4;
+  bool has_published_parent = 5;
+  PrefixKey published_parent = 6;
+  bytes bucket = 7;
+  uint64 published_tail_pages = 8;
+  CopyMode mode = 9;
+  // The writer's generation of the holding being spilled (informational).
+  uint64 generation = 10;
+}
+
+message PutAccept {
+  uint64 put_id = 1;
+  // The parent the manager chose (may be older than the published one) and the
+  // first page of the record it needs.
+  uint64 first_page = 2;
+  bool has_parent = 3;
+  PrefixKey parent = 4;
+  uint64 record_bytes = 5;
+  DataChannelRef channel = 6;      // DATA_CHANNEL only.
+}
+
+// A window to fill, STAGING or ARENA region. At most Limits.window_credits
+// unfilled at once. Unfilled windows stay leased to the writer until FenceAck
+// for the put, because the writer may still be writing.
+message PutGrant {
+  uint64 put_id = 1;
+  WindowSpec window = 2;
+}
+
+message PutFilled {
+  uint64 put_id = 1;
+  uint32 index = 2;
+  repeated uint64 page_xxh3 = 3;
+  uint64 row_xxh3 = 4;
+  bool has_row = 5;
+}
+
+// Concatenated in offset order, the first 4096 bytes are the record header and
+// the rest is the padded checksum segment (the persisted checksums later served
+// to requesters). Sent once, after every window is filled; after it the put runs
+// to Stored or PutRefused. Before indexing, the manager MUST validate the
+// metadata against the accepted geometry, the scope identity (model, layout
+// fingerprint, tenant), the accepted parent and first page, the byte length, and
+// the checksums it verified over the received payload; any mismatch is
+// PutRefused{INVALID}.
 message PutCommit {
-  uint64 transfer = 1; uint64 metadata_offset = 2; bytes metadata = 3;
-  // Concatenate every metadata fragment in offset order: the first 4096 bytes are
-  // the Header, the rest is the padded checksum segment.
-}
-message PutReply { oneof r { PutAccept accept = 1; WindowGrant grant = 2; Stored stored = 3; Refused refused = 4; } }
-message PutAccept { uint64 transfer = 1; uint64 first_page = 2; Key parent = 3; bool has_parent = 4; uint64 record_bytes = 5; }
-message Stored { uint64 bytes = 1; }
-message Refused { Reason reason = 1; string detail = 2; }
-enum Reason { REASON_UNSPECIFIED = 0; PRESENT = 1; INFLIGHT = 2; BUDGET = 3; OVERSIZE = 4; QUOTA = 5; INVALID = 6; QUEUE = 7; IO = 8; }
-
-message GetMessage {
-  oneof m { GetBegin begin = 1; WindowReleased released = 2; Cancel cancel = 3; }
-}
-message GetDestination {
-  uint32 record = 1;                // chain index
-  Region region = 2;                // the origin's region
-  uint64 offset = 3;                // reserved destination base
-  uint64 bytes = 4;                 // reservation for this record's page/row payload
-}
-message GetBegin {
-  bytes namespace_id = 1; repeated Key chain = 2;
-  uint64 skip_pages = 3; uint64 expected_pages = 4; bool row = 5;
-  repeated GetDestination destinations = 6;   // PeerCache.Get only; must be empty on LocalCache
-  uint64 transfer = 7;                        // PeerCache.Get only; the origin assigns it
-}
-message WindowReleased { uint64 transfer = 1; uint32 index = 2; }
-message GetReply {
-  oneof r { GetLeased leased = 1; RecordMeta meta = 2; WindowGrant ready = 3; GetDone done = 4; Refused refused = 5; }
-}
-message GetLeased { uint64 transfer = 1; repeated uint64 record_bytes = 2; }
-message RecordMeta {
-  uint32 record = 1; uint64 metadata_offset = 2; bytes metadata = 3;
-  Tier source = 4;                  // where this record's bytes are served from
-  // Concatenate in offset order: Header (4096 bytes) then the padded checksum segment.
-}
-message GetDone {}
-message Cancel {}
-
-message LocateRequest { bytes namespace_id = 1; repeated Key keys = 2; }
-message LocateReply { repeated Location locations = 1; }
-message Location { Key key = 1; Tier tier = 2; string node = 3; }
-
-message PeerHelloRequest {
-  uint32 protocol = 1; string node = 2; repeated string transports = 3; bytes rdma = 4;
-  uint64 arena_bytes = 5; uint64 staging_bytes = 6;
-}
-message PeerHelloReply {
-  uint64 generation = 1; string transport = 2; bytes stream_token = 3;
-  string stream_addr = 4; bytes rdma = 5;
-  uint64 arena_bytes = 6; uint64 staging_bytes = 7;
+  uint64 put_id = 1;
+  uint64 metadata_offset = 2;
+  bytes metadata = 3;
 }
 
-message StatsRequest {}
-message StatsReply { string prometheus = 1; }
-message PinRequest { bytes namespace_id = 1; repeated Key keys = 2; bool pin = 3; }
-message PinReply { uint32 changed = 1; }
-message PurgeRequest { bytes namespace_id = 1; bool all_namespaces = 2; }
-message PurgeReply { uint64 records = 1; uint64 bytes = 2; }
-message QuotaRequest { bytes namespace_id = 1; uint64 dram_bytes = 2; uint64 nvme_bytes = 3; }
-message QuotaReply { uint64 blocked_bytes = 1; }   // >0: reduction blocked by pins/leases
+// Only before PutCommit. Leaves windows leased until FenceAck{put_id}.
+message PutCancel { uint64 put_id = 1; }
+
+// The record is committed in the manager's store: durable if the manager says so,
+// checksummed and indexed. Only now may the writer's lower-level copy be dropped
+// ("already held means committed").
+message Stored {
+  uint64 put_id = 1;
+  uint64 bytes = 2;
+}
+
+message PutRefused {
+  uint64 put_id = 1;
+  Reason reason = 2;
+  string detail = 3;
+}
+
+// The manager has room again after a put was refused BUDGET. Informational for
+// later eviction attempts only: a refused put is not retried on Room; the record
+// has already moved to the next tier. Pushed once, never periodically.
+message Room { uint64 bytes = 1; }

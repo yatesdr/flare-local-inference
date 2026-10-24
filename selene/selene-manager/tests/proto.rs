@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 
-const PROTO_SHA256: &str = "80805fbcd2cc60f11f8f0538c67be47880d6da3f8a90af28166642420cd22fc9";
+const PROTO_SHA256: &str = "3c0ba7492991ce2947a85970a876069e15cc7606e9dc73874f8cd06d12493689";
 
 #[test]
 fn manager_proto_matches_the_pinned_digest() {
