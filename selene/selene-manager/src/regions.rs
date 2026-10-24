@@ -1,6 +1,6 @@
 //! `RegionAccess` over the manager's shared arena and staging mappings.
 //!
-//! The peer thread and the data channels outlive any borrow of `Local`, so they receive clones
+//! The data channels outlive any borrow of `Local`, so they receive clones
 //! of the two `Arena`s. Each clone holds the mapping alive, and the mapping's base address and
 //! length never change, which is what `RegionAccess` promises.
 
@@ -8,7 +8,7 @@ use crate::arena::Arena;
 use crate::data::{Region, RegionAccess};
 use std::io;
 
-/// The store's two regions, safe to share with a peer thread.
+/// The store's two regions, safe to share with the data channels.
 #[derive(Clone)]
 pub struct LocalRegions {
     arena: Arena,
@@ -18,16 +18,6 @@ pub struct LocalRegions {
 impl LocalRegions {
     pub fn new(arena: Arena, staging: Arena) -> Self {
         Self { arena, staging }
-    }
-
-    #[allow(dead_code)] // used by the peer runtime, not by this module's tests
-    pub fn arena(&self) -> &Arena {
-        &self.arena
-    }
-
-    #[allow(dead_code)] // used by the peer runtime, not by this module's tests
-    pub fn staging(&self) -> &Arena {
-        &self.staging
     }
 
     fn region(&self, region: Region) -> &Arena {

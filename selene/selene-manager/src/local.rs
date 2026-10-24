@@ -235,8 +235,8 @@ struct Connection {
     armed: u64,
 }
 
-/// Who owns a session's windows. Peer sessions have no local pidfd; they are
-/// reclaimed when their control/data streams close.
+/// Who owns a session's windows. Sessions of instances on other hosts have no local pidfd and
+/// are leased no windows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionKind {
     Local { pid: u32 },
@@ -395,8 +395,8 @@ impl Local {
         self.accept_with(connection, SessionKind::Local { pid })
     }
 
-    /// Registers a manager-to-manager session. It has no local pidfd; a peer's
-    /// windows are reclaimed by `close`/`peer_lost`.
+    /// Registers a session of an instance on another host. It has no local pidfd and is leased
+    /// no windows; `close` removes it.
     pub fn accept_remote(&mut self, connection: u64) -> Result<()> {
         self.accept_with(connection, SessionKind::Remote)
     }
@@ -444,17 +444,6 @@ impl Local {
                 record.reported = true;
                 record.windows.clear();
             }
-        }
-        self.connections
-            .retain(|_, record| !(record.closed && record.exited && record.reported));
-    }
-
-    /// Releases a peer's windows when its control/data streams end.
-    pub fn peer_lost(&mut self, connection: u64) {
-        if let Some(record) = self.connections.get_mut(&connection) {
-            record.closed = true;
-            record.exited = true;
-            record.windows.clear();
         }
         self.connections
             .retain(|_, record| !(record.closed && record.exited && record.reported));

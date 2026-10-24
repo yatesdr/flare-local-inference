@@ -4,7 +4,6 @@ pub mod config;
 pub mod control;
 pub mod data;
 pub mod disk;
-pub mod grants;
 pub mod local;
 pub mod pool;
 pub mod proto;
