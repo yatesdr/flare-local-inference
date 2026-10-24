@@ -24,8 +24,8 @@ defines configuration precedence.
 ## 1. Scope and configurations
 
 - Published prefix checkpoints at instruction, prompt, and terminal endpoints
-  are copied to the host store when they are created and restored to the GPU
-  when a later request matches a checkpoint the GPU no longer holds.
+  are announced when created and copied to the host store under GPU pressure.
+  A later matching request restores a retained checkpoint the GPU no longer holds.
 - Live request state, in-flight speculative rounds, and anything not published
   as a checkpoint are never offloaded.
 - Every model contract is covered through the package's runtime-sized
@@ -121,25 +121,30 @@ The worker depends on one trait:
 
 ```rust
 pub trait PrefixStore {
-    fn lookup(&mut self, history: &PrefixHistory, resident: u64) -> Option<HostHit>;
-    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<bool>;
+    fn lookup(&mut self, history: &PrefixHistory, resident: u64, before: u64) -> Option<HostHit>;
+    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
+    fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()>;
-    fn poll(&mut self, events: &mut Vec<StoreEvent>);
+    fn poll(&mut self, events: &mut Vec<StoreEvent>) -> Result<()>;
     fn stats(&self) -> StoreStats;
     fn close(&mut self) -> Result<()>;
 }
 ```
 
-`store` copies a published GPU checkpoint out and returns whether it queued
-the copy; `Ok(false)` means the key is already present or in flight or no
-slabs could be freed, and no event follows. `fetch` copies a looked-up chain
-into the ticket's page ids and state slot. Both enqueue work and return;
-`poll` drains completions as `StoreEvent::Stored`, `StoreEvent::Fetched`, and
-their failures. A `PublishedCheckpoint` names the GPU checkpoint, its key,
-its parent's key, its bucket digest, every page of its chain from the root
-with the count that belongs to the checkpoint itself, and the state slot of
-its row. `MemoryStore`, `DiskStore`, and `CompositeStore` implement the
-trait for serving, and a test double implements it for worker tests. The
+The worker calls `store` for every publication. `Noted` records it without a
+copy, a pin, or a later event; the checkpoint remains dirty. Under pressure the
+worker calls `write_back` on cold dirty eviction candidates. Both calls can
+answer `Queued`, which holds one GPU pin until `Stored` or `Deferred`, or
+`Present`, which marks the checkpoint clean immediately. Successful `Stored`
+marks it clean before releasing the pin; a failed copy leaves it dirty.
+`Retry` accepts no copy and stops a write-back round. Publish-time `Queued`
+retains its existing immediate-copy behavior. `fetch` copies a looked-up chain
+into the ticket's page ids and state slot. Every submission returns without
+waiting; `poll` drains completions and failures. A `PublishedCheckpoint` names
+the GPU checkpoint, its key, its parent's key, its bucket digest, every page of
+its chain from the root with the count that belongs to the checkpoint itself,
+and the state slot of its row. `MemoryStore`, `DiskStore`, and `CompositeStore`
+implement the trait for serving, and a test double implements it for worker tests. The
 worker holds `Option<Box<dyn PrefixStore>>`.
 
 Three components are shared by the implementations:
@@ -466,12 +471,14 @@ loader created. Process-peer tensor parallelism accepts the option only for a
 disk-only store whose ranks each keep their own records; see
 [section 2.14](#214-ranks-on-separate-hosts).
 
-The worker loop order is: admit, poll and complete executor frames, publish
-finished requests, drain publications into `store` calls, `poll` the store and
-apply inbound and outbound results, plan, submit. Eviction happens only inside
-admission, and outbound pins are taken before the next admission, so a
-checkpoint cannot be evicted between publication and its copy-out. Every
-store call from the worker returns without waiting.
+The worker loop admits requests, completes executor frames, and publishes
+finished requests. `service_store` polls host completions, applies inbound and
+outbound results, delivers eviction notices, reports publications through
+`store`, and starts pressure-driven write-back. The worker then plans and
+submits model work. Copy-out pins are taken before the next admission, so a
+checkpoint cannot be evicted between submission and its pin. Local and pooled
+stores receive logical eviction notices, including compaction. Every store
+call from the worker returns without waiting.
 
 Admission consults the store after `plan_admission`: `lookup` runs above the
 GPU hit, the policy in section 2.10 decides whether to fetch, and
@@ -504,8 +511,22 @@ the store and its transfer threads.
 
 Policy:
 
-- Outbound: every publication, immediately, unless the key exists or no slabs
-  can be freed for a window.
+- Outbound: publication calls `store`; a `Noted` outcome defers copying until
+  pressure. The high-water mark is the next eligible admission's reservation
+  from `admission_pages`, plus the next-step growth of running decodes, plus
+  `WINDOW_PAGES * max(IN_FLIGHT_WINDOWS, WINDOWS_IN_FLIGHT)`: currently
+  64 pages times two windows, or 128 pages of headroom. There is no new flag.
+  Free pages, retirement backing, and pages reclaimable from clean checkpoints
+  cover the mark without copying. Snapshot aliases are counted once through
+  the scheduler's existing backing calculation. Below it, dirty candidates
+  are offered coldest first, using the cache's leaf and compaction rules.
+  `Retry` stops submissions for that round; `Present` can end pressure at once.
+  Before each write-back pin, the export headroom check preserves decode growth
+  and the next admission's pages and restore row. A candidate that would consume
+  that capacity is skipped. Admission never waits for write-back: it prefers
+  the coldest clean eligible checkpoint, then drops the coldest dirty one if
+  no clean candidate is eligible. Existing pins and retirement fences apply.
+  With no host store configured, publication and write-back do nothing.
 - Inbound: fetch when the estimated transfer time is below half the estimated
   prefill time of the tokens gained. Transfer time is record bytes divided by
   the tier rate; prefill time is tokens gained divided by prefill throughput.
@@ -542,7 +563,7 @@ Offload limits interference through bounded work and explicit ownership:
   records awaiting their write stay pinned; when a pool is exhausted by pinned
   records, copy-out is skipped and counted, never waited for. Inbound waits
   are per request and visible as the `Inbound` phase.
-- Worker thread cost per publication is one job message carrying page ids;
+- A noted publication submits no copy job. A queued copy carries page ids;
   address expansion runs on the transfer threads.
 - Direct NVMe DMA uses the same per-batch byte limit. Section 4 measures
   contention for GPU memory bandwidth and its effect on serving latency.
@@ -769,9 +790,9 @@ memory its transfers may still use.
 instance to a pool manager, at `unix:PATH` on this host or `HOST:PORT`. The
 tenant requires the pool and defaults to `default`; it scopes
 what the manager shares, so nothing crosses tenants. Without the pool flag none
-of the code below runs: the worker builds no lookup history, tracks no evictions, sees no export requests, and
-local tiers behave as in the earlier sections (the pooled exception is the
-eviction bullet below). A pooled instance still reads
+of the sharing code below runs: the worker builds no pool lookup history and
+sees no export requests. Local and pooled instances use the same GPU write-back
+and eviction policy from section 2.10. A pooled instance still reads
 its own memory and disk tiers first; the pool supplies what they lack.
 
 The worker's part is a set of defaulted `PrefixStore` hooks, all run on the
@@ -829,8 +850,12 @@ model worker thread and none waiting on the network.
   record at once; a failed write is tried once more the next time the tier
   needs room, and the second failure drops it. None of this waits on the
   model worker: moves are queued, and the coldest waiting record is dropped
-  when the queue is full. The publication of a checkpoint still copies it into
-  the first host tier when it is published, not when the GPU cache evicts it.
+  when the queue is full. GPU publication still calls `store`, so dirty GPU
+  checkpoints are announced and remain claimable through export before a host
+  copy exists. `Noted` starts no copy; pressure-driven `write_back` copies into
+  the first host tier, using the same policy in local and pool modes. A dirty
+  GPU eviction drops the checkpoint and sends the existing eviction notice;
+  it never waits for a host copy.
 - **Two sources.** A restore reads at most two parts: the longest prefix held
   at the closest level, then one farther source from exactly where that part
   ends, with the endpoint's row from whichever ends last. The parts are planned

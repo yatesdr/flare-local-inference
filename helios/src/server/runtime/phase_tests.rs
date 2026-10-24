@@ -1176,6 +1176,8 @@ struct FakeStore {
     hit: Option<crate::offload::HostHit>,
     reject_fetch: bool,
     store_outcomes: VecDeque<crate::offload::StoreOutcome>,
+    write_back_outcomes: VecDeque<crate::offload::StoreOutcome>,
+    write_backs: Vec<crate::offload::PublishedCheckpoint>,
     progress: u64,
     stored: Vec<crate::offload::PublishedCheckpoint>,
     fetched: Vec<(crate::offload::HostHit, crate::offload::InboundTicket)>,
@@ -1218,6 +1220,8 @@ impl FakeStore {
             hit,
             reject_fetch: false,
             store_outcomes: VecDeque::new(),
+            write_back_outcomes: VecDeque::new(),
+            write_backs: Vec::new(),
             progress: 0,
             stored: Vec::new(),
             fetched: Vec::new(),
@@ -1342,6 +1346,18 @@ impl crate::offload::PrefixStore for FakeStore {
             .store_outcomes
             .pop_front()
             .unwrap_or(crate::offload::StoreOutcome::Queued))
+    }
+    fn write_back(
+        &mut self,
+        checkpoint: &crate::offload::PublishedCheckpoint,
+    ) -> Result<crate::offload::StoreOutcome> {
+        self.write_backs.push(checkpoint.clone());
+        Ok(self
+            .write_back_outcomes
+            .pop_front()
+            .unwrap_or(crate::offload::StoreOutcome::Retry(
+                crate::offload::StoreReason::Queue,
+            )))
     }
     fn fetch(
         &mut self,
@@ -1919,7 +1935,7 @@ fn an_export_is_refused_when_the_next_admission_would_no_longer_fit() {
 }
 
 #[test]
-fn a_pooled_store_hears_of_evictions_and_a_local_one_does_not() {
+fn pooled_and_local_stores_hear_of_evictions() {
     for pooled in [true, false] {
         let mut fixture = Fixture::new();
         fixture.config.limits.pages = 3;
@@ -1942,14 +1958,10 @@ fn a_pooled_store_hears_of_evictions_and_a_local_one_does_not() {
         worker.admit().unwrap();
         worker.service_store().unwrap();
         let evicted = &fake_store(&mut worker).evicted;
-        if pooled {
-            assert_eq!(evicted.len(), 1);
-            assert_eq!((evicted[0].0, evicted[0].1), (key, id.value()));
-            assert!(evicted[0].2.is_none());
-            assert_eq!(publication.key, key);
-        } else {
-            assert!(evicted.is_empty());
-        }
+        assert_eq!(evicted.len(), 1);
+        assert_eq!((evicted[0].0, evicted[0].1), (key, id.value()));
+        assert!(evicted[0].2.is_none());
+        assert_eq!(publication.key, key);
     }
 }
 
@@ -3661,4 +3673,392 @@ fn native_prompt_rejects_invalid_requested_logprob_ids() {
     incoming.prompt.logprob_token_ids = vec![0];
     incoming.prompt.logprobs = false;
     assert!(validate(&fixture.config, &incoming.prompt).is_err());
+}
+
+/// Create a ready checkpoint through the scheduler's inbound publication path,
+/// then release its request so eviction policy can consider it.
+fn unpinned_checkpoint(
+    worker: &mut Worker<'_>,
+    token: u32,
+    end: usize,
+) -> crate::cache::CheckpointId {
+    let spec = RequestSpec {
+        prompt: vec![token; end + 1],
+        message_boundaries: vec![],
+        conditioning: vec![],
+        max_new_tokens: 1,
+        grammar_constrained: false,
+        host_stops: false,
+        prompt_logprobs: false,
+        growable_output: true,
+    };
+    let plan = worker.scheduler.plan_admission(&spec).unwrap();
+    let key = plan.history().key_at(end as u64).unwrap();
+    let pages = (end as u64 - plan.resident_tokens()) as usize / 64;
+    let admitted = worker
+        .scheduler
+        .admit_planned(
+            spec,
+            plan,
+            Some(crate::scheduler::InboundRequest {
+                key,
+                consumed_tokens: end as u64,
+                pages,
+            }),
+        )
+        .unwrap();
+    worker.scheduler.finish_inbound(key, true).unwrap();
+    let id = worker
+        .scheduler
+        .request(admitted.handle)
+        .unwrap()
+        .prefix()
+        .unwrap();
+    worker.scheduler.cancel(admitted.handle).unwrap();
+    id
+}
+
+fn complete_store(worker: &mut Worker<'_>, id: crate::cache::CheckpointId, success: bool) {
+    let key = worker.scheduler.cache().checkpoint(id).unwrap().prefix();
+    fake_store(worker)
+        .events
+        .push_back(crate::offload::StoreEvent::Stored {
+            checkpoint: id,
+            key,
+            result: if success {
+                Ok(1)
+            } else {
+                Err("copy failed".into())
+            },
+        });
+}
+
+#[test]
+fn noted_publications_remain_dirty_without_pins_or_copies_when_there_is_room() {
+    for pooled in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.config.limits.pages = 256;
+        let (_sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        let mut store = FakeStore::new(None);
+        store.pooled = pooled;
+        store
+            .store_outcomes
+            .push_back(crate::offload::StoreOutcome::Noted);
+        worker.attach_store(Some(Box::new(store)));
+        let id = unpinned_checkpoint(&mut worker, 0, 64);
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 0);
+        assert!(
+            !worker
+                .scheduler
+                .cache()
+                .checkpoint(id)
+                .unwrap()
+                .host_clean()
+        );
+        assert!(worker.deferred_stores.is_empty());
+        assert_eq!(fake_store(&mut worker).stored.len(), 1);
+        assert!(!worker.service_store().unwrap());
+        assert!(fake_store(&mut worker).write_backs.is_empty());
+    }
+}
+
+#[test]
+fn queued_publications_release_one_pin_and_only_success_marks_them_clean() {
+    for success in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.config.limits.pages = 256;
+        let (_sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        worker.attach_store(Some(Box::new(FakeStore::new(None))));
+        let id = unpinned_checkpoint(&mut worker, 0, 64);
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 1);
+        assert!(
+            !worker
+                .scheduler
+                .cache()
+                .checkpoint(id)
+                .unwrap()
+                .host_clean()
+        );
+        complete_store(&mut worker, id, success);
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 0);
+        assert_eq!(
+            worker
+                .scheduler
+                .cache()
+                .checkpoint(id)
+                .unwrap()
+                .host_clean(),
+            success
+        );
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 0);
+    }
+}
+
+#[test]
+fn pressure_writes_cold_dirty_checkpoints_and_retry_stops_each_round() {
+    use crate::offload::{StoreOutcome::*, StoreReason};
+    for pooled in [false, true] {
+        let fixture = Fixture::new();
+        let (_sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        let mut store = FakeStore::new(None);
+        store.pooled = pooled;
+        store.store_outcomes.extend([Noted; 3]);
+        store
+            .write_back_outcomes
+            .extend([Queued, Retry(StoreReason::Queue)]);
+        worker.attach_store(Some(Box::new(store)));
+        let a = unpinned_checkpoint(&mut worker, 0, 64);
+        let b = unpinned_checkpoint(&mut worker, 1, 64);
+        let c = unpinned_checkpoint(&mut worker, 2, 64);
+        worker.service_store().unwrap();
+        assert_eq!(
+            fake_store(&mut worker)
+                .write_backs
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
+            [a, b]
+        );
+        assert_eq!(
+            (pins(&worker, a), pins(&worker, b), pins(&worker, c)),
+            (1, 0, 0)
+        );
+        fake_store(&mut worker)
+            .write_back_outcomes
+            .extend([Present, Queued]);
+        worker.service_store().unwrap();
+        assert_eq!(
+            fake_store(&mut worker)
+                .write_backs
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
+            [a, b, b, c]
+        );
+        assert!(worker.scheduler.cache().checkpoint(b).unwrap().host_clean());
+        assert!(!worker.scheduler.cache().checkpoint(a).unwrap().host_clean());
+        complete_store(&mut worker, a, true);
+        complete_store(&mut worker, c, true);
+        worker.service_store().unwrap();
+        worker.service_store().unwrap();
+        assert_eq!(
+            (pins(&worker, a), pins(&worker, b), pins(&worker, c)),
+            (0, 0, 0)
+        );
+        assert_eq!(fake_store(&mut worker).write_backs.len(), 4);
+    }
+}
+
+#[test]
+fn write_back_does_not_take_capacity_from_the_next_admission() {
+    use crate::offload::StoreOutcome::*;
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 3;
+    fixture.config.limits.max_sequence_tokens = 192;
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.store_outcomes.push_back(Noted);
+    store.write_back_outcomes.push_back(Queued);
+    worker.attach_store(Some(Box::new(store)));
+    let id = unpinned_checkpoint(&mut worker, 0, 64);
+    let (incoming, generation) = fixture.incoming(vec![1; 150], 4);
+    worker.pending.push_back(incoming);
+    worker.service_store().unwrap();
+    assert!(fake_store(&mut worker).write_backs.is_empty());
+    assert_eq!(pins(&worker, id), 0);
+    let _ = worker.admit().unwrap();
+    assert_eq!(worker.scheduler.stats().active_requests, 1);
+    assert!(worker.scheduler.cache().checkpoint(id).is_err());
+    worker.service_store().unwrap();
+    assert_eq!(fake_store(&mut worker).evicted[0].1, id.value());
+    drop(generation);
+}
+
+#[test]
+fn admission_proceeds_while_a_write_back_copy_is_in_flight() {
+    use crate::offload::StoreOutcome::*;
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.store_outcomes.push_back(Noted);
+    store.write_back_outcomes.push_back(Queued);
+    worker.attach_store(Some(Box::new(store)));
+    let id = unpinned_checkpoint(&mut worker, 0, 64);
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, id), 1);
+    let (incoming, generation) = fixture.incoming(vec![1; 70], 4);
+    worker.pending.push_back(incoming);
+    let _ = worker.admit().unwrap();
+    assert_eq!(worker.scheduler.stats().active_requests, 1);
+    assert_eq!(pins(&worker, id), 1);
+    complete_store(&mut worker, id, true);
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, id), 0);
+    drop(generation);
+}
+
+#[test]
+fn write_back_and_export_release_their_own_pins_in_either_completion_order() {
+    use crate::offload::StoreOutcome::*;
+    for export_first in [false, true] {
+        let fixture = Fixture::new();
+        let (_sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        let mut store = FakeStore::new(None);
+        store.pooled = true;
+        store.store_outcomes.push_back(Noted);
+        store.write_back_outcomes.push_back(Queued);
+        worker.attach_store(Some(Box::new(store)));
+        let id = unpinned_checkpoint(&mut worker, 0, 64);
+        worker.service_store().unwrap();
+        let key = worker.scheduler.cache().checkpoint(id).unwrap().prefix();
+        fake_store(&mut worker)
+            .events
+            .push_back(export_request(1, key, id.value(), 0));
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 2);
+        if export_first {
+            fake_store(&mut worker).events.push_back(export_ended(1));
+        } else {
+            complete_store(&mut worker, id, true);
+        }
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 1);
+        if export_first {
+            complete_store(&mut worker, id, true);
+        } else {
+            fake_store(&mut worker).events.push_back(export_ended(1));
+        }
+        fake_store(&mut worker).events.push_back(export_ended(1));
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 0);
+        assert!(
+            worker
+                .scheduler
+                .cache()
+                .checkpoint(id)
+                .unwrap()
+                .host_clean()
+        );
+        assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
+    }
+}
+
+#[test]
+fn write_back_pins_survive_ancestor_compaction() {
+    use crate::offload::StoreOutcome::*;
+    let mut fixture = Fixture::new();
+    fixture.config.limits.max_sequence_tokens = 256;
+    fixture.config.limits.snapshots = 2;
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.store_outcomes.extend([Noted; 2]);
+    worker.attach_store(Some(Box::new(store)));
+    let a = unpinned_checkpoint(&mut worker, 0, 64);
+    let b = unpinned_checkpoint(&mut worker, 0, 128);
+    // Commit the ancestor's host copy so pressure selects the dirty child.
+    worker.scheduler.stored_checkpoint(a).unwrap();
+    fake_store(&mut worker)
+        .write_back_outcomes
+        .push_back(Queued);
+    worker.service_store().unwrap();
+    let original = fake_store(&mut worker).write_backs[0].clone();
+    assert_eq!(original.id, b);
+    assert_eq!(pins(&worker, b), 1);
+    let (incoming, generation) = fixture.incoming(vec![1; 70], 4);
+    let spec = RequestSpec {
+        prompt: incoming.prompt.tokens.clone(),
+        message_boundaries: vec![],
+        conditioning: vec![],
+        max_new_tokens: 4,
+        grammar_constrained: false,
+        host_stops: false,
+        prompt_logprobs: false,
+        growable_output: true,
+    };
+    let plan = worker.scheduler.plan_admission(&spec).unwrap();
+    let key = plan.history().key_at(64).unwrap();
+    worker
+        .scheduler
+        .admit_planned(
+            spec,
+            plan,
+            Some(crate::scheduler::InboundRequest {
+                key,
+                consumed_tokens: 64,
+                pages: 1,
+            }),
+        )
+        .unwrap();
+    assert!(worker.scheduler.cache().checkpoint(a).is_err());
+    assert_eq!(pins(&worker, b), 1);
+    assert_eq!(
+        worker.scheduler.cache().page_chain(b).unwrap(),
+        original.chain_pages
+    );
+    complete_store(&mut worker, b, true);
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, b), 0);
+    let notice = &fake_store(&mut worker).evicted[0];
+    assert_eq!(notice.1, a.value());
+    assert_eq!(notice.2.as_ref().unwrap().id, b);
+    drop(generation);
+}
+
+#[test]
+fn present_stops_write_back_when_clean_reclamation_covers_the_watermark() {
+    use crate::offload::StoreOutcome::*;
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 130;
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.store_outcomes.extend([Noted; 3]);
+    store.write_back_outcomes.push_back(Present);
+    worker.attach_store(Some(Box::new(store)));
+    let a = unpinned_checkpoint(&mut worker, 0, 64);
+    let b = unpinned_checkpoint(&mut worker, 1, 64);
+    let c = unpinned_checkpoint(&mut worker, 2, 64);
+    assert_eq!(worker.scheduler.free_page_count(), 127);
+    worker.service_store().unwrap();
+    assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
+    assert!(worker.scheduler.cache().checkpoint(a).unwrap().host_clean());
+    assert!(!worker.scheduler.cache().checkpoint(b).unwrap().host_clean());
+    assert!(!worker.scheduler.cache().checkpoint(c).unwrap().host_clean());
+    assert!(!worker.service_store().unwrap());
+    assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
+}
+
+#[test]
+fn present_at_publication_marks_clean_without_a_pin_or_write_back() {
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store
+        .store_outcomes
+        .push_back(crate::offload::StoreOutcome::Present);
+    worker.attach_store(Some(Box::new(store)));
+    let id = unpinned_checkpoint(&mut worker, 0, 64);
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, id), 0);
+    assert!(
+        worker
+            .scheduler
+            .cache()
+            .checkpoint(id)
+            .unwrap()
+            .host_clean()
+    );
+    assert!(fake_store(&mut worker).write_backs.is_empty());
 }

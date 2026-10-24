@@ -1020,8 +1020,6 @@ impl<'a> Worker<'a> {
     fn attach_store(&mut self, store: Option<Box<dyn crate::offload::PrefixStore>>) {
         if store.is_some() {
             self.scheduler.enable_publications();
-        }
-        if store.as_ref().is_some_and(|store| store.pooled()) {
             self.scheduler.enable_evictions();
         }
         self.store = store;
@@ -2115,8 +2113,8 @@ impl<'a> Worker<'a> {
         Ok(true)
     }
 
-    /// Copy newly ready checkpoints out, apply finished host transfers, and
-    /// re-admit the waiters of a failed restore without the host store.
+    /// Report publications, apply host transfers, and start write-back under pressure.
+    /// Re-admit the waiters of a failed restore without the host store.
     fn service_store(&mut self) -> Result<bool> {
         self.scheduler
             .advance_to(super::observation::monotonic_ns())?;
@@ -2131,7 +2129,12 @@ impl<'a> Worker<'a> {
         let mut released = false;
         for event in events {
             match event {
-                StoreEvent::Stored { checkpoint, .. } => {
+                StoreEvent::Stored {
+                    checkpoint, result, ..
+                } => {
+                    if result.is_ok() {
+                        self.scheduler.stored_checkpoint(checkpoint)?;
+                    }
                     self.scheduler.unpin_checkpoint(checkpoint)?;
                     released = true;
                 }
@@ -2213,15 +2216,12 @@ impl<'a> Worker<'a> {
             let outcome = store.store(&publication);
             if let Ok(outcome) = outcome {
                 self.metrics.host_store_outcome(outcome);
-                match outcome {
-                    StoreOutcome::Queued => self.scheduler.pin_checkpoint(publication.id)?,
-                    StoreOutcome::Retry(_) => {
-                        if !waiting.contains(&publication.id) {
-                            waiting.push(publication.id);
-                        }
-                        continue;
+                self.scheduler.store_outcome(publication.id, outcome)?;
+                if matches!(outcome, StoreOutcome::Retry(_)) {
+                    if !waiting.contains(&publication.id) {
+                        waiting.push(publication.id);
                     }
-                    _ => {}
+                    continue;
                 }
                 if retry_ids.contains(&publication.id) {
                     let counter = if outcome == StoreOutcome::Oversize {
@@ -2238,6 +2238,29 @@ impl<'a> Worker<'a> {
             }
         }
         self.deferred_stores = waiting;
+        let next = next_admission(&self.scheduler, &self.parked, &self.pending);
+        for id in self.scheduler.write_back_candidates(next) {
+            // Like exports, copy-outs must leave the next admission and decode room.
+            if !self.scheduler.export_fits(id, next) || self.deferred_stores.contains(&id) {
+                continue;
+            }
+            let Some(publication) = self.scheduler.publication(id) else {
+                continue;
+            };
+            if let Ok(outcome) = store.write_back(&publication) {
+                self.metrics.host_store_outcome(outcome);
+                self.scheduler.store_outcome(id, outcome)?;
+                if matches!(outcome, StoreOutcome::Retry(_)) {
+                    break;
+                }
+                progress |= matches!(outcome, StoreOutcome::Queued | StoreOutcome::Present);
+                if outcome == StoreOutcome::Present
+                    && self.scheduler.write_back_candidates(next).is_empty()
+                {
+                    break;
+                }
+            }
+        }
         // Store gauges change without events, so they are refreshed every pass.
         self.metrics.store(store.stats());
         for handle in requeued {

@@ -59,6 +59,7 @@ pub struct Checkpoint {
     direct_pins: u64,
     pins: u64,
     accessed: u64,
+    host_clean: bool,
 }
 
 impl Checkpoint {
@@ -84,6 +85,9 @@ impl Checkpoint {
     }
     pub fn ready(&self) -> bool {
         self.ready
+    }
+    pub fn host_clean(&self) -> bool {
+        self.host_clean
     }
     pub fn pin_count(&self) -> u64 {
         self.pins
@@ -343,6 +347,7 @@ impl PrefixCheckpointCache {
             direct_pins: 0,
             pins: 0,
             accessed: tick,
+            host_clean: false,
         };
         self.next_id = next_id;
         self.clock = tick;
@@ -503,6 +508,35 @@ impl PrefixCheckpointCache {
         Ok(self.retire_leaf(id))
     }
 
+    pub(crate) fn mark_host_clean(&mut self, id: CheckpointId) -> Result<()> {
+        self.nodes
+            .get_mut(&id)
+            .ok_or("unknown checkpoint")?
+            .host_clean = true;
+        Ok(())
+    }
+
+    fn eviction_candidates(&self) -> impl Iterator<Item = &Checkpoint> {
+        self.nodes.values().filter(|node| {
+            node.ready
+                && ((node.pins == 0 && node.child_count == 0)
+                    || (node.direct_pins == 0 && node.child_count == 1))
+        })
+    }
+
+    pub(crate) fn dirty_eviction_candidates(&self) -> Vec<CheckpointId> {
+        let mut nodes: Vec<_> = self
+            .eviction_candidates()
+            .filter(|node| !node.host_clean)
+            .collect();
+        nodes.sort_by_key(|node| (node.accessed, node.id));
+        nodes.into_iter().map(|node| node.id).collect()
+    }
+
+    pub(crate) fn clean_reclaimable(&self) -> Reclaimable {
+        self.reclaimable(&[], true)
+    }
+
     /// Retire the oldest eligible leaf or compactable ancestor under either pressure.
     /// Only advance_completed permits reuse of the returned storage.
     pub fn evict(&mut self, target: EvictionTarget) -> EvictionReport {
@@ -510,14 +544,8 @@ impl PrefixCheckpointCache {
         while report.pages_scheduled < target.pages || report.snapshots_scheduled < target.snapshots
         {
             let candidate = self
-                .nodes
-                .values()
-                .filter(|node| {
-                    node.ready
-                        && ((node.pins == 0 && node.child_count == 0)
-                            || (node.direct_pins == 0 && node.child_count == 1))
-                })
-                .min_by_key(|node| (node.accessed, node.id))
+                .eviction_candidates()
+                .min_by_key(|node| (!node.host_clean, node.accessed, node.id))
                 .map(|node| node.id);
             let Some(id) = candidate else {
                 break;
@@ -543,9 +571,13 @@ impl PrefixCheckpointCache {
     /// unready children count as live; compaction keeps a node's pages (they
     /// move to its child and are reclaimed with it) and reclaims its snapshot.
     pub fn reclaimable_if_pinned(&self, id: CheckpointId) -> Result<Reclaimable> {
-        let chain = self.chain(id)?;
+        Ok(self.reclaimable(&self.chain(id)?, false))
+    }
+
+    fn reclaimable(&self, chain: &[CheckpointId], clean_only: bool) -> Reclaimable {
         let pinned = |node: &Checkpoint| node.pins + u64::from(chain.contains(&node.id));
-        let direct = |node: &Checkpoint| node.direct_pins + u64::from(node.id == id);
+        let direct =
+            |node: &Checkpoint| node.direct_pins + u64::from(chain.first() == Some(&node.id));
         let mut live: HashMap<CheckpointId, usize> = HashMap::new();
         let mut kids: HashMap<CheckpointId, Vec<CheckpointId>> = HashMap::new();
         let mut parent: HashMap<CheckpointId, Option<CheckpointId>> = HashMap::new();
@@ -566,7 +598,7 @@ impl PrefixCheckpointCache {
                 continue;
             }
             let node = &self.nodes[&next];
-            if !node.ready {
+            if !node.ready || (clean_only && !node.host_clean) {
                 continue;
             }
             let children = live[&next];
@@ -599,7 +631,7 @@ impl PrefixCheckpointCache {
                 }
             }
         }
-        Ok(out)
+        out
     }
 
     pub(crate) fn pending_retirement(&self) -> &[RetiredResources] {
