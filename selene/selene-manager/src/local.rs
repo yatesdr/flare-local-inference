@@ -1029,13 +1029,13 @@ fn create_region(
     Ok((path, size))
 }
 
-enum Pidfd {
+pub(crate) enum Pidfd {
     Open(OwnedFd),
     Exited,
     Unknown,
 }
 
-fn open_pidfd(pid: u32) -> Pidfd {
+pub(crate) fn open_pidfd(pid: u32) -> Pidfd {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) } as i32;
     if fd >= 0 {
         return Pidfd::Open(unsafe { OwnedFd::from_raw_fd(fd) });
@@ -1047,7 +1047,7 @@ fn open_pidfd(pid: u32) -> Pidfd {
     }
 }
 
-fn pidfd_exited(pidfd: &OwnedFd) -> bool {
+pub(crate) fn pidfd_exited(pidfd: &OwnedFd) -> bool {
     let mut poll = libc::pollfd {
         fd: pidfd.as_raw_fd(),
         events: libc::POLLIN,
