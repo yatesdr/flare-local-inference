@@ -93,7 +93,7 @@ pub fn descriptor() -> Descriptor {
 
 pub fn base(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
-        "cm-{}-{}-{label}",
+        "selene-{}-{}-{label}",
         std::process::id(),
         SERIAL.fetch_add(1, Ordering::Relaxed)
     ))
@@ -101,7 +101,7 @@ pub fn base(label: &str) -> PathBuf {
 
 pub fn instance_name(label: &str) -> String {
     format!(
-        "cm-{}-{label}-{}",
+        "selene-{}-{label}-{}",
         std::process::id(),
         SERIAL.fetch_add(1, Ordering::Relaxed)
     )
@@ -212,7 +212,7 @@ impl Host {
                     .parent()
                     .and_then(|path| path.parent().map(Path::to_path_buf))
             })
-            .unwrap_or_else(|| std::env::temp_dir().join("cm-host"));
+            .unwrap_or_else(|| std::env::temp_dir().join("selene-host"));
         Self {
             base,
             config,
