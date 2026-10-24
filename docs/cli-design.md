@@ -1047,7 +1047,7 @@ decoded-source windows are accounted for separately at startup.
 
 `--prefix-cache-pool ADDRESS` (`unix:PATH` or `HOST:PORT`) and
 `--prefix-cache-pool-tenant NAME` share checkpoints with other instances
-through a pool manager. The tenant is optional and defaults to the pool's default scope;
+through a pool manager. The tenant is optional and defaults to `default`;
 it requires the pool flag. Neither affects an instance that omits them. They are command-line
 options, forwarded to every rank like the other prefix cache settings, with no
 configuration-file key. See [the pool section](prefix-cache-offload.md#215-sharing-through-a-pool).
