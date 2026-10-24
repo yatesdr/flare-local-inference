@@ -304,8 +304,8 @@ mod tests {
         assert_eq!((sums.pages.len(), sums.row), (0, Some(22)));
 
         // A window the wrong size, or beyond the chain, is refused.
-        assert!(bytes.fill(0, 1, false, &mut vec![0u8; PAGE + 1]).is_err());
-        assert!(bytes.fill(4, 3, false, &mut vec![0u8; 3 * PAGE]).is_err());
+        assert!(bytes.fill(0, 1, false, &mut [0u8; PAGE + 1]).is_err());
+        assert!(bytes.fill(4, 3, false, &mut [0u8; 3 * PAGE]).is_err());
         drop(bytes);
         assert_eq!(releases.drain(), [key(48, 1), key(80, 2)]);
     }
