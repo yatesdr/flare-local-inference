@@ -307,7 +307,7 @@ impl Host {
     pub fn gauge(&self, name: &str) -> u64 {
         self.metrics()
             .lines()
-            .find_map(|line| line.strip_prefix(&format!("cm_{name} ")))
+            .find_map(|line| line.strip_prefix(&format!("selene_{name} ")))
             .and_then(|value| value.parse().ok())
             .unwrap_or(0)
     }
@@ -315,7 +315,7 @@ impl Host {
     pub fn durable_records(&self) -> usize {
         self.metrics()
             .lines()
-            .filter(|line| line.starts_with("cm_records{") && line.contains("tier=\"disk\""))
+            .filter(|line| line.starts_with("selene_records{") && line.contains("tier=\"disk\""))
             .filter_map(|line| line.rsplit(' ').next().unwrap().parse::<usize>().ok())
             .sum()
     }
@@ -324,7 +324,7 @@ impl Host {
         wait(|| {
             self.metrics()
                 .lines()
-                .filter(|line| line.starts_with("cm_records{") && line.contains("tier=\"disk\""))
+                .filter(|line| line.starts_with("selene_records{") && line.contains("tier=\"disk\""))
                 .filter_map(|line| line.rsplit(' ').next().unwrap().parse::<usize>().ok())
                 .sum::<usize>()
                 == count

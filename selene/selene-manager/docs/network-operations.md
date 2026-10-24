@@ -62,7 +62,7 @@ manager has a certificate), presents the token and says which carrier moves the 
   never touches the manager's windows, so its own exit is not waited for.
 - **Limits**: a transfer that makes no progress for the claim's progress timeout (3 s by
   default) expires; a socket that stalls for 20 s fails. The metrics carry
-  `cm_pool_channel_windows_total` and `cm_pool_channel_bytes_total` by `carrier`.
+  `selene_pool_channel_windows_total` and `selene_pool_channel_bytes_total` by `carrier`.
 
 A neighbour's host or GPU records are offered to a session without shared memory too, and an
 instance without shared memory can be the neighbour: the manager relays the windows between the two

@@ -6904,10 +6904,10 @@ impl Store {
             ("forward_retries_total", self.metrics.forward_retries),
             ("remote_fetched_total", self.metrics.remote_fetched),
         ] {
-            text.push_str(&format!("cm_{name} {value}\n"));
+            text.push_str(&format!("selene_{name} {value}\n"));
         }
         text.push_str(&format!(
-            "cm_nvme_seconds_total {}\n",
+            "selene_nvme_seconds_total {}\n",
             self.metrics.nvme_seconds
         ));
         for (outcome, count) in [
@@ -6919,13 +6919,13 @@ impl Store {
             ("inflight", self.metrics.retry_inflight),
             ("oversize", self.metrics.oversize),
         ] {
-            text.push_str(&format!("cm_puts_total{{outcome=\"{outcome}\"}} {count}\n"));
+            text.push_str(&format!("selene_puts_total{{outcome=\"{outcome}\"}} {count}\n"));
         }
         for (outcome, count) in [
             ("ok", self.metrics.gets_ok),
             ("error", self.metrics.gets_error),
         ] {
-            text.push_str(&format!("cm_gets_total{{outcome=\"{outcome}\"}} {count}\n"));
+            text.push_str(&format!("selene_gets_total{{outcome=\"{outcome}\"}} {count}\n"));
         }
         let mut ids: Vec<&NamespaceId> = self.namespaces.keys().collect();
         ids.sort_unstable();
@@ -6950,7 +6950,7 @@ impl Store {
                         };
                     }
                 }
-                text.push_str(&format!("cm_records{{namespace=\"{name}\",tier=\"{tier}\"}} {count}\ncm_bytes{{namespace=\"{name}\",tier=\"{tier}\"}} {bytes}\n"));
+                text.push_str(&format!("selene_records{{namespace=\"{name}\",tier=\"{tier}\"}} {count}\nselene_bytes{{namespace=\"{name}\",tier=\"{tier}\"}} {bytes}\n"));
                 let hits = self
                     .metrics
                     .hits
@@ -6958,7 +6958,7 @@ impl Store {
                     .copied()
                     .unwrap_or(0);
                 text.push_str(&format!(
-                    "cm_hits_total{{namespace=\"{name}\",tier=\"{tier}\"}} {hits}\n"
+                    "selene_hits_total{{namespace=\"{name}\",tier=\"{tier}\"}} {hits}\n"
                 ));
             }
         }
