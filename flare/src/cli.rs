@@ -9,8 +9,8 @@ use clap::{Args, Parser, Subcommand, builder::PossibleValuesParser, builder::Typ
 use flare_helios::{
     engram::Storage,
     offload::{
-        PoolOptions, PrefixCacheOffload, Transport, parse_pool_address, parse_pool_tenant,
-        parse_size,
+        PoolOptions, PrefixCacheOffload, Transport, DEFAULT_POOL_TENANT, parse_pool_address,
+        parse_pool_tenant, parse_size,
     },
     runtime_package::{KvCacheLimit, LoadOptions, MemoryLimit},
 };
@@ -742,7 +742,7 @@ pub struct ServingOptions {
         help_heading = "Prefix cache options")]
     pub prefix_cache_pool: Option<String>,
 
-    /// Tenant that scopes the pool; checkpoints are never shared across tenants [default: the pool's default scope].
+    /// Tenant that scopes the pool; checkpoints are never shared across tenants [default: default].
     #[arg(long, value_name = "NAME", value_parser = parse_pool_tenant,
         requires = "prefix_cache_pool", help_heading = "Prefix cache options")]
     pub prefix_cache_pool_tenant: Option<String>,
@@ -928,7 +928,9 @@ impl ServingOptions {
                 transport: self.prefix_cache_disk_transport,
                 pool: self.prefix_cache_pool.clone().map(|address| PoolOptions {
                     address,
-                    tenant: self.prefix_cache_pool_tenant.clone().unwrap_or_default(),
+                    tenant: self.prefix_cache_pool_tenant
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_POOL_TENANT.to_owned()),
                 }),
             },
             cluster_rank,
@@ -1530,7 +1532,7 @@ mod tests {
     }
 
     #[test]
-    fn the_tenant_needs_a_pool_and_defaults_to_empty() {
+    fn the_tenant_needs_a_pool_and_has_a_default() {
         let rejected = |arguments: &[&str]| {
             let mut all = vec!["flare", "run", "model.safetensors"];
             all.extend(arguments);
@@ -1548,7 +1550,7 @@ mod tests {
             single.load_options().prefix_cache.pool,
             Some(PoolOptions {
                 address: "unix:/run/selene.sock".into(),
-                tenant: String::new()
+                tenant: DEFAULT_POOL_TENANT.into()
             })
         );
         assert_eq!(

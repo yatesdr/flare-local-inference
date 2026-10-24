@@ -767,7 +767,7 @@ memory its transfers may still use.
 
 `--prefix-cache-pool ADDRESS` and `--prefix-cache-pool-tenant NAME` attach the
 instance to a pool manager, at `unix:PATH` on this host or `HOST:PORT`. The
-tenant requires the pool and defaults to the pool's default scope; it scopes
+tenant requires the pool and defaults to `default`; it scopes
 what the manager shares, so nothing crosses tenants. Without the pool flag none
 of the code below runs: the worker builds no lookup history, tracks no evictions, sees no export requests, and
 local tiers behave as in the earlier sections. A pooled instance still reads
@@ -824,8 +824,24 @@ model worker thread and none waiting on the network.
   worker the restore is one inbound ticket and one `Fetched` event, after both
   parts' writes drain, and a failure of either discards the destination pages.
 
-A pooled instance supports a single host. Multi-host packages keep disk-only
-retention and do not use a pool.
+Loading attaches the pool to the local tiers, if any, as a `PooledStore`; with
+no memory or disk tier every restore comes from the pool. The pool has its own
+copier, a third set of rank threads that names the manager's shared-memory
+windows by host address, so the registrar for those regions refuses any
+registration whose device address differs from its host address. The tenant
+defaults to `default`, because the protocol requires a nonempty one. The
+scope is the tenant, the model identity, the layout fingerprint and the
+per-rank plane sizes, so instances share only identical record layouts, and
+the instance id comes from the GPUs' UUIDs and is stable across restarts.
+
+The instance holds no pool staging of its own: the manager's regions are its
+memory, mapped and registered here once a session opens. Startup budgets the
+copier's streams and events on each device, like each local tier's, and adds no
+host bytes; the device cost of registering the manager's regions, about 2 MiB
+per GiB, depends on sizes the manager announces and is not included.
+
+A pooled instance supports a single host. A multi-host package keeps disk-only
+retention, and startup refuses a pool for it.
 
 ## 3. Implementation sequence
 

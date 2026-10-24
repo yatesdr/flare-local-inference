@@ -245,7 +245,9 @@ struct RankWorker {
     rank: usize,
     geometry: CacheGeometry,
     layout: RankLayout,
-    part: RankPart,
+    /// Resolves slab identities to GPU addresses; without it host addresses are
+    /// already GPU-addressable, as for memory registered with identical addresses.
+    part: Option<RankPart>,
     stream: Stream,
     event: Event,
     descriptors: Vec<Descriptor>,
@@ -263,7 +265,7 @@ impl RankWorker {
         device: i32,
         geometry: CacheGeometry,
         layout: RankLayout,
-        part: RankPart,
+        part: Option<RankPart>,
     ) -> Result<Self> {
         let stream = Stream::open_lowest_priority(context, device)?;
         let event = stream.blocking_event()?;
@@ -294,7 +296,7 @@ impl RankWorker {
         expand(
             &self.geometry,
             &self.layout,
-            Some(&self.part),
+            self.part.as_ref(),
             job,
             &mut self.descriptors,
         )?;
@@ -380,7 +382,32 @@ impl Transfers {
             )));
         }
         let layout = Layout::new(&geometry)?;
-        let parts = pool.device_parts(&layout)?;
+        let parts = pool.device_parts(&layout)?.into_iter().map(Some).collect();
+        Self::start_parts(contexts, geometry, layout, parts)
+    }
+
+    /// Start threads that copy to and from host memory registered with identical
+    /// host and device addresses, which a job names directly. The shared pool
+    /// regions map and register after startup, so no slab pool describes them.
+    pub fn start_unmapped(contexts: &[(usize, i32)], geometry: Vec<CacheGeometry>) -> Result<Self> {
+        if contexts.is_empty() || contexts.len() != geometry.len() {
+            return Err(invalid(format!(
+                "transfer threads need one context per rank: {} contexts for {} ranks",
+                contexts.len(),
+                geometry.len()
+            )));
+        }
+        let layout = Layout::new(&geometry)?;
+        let parts = vec![None; contexts.len()];
+        Self::start_parts(contexts, geometry, layout, parts)
+    }
+
+    fn start_parts(
+        contexts: &[(usize, i32)],
+        geometry: Vec<CacheGeometry>,
+        layout: Layout,
+        parts: Vec<Option<RankPart>>,
+    ) -> Result<Self> {
         let (reply_sender, receiver) = mpsc::channel();
         let mut transfers = Self {
             layout,

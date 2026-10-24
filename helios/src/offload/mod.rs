@@ -65,6 +65,9 @@ pub struct PoolOptions {
     pub tenant: String,
 }
 
+/// The tenant of an instance that names none: the protocol requires a nonempty one.
+pub const DEFAULT_POOL_TENANT: &str = "default";
+
 /// Accept `unix:PATH` or `HOST:PORT` as the pool address.
 pub fn parse_pool_address(text: &str) -> std::result::Result<String, String> {
     let invalid = || format!("invalid pool address '{text}': use unix:PATH or HOST:PORT");
@@ -145,7 +148,19 @@ impl PrefixCacheOffload {
         } else {
             pinned.div_ceil(ranks.max(1) as u64)
         };
-        Ok((mapped.div_ceil(512) + STORE_DEVICE_MARGIN_BYTES, host))
+        // The pool's copier adds its own streams and events. The manager's shared
+        // regions are its memory, mapped here, so the instance holds no staging of its own.
+        let tiers = if memory != 0 || disk {
+            mapped.div_ceil(512) + STORE_DEVICE_MARGIN_BYTES
+        } else {
+            0
+        };
+        let pool = if self.pool.is_some() {
+            STORE_DEVICE_MARGIN_BYTES
+        } else {
+            0
+        };
+        Ok((tiers + pool, host))
     }
 }
 
@@ -215,6 +230,7 @@ pub struct Prepared {
     /// Rank zero's record connection to each peer rank, ranks 1 onward, when the ranks run as
     /// separate processes; see [`shard`].
     pub(crate) shards: Vec<shard::Link>,
+    pub pool: Option<PoolOptions>,
 }
 
 /// The loader's result: either prepared resources or the reason no store exists.
@@ -391,8 +407,8 @@ pub fn prepare_with_inputs(
         return Ok(Preparation::None("disabled".to_owned()));
     }
     let _ = package;
-    if options.pool.is_some() {
-        return Err("the prefix cache pool client is not built into this binary".into());
+    if options.pool.is_some() && shard.is_some() {
+        return Err("a multi-host package cannot share prefixes through a pool".into());
     }
     let layout = Layout::new(&geometry)?;
     let fingerprint = match (shard, geometry.as_slice()) {
@@ -443,7 +459,7 @@ pub fn prepare_with_inputs(
         },
     };
     let directory = directory.filter(|_| disk_limit != 0);
-    if memory_bytes == 0 && directory.is_none() {
+    if memory_bytes == 0 && directory.is_none() && options.pool.is_none() {
         notes.insert(0, "disabled".to_owned());
         return Ok(Preparation::None(notes.join("; ")));
     }
@@ -517,6 +533,7 @@ pub fn prepare_with_inputs(
         scanned,
         directory_lock,
         shards: Vec::new(),
+        pool: options.pool.clone(),
     })))
 }
 
@@ -594,16 +611,23 @@ pub fn open(prepared: Prepared) -> Result<Box<dyn PrefixStore>> {
         scanned,
         directory_lock,
         shards,
+        pool,
     } = prepared;
-    let transfers: flare_selene::SharedCopier =
-        std::sync::Arc::new(std::sync::Mutex::new(transfer::Transfers::start(
-            &contexts,
-            geometry.clone(),
-            memory_pool
-                .as_ref()
-                .or(staging_pool.as_ref())
-                .ok_or("prefix transfers require a slab pool")?,
-        )?));
+    let pool_geometry = pool.is_some().then(|| geometry.clone());
+    let transfers: Option<flare_selene::SharedCopier> = memory_pool
+        .as_ref()
+        .or(staging_pool.as_ref())
+        .map(|slabs| {
+            Ok::<_, crate::Error>(std::sync::Arc::new(std::sync::Mutex::new(
+                transfer::Transfers::start(&contexts, geometry.clone(), slabs)?,
+            )) as flare_selene::SharedCopier)
+        })
+        .transpose()?;
+    let tier_transfers = || {
+        transfers
+            .clone()
+            .ok_or_else(|| flare_selene::Error::new("prefix transfers require a slab pool"))
+    };
     let disk = directory_lock
         .map(|directory| {
             let disk_transfers: flare_selene::SharedCopier = if memory_pool.is_some() {
@@ -615,7 +639,7 @@ pub fn open(prepared: Prepared) -> Result<Box<dyn PrefixStore>> {
                         .ok_or("disk transfers require a staging pool")?,
                 )?))
             } else {
-                transfers.clone()
+                tier_transfers()?
             };
             let transport: Box<dyn disk_store::DiskTransport> = match resolved.transport {
                 Transport::Staged if !shards.is_empty() => {
@@ -652,19 +676,105 @@ pub fn open(prepared: Prepared) -> Result<Box<dyn PrefixStore>> {
     let memory = memory_pool
         .map(|pool| {
             if disk.is_some() {
-                memory::MemoryStore::new_flat(identity, pool, transfers.clone())
+                memory::MemoryStore::new_flat(identity, pool, tier_transfers()?)
             } else {
-                memory::MemoryStore::new(identity, pool, transfers.clone())
+                memory::MemoryStore::new(identity, pool, tier_transfers()?)
             }
         })
         .transpose()?;
-    let store: Box<dyn HostStore> = match (memory, disk) {
-        (Some(memory), Some(disk)) => Box::new(composite::CompositeStore::new(memory, disk)?),
-        (Some(memory), None) => Box::new(memory),
-        (None, Some(disk)) => Box::new(disk),
-        (None, None) => return Err("no prefix store tier is configured".into()),
+    let local: Option<Box<dyn HostStore>> = match (memory, disk) {
+        (Some(memory), Some(disk)) => Some(Box::new(composite::CompositeStore::new(memory, disk)?)),
+        (Some(memory), None) => Some(Box::new(memory)),
+        (None, Some(disk)) => Some(Box::new(disk)),
+        (None, None) => None,
     };
-    Ok(Box::new(adapter::Host::new(store, false)))
+    let (Some(pool), Some(pool_geometry)) = (pool, pool_geometry) else {
+        let store = local.ok_or("no prefix store tier is configured")?;
+        return Ok(Box::new(adapter::Host::new(store, false)));
+    };
+    // The pool's copier reads and writes the manager's shared memory, which
+    // registers with identical host and device addresses after the session opens.
+    let copier: flare_selene::SharedCopier = std::sync::Arc::new(std::sync::Mutex::new(
+        transfer::Transfers::start_unmapped(&contexts, pool_geometry.clone())?,
+    ));
+    let uuids = contexts
+        .iter()
+        .map(|&(_, device)| crate::cuda::device_uuid(device))
+        .collect::<Result<Vec<_>>>()?;
+    attach_pool(
+        local,
+        &pool,
+        identity,
+        &pool_geometry,
+        copier,
+        std::sync::Arc::new(registrar::PoolRegistrar),
+        uuids,
+        contexts[0].0,
+    )
+}
+
+/// What a pool shares: the tenant, the model and the record layout.
+fn pool_scope(
+    tenant: &str,
+    identity: [u8; 32],
+    geometry: &[CacheGeometry],
+) -> Result<flare_selene::pool::Scope> {
+    let layout = Layout::new(geometry)?;
+    Ok(flare_selene::pool::Scope {
+        tenant: tenant.to_owned(),
+        model_identity: identity,
+        layout_fingerprint: geometry::fingerprint(geometry),
+        geometry: flare_selene::pool::Geometry {
+            page_tokens: layout.page_tokens,
+            ranks: geometry
+                .iter()
+                .map(|rank| flare_selene::pool::RankPlanes {
+                    plane_bytes: rank
+                        .planes
+                        .iter()
+                        .map(|plane| plane.padded_bytes())
+                        .collect(),
+                    row_bytes: rank.row.padded_bytes(),
+                })
+                .collect(),
+            page_record_bytes: layout.page_record_bytes,
+            row_record_bytes: layout.row_record_bytes,
+        },
+    })
+}
+
+/// Wrap the local tiers, if any, in a store attached to the pool. The client
+/// starts its thread and returns without waiting for the manager.
+#[allow(clippy::too_many_arguments)]
+fn attach_pool(
+    local: Option<Box<dyn HostStore>>,
+    pool: &PoolOptions,
+    identity: [u8; 32],
+    geometry: &[CacheGeometry],
+    copier: flare_selene::SharedCopier,
+    registrar: std::sync::Arc<dyn flare_selene::HostRegistrar + Send + Sync>,
+    gpu_uuids: Vec<[u8; 16]>,
+    registration_context: usize,
+) -> Result<Box<dyn PrefixStore>> {
+    use flare_selene::pool::{PoolAddress, PoolConfig, PooledStore};
+    let address = match pool.address.strip_prefix("unix:") {
+        Some(path) => PoolAddress::Unix(path.into()),
+        None => PoolAddress::Tcp(pool.address.clone()),
+    };
+    let config = PoolConfig {
+        address,
+        tenant: pool.tenant.clone(),
+        ca: None,
+        scope: pool_scope(&pool.tenant, identity, geometry)?,
+        instance_name: format!("flare-{}", std::process::id()),
+        gpu_uuids,
+        export_slots: 2,
+        claim_slots: 2,
+        level_order: None,
+        registration_context,
+    };
+    let store = PooledStore::connect(adapter::Tiers::new(local), config, copier, registrar, None)?;
+    Ok(Box::new(adapter::Host::new(Box::new(store), true)))
 }
 
 /// Completion of work a store accepted earlier.
@@ -777,6 +887,140 @@ mod tests {
             std::process::id(),
             SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
+    }
+
+    struct NoRegistrar;
+    impl flare_selene::HostRegistrar for NoRegistrar {
+        fn register(
+            &self,
+            _context: usize,
+            _address: usize,
+            _bytes: usize,
+        ) -> flare_selene::Result<Box<dyn flare_selene::Registration>> {
+            Err(flare_selene::Error::new("no registration in this test"))
+        }
+        fn map_split(
+            &self,
+            _requests: &[(usize, i32, usize)],
+        ) -> flare_selene::Result<Box<dyn flare_selene::SplitMapping>> {
+            Err(flare_selene::Error::new("no split mapping in this test"))
+        }
+    }
+
+    fn pool(address: &str) -> PoolOptions {
+        PoolOptions {
+            address: address.into(),
+            tenant: DEFAULT_POOL_TENANT.into(),
+        }
+    }
+
+    #[test]
+    fn a_pool_is_refused_for_a_multi_host_package_before_anything_is_built() {
+        let options = PrefixCacheOffload {
+            pool: Some(pool("unix:/run/selene.sock")),
+            ..Default::default()
+        };
+        let error = prepare_with_inputs(
+            &options,
+            std::path::Path::new("/missing/model.safetensors"),
+            [0; 32],
+            Vec::new(),
+            Vec::new(),
+            0,
+            Some((1, 2)),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("multi-host"), "{error}");
+    }
+
+    #[test]
+    fn without_a_pool_nothing_for_it_is_budgeted_or_built() {
+        let layout =
+            Layout::new(&[flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)]).unwrap();
+        assert_eq!(
+            PrefixCacheOffload::default()
+                .headroom_bytes(1, &layout)
+                .unwrap(),
+            (0, 0)
+        );
+        let tiers = PrefixCacheOffload {
+            memory_bytes: Some(1 << 30),
+            ..Default::default()
+        };
+        let pooled = PrefixCacheOffload {
+            pool: Some(pool("host:7000")),
+            ..tiers.clone()
+        };
+        let (device, host) = tiers.headroom_bytes(1, &layout).unwrap();
+        // The pool adds a copier's streams and events and no host staging.
+        assert_eq!(
+            pooled.headroom_bytes(1, &layout).unwrap(),
+            (device + STORE_DEVICE_MARGIN_BYTES, host)
+        );
+        let alone = PrefixCacheOffload {
+            pool: Some(pool("host:7000")),
+            ..Default::default()
+        };
+        assert!(alone.enabled());
+        assert_eq!(
+            alone.headroom_bytes(1, &layout).unwrap(),
+            (STORE_DEVICE_MARGIN_BYTES, 0)
+        );
+    }
+
+    #[test]
+    fn the_pool_scope_follows_the_record_layout_and_names_the_tenant() {
+        let geometry = vec![
+            flare_selene::testing::geometry(64, &[("k", 4096), ("v", 5000)], 4096),
+            flare_selene::testing::geometry(64, &[("k", 4096), ("v", 5000)], 4096),
+        ];
+        let layout = Layout::new(&geometry).unwrap();
+        let scope = pool_scope("acme", [9; 32], &geometry).unwrap();
+        assert_eq!(scope.tenant, "acme");
+        assert_eq!(scope.model_identity, [9; 32]);
+        assert_eq!(scope.layout_fingerprint, geometry::fingerprint(&geometry));
+        assert_eq!(scope.geometry.page_record_bytes, layout.page_record_bytes);
+        assert_eq!(scope.geometry.row_record_bytes, layout.row_record_bytes);
+        assert_eq!(scope.geometry.ranks.len(), 2);
+        assert_eq!(
+            scope.geometry.ranks[0].plane_bytes.iter().sum::<u64>() * 2,
+            layout.page_record_bytes
+        );
+        assert_ne!(
+            scope.layout_fingerprint,
+            geometry::fingerprint(&geometry[..1])
+        );
+    }
+
+    #[test]
+    fn a_pooled_store_starts_without_waiting_for_the_manager_and_closes() {
+        let geometry = vec![flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)];
+        let copier = flare_selene::testing::StoppedCopier::shared(&geometry).unwrap();
+        let directory = test_directory();
+        std::fs::create_dir_all(&directory).unwrap();
+        let socket = directory.join("absent.sock");
+        let mut store = attach_pool(
+            None,
+            &pool(&format!("unix:{}", socket.display())),
+            [3; 32],
+            &geometry,
+            copier,
+            std::sync::Arc::new(NoRegistrar),
+            vec![[1; 16]],
+            0,
+        )
+        .unwrap();
+        // The client is local until a manager answers: nothing is found or fetched.
+        assert!(store.pooled());
+        let mut history = PrefixHistory::new([3; 32]);
+        history.append(&[7; 128], &[]).unwrap();
+        assert!(store.lookup(&history, 0, u64::MAX).is_none());
+        let mut events = Vec::new();
+        store.poll(&mut events).unwrap();
+        assert!(events.is_empty());
+        store.close().unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
