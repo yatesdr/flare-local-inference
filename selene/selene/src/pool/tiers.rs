@@ -129,15 +129,16 @@ pub(crate) struct HashDone {
 
 /// Hashes records off the worker thread. Started when a store first announces.
 pub(crate) struct Hasher {
-    jobs: mpsc::Sender<HashJob>,
+    jobs: Option<mpsc::Sender<HashJob>>,
     done: mpsc::Receiver<HashDone>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Hasher {
     pub(crate) fn start() -> Result<Self> {
         let (jobs, rx) = mpsc::channel::<HashJob>();
         let (tx, done) = mpsc::channel();
-        thread::Builder::new()
+        let thread = thread::Builder::new()
             .name("selene-checksum".into())
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
@@ -162,15 +163,31 @@ impl Hasher {
                 }
             })
             .map_err(|e| crate::Error::caused_by("cannot start the checksum thread", e))?;
-        Ok(Self { jobs, done })
+        Ok(Self {
+            jobs: Some(jobs),
+            done,
+            thread: Some(thread),
+        })
     }
 
     pub(crate) fn submit(&self, job: HashJob) -> bool {
-        self.jobs.send(job).is_ok()
+        self.jobs
+            .as_ref()
+            .is_some_and(|jobs| jobs.send(job).is_ok())
     }
 
     pub(crate) fn collect(&self) -> Vec<HashDone> {
         self.done.try_iter().collect()
+    }
+}
+
+impl Drop for Hasher {
+    /// Wait for the job in progress, which reads slabs the store frees next.
+    fn drop(&mut self) {
+        self.jobs = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 

@@ -911,8 +911,9 @@ struct Announce {
 }
 
 pub struct MemoryStore {
-    core: Core,
+    // Dropped first: the checksum thread reads slabs the core frees.
     announce: Option<Announce>,
+    core: Core,
     transfers: SharedCopier,
     /// Reply scratch reused across polls.
     replies: Vec<Reply>,
