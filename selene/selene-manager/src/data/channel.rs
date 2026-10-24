@@ -25,7 +25,9 @@ use std::{
     time::Duration,
 };
 
-use flare_selene::pool::frame::{Carrier, Shape, TOKEN_BYTES, ToInstance, ToManager, Window};
+use flare_selene::pool::frame::{
+    Carrier, NO_SLOT, Shape, TOKEN_BYTES, ToInstance, ToManager, Window,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -404,14 +406,14 @@ async fn serve(inner: Arc<Inner>, stream: TcpStream) {
     // end from a cut), then drop the connection: only now is the transfer's memory quiet.
     let _ = timeout(GOODBYE, conn.shutdown()).await;
     drop(conn);
-    entry.queues.lock().unwrap().attached = false;
-    if let End::Failed(reason) = result {
-        let _ = inner.events.send(Event::Failed { transfer, reason });
-    }
     #[cfg(test)]
     {
         let delay = *inner.closed_delay.lock().unwrap();
         tokio::time::sleep(delay).await;
+    }
+    entry.queues.lock().unwrap().attached = false;
+    if let End::Failed(reason) = result {
+        let _ = inner.events.send(Event::Failed { transfer, reason });
     }
     let _ = inner.events.send(Event::Closed { transfer });
 }
@@ -422,7 +424,7 @@ async fn run(inner: &Inner, transfer: u64, entry: &Transfer, conn: &mut Box<dyn 
         Ok(Err(error)) => return failure(error),
         Err(_) => return End::Failed("the instance sent no hello".into()),
     };
-    if hello != ToManager::Hello(Carrier::Tcp) {
+    if hello != ToManager::Hello(Carrier::Stream) {
         return End::Failed("the instance did not ask for the stream carrier".into());
     }
     let result = match entry.kind {
@@ -503,6 +505,7 @@ async fn send_windows(
             shape: window.shape,
             page_xxh3: window.page_xxh3,
             row_xxh3: window.row_xxh3,
+            slot: NO_SLOT,
         });
         timeout(IO_TIMEOUT, async {
             frame.write(conn).await?;
@@ -558,10 +561,16 @@ async fn receive_windows(
                 index,
                 row_xxh3,
                 page_xxh3,
+                slot,
             } = frame
             else {
                 return Err(invalid("the instance sent a frame a put does not take"));
             };
+            if slot != NO_SLOT {
+                return Err(invalid(
+                    "a filled window names a slot on the stream carrier",
+                ));
+            }
             if index != grant.shape.index
                 || page_xxh3.len() != grant.shape.page_count as usize
                 || row_xxh3.is_some() != grant.shape.row
@@ -671,7 +680,7 @@ mod tests {
     async fn connect(address: &str, token: &[u8; TOKEN_BYTES]) -> Box<dyn Conn> {
         let mut stream = TcpStream::connect(address).await.unwrap();
         stream.write_all(token).await.unwrap();
-        ToManager::Hello(Carrier::Tcp)
+        ToManager::Hello(Carrier::Stream)
             .write(&mut stream)
             .await
             .unwrap();
@@ -878,6 +887,7 @@ mod tests {
             index: 0,
             row_xxh3: Some(3),
             page_xxh3: vec![1, 2],
+            slot: NO_SLOT,
         }
         .write(&mut conn)
         .await
@@ -936,6 +946,7 @@ mod tests {
             index: 0,
             row_xxh3: None,
             page_xxh3: vec![1],
+            slot: NO_SLOT,
         }
         .write(&mut conn)
         .await
@@ -1014,7 +1025,7 @@ mod tests {
         let tcp = TcpStream::connect(&address).await.unwrap();
         let mut conn = client(roots).connect(name, tcp).await.unwrap();
         conn.write_all(&token).await.unwrap();
-        ToManager::Hello(Carrier::Tcp)
+        ToManager::Hello(Carrier::Stream)
             .write(&mut conn)
             .await
             .unwrap();

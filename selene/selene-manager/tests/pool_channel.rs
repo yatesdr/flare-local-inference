@@ -381,6 +381,7 @@ async fn d6_a_put_whose_writer_dies_mid_window_fails_and_the_same_record_stores_
         index: shape.index,
         row_xxh3: None,
         page_xxh3: vec![0; shape.page_count as usize],
+        slot: flare_selene::pool::frame::NO_SLOT,
     }
     .write(&mut conn)
     .await

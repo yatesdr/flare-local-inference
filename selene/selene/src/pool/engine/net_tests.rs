@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use crate::{
     PageId, Registration, Result, StateSlotId,
     pool::{
-        frame::{Shape, Window},
+        frame::{NO_SLOT, Shape, Window},
         net::{Channel, Dial, Event, Filled, Id, Open, Staging},
         shared::{Command, PutSource},
         wire::{self, client_message::M as Out, server_message::M as In},
@@ -135,6 +135,7 @@ impl NetRig {
                 shape,
                 page_xxh3: sums,
                 row_xxh3: row,
+                slot: NO_SLOT,
             },
             slot,
         }
