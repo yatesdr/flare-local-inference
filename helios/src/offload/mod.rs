@@ -148,6 +148,9 @@ impl PrefixCacheOffload {
         let pinned = memory - ordinary;
         let mapped = if disk {
             pinned + staging
+        } else if self.pool.is_some() {
+            // Records a pool shares must be readable by the CPU, so the pool is not split.
+            pinned
         } else {
             pinned.div_ceil(ranks.max(1) as u64)
         };
@@ -478,7 +481,8 @@ pub fn prepare_with_inputs(
     let checkpoint_memory = memory_bytes - input_memory;
     let memory_pool = (checkpoint_memory != 0)
         .then(|| {
-            if directory.is_none() {
+            // A pool shares what the CPU can read, so its memory is never split by rank.
+            if directory.is_none() && options.pool.is_none() {
                 return Ok(slab::SlabPool::sized_by_rank(
                     &layout,
                     checkpoint_memory,
@@ -988,6 +992,11 @@ mod tests {
             pooled.headroom_bytes(1, &layout).unwrap(),
             (device + STORE_DEVICE_MARGIN_BYTES, host)
         );
+        // A pool shares what the CPU reads, so its memory is mapped whole by the device
+        // instead of split across ranks.
+        let split = tiers.headroom_bytes(2, &layout).unwrap().0;
+        let whole = pooled.headroom_bytes(2, &layout).unwrap().0;
+        assert!(whole > split + STORE_DEVICE_MARGIN_BYTES, "{whole} {split}");
         let alone = PrefixCacheOffload {
             pool: Some(pool("host:7000")),
             ..Default::default()
