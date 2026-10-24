@@ -187,6 +187,10 @@ pub enum StoreOutcome {
     Present,
     Retry(StoreReason),
     Oversize,
+    /// The store recorded the publication without copying it. The checkpoint
+    /// has no host copy until a later `write_back` stores it; no pin is kept
+    /// and no event follows.
+    Noted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,8 +240,17 @@ pub enum Retirement {
 pub trait HostStore {
     /// Deepest record chain extending `resident` and strictly below `before`.
     fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit>;
-    /// Only Queued promises an event and retains a GPU copy-out pin.
+    /// Only Queued promises an event and retains a GPU copy-out pin. A store
+    /// that copies under memory pressure answers Noted and copies on
+    /// `write_back`.
     fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
+    /// Copy a checkpoint the store answered Noted for, because the worker
+    /// expects to evict it soon. Outcomes mean what they mean for `store`:
+    /// Queued keeps the pin until Stored, Present means a host copy already
+    /// exists, and Retry means not now.
+    fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+        self.store(checkpoint)
+    }
     /// Copy a looked-up chain into the ticket's ids. An error means no event follows.
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()>;
     /// Report completed work. `Err` means the store can no longer report
