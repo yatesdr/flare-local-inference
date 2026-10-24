@@ -824,6 +824,11 @@ pub trait PrefixStore {
     fn lookup(&mut self, history: &PrefixHistory, resident: u64, before: u64) -> Option<HostHit>;
     /// Only Queued promises an event and retains a GPU copy-out pin.
     fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
+    /// Copy a checkpoint `store` answered Noted for, ahead of its eviction;
+    /// see `flare_selene::HostStore::write_back`.
+    fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+        self.store(checkpoint)
+    }
     /// Copy a looked-up chain into the ticket's ids. An error means no event follows.
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()>;
     /// Report completed work. `Err` means the store can no longer report

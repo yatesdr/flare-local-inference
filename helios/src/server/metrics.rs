@@ -465,7 +465,7 @@ impl Metrics {
     pub(super) fn host_store_outcome(&self, outcome: crate::offload::StoreOutcome) {
         use crate::offload::{StoreOutcome, StoreReason};
         let reason = match outcome {
-            StoreOutcome::Queued => return,
+            StoreOutcome::Queued | StoreOutcome::Noted => return,
             StoreOutcome::Present => 0,
             StoreOutcome::Retry(StoreReason::Inflight) => 1,
             StoreOutcome::Retry(StoreReason::Slabs) => 2,

@@ -46,6 +46,10 @@ impl PrefixStore for Host {
         Ok(self.store.store(checkpoint)?)
     }
 
+    fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+        Ok(self.store.write_back(checkpoint)?)
+    }
+
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()> {
         Ok(self.store.fetch(hit, ticket)?)
     }
@@ -172,6 +176,16 @@ impl HostStore for Tiers {
     fn store(&mut self, checkpoint: &PublishedCheckpoint) -> flare_selene::Result<StoreOutcome> {
         match &mut self.0 {
             Some(tiers) => tiers.store(checkpoint),
+            None => Ok(StoreOutcome::Present),
+        }
+    }
+
+    fn write_back(
+        &mut self,
+        checkpoint: &PublishedCheckpoint,
+    ) -> flare_selene::Result<StoreOutcome> {
+        match &mut self.0 {
+            Some(tiers) => tiers.write_back(checkpoint),
             None => Ok(StoreOutcome::Present),
         }
     }
