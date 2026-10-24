@@ -1,0 +1,577 @@
+//! The writer role: spilling a record into the manager's store.
+//!
+//! A put asks the manager to accept a record, fills the windows the manager
+//! grants (from GPU pages by D2H copies, or from bytes a store or probe
+//! supplies on the host copy thread), reports each window's checksums after the
+//! copy drained, and commits the record's header and checksum segment. The
+//! writer's own copy may be dropped only when the put ends `Stored` or
+//! `Present`. A put ends, and reports once, only after every copy that read
+//! its source has drained; windows left unfilled stay leased to it until the
+//! fence acknowledgment that follows a refusal, a cancel or a failure.
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime},
+};
+
+use crate::{
+    Direction, Error, Job, JobId, PrefixKey,
+    record::{Header, checksum},
+    slab::WINDOW_PAGES,
+};
+
+use super::{
+    super::{
+        codec,
+        exporter::{Checksums, PutBytes},
+        shared::{PoolEvent, PutOutcome, PutRefusal, PutRequest, PutSource},
+        wire::{self, client_message::M as Out},
+    },
+    Engine, Owner,
+    coverage::Coverage,
+    hostfill::{FillJob, FillOwner},
+    requester::ExpectedRecord,
+};
+
+/// A put that has not ended by then is abandoned.
+pub const PUT_DEADLINE: Duration = Duration::from_secs(30);
+
+enum Source {
+    Gpu {
+        pages: Vec<crate::PageId>,
+        slot: crate::StateSlotId,
+    },
+    Host(Arc<Mutex<Box<dyn PutBytes>>>),
+}
+
+#[derive(PartialEq, Eq)]
+enum Phase {
+    Begun,
+    Accepted,
+    Committed,
+}
+
+struct Put {
+    key: PrefixKey,
+    bucket: [u8; 16],
+    chain_pages: u64,
+    row: bool,
+    source: Source,
+    phase: Phase,
+    first_page: u64,
+    parent: Option<PrefixKey>,
+    coverage: Option<Coverage>,
+    /// Checksums of the accepted record's pages, in order, and of its row.
+    sums: Vec<u64>,
+    row_sum: Option<u64>,
+    /// Windows granted and not yet reported filled, with the claim-order index
+    /// of their first page.
+    windows: HashMap<u32, (wire::WindowSpec, u64)>,
+    jobs_outstanding: u32,
+    failed: Option<Error>,
+    cancelled: bool,
+    cancel_sent: bool,
+    refused: Option<PutOutcome>,
+    stored: Option<u64>,
+    fence_sent: bool,
+    deadline: Instant,
+}
+
+#[derive(Default)]
+pub(crate) struct State {
+    puts: HashMap<u64, Put>,
+}
+
+impl State {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.puts.is_empty()
+    }
+
+    pub(crate) fn busy(&self) -> bool {
+        self.puts.values().any(|p| p.jobs_outstanding > 0)
+    }
+}
+
+fn refusal(reason: i32) -> PutOutcome {
+    use wire::Reason as R;
+    match R::try_from(reason) {
+        Ok(R::Present) => PutOutcome::Present,
+        Ok(R::Inflight) => PutOutcome::Refused(PutRefusal::Inflight),
+        Ok(R::Budget) => PutOutcome::Refused(PutRefusal::Budget),
+        Ok(R::Oversize) => PutOutcome::Refused(PutRefusal::Oversize),
+        Ok(R::Quota) => PutOutcome::Refused(PutRefusal::Quota),
+        Ok(R::Invalid) => PutOutcome::Refused(PutRefusal::Invalid),
+        Ok(R::Queue) => PutOutcome::Refused(PutRefusal::Queue),
+        Ok(R::Io) => PutOutcome::Refused(PutRefusal::Io),
+        Ok(R::PutNotReady) => PutOutcome::Refused(PutRefusal::NotReady),
+        _ => PutOutcome::Failed(Error::new("the manager refused the put without a reason")),
+    }
+}
+
+impl Engine {
+    pub(crate) fn start_put(&mut self, now: Instant, id: u64, request: PutRequest) {
+        let fail = |engine: &Engine, why: &str| {
+            engine.event(PoolEvent::Put {
+                id,
+                outcome: PutOutcome::Failed(Error::new(why)),
+            })
+        };
+        if !self.ready() || self.closing || self.quarantined() {
+            return fail(self, "the pool is not ready");
+        }
+        if self
+            .sess
+            .as_ref()
+            .and_then(|s| s.regions.as_ref())
+            .is_none()
+        {
+            return fail(self, "this session has no shared memory to write through");
+        }
+        let gpu_matches = match &request.source {
+            PutSource::Gpu { pages, .. } => pages.len() as u64 == request.chain_pages,
+            PutSource::Host(_) => true,
+        };
+        if request.tail_pages > request.chain_pages || !gpu_matches {
+            return fail(self, "the put does not describe a consistent record");
+        }
+        self.emit(Out::PutBegin(wire::PutBegin {
+            put_id: id,
+            key: Some(codec::key_to(request.key)),
+            chain_pages: request.chain_pages,
+            row: request.row,
+            has_published_parent: request.parent.is_some(),
+            published_parent: request.parent.map(codec::key_to),
+            bucket: request.bucket.to_vec(),
+            published_tail_pages: request.tail_pages,
+            mode: wire::CopyMode::SharedWindows as i32,
+            generation: request.generation,
+        }));
+        self.writer.puts.insert(
+            id,
+            Put {
+                key: request.key,
+                bucket: request.bucket,
+                chain_pages: request.chain_pages,
+                row: request.row,
+                source: match request.source {
+                    PutSource::Gpu { pages, slot } => Source::Gpu { pages, slot },
+                    PutSource::Host(bytes) => Source::Host(Arc::new(Mutex::new(bytes))),
+                },
+                phase: Phase::Begun,
+                first_page: 0,
+                parent: None,
+                coverage: None,
+                sums: Vec::new(),
+                row_sum: None,
+                windows: HashMap::new(),
+                jobs_outstanding: 0,
+                failed: None,
+                cancelled: false,
+                cancel_sent: false,
+                refused: None,
+                stored: None,
+                fence_sent: false,
+                deadline: now + PUT_DEADLINE,
+            },
+        );
+    }
+
+    /// Stop a put that has not been committed. It ends `Cancelled` once its
+    /// copies drained; one already committed runs to the manager's answer.
+    pub(crate) fn cancel_put(&mut self, id: u64) {
+        let Some(put) = self.writer.puts.get_mut(&id) else {
+            return;
+        };
+        put.cancelled = true;
+        self.send_cancel(id);
+        self.drive_put(id);
+    }
+
+    fn send_cancel(&mut self, id: u64) {
+        let Some(put) = self.writer.puts.get_mut(&id) else {
+            return;
+        };
+        if put.phase != Phase::Committed && !put.cancel_sent {
+            put.cancel_sent = true;
+            self.emit(Out::PutCancel(wire::PutCancel { put_id: id }));
+        }
+    }
+
+    fn fail_put(&mut self, id: u64, error: Error) {
+        let Some(put) = self.writer.puts.get_mut(&id) else {
+            return;
+        };
+        put.failed.get_or_insert(error);
+        self.send_cancel(id);
+        self.drive_put(id);
+    }
+
+    /// The record the manager accepted, as a header and a checksum segment.
+    fn put_header(&self, put: &Put) -> crate::Result<Header> {
+        let scope = &self.st.scope;
+        Header::new(
+            &scope.record_geometry(),
+            scope.model_identity,
+            scope.layout_fingerprint,
+            put.key,
+            put.parent,
+            put.bucket,
+            (put.chain_pages - put.first_page) as u32,
+            SystemTime::now(),
+        )
+    }
+
+    pub(crate) fn on_put_accept(&mut self, accept: wire::PutAccept) {
+        let id = accept.put_id;
+        let Some(put) = self.writer.puts.get(&id) else {
+            return;
+        };
+        if put.phase != Phase::Begun || put.cancelled || put.failed.is_some() {
+            return;
+        }
+        let pages = put.chain_pages.checked_sub(accept.first_page);
+        let parent = accept
+            .parent
+            .as_ref()
+            .and_then(codec::key_from)
+            .filter(|_| accept.has_parent);
+        let Some(pages) = pages.filter(|_| accept.channel.is_none()) else {
+            return self.fail_put(
+                id,
+                Error::new("the manager accepted a put this client cannot carry out"),
+            );
+        };
+        if pages == 0 && !put.row {
+            return self.fail_put(
+                id,
+                Error::new("the manager accepted a put with nothing to write"),
+            );
+        }
+        let put = self.writer.puts.get_mut(&id).expect("present");
+        put.first_page = accept.first_page;
+        put.parent = parent;
+        let expected = match self.put_header(self.writer.puts.get(&id).expect("present")) {
+            Ok(header) => {
+                if self.writer.puts[&id].row {
+                    header.length_with_row()
+                } else {
+                    header.row_segment
+                }
+            }
+            Err(error) => return self.fail_put(id, error),
+        };
+        if accept.record_bytes != expected {
+            return self.fail_put(
+                id,
+                Error::new(format!(
+                    "the manager expects a {}-byte record, this client writes {expected}",
+                    accept.record_bytes
+                )),
+            );
+        }
+        let put = self.writer.puts.get_mut(&id).expect("present");
+        put.coverage = Some(Coverage::new(vec![ExpectedRecord {
+            key: put.key,
+            first_page: 0,
+            pages: pages as u32,
+            row: put.row,
+        }]));
+        put.sums = vec![0; pages as usize];
+        put.phase = Phase::Accepted;
+    }
+
+    pub(crate) fn on_put_grant(&mut self, grant: wire::PutGrant) {
+        let id = grant.put_id;
+        let (page_bytes, row_bytes) = (self.st.page_record_bytes(), self.st.row_record_bytes());
+        let regions = self.sess.as_ref().and_then(|s| s.regions.clone());
+        let (Some(spec), Some(put)) = (grant.window, self.writer.puts.get_mut(&id)) else {
+            return;
+        };
+        if put.phase != Phase::Accepted || put.cancelled || put.failed.is_some() {
+            return;
+        }
+        let dest = match put
+            .coverage
+            .as_mut()
+            .expect("accepted")
+            .accept(&spec, page_bytes, row_bytes)
+        {
+            Ok(dest) => dest,
+            Err(why) => return self.fail_put(id, Error::new(why)),
+        };
+        let address = regions
+            .as_ref()
+            .and_then(|r| r.get(spec.region()))
+            .and_then(|region| region.address(spec.offset, spec.length));
+        let Some(address) = address else {
+            return self.fail_put(id, Error::new("the granted window lies outside its region"));
+        };
+        let put = self.writer.puts.get_mut(&id).expect("present");
+        let first = put.first_page + dest;
+        let count = spec.page_count as usize;
+        put.windows.insert(spec.index, (spec, dest));
+        match &put.source {
+            Source::Gpu { pages, slot } => {
+                let mut jobs = Vec::new();
+                let mut from = 0;
+                while from < count || (count == 0 && jobs.is_empty()) {
+                    let end = (from + WINDOW_PAGES).min(count);
+                    let job_pages = (from..end)
+                        .map(|i| (pages[first as usize + i], address + i * page_bytes as usize))
+                        .collect();
+                    let row = (end == count && spec.row)
+                        .then(|| (*slot, address + count * page_bytes as usize));
+                    jobs.push(Job {
+                        id: JobId(0),
+                        window: spec.index,
+                        direction: Direction::Out,
+                        pages: job_pages,
+                        row,
+                    });
+                    from = end;
+                    if count == 0 {
+                        break;
+                    }
+                }
+                put.jobs_outstanding += jobs.len() as u32;
+                for job in jobs {
+                    self.queue_job(
+                        job,
+                        Owner::Put {
+                            put: id,
+                            window: spec.index,
+                        },
+                    );
+                }
+            }
+            Source::Host(bytes) => {
+                let bytes = bytes.clone();
+                put.jobs_outstanding += 1;
+                let (row, count) = (spec.row, spec.page_count);
+                let job = FillJob {
+                    owner: FillOwner::Put(id),
+                    window: spec.index,
+                    address,
+                    length: spec.length as usize,
+                    work: Box::new(move |dst| bytes.lock().unwrap().fill(first, count, row, dst)),
+                };
+                if !self.submit_fill(job) {
+                    let put = self.writer.puts.get_mut(&id).expect("present");
+                    put.jobs_outstanding -= 1;
+                    self.fail_put(id, Error::new("the host copy thread cannot start"));
+                }
+            }
+        }
+    }
+
+    /// A D2H job of a put drained.
+    pub(crate) fn on_put_job(&mut self, id: u64, window: u32, result: crate::Result<()>) {
+        let Some(put) = self.writer.puts.get_mut(&id) else {
+            return;
+        };
+        put.jobs_outstanding = put.jobs_outstanding.saturating_sub(1);
+        match result {
+            Err(error) => self.fail_put(id, error),
+            Ok(()) => {
+                let owner = Owner::Put { put: id, window };
+                let running = self
+                    .jobs
+                    .values()
+                    .any(|o| matches!((o, owner), (Owner::Put { put: a, window: b }, Owner::Put { put: c, window: d }) if *a == c && *b == d))
+                    || self.pending.iter().any(|(_, o)| matches!(o, Owner::Put { put: a, window: b } if *a == id && *b == window));
+                if !running {
+                    self.window_filled(id, window, None);
+                }
+            }
+        }
+        self.drive_put(id);
+    }
+
+    /// A host fill of a put finished.
+    pub(crate) fn on_put_fill(
+        &mut self,
+        owner: FillOwner,
+        window: u32,
+        result: crate::Result<Checksums>,
+    ) {
+        let FillOwner::Put(id) = owner else {
+            return;
+        };
+        let Some(put) = self.writer.puts.get_mut(&id) else {
+            return;
+        };
+        put.jobs_outstanding = put.jobs_outstanding.saturating_sub(1);
+        match result {
+            Err(error) => self.fail_put(id, error),
+            Ok(sums) => self.window_filled(id, window, Some(sums)),
+        }
+        self.drive_put(id);
+    }
+
+    /// The window's bytes are in place: report it with the checksums to commit
+    /// (the source's own when it persists them, otherwise of what was written).
+    fn window_filled(&mut self, id: u64, window: u32, supplied: Option<Checksums>) {
+        let page_bytes = self.st.page_record_bytes() as usize;
+        let regions = self.sess.as_ref().and_then(|s| s.regions.clone());
+        let Some(put) = self.writer.puts.get_mut(&id) else {
+            return;
+        };
+        if put.failed.is_some() || put.cancelled || put.refused.is_some() || put.stored.is_some() {
+            return;
+        }
+        let Some((spec, dest)) = put.windows.remove(&window) else {
+            return;
+        };
+        let sums = supplied.or_else(|| {
+            let region = regions.as_ref()?.get(spec.region())?;
+            let bytes = region.bytes(spec.offset, spec.length)?;
+            let count = spec.page_count as usize;
+            Some(Checksums {
+                pages: (0..count)
+                    .map(|i| checksum(&bytes[i * page_bytes..(i + 1) * page_bytes]))
+                    .collect(),
+                row: spec.row.then(|| checksum(&bytes[count * page_bytes..])),
+            })
+        });
+        let Some(sums) = sums.filter(|s| s.pages.len() == spec.page_count as usize) else {
+            return self.fail_put(id, Error::new("a window's checksums are missing"));
+        };
+        for (i, sum) in sums.pages.iter().enumerate() {
+            put.sums[dest as usize + i] = *sum;
+        }
+        if spec.row {
+            put.row_sum = sums.row;
+        }
+        self.emit(Out::PutFilled(wire::PutFilled {
+            put_id: id,
+            index: window,
+            page_xxh3: sums.pages,
+            row_xxh3: sums.row.unwrap_or(0),
+            has_row: sums.row.is_some(),
+        }));
+    }
+
+    pub(crate) fn on_stored(&mut self, stored: wire::Stored) {
+        if let Some(put) = self.writer.puts.get_mut(&stored.put_id) {
+            put.stored = Some(stored.bytes);
+            self.drive_put(stored.put_id);
+        }
+    }
+
+    pub(crate) fn on_put_refused(&mut self, refused: wire::PutRefused) {
+        if let Some(put) = self.writer.puts.get_mut(&refused.put_id) {
+            put.refused.get_or_insert(refusal(refused.reason));
+            self.drive_put(refused.put_id);
+        }
+    }
+
+    /// Commit when every window is filled; end the put when it is over and its
+    /// source is no longer read.
+    fn drive_put(&mut self, id: u64) {
+        let Some(put) = self.writer.puts.get_mut(&id) else {
+            return;
+        };
+        let over =
+            put.stored.is_some() || put.refused.is_some() || put.failed.is_some() || put.cancelled;
+        if !over {
+            let ready = put.phase == Phase::Accepted
+                && put.coverage.as_ref().is_some_and(|c| c.complete())
+                && put.windows.is_empty()
+                && put.jobs_outstanding == 0;
+            if ready {
+                return self.commit_put(id);
+            }
+            return;
+        }
+        if put.jobs_outstanding > 0 {
+            return;
+        }
+        let fenced = put.stored.is_some() || put.phase == Phase::Begun || put.fence_sent;
+        if !fenced {
+            put.fence_sent = true;
+            self.emit(Out::FenceAck(wire::FenceAck {
+                subject: Some(wire::fence_ack::Subject::PutId(id)),
+                outcome: wire::FenceOutcome::Drained as i32,
+            }));
+        }
+        let put = self.writer.puts.remove(&id).expect("present");
+        let outcome = if let Some(bytes) = put.stored {
+            PutOutcome::Stored { bytes }
+        } else if let Some(outcome) = put.refused {
+            outcome
+        } else if put.cancelled {
+            PutOutcome::Cancelled
+        } else {
+            PutOutcome::Failed(put.failed.unwrap_or_else(|| Error::new("the put failed")))
+        };
+        self.event(PoolEvent::Put { id, outcome });
+    }
+
+    fn commit_put(&mut self, id: u64) {
+        let put = &self.writer.puts[&id];
+        let metadata = self.put_header(put).and_then(|mut header| {
+            header.row_checksum = put.row_sum.unwrap_or(0);
+            let mut bytes = header.encode()?.to_vec();
+            let mut sums = vec![0u8; header.checksum_bytes() as usize];
+            for (i, sum) in put.sums.iter().enumerate() {
+                sums[i * 8..i * 8 + 8].copy_from_slice(&sum.to_le_bytes());
+            }
+            bytes.extend(sums);
+            Ok(bytes)
+        });
+        match metadata {
+            Err(error) => self.fail_put(id, error),
+            Ok(metadata) => {
+                self.writer.puts.get_mut(&id).expect("present").phase = Phase::Committed;
+                self.emit(Out::PutCommit(wire::PutCommit {
+                    put_id: id,
+                    metadata_offset: 0,
+                    metadata,
+                }));
+            }
+        }
+    }
+
+    pub(crate) fn writer_tick(&mut self, now: Instant) {
+        let late: Vec<u64> = self
+            .writer
+            .puts
+            .iter()
+            .filter(|(_, p)| {
+                now >= p.deadline && p.failed.is_none() && p.stored.is_none() && p.refused.is_none()
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in late {
+            self.fail_put(id, Error::new("the put ran out of time"));
+        }
+    }
+
+    /// The session is gone: every put fails once its copies drained, and the
+    /// fence for its windows is owed to the next session.
+    pub(crate) fn writer_lost(&mut self) {
+        let ids: Vec<u64> = self.writer.puts.keys().copied().collect();
+        for id in ids {
+            self.fail_put(id, Error::new("the pool session was lost"));
+        }
+    }
+
+    pub(crate) fn writer_close(&mut self) {
+        let ids: Vec<u64> = self.writer.puts.keys().copied().collect();
+        for id in ids {
+            self.cancel_put(id);
+        }
+    }
+
+    pub(crate) fn writer_quarantine(&mut self) {
+        let ids: Vec<u64> = self.writer.puts.keys().copied().collect();
+        for id in ids {
+            self.emit(Out::FenceAck(wire::FenceAck {
+                subject: Some(wire::fence_ack::Subject::PutId(id)),
+                outcome: wire::FenceOutcome::Quarantined as i32,
+            }));
+        }
+        std::mem::forget(std::mem::take(&mut self.writer.puts));
+    }
+}

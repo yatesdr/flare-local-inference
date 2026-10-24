@@ -31,7 +31,7 @@ use super::{
     client::PoolClient,
     exporter::HostPin,
     lookup::{LookupState, LookupTicket},
-    shared::{FetchPart, PoolEvent, PoolFetch},
+    shared::{FetchPart, PoolEvent, PoolFetch, PutOutcome, PutRequest},
     types::{HeldRange, PoolCandidate, SourceRef, Tier},
 };
 
@@ -45,6 +45,8 @@ pub trait PoolPort {
     fn saved(&self, entry: IndexEntry);
     fn evicted(&self, key: PrefixKey, tier: Tier, generation: u64, heir: Option<IndexEntry>);
     fn evictions_lost(&self);
+    fn put(&mut self, request: PutRequest) -> Result<u64>;
+    fn cancel_put(&mut self, id: u64);
     fn announcer(&self) -> Announcer;
     fn host_pinned(&mut self, export: ExportId, pin: Box<dyn HostPin>);
     fn export_pinned(&mut self, export: ExportId, chain: ExportChain);
@@ -73,6 +75,12 @@ impl PoolPort for PoolClient {
     }
     fn evictions_lost(&self) {
         PoolClient::evictions_lost(self)
+    }
+    fn put(&mut self, request: PutRequest) -> Result<u64> {
+        PoolClient::put(self, request)
+    }
+    fn cancel_put(&mut self, id: u64) {
+        PoolClient::cancel_put(self, id)
     }
     fn announcer(&self) -> Announcer {
         PoolClient::announcer(self)
@@ -155,6 +163,8 @@ pub struct PooledStore<S: HostStore, P: PoolPort = PoolClient> {
     skip: HashMap<(SourceRef, Tier), Instant>,
     inner_events: Vec<StoreEvent>,
     pool_events: Vec<PoolEvent>,
+    /// How the puts started through this store ended, until collected.
+    puts: Vec<(u64, PutOutcome)>,
 }
 
 impl<S: HostStore> PooledStore<S, PoolClient> {
@@ -194,7 +204,13 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             skip: HashMap::new(),
             inner_events: Vec::new(),
             pool_events: Vec::new(),
+            puts: Vec::new(),
         }
+    }
+
+    /// The puts that ended since the last call.
+    pub fn take_puts(&mut self) -> Vec<(u64, PutOutcome)> {
+        std::mem::take(&mut self.puts)
     }
 
     pub fn pool(&self) -> &P {
@@ -647,6 +663,7 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
                     events.push(StoreEvent::ExportEnded { export })
                 }
                 PoolEvent::Fetched { id, result } => self.pool_finished(id, result, events),
+                PoolEvent::Put { id, outcome } => self.puts.push((id, outcome)),
                 PoolEvent::Status(_) => {}
             }
         }
@@ -866,6 +883,10 @@ mod tests {
         fn evictions_lost(&self) {
             self.0.lock().unwrap().lost += 1;
         }
+        fn put(&mut self, _: PutRequest) -> Result<u64> {
+            Err("the fake pool takes no puts".into())
+        }
+        fn cancel_put(&mut self, _: u64) {}
         fn announcer(&self) -> Announcer {
             self.2.clone()
         }
