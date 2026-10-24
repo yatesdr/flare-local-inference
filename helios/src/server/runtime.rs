@@ -135,7 +135,11 @@ impl Drop for Generation {
 }
 
 /// The longest a request waits for its pool lookup before it is admitted with what it has.
-const POOL_LOOKUP_GRACE_NS: u64 = 25_000_000;
+/// The manager answers a lookup on receipt: over a Unix socket the round trip measured p50
+/// 0.43 ms, p99 0.55 ms and at worst 0.81 ms in 2000 lookups against a 5000-entry index
+/// (`a_lookup_is_answered_in_well_under_a_millisecond_over_a_unix_socket`). The hold is
+/// set just above that p99, with room for a loaded host.
+const POOL_LOOKUP_GRACE_NS: u64 = 2_000_000;
 
 /// Idle page ids the pool's characterization probes copy into.
 const CHARACTERIZATION_PAGES: usize = 64;
@@ -973,10 +977,14 @@ impl<'a> Worker<'a> {
                 } else {
                     self.characterize_pool();
                     self.scheduler.idle()?;
-                    match self
-                        .receiver
-                        .recv_timeout(std::time::Duration::from_millis(2))
-                    {
+                    // A request holding for its pool lookup is retried well within the hold.
+                    let now_ns = super::observation::monotonic_ns();
+                    let wait = if self.pending.iter().any(|i| i.awaits_pool(now_ns)) {
+                        std::time::Duration::from_micros(100)
+                    } else {
+                        std::time::Duration::from_millis(2)
+                    };
+                    match self.receiver.recv_timeout(wait) {
                         Ok(request) => self.enqueue(request),
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
