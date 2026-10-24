@@ -12,21 +12,33 @@ use crate::{
 };
 use std::collections::VecDeque;
 
-/// A source's running cost as microseconds and pages, each decayed by 7/8 per claim.
-pub(super) type Estimate = (u64, u64);
+/// A source's running cost: microseconds, pages and claims, each decayed by 7/8 per claim.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct Estimate {
+    micros: f64,
+    pages: f64,
+    claims: f64,
+}
+
+/// A source's estimate is given only once its claims average at least this many pages. Below
+/// that, as with the few-page claims of a characterization probe, the cost per page is mostly
+/// the fixed cost of a claim and says nothing about a long transfer.
+const MIN_AVERAGE_CLAIM_PAGES: f64 = 32.0;
 
 /// Add a finished claim to a source's running cost.
 pub(super) fn blend_estimate(estimate: &mut Estimate, micros: u64, pages: u64) {
-    *estimate = (estimate.0 * 7 / 8 + micros, estimate.1 * 7 / 8 + pages);
+    estimate.micros = estimate.micros * 0.875 + micros as f64;
+    estimate.pages = estimate.pages * 0.875 + pages as f64;
+    estimate.claims = estimate.claims * 0.875 + 1.0;
 }
 
-/// The running cost per page, or 0 when nothing is known. Weighted by pages, so a claim of
-/// a few pages, which is mostly fixed cost, cannot dominate one of hundreds.
+/// The running cost per page, weighted by pages, or 0 when there is none to give: nothing is
+/// known, or the claims so far were too short to say what a long one costs.
 pub(super) fn estimate_us_per_page(estimate: Estimate) -> u32 {
-    if estimate.1 == 0 {
+    if estimate.pages <= 0.0 || estimate.pages / estimate.claims < MIN_AVERAGE_CLAIM_PAGES {
         return 0;
     }
-    (estimate.0 / estimate.1).clamp(1, u64::from(u32::MAX)) as u32
+    (estimate.micros / estimate.pages).clamp(1.0, f64::from(u32::MAX)) as u32
 }
 
 /// Entries scanned per lookup at most, so one lookup cannot hold the actor.
@@ -389,15 +401,16 @@ mod estimate_tests {
     use super::*;
 
     #[test]
-    fn a_long_claim_outweighs_the_fixed_cost_of_short_ones() {
+    fn short_claims_give_no_estimate_and_long_ones_outweigh_them() {
         let mut estimate = Estimate::default();
         assert_eq!(estimate_us_per_page(estimate), 0);
-        // Probe claims: a few pages at mostly fixed cost, 4.25 ms a page.
-        for _ in 0..9 {
-            blend_estimate(&mut estimate, 8_500, 2);
+        // Probe claims of 2, 16 and 64 pages, mostly fixed cost: no estimate to give.
+        for pages in [2u64, 16, 64, 2, 16, 64, 2, 16, 64] {
+            blend_estimate(&mut estimate, 8_000 + 300 * pages, pages);
         }
-        assert!(estimate_us_per_page(estimate) >= 4_000);
-        // Real restores of hundreds of pages at 0.9 ms a page.
+        assert_eq!(estimate_us_per_page(estimate), 0);
+        // Real restores of hundreds of pages at 0.9 ms a page: now it speaks, and the short
+        // claims weigh little in it.
         for _ in 0..4 {
             blend_estimate(&mut estimate, 470_000, 520);
         }
