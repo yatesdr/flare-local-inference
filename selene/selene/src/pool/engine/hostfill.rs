@@ -1,10 +1,11 @@
-//! The copy thread that fills windows from pinned host records.
+//! The copy thread that fills windows from host sources: pinned host records
+//! for exports, and bytes a store or a probe supplies for puts.
 //!
-//! Started on the first host-tier export only, so an instance that never
-//! serves one has no such thread.
+//! Started on first use only, so an instance that never serves a host-tier
+//! export or writes a host-tier put has no such thread.
 
 use std::{
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, mpsc},
     thread,
 };
 
@@ -12,21 +13,30 @@ use tokio::sync::Notify;
 
 use crate::Result;
 
-use super::super::exporter::{Checksums, HostPin, HostWindow};
+use super::super::exporter::Checksums;
+
+/// Whose window a fill is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FillOwner {
+    Export(u64),
+    Put(u64),
+}
+
+/// Fills a window with the bytes the owner serves and returns their checksums.
+pub(crate) type Work = Box<dyn FnOnce(&mut [u8]) -> Result<Checksums> + Send>;
 
 pub(crate) struct FillJob {
-    pub export: u64,
+    pub owner: FillOwner,
     pub window: u32,
-    pub pin: Arc<Mutex<Box<dyn HostPin>>>,
-    pub span: HostWindow,
-    /// The window's address and length inside the mapped staging region, which
-    /// the engine keeps mapped until the job's completion is collected.
+    /// The window's address and length inside a mapped region, which the engine
+    /// keeps mapped until the job's completion is collected.
     pub address: usize,
     pub length: usize,
+    pub work: Work,
 }
 
 pub(crate) struct FillDone {
-    pub export: u64,
+    pub owner: FillOwner,
     pub window: u32,
     pub result: Result<Checksums>,
 }
@@ -41,16 +51,16 @@ impl HostFiller {
         let (jobs, rx) = mpsc::channel::<FillJob>();
         let (tx, done) = mpsc::channel();
         thread::Builder::new()
-            .name("selene-host-export".into())
+            .name("selene-host-fill".into())
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
-                    // The window is owned by this export until it reports done.
+                    // The window belongs to this job until it reports done.
                     let dst = unsafe {
                         std::slice::from_raw_parts_mut(job.address as *mut u8, job.length)
                     };
-                    let result = job.pin.lock().unwrap().read(&job.span, dst);
+                    let result = (job.work)(dst);
                     let _ = tx.send(FillDone {
-                        export: job.export,
+                        owner: job.owner,
                         window: job.window,
                         result,
                     });

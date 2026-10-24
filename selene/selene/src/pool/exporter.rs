@@ -46,3 +46,18 @@ pub trait HostPin: Send {
     /// persisted checksums. May block on a device: it runs on a copy thread.
     fn read(&mut self, window: &HostWindow, dst: &mut [u8]) -> Result<Checksums>;
 }
+
+/// Bytes a store or a probe supplies for a put, window by window.
+pub trait PutBytes: Send {
+    /// Fill `dst` with `page_count` page records starting at page `first_page`
+    /// of the chain, then the row record when `row`, and return the checksums to
+    /// commit with them: the persisted ones when the source has them, never
+    /// hashes of what was just read.
+    fn fill(
+        &mut self,
+        first_page: u64,
+        page_count: u32,
+        row: bool,
+        dst: &mut [u8],
+    ) -> Result<Checksums>;
+}

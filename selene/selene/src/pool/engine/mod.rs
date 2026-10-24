@@ -11,6 +11,7 @@ mod requester;
 mod source;
 #[cfg(test)]
 mod tests;
+mod writer;
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -88,6 +89,7 @@ pub(crate) struct Session {
 pub(crate) enum Owner {
     Claim { claim: u64, window: u32 },
     Export { export: u64, window: u32 },
+    Put { put: u64, window: u32 },
 }
 
 /// Why the engine stopped serving a session.
@@ -116,9 +118,11 @@ pub(crate) struct Engine {
     lookups: HashMap<u64, Instant>,
     pub(crate) requester: requester::State,
     pub(crate) source: source::State,
+    pub(crate) writer: writer::State,
     quarantined: bool,
     drain_started: Option<Instant>,
     pub(crate) closing: bool,
+    filler: Option<hostfill::HostFiller>,
 }
 
 impl Engine {
@@ -146,9 +150,11 @@ impl Engine {
             lookups: HashMap::new(),
             requester: Default::default(),
             source: Default::default(),
+            writer: Default::default(),
             quarantined: false,
             drain_started: None,
             closing: false,
+            filler: None,
         }
     }
 
@@ -158,7 +164,10 @@ impl Engine {
 
     /// Copies are queued or running, so the copier needs polling soon.
     pub(crate) fn busy(&self) -> bool {
-        !self.jobs.is_empty() || !self.pending.is_empty() || self.source.busy()
+        !self.jobs.is_empty()
+            || !self.pending.is_empty()
+            || self.source.busy()
+            || self.writer.busy()
     }
 
     pub(crate) fn quarantined(&self) -> bool {
@@ -274,6 +283,7 @@ impl Engine {
         self.shared.fail_lookups();
         self.requester_lost();
         self.source_lost();
+        self.writer_lost();
         self.drain_started.get_or_insert(now);
         self.shared.set_status(PoolStatus::Local);
         self.pump(now);
@@ -296,6 +306,7 @@ impl Engine {
             && self.pending.is_empty()
             && self.requester.is_empty()
             && self.source.is_empty()
+            && self.writer.is_empty()
     }
 
     // ---- server messages --------------------------------------------------
@@ -361,12 +372,12 @@ impl Engine {
             In::ExportRequest(request) => self.on_export_request(now, request),
             In::ExportFill(fill) => self.on_export_fill(fill),
             In::ExportCancel(cancel) => self.on_export_cancel(cancel),
-            // The writer role is not in this client.
-            In::PutAccept(_)
-            | In::PutGrant(_)
-            | In::Stored(_)
-            | In::PutRefused(_)
-            | In::Room(_) => {}
+            In::PutAccept(accept) => self.on_put_accept(accept),
+            In::PutGrant(grant) => self.on_put_grant(grant),
+            In::Stored(stored) => self.on_stored(stored),
+            In::PutRefused(refused) => self.on_put_refused(refused),
+            // Room is only a hint for later eviction attempts.
+            In::Room(_) => {}
         }
         self.pump(now);
         Ok(())
@@ -410,6 +421,8 @@ impl Engine {
             Command::Fetch(fetch) => self.start_fetch(now, fetch),
             Command::ExportPinned { export, chain } => self.on_export_pinned(export, chain),
             Command::HostPinned { export, pin } => self.on_host_pinned(export, pin),
+            Command::Put { id, request } => self.start_put(now, id, request),
+            Command::PutCancel(id) => self.cancel_put(id),
             Command::ExportRefused { export, reason } => self.on_export_refused(export, reason),
         }
     }
@@ -470,6 +483,7 @@ impl Engine {
         }
         self.requester_tick(now);
         self.source_tick(now);
+        self.writer_tick(now);
         self.pump(now);
         if self.quiet() {
             self.drain_started = None;
@@ -498,6 +512,7 @@ impl Engine {
         }
         self.source_quarantine();
         self.requester_quarantine();
+        self.writer_quarantine();
         self.shared.set_status(PoolStatus::Disabled(
             "a copy could not be drained; memory is quarantined".into(),
         ));
@@ -517,6 +532,7 @@ impl Engine {
                     Owner::Export { export, window } => {
                         self.on_export_job(export, window, reply.result)
                     }
+                    Owner::Put { put, window } => self.on_put_job(put, window, reply.result),
                 }
             }
         }
@@ -548,6 +564,7 @@ impl Engine {
                         Owner::Export { export, window } => {
                             self.on_export_job(export, window, Err(error))
                         }
+                        Owner::Put { put, window } => self.on_put_job(put, window, Err(error)),
                     }
                 }
             }
@@ -649,7 +666,29 @@ impl Engine {
         self.shared.fail_lookups();
         self.requester_close();
         self.source_close();
+        self.writer_close();
         self.pump(now);
+    }
+
+    /// Run a window fill on the host copy thread, starting it on first use.
+    pub(crate) fn submit_fill(&mut self, job: hostfill::FillJob) -> bool {
+        if self.filler.is_none() {
+            match hostfill::HostFiller::start(self.shared.wake.clone()) {
+                Ok(filler) => self.filler = Some(filler),
+                Err(_) => return false,
+            }
+        }
+        self.filler
+            .as_ref()
+            .is_some_and(|filler| filler.submit(job))
+    }
+
+    pub(crate) fn collect_fills(&self) -> Vec<hostfill::FillDone> {
+        let mut done = Vec::new();
+        if let Some(filler) = &self.filler {
+            filler.collect(&mut done);
+        }
+        done
     }
 
     pub(crate) fn goodbye(&mut self) {

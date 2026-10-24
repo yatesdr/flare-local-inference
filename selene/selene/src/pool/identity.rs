@@ -10,9 +10,10 @@ use blake2::{
     digest::consts::{U16, U32},
 };
 
-use crate::{Error, Result};
+use crate::{CacheGeometry, Error, Layout, Plane, Result};
 
-/// Bytes per page and per state row for one rank, as a record holds them.
+/// The plane and row sizes of one rank, as the GPU geometry declares them:
+/// unpadded unit sizes. A record pads each to a 4 KiB block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RankPlanes {
     pub plane_bytes: Vec<u64>,
@@ -35,6 +36,67 @@ pub struct Scope {
     pub model_identity: [u8; 32],
     pub layout_fingerprint: [u8; 16],
     pub geometry: Geometry,
+}
+
+impl Scope {
+    /// The scope of the records a model package writes on `geometry`, one
+    /// element per rank, under `layout_fingerprint` (see
+    /// [`crate::geometry::fingerprint`] and `shard_fingerprint`).
+    pub fn new(
+        tenant: impl Into<String>,
+        model_identity: [u8; 32],
+        layout_fingerprint: [u8; 16],
+        geometry: &[CacheGeometry],
+    ) -> Result<Self> {
+        let layout = Layout::new(geometry)?;
+        Ok(Self {
+            tenant: tenant.into(),
+            model_identity,
+            layout_fingerprint,
+            geometry: Geometry {
+                page_tokens: layout.page_tokens,
+                ranks: geometry
+                    .iter()
+                    .map(|rank| RankPlanes {
+                        plane_bytes: rank.planes.iter().map(|plane| plane.unit_bytes).collect(),
+                        row_bytes: rank.row.unit_bytes,
+                    })
+                    .collect(),
+                page_record_bytes: layout.page_record_bytes,
+                row_record_bytes: layout.row_record_bytes,
+            },
+        })
+    }
+
+    /// A cache geometry with this scope's sizes (names and addresses are
+    /// placeholders), for building record headers.
+    pub(crate) fn record_geometry(&self) -> Vec<CacheGeometry> {
+        self.geometry
+            .ranks
+            .iter()
+            .map(|rank| CacheGeometry {
+                page_tokens: self.geometry.page_tokens,
+                page_capacity: 1,
+                row_capacity: 1,
+                row: Plane {
+                    name: "state".into(),
+                    address: 0,
+                    unit_bytes: rank.row_bytes,
+                },
+                planes: rank
+                    .plane_bytes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, bytes)| Plane {
+                        name: format!("plane{index}"),
+                        address: 0,
+                        unit_bytes: *bytes,
+                    })
+                    .collect(),
+                snapshot_pages: Vec::new(),
+            })
+            .collect()
+    }
 }
 
 impl Geometry {
@@ -171,6 +233,39 @@ mod tests {
         assert_ne!(id, instance_id("acme", &[1; 32], &[9; 16], &a));
         let disjoint = [[3u8; 16], [4u8; 16]];
         assert_ne!(id, instance_id("acme", &[1; 32], &[2; 16], &disjoint));
+    }
+
+    #[test]
+    fn a_scope_built_from_geometry_matches_the_layout_and_round_trips_through_record_headers() {
+        use crate::{geometry::fingerprint, record::Header, testing::geometry};
+        let ranks = [
+            geometry(64, &[("k", 8192), ("v", 100)], 5000),
+            geometry(64, &[("k", 8192), ("v", 100)], 5000),
+        ];
+        let scope = Scope::new("t", [1; 32], fingerprint(&ranks), &ranks).unwrap();
+        let layout = Layout::new(&ranks).unwrap();
+        assert_eq!(scope.geometry.page_record_bytes, layout.page_record_bytes);
+        assert_eq!(scope.geometry.row_record_bytes, layout.row_record_bytes);
+        assert_eq!(scope.geometry.ranks[0].plane_bytes, [8192, 100]);
+        // A header built from the scope's sizes describes the same records.
+        let key = crate::PrefixKey {
+            consumed_tokens: 128,
+            digest: [3; 16],
+        };
+        let header = Header::new(
+            &scope.record_geometry(),
+            [1; 32],
+            scope.layout_fingerprint,
+            key,
+            None,
+            [0; 16],
+            2,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        assert!(header.matches(&scope.record_geometry()));
+        assert_eq!(header.page_record_bytes(), layout.page_record_bytes);
+        assert_eq!(header.row_record_bytes(), layout.row_record_bytes);
     }
 
     #[test]

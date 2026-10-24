@@ -23,7 +23,7 @@ use super::{
     exporter::HostPin,
     identity::{self, Scope},
     lookup::{LookupState, LookupTicket},
-    shared::{Command, PoolEvent, PoolFetch, PoolStatus, Shared},
+    shared::{Command, PoolEvent, PoolFetch, PoolStatus, PutRequest, Shared},
     types::{HeldRange, Tier},
 };
 
@@ -65,6 +65,7 @@ pub struct PoolClient {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<Result<()>>>,
     next_fetch: u64,
+    next_put: u64,
 }
 
 impl PoolClient {
@@ -159,6 +160,7 @@ impl PoolClient {
             stop,
             thread: Some(thread),
             next_fetch: 0,
+            next_put: 0,
         })
     }
 
@@ -250,6 +252,29 @@ impl PoolClient {
     pub fn export_pinned(&mut self, export: ExportId, chain: ExportChain) {
         self.shared
             .push_command(Command::ExportPinned { export, chain }, true);
+    }
+
+    /// Write a record into the manager's store. An error means nothing was
+    /// accepted and no event follows; otherwise exactly one [`PoolEvent::Put`]
+    /// with the returned id follows, after every copy that read the source
+    /// drained. The source must stay valid (GPU pages pinned) until then, and
+    /// the caller's own copy may be dropped only on `Stored` or `Present`.
+    pub fn put(&mut self, request: PutRequest) -> Result<u64> {
+        crate::pool::shared::require_ready(&self.shared.status())?;
+        self.next_put += 1;
+        let id = self.next_put;
+        if !self
+            .shared
+            .push_command(Command::Put { id, request }, false)
+        {
+            return Err(Error::new("the pool's command queue is full"));
+        }
+        Ok(id)
+    }
+
+    /// Withdraw a put that has not been committed.
+    pub fn cancel_put(&mut self, id: u64) {
+        self.shared.push_command(Command::PutCancel(id), true);
     }
 
     /// A host tier pinned a record chain for `export`.

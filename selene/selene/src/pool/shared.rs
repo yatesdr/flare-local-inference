@@ -18,7 +18,7 @@ use crate::{
 };
 
 use super::{
-    exporter::HostPin,
+    exporter::{HostPin, PutBytes},
     lookup::{Answer, LookupState, LookupTicket, TicketInner},
     types::{HeldRange, PoolCandidate, SourceRef, Tier},
 };
@@ -84,7 +84,76 @@ pub enum PoolEvent {
     ExportEnded {
         export: ExportId,
     },
+    /// A put ended, after every copy that read its source drained.
+    Put {
+        id: u64,
+        outcome: PutOutcome,
+    },
     Status(PoolStatus),
+}
+
+/// Where a put's bytes come from.
+pub enum PutSource {
+    /// The GPU pages of the whole chain, ascending, and the state slot holding
+    /// the endpoint row. The caller keeps them pinned until the put ends.
+    Gpu {
+        pages: Vec<PageId>,
+        slot: StateSlotId,
+    },
+    /// Bytes from a host tier or a probe.
+    Host(Box<dyn PutBytes>),
+}
+
+/// A record to write into the manager's store. The writer drops its own copy
+/// only when the put ends `Stored` or `Present`.
+pub struct PutRequest {
+    pub key: PrefixKey,
+    /// The key of the previous record in the chain, if any.
+    pub parent: Option<PrefixKey>,
+    pub bucket: [u8; 16],
+    /// Pages of the whole chain up to `key`.
+    pub chain_pages: u64,
+    /// Pages the record owns, counted from its published parent.
+    pub tail_pages: u64,
+    pub row: bool,
+    pub generation: u64,
+    pub source: PutSource,
+}
+
+/// Why the manager did not store a record. None of them is retried in a loop:
+/// the record moves to the next tier or is dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PutRefusal {
+    /// A put for the same key is running.
+    Inflight,
+    /// Out of write budget or full.
+    Budget,
+    /// The record can never fit.
+    Oversize,
+    Quota,
+    /// The metadata did not match what was accepted.
+    Invalid,
+    /// The manager has as many puts open as it allows.
+    Queue,
+    /// A manager device error.
+    Io,
+    /// The manager is not serving puts yet.
+    NotReady,
+}
+
+#[derive(Debug)]
+pub enum PutOutcome {
+    /// Committed and indexed in the manager's store.
+    Stored {
+        bytes: u64,
+    },
+    /// Already stored there: a successful deduplication, nothing moved.
+    Present,
+    Refused(PutRefusal),
+    /// Cancelled by the caller or by closing before it was committed.
+    Cancelled,
+    /// The put could not be carried out (session lost, copy failed, bad answer).
+    Failed(Error),
 }
 
 /// One part of a pool restore.
@@ -119,6 +188,11 @@ pub(crate) enum Command {
     Lookup(LookupSend),
     CancelLookup(u64),
     Fetch(PoolFetch),
+    Put {
+        id: u64,
+        request: PutRequest,
+    },
+    PutCancel(u64),
     ExportPinned {
         export: ExportId,
         chain: ExportChain,
