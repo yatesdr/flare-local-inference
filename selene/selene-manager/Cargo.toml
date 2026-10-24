@@ -1,0 +1,44 @@
+[package]
+name = "flare-selene-manager"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2024"
+rust-version = "1.87"
+publish = false
+
+[lib]
+name = "selene_manager"
+
+[[bin]]
+name = "selene"
+path = "src/main.rs"
+
+[features]
+default = []
+rdma = ["dep:ibverbs-sys"]
+
+[dependencies]
+blake2 = "0.10"
+ibverbs-sys = { version = "0.3.2", optional = true }
+libc = "0.2"
+prost = "0.14"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
+toml = "0.8"
+tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "tls-ring", "router"] }
+tonic-prost = "0.14"
+twox-hash = { version = "2.1", default-features = false, features = ["std", "xxhash3_64"] }
+tower = { version = "0.5", features = ["util"] }
+
+[build-dependencies]
+prost-build = "0.14"
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+rcgen = { version = "0.14", features = ["pem"] }
+sha2 = "0.10"
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+[profile.release]
+debug = 1
