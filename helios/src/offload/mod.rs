@@ -52,11 +52,55 @@ pub struct PrefixCacheOffload {
     /// Bytes of record files kept on disk; zero selects no disk store.
     pub disk_limit: Option<u64>,
     pub transport: Option<Transport>,
+    /// Pool manager through which this instance shares prefix checkpoints.
+    pub pool: Option<PoolOptions>,
+}
+
+/// The manager an instance shares prefix checkpoints with, and the tenant that
+/// scopes what it may see.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolOptions {
+    /// `unix:PATH` for a manager on this host, or `HOST:PORT`.
+    pub address: String,
+    pub tenant: String,
+}
+
+/// Accept `unix:PATH` or `HOST:PORT` as the pool address.
+pub fn parse_pool_address(text: &str) -> std::result::Result<String, String> {
+    let invalid = || format!("invalid pool address '{text}': use unix:PATH or HOST:PORT");
+    if let Some(path) = text.strip_prefix("unix:") {
+        return if path.is_empty() {
+            Err(invalid())
+        } else {
+            Ok(text.to_owned())
+        };
+    }
+    match text.rsplit_once(':') {
+        Some((host, port))
+            if !host.is_empty()
+                && !host.contains(char::is_whitespace)
+                && port.parse::<u16>().is_ok_and(|port| port != 0) =>
+        {
+            Ok(text.to_owned())
+        }
+        _ => Err(invalid()),
+    }
+}
+
+/// A tenant names a partition the manager never crosses: nonempty, at most 255 bytes.
+pub fn parse_pool_tenant(text: &str) -> std::result::Result<String, String> {
+    if text.is_empty() || text.len() > 255 || text.chars().any(char::is_control) {
+        Err("a pool tenant must be 1 to 255 bytes without control characters".into())
+    } else {
+        Ok(text.to_owned())
+    }
 }
 
 impl PrefixCacheOffload {
     pub fn enabled(&self) -> bool {
-        self.memory_bytes.unwrap_or(0) != 0 || (self.disk.is_some() && self.disk_limit != Some(0))
+        self.memory_bytes.unwrap_or(0) != 0
+            || (self.disk.is_some() && self.disk_limit != Some(0))
+            || self.pool.is_some()
     }
 
     /// Future device and host bytes, sized from the actual record layout. A registered host
@@ -347,6 +391,9 @@ pub fn prepare_with_inputs(
         return Ok(Preparation::None("disabled".to_owned()));
     }
     let _ = package;
+    if options.pool.is_some() {
+        return Err("the prefix cache pool client is not built into this binary".into());
+    }
     let layout = Layout::new(&geometry)?;
     let fingerprint = match (shard, geometry.as_slice()) {
         (None, _) => geometry::fingerprint(&geometry),
