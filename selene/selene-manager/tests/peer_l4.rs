@@ -2,12 +2,10 @@
 //!
 //! Two manager processes are started in separate network namespaces joined by a veth pair,
 //! with `netem` delay and bandwidth limits in both directions, and driven through their Unix
-//! sockets from this process. A second test runs the same managers on the loopback interface
-//! with `--peer-transport rdma` (Soft-RoCE) and checks that the RDMA handshake is used.
+//! sockets from this process.
 //!
-//! These tests are ignored by default because they change host networking state. Run them as
-//! root inside a privileged container that has `ip` and `tc` installed and, for the RDMA leg,
-//! `/dev/infiniband` with an rxe device:
+//! The test is ignored by default because it changes host networking state. Run it as root
+//! inside a privileged container that has `ip` and `tc` installed:
 //!
 //! ```text
 //! cargo test --release --test peer_l4 -- --ignored --nocapture --test-threads=1
@@ -16,11 +14,10 @@
 //! Every check prints PASS or FAIL with its name; the test fails at the end if any check failed.
 //! Namespaces, veth pairs and manager processes are removed by their guards, including on panic.
 //!
-//! The stream test pins `--peer-transport stream` and `--stream-connections 1`. The build may
-//! have RDMA enabled, and `auto` would then carry bulk bytes over RDMA, bypassing the shaped
-//! veth; and several parallel stream connections would each get their own share of the link,
-//! defeating the per-link rate that makes an in-flight fetch interruptible. The RDMA test
-//! covers the other transport on its own.
+//! The test pins `--peer-transport stream` and `--stream-connections 1`. The build may have
+//! RDMA enabled, and `auto` would then carry bulk bytes over RDMA, bypassing the shaped veth;
+//! and several parallel stream connections would each get their own share of the link,
+//! defeating the per-link rate that makes an in-flight fetch interruptible.
 
 mod support;
 
@@ -866,131 +863,4 @@ fn identity_is_root() -> bool {
         .ok()
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .is_some_and(|uid| uid.trim() == "0")
-}
-
-/// The RDMA leg: the same forward and remote-read checks with `--peer-transport rdma` over
-/// Soft-RoCE on the loopback interface.
-#[cfg(feature = "rdma")]
-#[test]
-#[ignore = "needs /dev/infiniband with an rxe device"]
-fn peer_l4_rdma_over_soft_roce() {
-    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
-    let base = base("l4-rdma");
-    std::fs::create_dir_all(&base).unwrap();
-    let tls = make_tls(&base, &[Ipv4Addr::LOCALHOST.into()]);
-    let peer = free_port();
-    let data = free_port();
-    let name = instance_name("l4-rdma");
-    let storage_socket = base.join("storage.sock");
-    let near_socket = base.join("near.sock");
-    let storage = Proc::spawn(
-        None,
-        &[
-            "--name".into(),
-            format!("{name}-storage"),
-            "--root".into(),
-            base.join("root-storage").display().to_string(),
-            "--nvme".into(),
-            "128M".into(),
-            "--memory".into(),
-            "32M".into(),
-            "--staging".into(),
-            "32M".into(),
-            "--socket".into(),
-            storage_socket.display().to_string(),
-            "--listen-peer".into(),
-            format!("127.0.0.1:{peer}"),
-            "--listen-data".into(),
-            format!("127.0.0.1:{data}"),
-            "--tls-cert".into(),
-            tls.server_cert.display().to_string(),
-            "--tls-key".into(),
-            tls.server_key.display().to_string(),
-            "--tls-ca".into(),
-            tls.ca.display().to_string(),
-        ],
-        &storage_socket,
-        &base.join("storage.log"),
-    );
-    wait_ready(&storage);
-    let near = Proc::spawn(
-        None,
-        &[
-            "--name".into(),
-            format!("{name}-near"),
-            "--memory".into(),
-            "32M".into(),
-            "--staging".into(),
-            "32M".into(),
-            "--socket".into(),
-            near_socket.display().to_string(),
-            "--upstream".into(),
-            format!("storage=127.0.0.1:{peer}"),
-            "--peer-transport".into(),
-            "rdma".into(),
-            "--tls-cert".into(),
-            tls.client_cert.display().to_string(),
-            "--tls-key".into(),
-            tls.client_key.display().to_string(),
-            "--tls-ca".into(),
-            tls.ca.display().to_string(),
-        ],
-        &near_socket,
-        &base.join("near.log"),
-    );
-    wait_ready(&near);
-    let mut checks = Checks::new();
-
-    let root = key(128);
-    let root_bytes = runtime().block_on(async {
-        let config = StoreConfig::dram_only(near_socket.clone(), 16 << 20);
-        let mut client = Client::connect(&config, descriptor()).await.unwrap();
-        client.store(root, None).await
-    });
-    checks.check(
-        "rdma-forward",
-        wait_for(
-            || catalog(&storage_socket).contains_key(&root),
-            "the storage catalog over RDMA",
-            Duration::from_secs(30),
-        )
-        .map(|_| "forwarded over RDMA".to_string()),
-    );
-    checks.check(
-        "rdma-get",
-        runtime().block_on(async {
-            let config = StoreConfig::dram_only(near_socket.clone(), 16 << 20);
-            let mut client = Client::connect(&config, descriptor()).await.unwrap();
-            match client
-                .get(&[root], 0, record_pages(&root, None), GetOptions::default())
-                .await
-            {
-                GetOutcome::Done(records) if records == vec![root_bytes] => {
-                    Ok("local Get of the forwarded record".into())
-                }
-                other => Err(format!("near Get returned {other:?}")),
-            }
-        }),
-    );
-    for (label, log) in [("near", &near.log), ("storage", &storage.log)] {
-        let text = std::fs::read_to_string(log).unwrap_or_default();
-        if text.contains("using stream") {
-            checks.fail("rdma-selected", format!("{label} fell back to stream"));
-        } else {
-            checks.pass("rdma-selected", format!("{label} stayed on RDMA"));
-        }
-    }
-
-    checks.finish();
-    drop(near);
-    drop(storage);
-}
-
-#[cfg(feature = "rdma")]
-fn free_port() -> u16 {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }

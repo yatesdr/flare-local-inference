@@ -1778,6 +1778,9 @@ pub fn run_peer(
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
     config.validate()?;
+    for warning in config.startup_warnings() {
+        eprintln!("{warning}");
+    }
     // Validate TLS before anything is started or accepted: a certificate error must not
     // leave an accepting data listener behind.
     validate_tls(&config)?;

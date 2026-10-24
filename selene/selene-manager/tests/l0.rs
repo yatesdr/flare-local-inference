@@ -442,6 +442,7 @@ fn l0_68_a_tls_error_starts_nothing() {
     local.tls_cert = Some(base.join("missing-cert.pem"));
     local.tls_key = Some(base.join("missing-key.pem"));
     local.tls_ca = Some(base.join("missing-ca.pem"));
+    local.peer_transport = selene_manager::config::PeerTransport::Stream;
     let mut store = Config::new(base.join("records"), socket.clone(), 65536, 64 << 20);
     store.name = local.name.clone();
     let error = control::run_peer(local, store, Arc::new(AtomicBool::new(false)))
@@ -473,6 +474,7 @@ fn l0_68_a_tls_error_starts_nothing() {
     local.tls_cert = Some(cert);
     local.tls_key = Some(key);
     local.tls_ca = Some(ca);
+    local.peer_transport = selene_manager::config::PeerTransport::Stream;
     let mut store = Config::new(base.join("records"), socket.clone(), 65536, 64 << 20);
     store.name = local.name.clone();
     let error = control::run_peer(local, store, Arc::new(AtomicBool::new(false)))
