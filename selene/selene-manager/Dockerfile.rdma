@@ -1,0 +1,22 @@
+# Experimental RDMA build. The default Dockerfile does not link libibverbs.
+FROM rust:1.94.1-bookworm AS build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        cmake ninja-build python3 pkg-config protobuf-compiler \
+        clang libclang-dev libnl-3-dev libnl-route-3-dev \
+        libibverbs-dev librdmacm-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY proto ./proto
+COPY src ./src
+RUN cargo build --release --locked --features rdma
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        rdma-core libibverbs1 ibverbs-providers ibverbs-utils \
+        libnl-3-200 libnl-route-3-200 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /build/target/release/selene /usr/local/bin/selene
+ENTRYPOINT ["/usr/local/bin/selene"]
