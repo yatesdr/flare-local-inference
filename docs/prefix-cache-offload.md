@@ -775,7 +775,8 @@ instance to a pool manager, at `unix:PATH` on this host or `HOST:PORT`. The
 tenant requires the pool and defaults to `default`; it scopes
 what the manager shares, so nothing crosses tenants. Without the pool flag none
 of the code below runs: the worker builds no lookup history, tracks no evictions, sees no export requests, and
-local tiers behave as in the earlier sections. A pooled instance still reads
+local tiers behave as in the earlier sections (the pooled exception is the
+eviction bullet below). A pooled instance still reads
 its own memory and disk tiers first; the pool supplies what they lack.
 
 The worker's part is a set of defaulted `PrefixStore` hooks, all run on the
@@ -822,6 +823,19 @@ model worker thread and none waiting on the network.
   withdraws a lookup still on the wire. A request that waits on capacity keeps
   it for the next attempt, a cancelled one drops it with the request, and a
   request readmitted without the store after a failed restore starts none.
+- **Eviction below the instance.** A pooled instance does not write every
+  publication through to its disk tier, and a tier gives up a record only
+  after the next one holds a committed copy. Memory writes a record to the
+  disk tier when a publication finds memory short, and a copy becomes
+  evictable when its file commits. The last local tier hands its coldest
+  records to the manager with a put, pinned together with the ancestors they
+  need, and drops one only when the manager answers `Stored` or `Present`. A
+  refusal for room, a manager that is not ready and a full queue drop the
+  record at once; a failed write is tried once more the next time the tier
+  needs room, and the second failure drops it. None of this waits on the
+  model worker: moves are queued, and the coldest waiting record is dropped
+  when the queue is full. The publication of a checkpoint still copies it into
+  the first host tier when it is published, not when the GPU cache evicts it.
 - **Two sources.** A restore reads at most two parts: the longest prefix held
   at the closest level, then one farther source from exactly where that part
   ends, with the endpoint's row from whichever ends last. The parts are planned
