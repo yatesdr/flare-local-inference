@@ -12,8 +12,8 @@ pub mod index;
 pub mod limits;
 mod lookup;
 mod notices;
-mod put;
 pub mod service;
+mod store_bridge;
 pub mod windows;
 
 use crate::{

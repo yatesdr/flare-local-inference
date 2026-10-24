@@ -9,13 +9,16 @@ use super::{
     Checked, Violation,
     core::{Core, Nonce, ProcKey, Session},
     index::{InstanceId, SourceId, Tier, walk_chain},
-    key_from, key_to, tier_from, tier_to,
+    key_from, key_to,
+    store_bridge::persisted_checksums,
+    tier_from, tier_to,
     windows::{self, PlannedWindow, RecordShape},
 };
 use crate::{
     Key,
     arena::Extent,
     proto::v2::{self, server_message::M},
+    store::GetAnswer,
 };
 use std::time::{Duration, Instant};
 
@@ -45,6 +48,7 @@ pub enum Phase {
 
 pub struct Win {
     pub plan: PlannedWindow,
+    pub region: i32,
     pub offset: u64,
     pub phase: Phase,
     /// A window allocated on its own (streaming claims).
@@ -91,6 +95,20 @@ pub struct Claim {
     pub granted_at: Option<Instant>,
     pub page_bytes: u64,
     pub row_bytes: u64,
+    /// Set when the manager's own store is the source.
+    pub manager: Option<ManagerGet>,
+}
+
+/// What a claim on the manager's store tracks beyond the common state.
+pub struct ManagerGet {
+    /// Persisted page and row checksums by record, from the store's metadata.
+    pub checks: std::collections::HashMap<u32, (Vec<u64>, u64)>,
+    /// A record's metadata pieces as they arrive.
+    pub meta: std::collections::HashMap<u32, Vec<u8>>,
+    /// The chain page at which each record's tail starts.
+    pub starts: Vec<u64>,
+    pub done: bool,
+    pub transfer_released: bool,
 }
 
 impl Claim {
@@ -126,7 +144,7 @@ impl Claim {
         let window = &self.windows[index];
         v2::WindowSpec {
             index: window.plan.index,
-            region: v2::Region::Staging as i32,
+            region: window.region,
             offset: window.offset,
             length: window.plan.length,
             record: window.plan.record,
@@ -359,11 +377,6 @@ impl Core {
                 return refuse(self, v2::ClaimReason::SourceLimit);
             }
         }
-        if source == SourceId::Manager {
-            // The manager's own store is served through the store bridge.
-            return refuse(self, v2::ClaimReason::UnknownSource);
-        }
-
         // The windows the claim will need, from the index's view of the chain.
         let start_page = m.begin_tokens / geometry.page_tokens;
         let Some(walk) = walk_chain(
@@ -386,6 +399,10 @@ impl Core {
             return refuse(self, v2::ClaimReason::InvalidClaim);
         };
         let total = windows::total_bytes(&plan);
+        if source == SourceId::Manager {
+            let _ = &plan;
+            return self.manager_claim(sid, key, &m, endpoint, &entry, walk, &geometry);
+        }
 
         // Retained staging: required for a GPU export, preferred for host tiers.
         let mut block = None;
@@ -438,6 +455,7 @@ impl Core {
             granted_at: None,
             page_bytes: geometry.page_bytes,
             row_bytes: geometry.row_bytes,
+            manager: None,
         };
         let reserved = claim.reserved_bytes;
         self.claims.insert(key, claim);
@@ -459,6 +477,252 @@ impl Core {
             }),
         );
         Ok(())
+    }
+
+    /// A claim whose source is the manager's own store: the store pins the chain
+    /// itself and hands out the windows.
+    #[allow(clippy::too_many_arguments)]
+    fn manager_claim(
+        &mut self,
+        sid: u64,
+        key: ClaimKey,
+        m: &v2::Claim,
+        endpoint: Key,
+        entry: &super::index::Entry,
+        walk: super::index::ChainWalk,
+        geometry: &super::ScopeGeometry,
+    ) -> Checked<()> {
+        let refuse = |core: &mut Core, reason: v2::ClaimReason| {
+            core.refused_claim(sid, key, m, reason);
+            Ok(())
+        };
+        if entry.generation != m.generation {
+            return refuse(self, v2::ClaimReason::GenerationChanged);
+        }
+        let (scope, pid) = {
+            let session = &self.sessions[&sid];
+            (session.scope, session.pid)
+        };
+        if self.link_for((key.0, key.1), scope, pid).is_none() {
+            return refuse(self, v2::ClaimReason::SourceBusy);
+        }
+        let last = walk.nodes.len() - 1;
+        let records: Vec<v2::Record> = walk
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| {
+                let first_page = if index == 0 { walk.skip_pages } else { 0 };
+                v2::Record {
+                    key: Some(key_to(node.key)),
+                    generation: node.generation,
+                    first_page,
+                    pages: node.tail_pages - first_page,
+                    row: index == last && m.want_row,
+                }
+            })
+            .collect();
+        let now = Instant::now();
+        let deadline_ms = if m.deadline_ms == 0 {
+            self.cfg.limits.max_claim_deadline_ms
+        } else {
+            m.deadline_ms.min(self.cfg.limits.max_claim_deadline_ms)
+        };
+        let claim = Claim {
+            key,
+            requester_sid: sid,
+            source: SourceId::Manager,
+            source_proc: None,
+            source_sid: 0,
+            endpoint,
+            want_row: m.want_row,
+            state: v2::ClaimState::Requested,
+            reason: v2::ClaimReason::Unspecified,
+            deadline: now + Duration::from_millis(u64::from(deadline_ms)),
+            last_progress: now,
+            pin_deadline: now + self.cfg.limits.pin_deadline(),
+            export_id: 0,
+            export: ExportState::None,
+            records,
+            total_pages: walk.pages,
+            row: m.want_row,
+            retained: false,
+            reserved_bytes: 0,
+            block: None,
+            windows: Vec::new(),
+            requester_fence: Party::Idle,
+            source_fence: Party::Idle,
+            terminal_at: None,
+            granted_at: None,
+            page_bytes: geometry.page_bytes,
+            row_bytes: geometry.row_bytes,
+            manager: Some(ManagerGet {
+                checks: Default::default(),
+                meta: Default::default(),
+                starts: walk
+                    .nodes
+                    .iter()
+                    .map(|node| {
+                        (node.key.consumed_tokens / geometry.page_tokens)
+                            .saturating_sub(u64::from(node.tail_pages))
+                    })
+                    .collect(),
+                done: false,
+                transfer_released: false,
+            }),
+        };
+        self.claims.insert(key, claim);
+        let chain: Vec<Key> = walk.nodes.iter().map(|node| node.key).collect();
+        if let Err(reason) = self.manager_get(key, chain, walk.skip_pages, walk.pages, m.want_row) {
+            self.finish(key, v2::ClaimState::Failed, reason);
+        }
+        Ok(())
+    }
+
+    /// The store's answers for a claim on the manager's own records.
+    pub(super) fn get_answer(&mut self, key: ClaimKey, answer: std::io::Result<GetAnswer>) {
+        let Some(claim) = self.claims.get_mut(&key) else {
+            return;
+        };
+        if claim.manager.is_none() {
+            return;
+        }
+        let terminal = claim.is_terminal();
+        match answer {
+            Ok(GetAnswer::Leased { .. }) => {
+                if terminal || claim.state != v2::ClaimState::Requested {
+                    return;
+                }
+                let now = Instant::now();
+                claim.state = v2::ClaimState::Granted;
+                claim.granted_at = Some(now);
+                claim.last_progress = now;
+                claim.requester_fence = Party::Pending;
+                let granted = v2::ClaimGranted {
+                    claim_id: key.2,
+                    records: claim.records.clone(),
+                    total_pages: claim.total_pages,
+                    row: claim.row,
+                    channel: None,
+                    window_credits: self.cfg.limits.window_credits,
+                    retained: false,
+                };
+                let sid = claim.requester_sid;
+                self.send(sid, M::ClaimGranted(granted));
+            }
+            Ok(GetAnswer::Meta {
+                record,
+                metadata_offset,
+                metadata,
+                ..
+            }) => {
+                // The store sends a record's header and checksum table in 4 KiB pieces.
+                if let Some(manager) = claim.manager.as_mut() {
+                    let buffer = manager.meta.entry(record).or_default();
+                    if buffer.len() as u64 == metadata_offset {
+                        buffer.extend_from_slice(&metadata);
+                        if let Some(checks) = persisted_checksums(buffer) {
+                            manager.checks.insert(record, checks);
+                        }
+                    }
+                }
+            }
+            Ok(GetAnswer::Ready(grant)) => {
+                if terminal {
+                    return;
+                }
+                // The store numbers pages from the start of the chain; the protocol
+                // numbers them within a record.
+                let start = claim
+                    .manager
+                    .as_ref()
+                    .and_then(|manager| manager.starts.get(grant.record as usize))
+                    .copied()
+                    .unwrap_or(0);
+                let first = grant.page_first.saturating_sub(start) as usize;
+                let count = grant.page_count as usize;
+                let sums = claim
+                    .manager
+                    .as_ref()
+                    .and_then(|manager| manager.checks.get(&grant.record))
+                    .and_then(|(pages, row_sum)| {
+                        pages
+                            .get(first..first + count)
+                            .map(|pages| (pages.to_vec(), *row_sum))
+                    });
+                let Some((page_xxh3, row_xxh3)) = sums else {
+                    self.cancel_get_and_fail(key, v2::ClaimReason::CopyError);
+                    return;
+                };
+                let plan = PlannedWindow {
+                    index: grant.index,
+                    record: grant.record,
+                    first_page: first as u32,
+                    page_count: grant.page_count,
+                    row: grant.row,
+                    length: grant.length,
+                };
+                let window = Win {
+                    plan,
+                    region: grant.region,
+                    offset: grant.offset,
+                    phase: Phase::RequesterRead,
+                    extent: None,
+                    page_xxh3: page_xxh3.clone(),
+                    row_xxh3,
+                };
+                let index = grant.index as usize;
+                while claim.windows.len() <= index {
+                    // A window index the store skipped is not in anyone's hands.
+                    let mut filler = Win {
+                        plan,
+                        region: grant.region,
+                        offset: 0,
+                        phase: Phase::Free,
+                        extent: None,
+                        page_xxh3: Vec::new(),
+                        row_xxh3: 0,
+                    };
+                    filler.plan.index = claim.windows.len() as u32;
+                    claim.windows.push(filler);
+                }
+                claim.windows[index] = window;
+                claim.state = v2::ClaimState::Copying;
+                claim.last_progress = Instant::now();
+                let spec = claim.spec(index);
+                let sid = claim.requester_sid;
+                self.send(
+                    sid,
+                    M::WindowReady(v2::WindowReady {
+                        claim_id: key.2,
+                        window: Some(spec),
+                        page_xxh3,
+                        row_xxh3,
+                        has_row: grant.row,
+                    }),
+                );
+            }
+            Ok(GetAnswer::Done) => {
+                if let Some(manager) = claim.manager.as_mut() {
+                    manager.done = true;
+                }
+            }
+            Ok(GetAnswer::Refused(refused)) => {
+                let reason = match refused.reason {
+                    // BUDGET, OVERSIZE: nothing to read into.
+                    3 | 4 => v2::ClaimReason::NoWindows,
+                    // IO: the record could not be read intact.
+                    8 => v2::ClaimReason::CopyError,
+                    _ => v2::ClaimReason::NotFound,
+                };
+                self.finish(key, v2::ClaimState::Failed, reason);
+            }
+            Err(_) => self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError),
+        }
+    }
+
+    fn cancel_get_and_fail(&mut self, key: ClaimKey, reason: v2::ClaimReason) {
+        self.finish(key, v2::ClaimState::Failed, reason);
     }
 
     /// Records a claim refused before any export and tells the requester.
@@ -493,6 +757,7 @@ impl Core {
             granted_at: None,
             page_bytes: 0,
             row_bytes: 0,
+            manager: None,
         };
         let message = self.terminal_message(&claim);
         self.claims.insert(key, claim);
@@ -607,6 +872,7 @@ impl Core {
                 }
                 Win {
                     plan,
+                    region: v2::Region::Staging as i32,
                     offset,
                     phase: Phase::Unissued,
                     extent: None,
@@ -787,9 +1053,14 @@ impl Core {
             }
         }
         claim.last_progress = Instant::now();
-        if claim.is_terminal() {
+        let from_store = claim.manager.is_some();
+        let terminal = claim.is_terminal();
+        if from_store {
+            self.store_release_window(key, m.index);
+        }
+        if terminal {
             self.reclaim(key);
-        } else {
+        } else if !from_store {
             self.issue_windows(key);
         }
         Ok(())
@@ -812,7 +1083,17 @@ impl Core {
                 // Exact coverage: every window issued, filled and released.
                 let covered = claim.state == v2::ClaimState::Copying
                     || claim.state == v2::ClaimState::Granted;
-                if covered && claim.all_windows_done() && !claim.windows.is_empty() {
+                let pages: u64 = claim
+                    .windows
+                    .iter()
+                    .map(|window| u64::from(window.plan.page_count))
+                    .sum();
+                let store_done = claim.manager.as_ref().is_none_or(|manager| {
+                    manager.done
+                        && pages == claim.total_pages
+                        && (!claim.want_row || claim.windows.iter().any(|window| window.plan.row))
+                });
+                if covered && store_done && claim.all_windows_done() && !claim.windows.is_empty() {
                     self.finish(key, v2::ClaimState::Copied, v2::ClaimReason::ReasonNone);
                 } else {
                     self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
@@ -995,6 +1276,9 @@ impl Core {
         let requester_sid = self.claims[&key].requester_sid;
         self.send(requester_sid, M::ClaimTerminal(message));
         self.cancel_export(key, reason);
+        if self.claims[&key].manager.is_some() {
+            self.store_cancel_get(key);
+        }
         self.reclaim(key);
     }
 
@@ -1074,6 +1358,14 @@ impl Core {
             .all(|window| window.phase == Phase::Free)
         {
             claim.block = None;
+        }
+        let release = requester_ok
+            && claim
+                .manager
+                .as_mut()
+                .is_some_and(|manager| !std::mem::replace(&mut manager.transfer_released, true));
+        if release {
+            self.store_release_transfer(key);
         }
     }
 

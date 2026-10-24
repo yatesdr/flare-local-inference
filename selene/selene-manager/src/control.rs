@@ -1821,6 +1821,7 @@ pub fn run_peer(
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
         ))
     })?;
+    let (commands, mut receiver) = mpsc::channel::<StoreCommand>(64);
     // The pool actor runs on the runtime; its sessions arrive through the gRPC service.
     let (shm, staging_arena, recovered_records) = store.pool_view();
     let pool_config = crate::pool::PoolConfig {
@@ -1837,8 +1838,14 @@ pub fn run_peer(
         transports: pool_transports(&config),
         data_address: None,
     };
-    let (pool_core, pool_handle, pool_events) =
-        crate::pool::Core::new(pool_config, shm, staging_arena, true, recovered_records);
+    let (pool_core, pool_handle, pool_events) = crate::pool::Core::new(
+        pool_config,
+        shm,
+        staging_arena,
+        true,
+        recovered_records,
+        Some(commands.clone()),
+    );
     let pool_service = crate::pool::PoolService::new(pool_handle.clone());
     let pool_task = runtime.spawn(pool_core.run(pool_events));
     // Bind every listener before any thread starts, so a startup failure leaves no threads
@@ -1873,7 +1880,6 @@ pub fn run_peer(
             directory.display()
         ))
     })?;
-    let (commands, mut receiver) = mpsc::channel::<StoreCommand>(64);
     let mut cleanup = Cleanup {
         stop: stop.clone(),
         commands: commands.clone(),
