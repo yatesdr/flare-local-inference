@@ -19,12 +19,12 @@ use std::{
 
 use crate::{
     Error, ExportChain, ExportId, ExportRefusal, History, HostHit, HostStore, InboundTicket,
-    PrefixKey, PublishedCheckpoint, Result, Scratch, StoreEvent, StoreOutcome, StoreStats,
-    Tier as Local,
+    PrefixKey, PublishedCheckpoint, Result, Scratch, StoreEvent, StoreOutcome, StoreReason,
+    StoreStats, Tier as Local,
     characterize::{Characterizer, Level, Pages},
     index::Match,
     plan::{self, Identity, Plan, Request, SourceId, Which},
-    store::INITIAL_PREFILL_RATE,
+    store::{INITIAL_MEMORY_RATE, INITIAL_PREFILL_RATE, INITIAL_STAGED_DISK_RATE, worth_transfer},
 };
 
 use super::{
@@ -131,6 +131,12 @@ const SKIP: Duration = Duration::from_secs(1);
 const PLANS: usize = 256;
 /// Times a failed pool restore is replanned from other sources.
 const RETRIES: u32 = 2;
+/// Copies out of the GPU in flight beyond which a publication is declined.
+const COPY_QUEUE: usize = 16;
+/// How long a record seen in a lookup answer counts as held elsewhere.
+const HELD_FOR: Duration = Duration::from_secs(30);
+/// Holdings remembered from lookup answers before the memory is cleared.
+const HELD_MAX: usize = 4096;
 
 /// The keys a history has at the positions a plan mentions, kept so that a
 /// plan can be rebuilt after the request's history is gone.
@@ -194,6 +200,8 @@ pub struct PooledStore<S: HostStore, P: PoolPort = PoolClient> {
     puts: Vec<(u64, PutOutcome)>,
     /// Moves of the last local tier's records to the manager.
     cascade: Cascade,
+    /// Records lookup answers showed in a host tier of the pool, with when.
+    held: HashMap<PrefixKey, (Level, Instant)>,
     characterizer: Option<Characterizer>,
     characterized_for: Option<crate::characterize::Topology>,
     /// What the synthetic probe records are keyed by: the model and, once connected, this instance.
@@ -287,6 +295,7 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             pool_events: Vec::new(),
             puts: Vec::new(),
             cascade: Cascade::new(layout),
+            held: HashMap::new(),
             characterizer: Characterizer::new(PROBE_PAGES, None).ok(),
             characterized_for: None,
             probe_model: identity_model,
@@ -363,6 +372,81 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
     /// The measured prefill rate the planner weighs transfers against.
     pub fn set_prefill_rate(&mut self, tokens_per_second: f64) {
         self.prefill_rate = tokens_per_second;
+    }
+
+    // ---- publication -----------------------------------------------------------
+
+    /// Remember which records the pool's host tiers held when a lookup asked.
+    fn remember_held(&mut self, now: Instant, candidates: &[PoolCandidate]) {
+        if self.held.len() >= HELD_MAX {
+            self.held
+                .retain(|_, (_, seen)| now.duration_since(*seen) < HELD_FOR);
+            if self.held.len() >= HELD_MAX {
+                self.held.clear();
+            }
+        }
+        for candidate in candidates {
+            let level = candidate.plan.level;
+            if matches!(level, Level::HostDram | Level::HostNvme) {
+                for key in candidate
+                    .plan
+                    .nodes
+                    .iter()
+                    .map(|node| node.key)
+                    .chain([candidate.plan.key])
+                {
+                    self.held.insert(key, (level, now));
+                }
+            }
+        }
+    }
+
+    /// Whether a host tier of the pool at least as close as the one a
+    /// publication would be copied into held `key` recently.
+    fn held_as_close(&self, key: &PrefixKey) -> bool {
+        let Some((level, seen)) = self.held.get(key) else {
+            return false;
+        };
+        let closest = match self.inner.closest_tier() {
+            Some(Local::Memory) => Level::HostDram,
+            _ => Level::HostNvme,
+        };
+        seen.elapsed() < HELD_FOR && (*level == Level::HostDram || closest == Level::HostNvme)
+    }
+
+    /// Whether restoring a checkpoint from the first host tier would beat
+    /// recomputing it, at the measured rate of that tier or its first estimate.
+    fn worth_keeping(&self, checkpoint: &PublishedCheckpoint) -> bool {
+        let bytes = checkpoint.tail_pages as u64 * self.page_record_bytes + self.row_record_bytes;
+        let initial = match self.inner.closest_tier() {
+            Some(Local::Disk) => INITIAL_STAGED_DISK_RATE,
+            _ => INITIAL_MEMORY_RATE,
+        };
+        let measured = self.inner.stats().inbound_rate;
+        let rate = if measured > 0.0 { measured } else { initial };
+        worth_transfer(
+            checkpoint.tail_pages as u64 * self.page_tokens,
+            bytes as f64 / rate,
+            self.prefill_rate,
+        )
+    }
+
+    /// Copy `checkpoint` to the first host tier now, if that is worth it:
+    /// `Oversize` (never stored; the worker does not ask again) when restoring
+    /// it would not beat recomputing it, `Present` when the pool already holds
+    /// it in a tier at least as close, `Retry(Queue)` when too many copies are
+    /// in flight, and otherwise what the tier answers.
+    fn copy_out(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+        if !self.worth_keeping(checkpoint) {
+            return Ok(StoreOutcome::Oversize);
+        }
+        if self.held_as_close(&checkpoint.key) {
+            return Ok(StoreOutcome::Present);
+        }
+        if self.inner.stats().outbound_in_flight >= COPY_QUEUE {
+            return Ok(StoreOutcome::Retry(StoreReason::Queue));
+        }
+        self.inner.write_back(checkpoint)
     }
 
     // ---- lookup ---------------------------------------------------------------
@@ -638,6 +722,7 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
             return local;
         };
         let now = Instant::now();
+        self.remember_held(now, &answer.candidates);
         let pool: Vec<PoolCandidate> = answer
             .candidates
             .iter()
@@ -710,7 +795,8 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
     }
 
     fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
-        let outcome = self.inner.store(checkpoint)?;
+        // The publication is announced as a GPU holding, so neighbours can
+        // claim it; copying it to a host tier waits for `write_back`.
         PoolPort::saved(
             &self.pool,
             IndexEntry {
@@ -725,7 +811,11 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
                     + self.row_record_bytes,
             },
         );
-        Ok(outcome)
+        Ok(StoreOutcome::Noted)
+    }
+
+    fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+        self.copy_out(checkpoint)
     }
 
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()> {
@@ -968,6 +1058,10 @@ mod tests {
         retired: Vec<(PrefixKey, Retirement)>,
         spill: Option<bool>,
         cascaded: bool,
+        /// Keys the local tiers were asked to copy, and the answer given.
+        stored: Vec<PrefixKey>,
+        store_outcome: Option<StoreOutcome>,
+        copies_in_flight: usize,
     }
 
     #[derive(Clone, Default)]
@@ -982,8 +1076,13 @@ mod tests {
                 .clone()
                 .filter(|hit| hit.resident_tokens == resident && hit.consumed_tokens < before)
         }
-        fn store(&mut self, _: &PublishedCheckpoint) -> Result<StoreOutcome> {
-            Ok(StoreOutcome::Queued)
+        fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+            let mut state = self.0.lock().unwrap();
+            state.stored.push(checkpoint.key);
+            Ok(state.store_outcome.unwrap_or(StoreOutcome::Queued))
+        }
+        fn closest_tier(&self) -> Option<Local> {
+            Some(Local::Memory)
         }
         fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()> {
             let mut state = self.0.lock().unwrap();
@@ -998,7 +1097,10 @@ mod tests {
             Ok(())
         }
         fn stats(&self) -> StoreStats {
-            StoreStats::default()
+            StoreStats {
+                outbound_in_flight: self.0.lock().unwrap().copies_in_flight,
+                ..StoreStats::default()
+            }
         }
         fn close(&mut self) -> Result<()> {
             Ok(())
@@ -1768,7 +1870,9 @@ mod tests {
             tail_pages: 2,
             slot: StateSlotId(1),
         };
-        assert_eq!(rig.store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
+        // Publishing announces the GPU holding and copies nothing.
+        assert_eq!(rig.store.store(&checkpoint).unwrap(), StoreOutcome::Noted);
+        assert!(rig.copies().is_empty());
         let saved = rig.pool.lock().unwrap().saved.clone();
         assert_eq!(saved.len(), 1);
         assert_eq!(
@@ -2238,5 +2342,122 @@ mod tests {
         let puts = rig.store.take_puts();
         assert!(matches!(puts.as_slice(), [(900, PutOutcome::Present)]));
         assert!(rig.retired().is_empty());
+    }
+
+    // ---- selective write-through at publication ----
+
+    impl Rig {
+        fn publication(&self, end: u64) -> PublishedCheckpoint {
+            let pages = (end / PT) as usize;
+            PublishedCheckpoint {
+                id: CheckpointId::new(5),
+                key: self.key(end),
+                parent: None,
+                bucket: [3; 16],
+                chain_pages: (0..pages as u32).map(PageId).collect(),
+                tail_pages: pages,
+                slot: StateSlotId(1),
+            }
+        }
+
+        fn copies(&self) -> Vec<PrefixKey> {
+            self.local.0.lock().unwrap().stored.clone()
+        }
+
+        fn announced_on_gpu(&self) -> usize {
+            self.pool
+                .lock()
+                .unwrap()
+                .saved
+                .iter()
+                .filter(|entry| entry.tier == Tier::Gpu)
+                .count()
+        }
+    }
+
+    #[test]
+    fn a_publication_is_noted_and_announced_and_copies_nothing_until_written_back() {
+        let mut rig = rig();
+        let checkpoint = rig.publication(800);
+        assert_eq!(rig.store.store(&checkpoint).unwrap(), StoreOutcome::Noted);
+        assert!(rig.copies().is_empty());
+        assert_eq!(rig.announced_on_gpu(), 1);
+        assert_eq!(
+            rig.store.write_back(&checkpoint).unwrap(),
+            StoreOutcome::Queued
+        );
+        assert_eq!(rig.copies(), [checkpoint.key]);
+        assert_eq!(rig.announced_on_gpu(), 1, "announced once");
+    }
+
+    #[test]
+    fn a_checkpoint_cheaper_to_recompute_than_to_restore_is_never_stored() {
+        let mut rig = rig();
+        let checkpoint = rig.publication(800);
+        // Prefill so fast that no restore can beat it.
+        rig.store.set_prefill_rate(1e12);
+        assert_eq!(
+            rig.store.write_back(&checkpoint).unwrap(),
+            StoreOutcome::Oversize
+        );
+        assert!(rig.copies().is_empty());
+        // At the ordinary prefill rate it is worth keeping again.
+        rig.store.set_prefill_rate(INITIAL_PREFILL_RATE);
+        assert_eq!(
+            rig.store.write_back(&checkpoint).unwrap(),
+            StoreOutcome::Queued
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_the_pools_dram_already_holds_is_present_and_not_copied_again() {
+        let mut rig = rig();
+        // A lookup showed another instance's DRAM holding the endpoint; an
+        // NVMe holding does not count for an instance with a memory tier.
+        rig.answer(vec![
+            rig.candidate(Level::HostDram, 2, 0, 0, &[800], 0),
+            rig.candidate(Level::HostNvme, 3, 0, 0, &[1600], 0),
+        ]);
+        rig.lookup();
+        let held = rig.publication(800);
+        assert_eq!(rig.store.write_back(&held).unwrap(), StoreOutcome::Present);
+        assert!(rig.copies().is_empty());
+        let farther = rig.publication(1600);
+        assert_eq!(
+            rig.store.write_back(&farther).unwrap(),
+            StoreOutcome::Queued
+        );
+        assert_eq!(rig.copies(), [farther.key]);
+        // A key no lookup showed is copied.
+        let unknown = rig.publication(400);
+        assert_eq!(
+            rig.store.write_back(&unknown).unwrap(),
+            StoreOutcome::Queued
+        );
+    }
+
+    #[test]
+    fn a_full_copy_queue_tells_the_worker_to_retry_and_the_tiers_answers_pass_through() {
+        let mut rig = rig();
+        let checkpoint = rig.publication(800);
+        rig.local.0.lock().unwrap().copies_in_flight = 16;
+        assert_eq!(
+            rig.store.write_back(&checkpoint).unwrap(),
+            StoreOutcome::Retry(StoreReason::Queue)
+        );
+        assert!(rig.copies().is_empty());
+        rig.local.0.lock().unwrap().copies_in_flight = 0;
+        for inner in [
+            StoreOutcome::Retry(StoreReason::Queue),
+            StoreOutcome::Retry(StoreReason::Slabs),
+            StoreOutcome::Retry(StoreReason::Inflight),
+            StoreOutcome::Retry(StoreReason::Budget),
+            StoreOutcome::Present,
+            StoreOutcome::Oversize,
+            StoreOutcome::Queued,
+        ] {
+            rig.local.0.lock().unwrap().store_outcome = Some(inner);
+            assert_eq!(rig.store.write_back(&checkpoint).unwrap(), inner);
+        }
     }
 }

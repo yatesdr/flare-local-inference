@@ -979,7 +979,13 @@ impl HostStore for CompositeStore {
         Some(hit)
     }
 
-    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+    /// A publication is only noted: the worker asks for the copy with
+    /// `write_back` when it expects to evict the checkpoint.
+    fn store(&mut self, _checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+        Ok(StoreOutcome::Noted)
+    }
+
+    fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
         if checkpoint.tail_pages > checkpoint.chain_pages.len() {
             self.stats.store_failed += 1;
             return Err(invalid(format!(
@@ -1012,7 +1018,7 @@ impl HostStore for CompositeStore {
                 return Ok(StoreOutcome::Retry(StoreReason::Inflight));
             }
             self.remove_copy(key);
-            return self.disk.store(checkpoint);
+            return self.disk.write_back(checkpoint);
         }
         if self.memory.index().contains(&key) {
             self.stats.store_skipped += 1;
@@ -1027,7 +1033,7 @@ impl HostStore for CompositeStore {
             rows += spillable_rows;
         }
         if tail.len() > pages || rows == 0 {
-            let result = self.disk.store(checkpoint);
+            let result = self.disk.write_back(checkpoint);
             match &result {
                 Ok(outcome) if *outcome != StoreOutcome::Queued => self.stats.store_skipped += 1,
                 Err(_) => self.stats.store_failed += 1,
@@ -1275,6 +1281,10 @@ impl HostStore for CompositeStore {
 
     fn retired(&mut self, key: PrefixKey, tier: PoolTier, how: Retirement) {
         self.disk.retired(key, tier, how);
+    }
+
+    fn closest_tier(&self) -> Option<Tier> {
+        Some(Tier::Memory)
     }
 
     fn announce_to(&mut self, announcer: Announcer) {
@@ -1757,11 +1767,11 @@ mod tests {
             2,
             StateSlotId(2),
         );
-        assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.write_back(&root).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.disk.stats().outbound_in_flight, 1);
         assert!(store.outbound.is_empty());
         assert_eq!(store.memory.pool().free_pages(), 4);
-        assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.write_back(&child).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.outbound[&child.key].parent, Some(root.key));
         let parent_pins = store.disk.index().node(&root.key).unwrap().pins();
         assert!(parent_pins > 0);
@@ -1931,7 +1941,7 @@ mod tests {
         let mut ids = Ids::new();
         let root = checkpoint(&mut ids, &full, 700, None, pages(0..10), 10, StateSlotId(1));
         written(&mut store, &root, None, 1);
-        assert_ne!(store.store(&root).unwrap(), StoreOutcome::Queued);
+        assert_ne!(store.write_back(&root).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().store_skipped, 1);
 
         // A child is shaped by the disk index and holds its parent in place
@@ -1945,8 +1955,8 @@ mod tests {
             10,
             StateSlotId(2),
         );
-        assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
-        assert_ne!(store.store(&child).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.write_back(&child).unwrap(), StoreOutcome::Queued);
+        assert_ne!(store.write_back(&child).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().store_skipped, 2);
         assert_eq!(store.stats().outbound_in_flight, 1);
         assert_eq!(store.disk.index().node(&root.key).unwrap().pins(), 1);
@@ -1981,14 +1991,14 @@ mod tests {
             8,
             StateSlotId(3),
         );
-        assert_eq!(store.store(&orphan).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.write_back(&orphan).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.outbound[&orphan.key].parent, None);
         assert_eq!(store.outbound[&orphan.key].tail_pages, 31);
         store.poll(&mut events).unwrap();
 
         let mut short = checkpoint(&mut ids, &full, 1000, None, pages(0..3), 3, StateSlotId(1));
         short.tail_pages = 15;
-        assert!(store.store(&short).is_err());
+        assert!(store.write_back(&short).is_err());
         assert_eq!(store.stats().store_failed, 3);
         store.close().unwrap();
         drop(store);
@@ -2588,7 +2598,7 @@ mod tests {
         assert!(store.memory.record(&root.key).unwrap().durable);
         assert_eq!(store.stats().stored, 1);
         // The closed store still answers: the key is indexed, so it is skipped.
-        assert_ne!(store.store(&root).unwrap(), StoreOutcome::Queued);
+        assert_ne!(store.write_back(&root).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().store_skipped, 1);
         drop(store);
         fs::remove_dir_all(&directory).unwrap();
@@ -2749,7 +2759,7 @@ mod tests {
         history.append(&list, &[]).unwrap();
         let hit = store.lookup(&history, 0, u64::MAX).unwrap();
         assert_eq!((hit.key, hit.tier), (root.key, Tier::Memory));
-        assert_eq!(store.store(&root).unwrap(), StoreOutcome::Present);
+        assert_eq!(store.write_back(&root).unwrap(), StoreOutcome::Present);
 
         // A record that cannot fit beside it makes memory write it.
         let mut other_history = PrefixHistory::new(IDENTITY);
@@ -2767,7 +2777,7 @@ mod tests {
             StateSlotId(2),
         );
         assert_eq!(
-            store.store(&other).unwrap(),
+            store.write_back(&other).unwrap(),
             StoreOutcome::Retry(StoreReason::Slabs)
         );
         assert!(store.parked[&root.key].writing);
@@ -2784,7 +2794,7 @@ mod tests {
         assert_eq!(store.stats().stored, 1);
 
         // Written once, its memory copy now gives way to the new record.
-        assert_eq!(store.store(&other).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.write_back(&other).unwrap(), StoreOutcome::Queued);
         assert!(store.memory.record(&root.key).is_none());
         assert!(store.disk.index().node(&root.key).unwrap().ready);
         assert_eq!(store.stats().stored, 1);
@@ -2982,7 +2992,7 @@ mod tests {
             StateSlotId(2),
         );
         assert_eq!(
-            store.store(&other).unwrap(),
+            store.write_back(&other).unwrap(),
             StoreOutcome::Retry(StoreReason::Slabs)
         );
         collect(&mut store, &mut notices, &|notices| {
@@ -2991,7 +3001,7 @@ mod tests {
                 .any(|n| matches!(n, Notice::Saved(e) if e.tier == Pool::Nvme && e.key == root.key))
         });
         // ...and when the memory copy gives way, the move is one notice.
-        assert_eq!(store.store(&other).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.write_back(&other).unwrap(), StoreOutcome::Queued);
         collect(&mut store, &mut notices, &|notices| {
             notices.iter().any(|n| matches!(n, Notice::Spilled { .. }))
         });
@@ -3021,6 +3031,25 @@ mod tests {
             n,
             Notice::Evicted { key, tier, .. } if *key == root.key && *tier == Pool::Dram
         )));
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn a_publication_is_noted_and_local_mode_writes_through_on_write_back() {
+        let Some(directory) = test_directory("noted-local") else {
+            return;
+        };
+        let mut store = composite(&directory, 12, 4, 1 << 30);
+        let full = history(2000);
+        let mut ids = Ids::new();
+        let root = checkpoint(&mut ids, &full, 700, None, pages(0..10), 10, StateSlotId(1));
+        assert_eq!(store.store(&root).unwrap(), StoreOutcome::Noted);
+        assert!(store.outbound.is_empty() && !store.memory.index().contains(&root.key));
+        // Local mode keeps write-through: the copy lands in memory and a file
+        // is reserved and written at once.
+        assert_eq!(store.write_back(&root).unwrap(), StoreOutcome::Queued);
+        assert!(store.outbound.contains_key(&root.key));
+        assert!(store.parked.is_empty());
         store.close().unwrap();
     }
 }

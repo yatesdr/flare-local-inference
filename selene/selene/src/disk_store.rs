@@ -1647,7 +1647,7 @@ impl DiskStore {
     ) -> Result<Duration> {
         let key = checkpoint.key;
         let pages = checkpoint.tail_pages;
-        if self.store(checkpoint)? != StoreOutcome::Queued {
+        if self.write_back(checkpoint)? != StoreOutcome::Queued {
             return Err(invalid("the disk refused the probe record"));
         }
         let mut events = Vec::new();
@@ -2514,7 +2514,13 @@ impl HostStore for DiskStore {
         Some(self.hit(chain))
     }
 
-    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+    /// A publication is only noted: the worker asks for the copy with
+    /// `write_back` when it expects to evict the checkpoint.
+    fn store(&mut self, _checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+        Ok(StoreOutcome::Noted)
+    }
+
+    fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
         if let Some(outcome) = self.store_status(checkpoint)? {
             self.stats.store_skipped += 1;
             return Ok(outcome);
@@ -2602,6 +2608,10 @@ impl HostStore for DiskStore {
         }
         self.flush_announcements();
         polled
+    }
+
+    fn closest_tier(&self) -> Option<Tier> {
+        Some(Tier::Disk)
     }
 
     fn announce_to(&mut self, announcer: Announcer) {
@@ -2934,7 +2944,10 @@ mod tests {
             let mut ids = Ids::new();
             let publication =
                 checkpoint(&mut ids, &full, 128, None, pages(0..2), 2, StateSlotId(1));
-            assert_eq!(store.store(&publication).unwrap(), StoreOutcome::Queued);
+            assert_eq!(
+                store.write_back(&publication).unwrap(),
+                StoreOutcome::Queued
+            );
             let events = complete(
                 &log,
                 TransportEvent::StoreInvalidated {
@@ -3003,7 +3016,10 @@ mod tests {
             // The GPU has a different parent: the stored parent determines the rewrite tail.
             let publication =
                 checkpoint(&mut ids, &full, 512, None, pages(0..8), 8, StateSlotId(3));
-            assert_eq!(store.store(&publication).unwrap(), StoreOutcome::Queued);
+            assert_eq!(
+                store.write_back(&publication).unwrap(),
+                StoreOutcome::Queued
+            );
             let node = store.index.node(&compacted.key).unwrap();
             assert!(!node.ready && !node.row && node.pinned());
             assert_eq!(node.parent, Some(root.key));
@@ -3216,7 +3232,7 @@ mod tests {
         let full = history(2000);
         let mut ids = Ids::new();
         let root = checkpoint(&mut ids, &full, 700, None, pages(0..10), 10, StateSlotId(1));
-        assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.write_back(&root).unwrap(), StoreOutcome::Queued);
         match &log.borrow().calls[..] {
             [
                 Call::Store {
@@ -3251,7 +3267,7 @@ mod tests {
 
         // The same key again is skipped without a second call, and a record
         // being written never matches a lookup.
-        assert_ne!(store.store(&root).unwrap(), StoreOutcome::Queued);
+        assert_ne!(store.write_back(&root).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().store_skipped, 1);
         assert_eq!(store.stats().outbound_in_flight, 1);
         assert_eq!(log.borrow().calls.len(), 1);
@@ -3267,7 +3283,7 @@ mod tests {
             10,
             StateSlotId(2),
         );
-        assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.write_back(&child).unwrap(), StoreOutcome::Queued);
         match &log.borrow().calls[1] {
             Call::Store {
                 id, header, pages, ..
@@ -3296,7 +3312,7 @@ mod tests {
             store.plan_record(&orphan),
             (None, orphan.chain_pages.clone())
         );
-        assert_eq!(store.store(&orphan).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.write_back(&orphan).unwrap(), StoreOutcome::Queued);
         match &log.borrow().calls[2] {
             Call::Store {
                 id, header, pages, ..
@@ -3426,7 +3442,7 @@ mod tests {
         // The store refuses a checkpoint whose chain cannot hold its tail.
         let mut short = checkpoint(&mut ids, &full, 1000, None, pages(0..3), 15, StateSlotId(1));
         short.tail_pages = 15;
-        assert!(store.store(&short).is_err());
+        assert!(store.write_back(&short).is_err());
         assert!(store.record(&short.key).is_none());
 
         store.close().unwrap();
@@ -3449,8 +3465,8 @@ mod tests {
             10,
             StateSlotId(2),
         );
-        assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
-        assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.write_back(&root).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.write_back(&child).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.used(), 2 * root_bytes);
 
         let events = complete(
@@ -3745,7 +3761,7 @@ mod tests {
         let full = history(2000);
         let mut ids = Ids::new();
         let root = checkpoint(&mut ids, &full, 700, None, pages(0..10), 10, StateSlotId(1));
-        assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.write_back(&root).unwrap(), StoreOutcome::Queued);
         complete(
             &log,
             TransportEvent::Stored {
@@ -3765,7 +3781,7 @@ mod tests {
             10,
             StateSlotId(2),
         );
-        assert_ne!(store.store(&child).unwrap(), StoreOutcome::Queued);
+        assert_ne!(store.write_back(&child).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().store_skipped, 1);
         assert!(unlinked(&log).is_empty());
         assert_eq!(log.borrow().calls.len(), 1);
@@ -3777,7 +3793,7 @@ mod tests {
 
         // Beside its parent the child fits, and the parent ends unpinned.
         store.limit = 2 * root_bytes;
-        assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.write_back(&child).unwrap(), StoreOutcome::Queued);
         let node = store.index().node(&root.key).unwrap();
         assert_eq!((node.children(), node.pins()), (1, 0));
         complete(
@@ -3801,7 +3817,7 @@ mod tests {
         );
         let sibling_bytes = 2 * 4096 + 11 * PAGE_RECORD + ROW_RECORD;
         store.limit = 2 * root_bytes + sibling_bytes;
-        assert_eq!(store.store(&sibling).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.write_back(&sibling).unwrap(), StoreOutcome::Queued);
         complete(
             &log,
             TransportEvent::Stored {
@@ -3823,7 +3839,7 @@ mod tests {
             11,
             StateSlotId(4),
         );
-        assert_eq!(store.store(&grandchild).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.write_back(&grandchild).unwrap(), StoreOutcome::Queued);
         assert_eq!(
             unlinked(&log),
             [store.directory().join(record::file_name(&sibling.key))]
@@ -3861,7 +3877,7 @@ mod tests {
             StateSlotId(5),
         );
         assert!(2 * 4096 + 47 * PAGE_RECORD + ROW_RECORD > store.limit());
-        assert_ne!(store.store(&huge).unwrap(), StoreOutcome::Queued);
+        assert_ne!(store.write_back(&huge).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().store_skipped, 2);
         assert_eq!(log.borrow().calls.len(), 5);
         assert_eq!(store.index().len(), 3);
@@ -5355,5 +5371,21 @@ mod tests {
         store.flush_announcements();
         assert_eq!(unlinked(&log).len(), 1);
         assert!(!store.index.contains(&leaf.key));
+    }
+
+    #[test]
+    fn a_publication_is_noted_and_the_file_waits_for_write_back() {
+        let (mut store, log) = store_with(Vec::new(), 1 << 30);
+        let full = history(1000);
+        let mut ids = Ids::new();
+        let publication = checkpoint(&mut ids, &full, 128, None, pages(0..2), 2, StateSlotId(1));
+        assert_eq!(store.store(&publication).unwrap(), StoreOutcome::Noted);
+        assert!(log.borrow().calls.is_empty());
+        assert!(store.index.is_empty());
+        assert_eq!(
+            store.write_back(&publication).unwrap(),
+            StoreOutcome::Queued
+        );
+        assert_eq!(log.borrow().calls.len(), 1);
     }
 }
