@@ -6,6 +6,10 @@
 
 mod identity;
 mod lookup;
+#[allow(clippy::all, dead_code)]
+pub(crate) mod wire {
+    tonic::include_proto!("selene.v2");
+}
 mod types;
 
 pub use identity::{Geometry, RankPlanes, Scope, instance_id, process_nonce, scope_id};
