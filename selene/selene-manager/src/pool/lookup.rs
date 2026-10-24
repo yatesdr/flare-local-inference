@@ -191,6 +191,16 @@ impl Core {
             request.max_candidates.min(limits.max_candidates)
         } as usize;
 
+        // Records shorter than one page all live in the root bucket, whatever they are
+        // records of, so for a history that has a block of its own they would fill the
+        // candidate list with records that cannot be told from a match. Such a record
+        // restores no page, so it is not offered then.
+        let short = if boundaries.len() > 1 {
+            geometry.page_tokens
+        } else {
+            0
+        };
+
         // Candidates.
         let mut scanned = 0usize;
         let mut found: Vec<Ranked> = Vec::new();
@@ -207,7 +217,10 @@ impl Core {
                 let Some(entry) = state.index.get(source, key, tier) else {
                     continue;
                 };
-                if !entry.row || entry.key.consumed_tokens >= request.before_tokens {
+                if !entry.row
+                    || entry.key.consumed_tokens >= request.before_tokens
+                    || entry.key.consumed_tokens < short
+                {
                     continue;
                 }
                 let Some((level, source_ref)) =

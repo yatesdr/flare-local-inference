@@ -694,6 +694,36 @@ async fn l1_to_l3_ordering_trimming_and_the_requesters_own_entries() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l1b_records_shorter_than_a_block_do_not_crowd_out_a_long_history_s_candidates() {
+    let mut host = host();
+    host.start();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    let (ia, ic) = (Ident::new("a"), Ident::new("c"));
+    let mut a = source(&mut pool, &ia).await;
+    let mut c_session = source(&mut pool, &ic).await;
+    // Twelve short records of unrelated prompts, nearer in level than the record we want.
+    let shorts: Vec<v2::IndexEntry> = (1..=12u64)
+        .map(|n| chain(&[10 + n], v2::Tier::Gpu, n).remove(0))
+        .collect();
+    a.notices(shorts.into_iter().map(saved).collect()).await;
+    a.notices(
+        chain(&[1024, 2048, 3072], v2::Tier::Dram, 3)
+            .into_iter()
+            .map(saved)
+            .collect(),
+    )
+    .await;
+    // A history with blocks of its own is offered the long records only.
+    let reply = c_session.lookup(1, 5000, vec![]).await;
+    let found = candidates_of(&reply);
+    assert_eq!(found.len(), 3, "{found:?}");
+    assert!(found.iter().all(|(_, _, tokens)| *tokens >= 1024), "{found:?}");
+    // A history shorter than a block has only the root bucket, so it still sees them.
+    let reply = c_session.lookup(2, 500, vec![]).await;
+    assert_eq!(candidates_of(&reply).len(), 8, "capped at max_candidates");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l5_to_l8_holes_limits_and_validation() {
     let mut host = host();
     host.config.pool.limits.max_concurrent_lookups = 2;
