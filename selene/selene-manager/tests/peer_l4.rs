@@ -181,8 +181,8 @@ impl Topology {
     fn create(label: &str) -> Self {
         let tag = format!("{}-{label}", std::process::id());
         let topology = Self {
-            near: format!("cm-l4-a-{tag}"),
-            storage: format!("cm-l4-b-{tag}"),
+            near: format!("selene-l4-a-{tag}"),
+            storage: format!("selene-l4-b-{tag}"),
             near_addr: "192.0.2.1".into(),
             storage_addr: "192.0.2.2".into(),
         };
