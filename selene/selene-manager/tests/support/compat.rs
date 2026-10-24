@@ -31,7 +31,7 @@ const WAIT: Duration = Duration::from_secs(30);
 /// A restore's `CopyResult{COPY_OK}` sent in the same instant as the last
 /// `WindowReleased` can overtake the manager's own completion of the read and be
 /// judged a copy error, so the client lets the manager finish first.
-const SETTLE: Duration = Duration::from_millis(60);
+pub const SETTLE: Duration = Duration::from_millis(60);
 
 /// The bucket digest `content_for` writes into every record.
 pub const BUCKET: [u8; 16] = [4; 16];
