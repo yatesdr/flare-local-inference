@@ -48,7 +48,8 @@ async fn h6_a_tcp_session_has_no_shared_memory_and_serves_exports_over_the_data_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l4_and_a22_remote_sessions_see_the_managers_records_as_level_five_and_instances_through_the_relay() {
+async fn l4_and_a22_remote_sessions_see_the_managers_records_as_level_five_and_instances_through_the_relay()
+ {
     let net = Net::start(|_| {});
     let mut unix = net.unix().await;
     // A same-host source with shared memory, and a record in the manager's store.

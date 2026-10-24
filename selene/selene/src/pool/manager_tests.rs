@@ -176,7 +176,7 @@ impl Manager {
             text.lines()
                 .find_map(|line| {
                     line.strip_prefix(&format!(
-                        "cm_pool_channel_{name}_total{{carrier=\"{carrier}\"}} "
+                        "selene_pool_channel_{name}_total{{carrier=\"{carrier}\"}} "
                     ))
                 })
                 .and_then(|value| value.trim().parse().ok())
