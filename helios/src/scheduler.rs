@@ -5,11 +5,13 @@ mod learning;
 mod policy;
 mod refresh;
 mod service;
+mod sharing;
 mod utility;
 #[cfg(feature = "server")]
 pub(crate) use cost::observed_duration_ns;
 pub use policy::{PolicyConfig, RequestAccounting};
 use refresh::PlanOrigin;
+pub use sharing::{EvictedCheckpoint, ExportChain, ExportLookup, ExportNode, NextAdmission};
 pub mod speculation;
 pub(crate) mod decoded_history;
 mod rounds;
@@ -20,9 +22,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::cache::{
-    CheckpointId, CompletionUpdate, ConditioningEvent, EvictionTarget, Fence, Lookup, PageId,
-    PrefixCheckpointCache, PrefixHistory, PrefixKey, Publication, PublishResult, SnapshotId,
-    StateSnapshot,
+    CheckpointId, CompletionUpdate, ConditioningEvent, EvictionReport, EvictionTarget, Fence,
+    Lookup, PageId, PrefixCheckpointCache, PrefixHistory, PrefixKey, Publication, PublishResult,
+    Reclaimable, SnapshotId, StateSnapshot,
 };
 use crate::execution::{CompletionRecord, GraphKind, REQUEST_LANES};
 use crate::offload::{InboundTicket, PublishedCheckpoint};
@@ -667,6 +669,7 @@ pub struct RequestScheduler {
     tickets: HashMap<PrefixKey, Ticket>,
     track_publications: bool,
     publications: Vec<CheckpointId>,
+    evictions: Vec<EvictedCheckpoint>,
     admissions: u64,
 }
 
@@ -740,6 +743,7 @@ impl RequestScheduler {
             tickets: HashMap::new(),
             track_publications: false,
             publications: Vec::new(),
+            evictions: Vec::new(),
             admissions: 0,
         })
     }
@@ -1137,7 +1141,7 @@ impl RequestScheduler {
                     "request resources are awaiting GPU retirement",
                 ));
             }
-            let evicted = self.cache.evict(EvictionTarget {
+            let evicted = self.evict(EvictionTarget {
                 pages: need_pages,
                 snapshots: need_snapshots,
             });
@@ -1222,7 +1226,7 @@ impl RequestScheduler {
                 if self.pending_page_count() >= want {
                     break;
                 }
-                let evicted = self.cache.evict(EvictionTarget {
+                let evicted = self.evict(EvictionTarget {
                     pages: want - self.free_pages.len(),
                     snapshots: 0,
                 });
@@ -1309,6 +1313,35 @@ impl RequestScheduler {
             request.accounting.terminal_since_ns.get_or_insert(now_ns);
         }
         Ok(())
+    }
+
+    /// Tokens a request may consume, including the widest speculative verification.
+    fn execution_limit(&self, prompt_tokens: usize, max_new_tokens: u32) -> usize {
+        let extra = self.speculative_widths.last().copied().unwrap_or(1) - 1;
+        (prompt_tokens + max_new_tokens as usize)
+            .saturating_add(extra)
+            .min(self.limits.max_sequence_tokens)
+    }
+
+    /// Pages a request reserves at admission when the destination already holds
+    /// `consumed_tokens`: a growable request reserves its prompt and one page of
+    /// output, and decoding grows it.
+    fn admission_pages(
+        &self,
+        prompt_tokens: usize,
+        max_new_tokens: u32,
+        growable: bool,
+        consumed_tokens: u64,
+    ) -> usize {
+        let page_tokens = self.capabilities.page_tokens;
+        let execution_limit = self.execution_limit(prompt_tokens, max_new_tokens);
+        let limit = if growable {
+            execution_limit.min(prompt_tokens + page_tokens)
+        } else {
+            execution_limit
+        };
+        limit.div_ceil(page_tokens) - (consumed_tokens / page_tokens as u64) as usize
+            + self.draft_pages()
     }
 
     pub fn admit(&mut self, spec: RequestSpec) -> Result<RequestHandle> {
@@ -1411,29 +1444,14 @@ impl RequestScheduler {
         if let Some(id) = pinned {
             self.cache.pin(id)?;
         }
-        let extra = self.speculative_widths.last().copied().unwrap_or(1) - 1;
-        let execution_limit = (spec.prompt.len() + spec.max_new_tokens as usize)
-            .saturating_add(extra)
-            .min(self.limits.max_sequence_tokens);
-        let draft_page = if !self.speculative_widths.is_empty()
-            && self.proposal_source == speculation::ProposalSource::Mtp
-        {
-            self.capabilities.draft_pages_per_request
-        } else {
-            0
-        };
-        // A growable request reserves its prompt and one page of output; decoding grows it.
-        let admission_limit = if spec.growable_output {
-            execution_limit.min(spec.prompt.len() + self.capabilities.page_tokens)
-        } else {
-            execution_limit
-        };
-        let reserved_count = admission_limit.div_ceil(self.capabilities.page_tokens)
-            - (consumed / page_tokens) as usize
-            + draft_page;
-        if admission_limit.div_ceil(self.capabilities.page_tokens) + draft_page
-            > self.limits.pages as usize
-        {
+        let execution_limit = self.execution_limit(spec.prompt.len(), spec.max_new_tokens);
+        let reserved_count = self.admission_pages(
+            spec.prompt.len(),
+            spec.max_new_tokens,
+            spec.growable_output,
+            consumed,
+        );
+        if reserved_count + (consumed / page_tokens) as usize > self.limits.pages as usize {
             if let Some(id) = pinned {
                 self.cache.unpin(id)?;
             }
