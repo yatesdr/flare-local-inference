@@ -994,6 +994,12 @@ message ExportRequest {
   // size of the chain before pinning and refuses NO_WINDOWS if it exceeds this.
   // For host tiers 0 means the claim will stream.
   uint64 reserved_bytes = 11;
+  // Set when the source has no shared memory with the manager (a TCP session):
+  // the source connects to this transfer after PINNED and writes each window it
+  // fills to it, in the direction of a put, and the manager relays the windows
+  // on to the requester. No ExportFill is sent and no WindowFilled expected:
+  // the windows are granted, and their checksums stated, on the channel.
+  DataChannelRef channel = 12;
 }
 
 enum PinResult {

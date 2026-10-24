@@ -64,8 +64,10 @@ manager has a certificate), presents the token and says which carrier moves the 
   default) expires; a socket that stalls for 20 s fails. The metrics carry
   `cm_pool_channel_windows_total` and `cm_pool_channel_bytes_total` by `carrier`.
 
-Instance-sourced candidates (a neighbour's host or GPU records) are not offered to a session
-without shared memory, so only the manager's own records travel this way. The framing is
+A neighbour's host or GPU records are offered to a session without shared memory too, and an
+instance without shared memory can be the neighbour: the manager relays the windows between the two
+legs through its staging, so the copy costs two network hops (or one, when either end is on the
+manager's host) and uses the manager's staging for the windows in flight. The framing is
 `flare_selene::pool::frame`, documented at the top of that file.
 
 ## Certificates
