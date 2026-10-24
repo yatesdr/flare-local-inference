@@ -272,17 +272,16 @@ fn preference(request: &Request, c: &Candidate) -> (usize, bool, u32, Reverse<u6
 /// Whether the part's pages beat recomputing the tokens they replace. A source
 /// whose cost is unknown, by its own estimate and by measurement, is not.
 fn worth(request: &Request, c: &Candidate, b: &Part, from: u64) -> bool {
-    let us = match c.us_per_page {
-        0 => request.ranking.us_per_page(c.level),
-        measured => Some(f64::from(measured)),
-    };
-    us.is_some_and(|us| {
-        worth_transfer(
-            c.key.consumed_tokens - from,
-            b.pages as f64 * us / 1e6,
-            request.prefill_tokens_per_second,
-        )
-    })
+    request
+        .ranking
+        .part_seconds(c.level, b.pages, c.us_per_page)
+        .is_some_and(|seconds| {
+            worth_transfer(
+                c.key.consumed_tokens - from,
+                seconds,
+                request.prefill_tokens_per_second,
+            )
+        })
 }
 
 /// The page where each node's tail starts, if the chain is consistent.
