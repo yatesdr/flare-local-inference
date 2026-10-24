@@ -974,20 +974,26 @@ fn coverage_must_be_exact_before_a_copy_ok_is_sent() {
 }
 
 #[test]
-fn a_window_that_leaves_out_the_row_does_not_cover_the_claim() {
+fn a_claim_whose_row_has_not_arrived_is_not_covered_until_its_window_does() {
     let mut rig = Rig::new();
     rig.open();
     let (_, claim) = granted_single(&mut rig);
     let w0 = ready(&rig, claim, window(0, 0, 0, 2, false, 0), 1);
     rig.send(In::WindowReady(w0));
     let w1 = ready(&rig, claim, window(1, 1, 0, 1, false, 2 * PAGE), 2);
-    let mut out = rig.send(In::WindowReady(w1));
-    // The first window's copy must drain before the verdict goes out.
-    assert!(pick!(out, CopyResult).is_empty());
-    out = rig.drain_copies();
+    rig.send(In::WindowReady(w1));
+    let out = rig.drain_copies();
+    assert!(
+        pick!(out, CopyResult).is_empty(),
+        "the row is still to come, so the claim is not covered"
+    );
+    // The row may follow in a window of its own, which completes the record.
+    let w2 = ready(&rig, claim, window(2, 1, 1, 0, true, 3 * PAGE), 3);
+    rig.send(In::WindowReady(w2));
+    let out = rig.drain_copies();
     assert_eq!(
         pick!(out, CopyResult)[0].outcome,
-        wire::CopyOutcome::CopyErrorOutcome as i32
+        wire::CopyOutcome::CopyOk as i32
     );
 }
 

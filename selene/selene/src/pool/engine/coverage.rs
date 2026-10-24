@@ -49,20 +49,24 @@ impl Coverage {
         let expected = &self.expected[record];
         let taken = self.taken[record];
         let last = record + 1 == self.expected.len();
+        let needs_row = last && expected.row;
         let remaining = expected.pages - taken;
-        if spec.first_page != expected.first_page + taken
+        // A row-only window follows the last page window when the row did not fit
+        // beside it. It names no page, so its first page is not compared.
+        if (spec.page_count > 0 && spec.first_page != expected.first_page + taken)
             || spec.page_count > remaining
-            || (spec.page_count == 0 && !(expected.pages == 0 && expected.row))
+            || (spec.page_count == 0 && !(needs_row && remaining == 0))
         {
             return Err(format!(
                 "window {} does not extend the coverage",
                 spec.index
             ));
         }
-        let completes = spec.page_count == remaining;
-        if spec.row != (last && completes && expected.row) {
+        let completes_pages = spec.page_count == remaining;
+        if spec.row && !(needs_row && completes_pages) {
             return Err(format!("window {} carries the row wrongly", spec.index));
         }
+        let completes = completes_pages && (!needs_row || spec.row);
         let row = if spec.row { row_bytes } else { 0 };
         if spec.length != u64::from(spec.page_count) * page_bytes + row {
             return Err(format!("window {} has the wrong length", spec.index));
@@ -77,5 +81,91 @@ impl Coverage {
         }
         self.windows += 1;
         Ok(before + u64::from(taken))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PrefixKey;
+
+    const PAGE: u64 = 100;
+    const ROW: u64 = 40;
+
+    fn record(first_page: u32, pages: u32, row: bool) -> ExpectedRecord {
+        ExpectedRecord {
+            key: PrefixKey {
+                consumed_tokens: 64,
+                digest: [1; 16],
+            },
+            first_page,
+            pages,
+            row,
+        }
+    }
+
+    fn window(index: u32, record: u32, first_page: u32, pages: u32, row: bool) -> wire::WindowSpec {
+        wire::WindowSpec {
+            index,
+            record,
+            first_page,
+            page_count: pages,
+            row,
+            length: u64::from(pages) * PAGE + if row { ROW } else { 0 },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_row_rides_with_the_last_pages_or_follows_in_a_window_of_its_own() {
+        let mut together = Coverage::new(vec![record(0, 2, true)]);
+        together
+            .accept(&window(0, 0, 0, 2, true), PAGE, ROW)
+            .unwrap();
+        assert!(together.complete());
+
+        let mut apart = Coverage::new(vec![record(0, 2, true)]);
+        apart.accept(&window(0, 0, 0, 2, false), PAGE, ROW).unwrap();
+        assert!(!apart.complete());
+        // The manager names no page for a window that carries only the row.
+        apart.accept(&window(1, 0, 0, 0, true), PAGE, ROW).unwrap();
+        assert!(apart.complete());
+    }
+
+    #[test]
+    fn a_misplaced_row_or_an_empty_window_is_refused() {
+        let mut early = Coverage::new(vec![record(0, 2, true)]);
+        assert!(early.accept(&window(0, 0, 0, 1, true), PAGE, ROW).is_err());
+        // Pages cannot follow a record's row, and an ancestor never carries one.
+        let mut ancestor = Coverage::new(vec![record(0, 1, true), record(1, 1, true)]);
+        assert!(
+            ancestor
+                .accept(&window(0, 0, 0, 1, true), PAGE, ROW)
+                .is_err()
+        );
+        let mut empty = Coverage::new(vec![record(0, 2, true)]);
+        assert!(empty.accept(&window(0, 0, 0, 0, true), PAGE, ROW).is_err());
+        // A row-only window needs a row to carry.
+        let mut rowless = Coverage::new(vec![record(0, 2, false)]);
+        rowless
+            .accept(&window(0, 0, 0, 2, false), PAGE, ROW)
+            .unwrap();
+        assert!(rowless.complete());
+        let mut without = Coverage::new(vec![record(0, 1, false), record(1, 1, false)]);
+        without
+            .accept(&window(0, 0, 0, 1, false), PAGE, ROW)
+            .unwrap();
+        assert!(
+            without
+                .accept(&window(1, 1, 1, 0, true), PAGE, ROW)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_row_only_tail_is_one_window_with_no_pages() {
+        let mut tail = Coverage::new(vec![record(3, 0, true)]);
+        tail.accept(&window(0, 0, 3, 0, true), PAGE, ROW).unwrap();
+        assert!(tail.complete());
     }
 }
