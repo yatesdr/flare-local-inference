@@ -163,8 +163,20 @@ pub const INITIAL_PREFILL_RATE: f64 = 8000.0;
 
 /// A fetch is worthwhile when the transfer takes less than half the prefill it replaces.
 pub fn worth_fetching(hit: &HostHit, prefill_tokens_per_second: f64) -> bool {
-    let gained = (hit.consumed_tokens - hit.resident_tokens) as f64;
-    hit.estimated_seconds < 0.5 * gained / prefill_tokens_per_second.max(1.0)
+    worth_transfer(
+        hit.consumed_tokens - hit.resident_tokens,
+        hit.estimated_seconds,
+        prefill_tokens_per_second,
+    )
+}
+
+/// The same rule for `gained_tokens` of prefill replaced by a transfer of `estimated_seconds`.
+pub fn worth_transfer(
+    gained_tokens: u64,
+    estimated_seconds: f64,
+    prefill_tokens_per_second: f64,
+) -> bool {
+    estimated_seconds < 0.5 * gained_tokens as f64 / prefill_tokens_per_second.max(1.0)
 }
 
 #[cfg(test)]
