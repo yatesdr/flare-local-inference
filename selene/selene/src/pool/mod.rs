@@ -15,6 +15,7 @@ mod host_tests;
 mod identity;
 mod lookup;
 pub(crate) mod pins;
+mod probe;
 mod shared;
 mod shm;
 #[cfg(test)]

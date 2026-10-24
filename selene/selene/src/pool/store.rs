@@ -19,8 +19,9 @@ use std::{
 
 use crate::{
     Error, ExportChain, ExportId, ExportRefusal, History, HostHit, HostStore, InboundTicket,
-    PrefixKey, PublishedCheckpoint, Result, StoreEvent, StoreOutcome, StoreStats, Tier as Local,
-    characterize::Level,
+    PrefixKey, PublishedCheckpoint, Result, Scratch, StoreEvent, StoreOutcome, StoreStats,
+    Tier as Local,
+    characterize::{Characterizer, Level, Pages},
     index::Match,
     plan::{self, Identity, Plan, Request, SourceId, Which},
     store::INITIAL_PREFILL_RATE,
@@ -31,6 +32,7 @@ use super::{
     client::PoolClient,
     exporter::HostPin,
     lookup::{LookupState, LookupTicket},
+    probe::StoreProbe,
     shared::{FetchPart, PoolEvent, PoolFetch, PutOutcome, PutRequest},
     types::{HeldRange, PoolCandidate, SourceRef, Tier},
 };
@@ -42,6 +44,8 @@ pub trait PoolPort {
     fn fetch(&mut self, fetch: PoolFetch) -> Result<u64>;
     fn poll(&mut self, events: &mut Vec<PoolEvent>) -> Result<()>;
     fn ranking(&self) -> crate::characterize::Ranking;
+    fn set_ranking(&self, ranking: crate::characterize::Ranking);
+    fn topology(&self) -> crate::characterize::Topology;
     fn saved(&self, entry: IndexEntry);
     fn evicted(&self, key: PrefixKey, tier: Tier, generation: u64, heir: Option<IndexEntry>);
     fn evictions_lost(&self);
@@ -66,6 +70,12 @@ impl PoolPort for PoolClient {
     }
     fn ranking(&self) -> crate::characterize::Ranking {
         PoolClient::ranking(self)
+    }
+    fn set_ranking(&self, ranking: crate::characterize::Ranking) {
+        PoolClient::set_ranking(self, ranking)
+    }
+    fn topology(&self) -> crate::characterize::Topology {
+        PoolClient::topology(self)
     }
     fn saved(&self, entry: IndexEntry) {
         PoolClient::saved(self, entry)
@@ -98,6 +108,14 @@ impl PoolPort for PoolClient {
         PoolClient::close(self)
     }
 }
+
+/// Pages of the three sizes the characterizer times: a small, a typical and a
+/// long prefix. The scratch ids must cover the long one.
+pub const PROBE_PAGES: Pages = Pages {
+    small: 2,
+    typical: 16,
+    long: 64,
+};
 
 /// The planner's name for this instance's own tiers.
 const LOCAL: SourceId = SourceId(0);
@@ -165,6 +183,9 @@ pub struct PooledStore<S: HostStore, P: PoolPort = PoolClient> {
     pool_events: Vec<PoolEvent>,
     /// How the puts started through this store ended, until collected.
     puts: Vec<(u64, PutOutcome)>,
+    characterizer: Option<Characterizer>,
+    characterized_for: Option<crate::characterize::Topology>,
+    model: [u8; 32],
 }
 
 impl<S: HostStore> PooledStore<S, PoolClient> {
@@ -183,13 +204,15 @@ impl<S: HostStore> PooledStore<S, PoolClient> {
             model: config.scope.model_identity,
             layout: config.scope.layout_fingerprint,
         };
+        let order = config.level_order;
         let pool = PoolClient::start(config, copier, registrar)?;
-        Ok(Self::new(inner, pool, identity, &layout))
+        Self::new(inner, pool, identity, &layout).with_pinned_order(order)
     }
 }
 
 impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
     pub fn new(mut inner: S, pool: P, identity: Identity, layout: &crate::Layout) -> Self {
+        let identity_model = identity.model;
         inner.announce_to(pool.announcer());
         Self {
             inner,
@@ -205,7 +228,65 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             inner_events: Vec::new(),
             pool_events: Vec::new(),
             puts: Vec::new(),
+            characterizer: Characterizer::new(PROBE_PAGES, None).ok(),
+            characterized_for: None,
+            model: identity_model,
         }
+    }
+
+    /// Pin the order of the copy levels instead of measuring it. `order` names
+    /// the four levels closest first.
+    pub fn with_pinned_order(mut self, order: Option<[Level; 4]>) -> Result<Self> {
+        let pinned = order.map(|order| {
+            let mut levels = vec![Level::ThisGpu];
+            levels.extend(order);
+            levels
+        });
+        self.characterizer = Some(Characterizer::new(PROBE_PAGES, pinned)?);
+        Ok(self)
+    }
+
+    /// Whether the copy levels were last measured under another topology than
+    /// the pool has now (or never). The caller then runs [`PooledStore::characterize`]
+    /// when it has scratch ids to spare.
+    pub fn needs_characterization(&self) -> bool {
+        let now = PoolPort::topology(&self.pool);
+        self.characterized_for != Some(now)
+    }
+
+    /// Measure the cost of each copy level end to end and rank them, if the
+    /// topology changed since the last time (or never measured). Blocks for
+    /// the time the transfers take, bounded: three repetitions at each of
+    /// [`PROBE_PAGES`] for each level this instance can time. The `scratch`
+    /// ids must be idle for the whole call and no transfer may be in flight;
+    /// call it before the scheduler admits requests. Returns the one log line
+    /// naming the order in use, when it measured.
+    pub fn characterize(&mut self, scratch: &Scratch) -> Result<Option<String>> {
+        let mut characterizer = self
+            .characterizer
+            .take()
+            .ok_or_else(|| Error::new("the characterizer could not be built"))?;
+        let topology = PoolPort::topology(&self.pool);
+        let measured = {
+            let mut probe = StoreProbe {
+                inner: &mut self.inner,
+                pool: &mut self.pool,
+                scratch,
+                model: self.model,
+                page_tokens: self.page_tokens,
+                page_bytes: self.page_record_bytes as usize,
+                row_bytes: self.row_record_bytes as usize,
+                stash: &mut self.pool_events,
+            };
+            characterizer.update(topology, &mut probe)
+        };
+        let line = measured.then(|| {
+            PoolPort::set_ranking(&self.pool, characterizer.ranking().clone());
+            characterizer.ranking().log_line()
+        });
+        self.characterizer = Some(characterizer);
+        self.characterized_for = Some(topology);
+        Ok(line)
     }
 
     /// The puts that ended since the last call.
@@ -760,6 +841,8 @@ mod tests {
         pinned: Vec<(Tier, PrefixKey)>,
         refuse_pin: Option<ExportRefusal>,
         announced: bool,
+        /// Microseconds per page this store's own `tier` takes to restore.
+        probe: Option<(Local, u64)>,
     }
 
     #[derive(Clone, Default)]
@@ -798,6 +881,21 @@ mod tests {
         fn announce_to(&mut self, _: Announcer) {
             self.0.lock().unwrap().announced = true;
         }
+        fn probe(
+            &mut self,
+            tier: Local,
+            _: &Scratch,
+            pages: usize,
+            _: bool,
+        ) -> Result<Option<Duration>> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .probe
+                .filter(|(held, _)| *held == tier)
+                .map(|(_, per_page)| Duration::from_micros(per_page * pages as u64)))
+        }
         fn pin_export(
             &mut self,
             tier: Tier,
@@ -831,6 +929,10 @@ mod tests {
 
     #[derive(Default)]
     struct PoolState {
+        ranking: Option<Ranking>,
+        topology: u64,
+        /// Serve the probe record at this level, as a manager would.
+        manager_level: Option<Level>,
         host_pinned: Vec<ExportId>,
         refused: Vec<(ExportId, ExportRefusal)>,
         answer: Option<Arc<Answer>>,
@@ -847,9 +949,38 @@ mod tests {
     struct FakePool(Arc<Mutex<PoolState>>, Ranking, Announcer);
 
     impl PoolPort for FakePool {
-        fn begin_lookup(&self, _: &dyn History, held: Vec<HeldRange>) -> LookupTicket {
+        fn begin_lookup(&self, history: &dyn History, held: Vec<HeldRange>) -> LookupTicket {
             let mut state = self.0.lock().unwrap();
             state.held.push(held);
+            if let Some(level) = state.manager_level {
+                let key = history.aligned_boundaries()[0];
+                let tail = (key.consumed_tokens / PT) as usize;
+                let candidate = PoolCandidate {
+                    plan: plan::Candidate {
+                        level,
+                        source: SourceId(9),
+                        generation: 1,
+                        key,
+                        begin_tokens: 0,
+                        skip_pages: 0,
+                        nodes: vec![plan::ChainNode {
+                            key,
+                            tail_pages: tail,
+                        }],
+                        us_per_page: 0,
+                    },
+                    source: SourceRef {
+                        instance: Vec::new(),
+                        session_incarnation: 0,
+                    },
+                    tier: Tier::Dram,
+                };
+                let answer = Arc::new(Answer {
+                    held: Vec::new(),
+                    candidates: vec![candidate],
+                });
+                return LookupTicket::watched(LookupState::Ready(answer), || {});
+            }
             match state.answer.clone() {
                 Some(answer) => LookupTicket::watched(LookupState::Ready(answer), || {}),
                 None => LookupTicket::watched(LookupState::Pending, || {}),
@@ -857,6 +988,12 @@ mod tests {
         }
         fn fetch(&mut self, fetch: PoolFetch) -> Result<u64> {
             let mut state = self.0.lock().unwrap();
+            if state.manager_level.is_some() {
+                let id = 78;
+                state.events.push(PoolEvent::Fetched { id, result: Ok(1) });
+                state.fetches.push(fetch);
+                return Ok(id);
+            }
             if state.reject {
                 return Err("the pool is not ready".into());
             }
@@ -868,7 +1005,12 @@ mod tests {
             Ok(())
         }
         fn ranking(&self) -> Ranking {
-            self.1.clone()
+            self.0
+                .lock()
+                .unwrap()
+                .ranking
+                .clone()
+                .unwrap_or_else(|| self.1.clone())
         }
         fn saved(&self, entry: IndexEntry) {
             self.0.lock().unwrap().saved.push(entry);
@@ -880,11 +1022,27 @@ mod tests {
                 .evicted
                 .push((key, tier, generation, heir));
         }
+        fn set_ranking(&self, ranking: Ranking) {
+            self.0.lock().unwrap().ranking = Some(ranking);
+        }
+        fn topology(&self) -> crate::characterize::Topology {
+            crate::characterize::Topology(self.0.lock().unwrap().topology)
+        }
         fn evictions_lost(&self) {
             self.0.lock().unwrap().lost += 1;
         }
-        fn put(&mut self, _: PutRequest) -> Result<u64> {
-            Err("the fake pool takes no puts".into())
+        fn put(&mut self, request: PutRequest) -> Result<u64> {
+            let mut state = self.0.lock().unwrap();
+            if state.manager_level.is_none() {
+                return Err("the fake pool takes no puts".into());
+            }
+            let _ = request;
+            let id = 77;
+            state.events.push(PoolEvent::Put {
+                id,
+                outcome: PutOutcome::Stored { bytes: 1 },
+            });
+            Ok(id)
         }
         fn cancel_put(&mut self, _: u64) {}
         fn announcer(&self) -> Announcer {
@@ -1479,5 +1637,82 @@ mod tests {
         rig.local_hit(800, Local::Memory);
         let hit = rig.lookup().unwrap();
         assert_eq!(hit.key, rig.key(1600));
+    }
+
+    fn scratch() -> Scratch {
+        Scratch {
+            pages: (0..64).map(PageId).collect(),
+            slot: StateSlotId(1),
+        }
+    }
+
+    #[test]
+    fn levels_are_ranked_by_what_the_stores_and_the_manager_measure_and_only_when_the_topology_changes()
+     {
+        let mut rig = rig();
+        rig.pool.lock().unwrap().topology = 5;
+        // Own DRAM is slow here; the manager serves host NVMe quickly.
+        rig.local.0.lock().unwrap().probe = Some((Local::Memory, 500));
+        rig.pool.lock().unwrap().manager_level = Some(Level::HostNvme);
+        assert!(rig.store.needs_characterization());
+        let line = rig
+            .store
+            .characterize(&scratch())
+            .unwrap()
+            .expect("measured");
+        assert!(line.contains("changed from the default"), "{line}");
+        assert!(line.contains("not measured"), "{line}");
+        let ranking = rig.store.pool().ranking();
+        assert!(ranking.rank(Level::HostNvme) < ranking.rank(Level::HostDram));
+        assert!(ranking.us_per_page(Level::HostDram).unwrap() > 400.0);
+        assert!(ranking.us_per_page(Level::NeighbourGpu).is_none());
+        assert!(
+            ranking.us_per_page(Level::RemoteNvme).is_none(),
+            "the manager serves it as host NVMe"
+        );
+        // Nothing moved: nothing is measured again.
+        assert!(!rig.store.needs_characterization());
+        assert!(rig.store.characterize(&scratch()).unwrap().is_none());
+        // A different manager or link measures again.
+        rig.pool.lock().unwrap().topology = 6;
+        assert!(rig.store.needs_characterization());
+        assert!(rig.store.characterize(&scratch()).unwrap().is_some());
+        // The pool's events that were not the probe's are kept for the worker.
+        assert!(rig.poll().is_empty());
+    }
+
+    #[test]
+    fn a_pinned_order_is_kept_whatever_is_measured_and_without_stores_or_manager_nothing_is_measured()
+     {
+        let local = FakeLocal::default();
+        let pool = Arc::new(Mutex::new(PoolState::default()));
+        pool.lock().unwrap().topology = 1;
+        let ranking = Ranking::default();
+        let order = [
+            Level::RemoteNvme,
+            Level::HostNvme,
+            Level::HostDram,
+            Level::NeighbourGpu,
+        ];
+        let mut store = PooledStore::new(
+            local.clone(),
+            FakePool(
+                pool.clone(),
+                ranking,
+                Announcer::new(Arc::new(tokio::sync::Notify::new())),
+            ),
+            identity(),
+            &layout(),
+        )
+        .with_pinned_order(Some(order))
+        .unwrap();
+        local.0.lock().unwrap().probe = Some((Local::Memory, 10));
+        let line = store.characterize(&scratch()).unwrap().unwrap();
+        assert!(line.contains("pinned"), "{line}");
+        assert_eq!(&store.pool().ranking().order()[1..], &order);
+        // With neither tier nor manager, every level stays where it was.
+        let mut bare = rig();
+        let line = bare.store.characterize(&scratch()).unwrap().unwrap();
+        assert!(line.contains("default order"), "{line}");
     }
 }
