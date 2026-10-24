@@ -882,3 +882,223 @@ async fn l9_not_ready_answers_with_a_retry_hint() {
     assert_eq!(info.sources_expected, 0);
     let _ = std::fs::remove_dir_all(base);
 }
+
+// ---------------------------------------------------------------- restart barrier (R, S)
+
+/// A rooted manager configuration whose directory outlives its fixture.
+fn rooted(label: &str) -> (std::path::PathBuf, selene_manager::store::Config) {
+    let base = std::env::temp_dir().join(format!("selene-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let mut config = selene_manager::store::Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        2 * 1024 * 1024,
+        64 * 1024 * 1024,
+    );
+    config.name = support::instance_name(label);
+    (base, config)
+}
+
+/// Runs a first manager in which `names` open, sync and leave cleanly.
+async fn first_life(config: &selene_manager::store::Config, names: &[&str]) -> String {
+    let mut first = config.clone();
+    first.name = support::instance_name("first");
+    let mut host = Host::open_config(first);
+    host.start();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    let arena = pool
+        .hello
+        .shared_memory
+        .as_ref()
+        .unwrap()
+        .arena_path
+        .clone();
+    for name in names {
+        let session = source(&mut pool, &Ident::new(name)).await;
+        session.goodbye(true).await;
+    }
+    host.stop();
+    // Dropping the fixture would delete the store directory.
+    host.base = std::env::temp_dir().join(format!("selene-unused-{}", std::process::id()));
+    arena
+}
+
+async fn wait_ready(session: &mut Session) -> v2::ReadinessInfo {
+    session
+        .take(|m| match m {
+            M::Readiness(info) if info.state == v2::ReadinessState::Ready as i32 => Some(*info),
+            _ => None,
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2_r3_and_s2_ready_when_remembered_sources_return_or_the_wait_ends() {
+    let (base, mut config) = rooted("r3");
+    config.pool.source_wait = Duration::from_secs(30);
+    let first_arena = first_life(&config, &["x", "y"]).await;
+
+    // Both return: READY as soon as the second snapshot installs, long before the bound.
+    let mut second = config.clone();
+    second.name = support::instance_name("second");
+    let mut host = Host::open_config(second);
+    host.start();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    // R6: the region files of a new incarnation are new files.
+    assert_ne!(
+        pool.hello.shared_memory.as_ref().unwrap().arena_path,
+        first_arena
+    );
+    assert_eq!(
+        pool.hello.readiness.unwrap().state,
+        v2::ReadinessState::AwaitingSources as i32
+    );
+    let mut watcher = pool.open(&Ident::new("w")).await;
+    watcher.snapshot(vec![]).await;
+    let started = std::time::Instant::now();
+    let mut x = pool.open(&Ident::new("x").restarted()).await;
+    x.snapshot(vec![]).await;
+    assert_eq!(watcher.readiness().await.sources_expected, 1);
+    let mut y = pool.open(&Ident::new("y").restarted()).await;
+    y.snapshot(vec![]).await;
+    let info = wait_ready(&mut watcher).await;
+    assert_eq!(info.sources_expected, 0);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(watcher.lookup(1, 1024, vec![]).await.status == v2::LookupStatus::LookupOk as i32);
+    host.stop();
+    host.base = std::env::temp_dir().join(format!("selene-unused2-{}", std::process::id()));
+
+    // One never returns: READY at the bound.
+    let mut third = config.clone();
+    third.name = support::instance_name("third");
+    third.pool.source_wait = Duration::from_millis(700);
+    let mut host = Host::open_config(third);
+    host.start();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    let mut watcher = pool.open(&Ident::new("w")).await;
+    watcher.snapshot(vec![]).await;
+    let began = std::time::Instant::now();
+    let mut x = pool.open(&Ident::new("x").restarted()).await;
+    x.snapshot(vec![]).await;
+    assert_eq!(
+        watcher.lookup(1, 1024, vec![]).await.status,
+        v2::LookupStatus::LookupNotReady as i32
+    );
+    wait_ready(&mut watcher).await;
+    assert!(
+        began.elapsed() >= Duration::from_millis(500),
+        "waited for the missing source"
+    );
+    assert!(began.elapsed() < Duration::from_secs(5));
+    host.stop();
+    host.base = std::env::temp_dir().join(format!("selene-unused3-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s8_a_changed_instance_id_does_not_satisfy_the_barrier_and_ages_out() {
+    let (base, mut config) = rooted("s8");
+    config.pool.source_wait = Duration::from_millis(900);
+    config.pool.instance_retention = Duration::from_secs(1);
+    first_life(&config, &["old"]).await;
+    // A different instance (its GPU set changed) returns: the old id still costs the wait.
+    let mut second = config.clone();
+    second.name = support::instance_name("second");
+    let mut host = Host::open_config(second);
+    host.start();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    let mut other = pool.open(&Ident::new("renamed")).await;
+    other.snapshot(vec![]).await;
+    assert_eq!(
+        other.readiness().await.state,
+        v2::ReadinessState::AwaitingSources as i32
+    );
+    wait_ready(&mut other).await;
+    host.stop();
+    host.base = std::env::temp_dir().join(format!("selene-unused-s8-{}", std::process::id()));
+    // Past the retention period the old id is forgotten and not waited for.
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let mut third = config.clone();
+    third.name = support::instance_name("third");
+    let mut host = Host::open_config(third);
+    host.start();
+    let pool = Pool::connect(&host.config.socket).await;
+    assert_eq!(
+        pool.hello.readiness.unwrap().state,
+        v2::ReadinessState::Ready as i32
+    );
+    host.stop();
+    host.base = std::env::temp_dir().join(format!("selene-unused-s8b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r13_shutdown_drains_claims_then_closes_sessions() {
+    let mut host = host();
+    host.config.pool.limits.progress_timeout_ms = 5000;
+    host.start();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    let mut source = source(&mut pool, &Ident::new("src")).await;
+    source
+        .notices(
+            chain(&[1024], v2::Tier::Gpu, 5)
+                .into_iter()
+                .map(saved)
+                .collect(),
+        )
+        .await;
+    let mut requester = self::source(&mut pool, &Ident::new("req")).await;
+    let candidate = requester.lookup(1, 1024, vec![]).await.candidates[0].clone();
+    requester
+        .claim(requester.claim_for(1, &candidate, 0, true))
+        .await;
+    let request = source.export_request().await;
+    let records = pool::records_for(&[1024], 0, 5, true);
+    source.pin_ok(&request, records, true).await;
+    requester.claim_granted(1).await;
+    let fill = source.export_fill().await;
+
+    host.request_stop();
+    let info = requester
+        .take(|m| match m {
+            M::Readiness(info) if info.state == v2::ReadinessState::Draining as i32 => Some(*info),
+            _ => None,
+        })
+        .await;
+    assert_eq!(info.state, v2::ReadinessState::Draining as i32);
+    // New sessions, lookups and claims are refused while draining.
+    let refused = pool.open(&Ident::new("late")).await;
+    assert_eq!(refused.opened.status, v2::OpenStatus::ShuttingDown as i32);
+    assert_eq!(
+        requester.lookup(2, 1024, vec![]).await.status,
+        v2::LookupStatus::LookupNotReady as i32
+    );
+    // The claim in flight still completes.
+    let content: Vec<u8> = (0..16)
+        .flat_map(|page| pool::page_bytes(1, page))
+        .chain(pool::row_bytes(1, 1024))
+        .collect();
+    source
+        .filled(request.export_id, &fill.windows[0], &content)
+        .await;
+    let ready = requester.window_ready(1).await;
+    requester.released(1, ready.window.unwrap().index).await;
+    source
+        .export_end(
+            request.export_id,
+            v2::ExportEndStatus::ExportComplete,
+            v2::FenceOutcome::Drained,
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    requester.copy_result(1, v2::CopyOutcome::CopyOk).await;
+    assert_eq!(
+        requester.claim_terminal(1).await.state,
+        v2::ClaimState::Copied as i32
+    );
+    requester.fence(1, v2::FenceOutcome::Drained).await;
+    let closing = requester.closed().await.expect("closing");
+    assert_eq!(closing.reason, v2::ClosingReason::ClosingShutdown as i32);
+    host.stop();
+}

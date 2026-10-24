@@ -299,6 +299,11 @@ impl Host {
         Ok(())
     }
 
+    /// Asks the manager to stop without waiting for it.
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
