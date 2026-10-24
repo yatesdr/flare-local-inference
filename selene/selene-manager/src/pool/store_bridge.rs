@@ -252,7 +252,7 @@ impl Core {
         let generation = if pid == 0 {
             // A process on another host has no pid to watch. It never touches the
             // manager's memory: the manager's own data-channel handler does.
-            self.store_call(|reply| StoreCommand::PeerHello {
+            self.store_call(|reply| StoreCommand::RemoteHello {
                 connection,
                 node: replica,
                 reply,

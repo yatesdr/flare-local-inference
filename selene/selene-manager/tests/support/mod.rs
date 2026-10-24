@@ -324,7 +324,9 @@ impl Host {
         wait(|| {
             self.metrics()
                 .lines()
-                .filter(|line| line.starts_with("selene_records{") && line.contains("tier=\"disk\""))
+                .filter(|line| {
+                    line.starts_with("selene_records{") && line.contains("tier=\"disk\"")
+                })
                 .filter_map(|line| line.rsplit(' ').next().unwrap().parse::<usize>().ok())
                 .sum::<usize>()
                 == count

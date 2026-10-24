@@ -845,8 +845,8 @@ What the manager serves, and where it is narrower than the contract above.
   through the manager's staging. On a manager with no network listener `DATA_CHANNEL` is refused
   (`INVALID_CLAIM`;
   `PutRefused{INVALID}` saying so). A remote instance has no pid, so the store gives it a
-  peer-style connection; it is told apart by its session, not watched, and no window is ever
-  leased to it.
+  connection of its own (`RemoteHello`); it is told apart by its session, not watched, and no
+  window is ever leased to it.
 - **Lookup timing.** Lookups are answered on the manager's 10 ms clock, not inline, so a
   burst beyond `max_concurrent_lookups` is refused `LOOKUP_OVERLOADED` at once. Candidates
   come from the index only; the manager never contacts a source to answer one.
