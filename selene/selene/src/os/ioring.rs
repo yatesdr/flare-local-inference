@@ -23,13 +23,13 @@ fn check(status: i32) -> io::Result<()> {
 }
 
 #[derive(Default)]
-pub(crate) struct Timings {
+pub struct Timings {
     pub submit: u64,
     pub wait: u64,
     pub complete: u64,
 }
 
-pub(crate) struct ReadRing {
+pub struct ReadRing {
     pub timings: Timings,
     handle: HIORING,
     event: HANDLE,
@@ -52,7 +52,7 @@ impl ReadRing {
     /// # Safety
     /// The depth * chunk_bytes writable bytes at address must remain valid until
     /// this ring is dropped. Do not read or reuse a slot before its completion.
-    pub(crate) unsafe fn new(
+    pub unsafe fn new(
         files: Vec<File>,
         address: usize,
         depth: usize,
@@ -224,7 +224,7 @@ impl ReadRing {
     /// consume the bytes before returning, when that slot becomes reusable.
     /// Complete every submitted read, including errors, before returning normally.
     /// An API failure poisons the ring: its slots cannot be reused before Drop drains.
-    pub(crate) fn read_all(
+    pub fn read_all(
         &mut self,
         reads: impl ExactSizeIterator<Item = (usize, u64, u32)>,
         mut complete: impl FnMut(usize, usize, io::Result<usize>),
@@ -290,7 +290,7 @@ impl ReadRing {
 }
 
 impl ReadRing {
-    pub(crate) fn cancel_and_drain(&mut self) {
+    pub fn cancel_and_drain(&mut self) {
         // CloseIoRing does NOT cancel or drain in-flight I/O. Cancel against the
         // private reader handle and retain all descriptors and buffers until drained.
         if self.in_flight != 0 {

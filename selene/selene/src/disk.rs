@@ -207,7 +207,7 @@ impl DiskThread {
     /// reading are closed. A timeout retains the worker and its resources;
     /// callers must retain their buffers until a later successful drain.
     pub fn close(&mut self) -> Result<()> {
-        self.close_until(std::time::Instant::now() + super::transfer::CLOSE_TIMEOUT)
+        self.close_until(std::time::Instant::now() + super::copier::CLOSE_TIMEOUT)
     }
 
     fn close_until(&mut self, deadline: std::time::Instant) -> Result<()> {
@@ -1141,11 +1141,9 @@ impl Drop for AlignedBuffer {
 mod tests {
     use super::*;
     use crate::{
-        cache::PrefixKey,
-        offload::{
-            geometry::tests::geometry,
-            record::{file_name, temporary_name},
-        },
+        PrefixKey,
+        record::{file_name, temporary_name},
+        testing::geometry,
     };
     use std::{
         io::{Seek, SeekFrom, Write as _},
