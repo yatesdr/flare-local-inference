@@ -20,8 +20,21 @@ pub(crate) fn host_chain(
     want_row: bool,
     nodes: &[(PrefixKey, u64, usize)],
 ) -> HostChain {
+    host_chain_kept(page_tokens, begin_tokens, want_row, nodes).0
+}
+
+/// [`host_chain`] with the positions in `nodes` of the records it kept, in order. A
+/// node that supplies no page is not a record unless it is the last, so whatever
+/// is held per node must be cut to these before windows name records by index.
+pub(crate) fn host_chain_kept(
+    page_tokens: u64,
+    begin_tokens: u64,
+    want_row: bool,
+    nodes: &[(PrefixKey, u64, usize)],
+) -> (HostChain, Vec<usize>) {
     let start_page = begin_tokens / page_tokens;
     let mut records = Vec::new();
+    let mut kept = Vec::new();
     for (index, (key, generation, tail)) in nodes.iter().enumerate() {
         let end = key.consumed_tokens / page_tokens;
         let start = end.saturating_sub(*tail as u64);
@@ -31,6 +44,7 @@ pub(crate) fn host_chain(
         if pages == 0 && !last {
             continue;
         }
+        kept.push(index);
         records.push(HostRecord {
             key: *key,
             generation: *generation,
@@ -39,11 +53,12 @@ pub(crate) fn host_chain(
             row: last && want_row,
         });
     }
-    HostChain {
+    let chain = HostChain {
         total_pages: records.iter().map(|r| u64::from(r.pages)).sum(),
         row: want_row,
         records,
-    }
+    };
+    (chain, kept)
 }
 
 fn check_window(
@@ -210,6 +225,27 @@ mod tests {
             consumed_tokens: tokens,
             digest: [salt; 16],
         }
+    }
+
+    #[test]
+    fn a_node_with_no_page_is_not_a_record_and_the_kept_positions_say_which_nodes_are() {
+        // b ends in the page a ended in, so it holds none; c holds pages 50..100.
+        let nodes = [
+            (key(800, 1), 5, 50),
+            (key(805, 2), 6, 0),
+            (key(1600, 3), 7, 50),
+        ];
+        let (chain, kept) = host_chain_kept(16, 0, true, &nodes);
+        assert_eq!(kept, [0, 2]);
+        assert_eq!(
+            chain.records.iter().map(|r| r.key).collect::<Vec<_>>(),
+            [key(800, 1), key(1600, 3)]
+        );
+        // The last node stays whatever it supplies: its row is the claim.
+        let tail = [(key(800, 1), 5, 50), (key(805, 2), 6, 0)];
+        let (chain, kept) = host_chain_kept(16, 0, true, &tail);
+        assert_eq!(kept, [0, 1]);
+        assert!(chain.records[1].row && chain.records[1].pages == 0);
     }
 
     #[test]
