@@ -1074,6 +1074,14 @@ async fn r13_shutdown_drains_claims_then_closes_sessions() {
         requester.lookup(2, 1024, vec![]).await.status,
         v2::LookupStatus::LookupNotReady as i32
     );
+    requester
+        .claim(requester.claim_for(2, &candidate, 0, true))
+        .await;
+    assert_eq!(
+        requester.claim_terminal(2).await.reason,
+        v2::ClaimReason::NotReady as i32,
+        "no new claim while draining"
+    );
     // The claim in flight still completes.
     let content: Vec<u8> = (0..16)
         .flat_map(|page| pool::page_bytes(1, page))
@@ -1101,4 +1109,119 @@ async fn r13_shutdown_drains_claims_then_closes_sessions() {
     let closing = requester.closed().await.expect("closing");
     assert_eq!(closing.reason, v2::ClosingReason::ClosingShutdown as i32);
     host.stop();
+}
+
+// ---------------------------------------------------------------- more index and limit cases
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i9_a_leaf_leaves_its_page_only_ancestors_until_they_are_named() {
+    let mut host = host();
+    host.start();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    let mut a = source(&mut pool, &Ident::new("a")).await;
+    let mut b = source(&mut pool, &Ident::new("b")).await;
+    a.notices(
+        chain(&[1024, 2048, 3072], v2::Tier::Dram, 1)
+            .into_iter()
+            .map(saved)
+            .collect(),
+    )
+    .await;
+    let keys = |reply: &v2::LookupReply| -> Vec<u64> {
+        reply
+            .candidates
+            .iter()
+            .map(|c| c.key.as_ref().unwrap().consumed_tokens)
+            .collect()
+    };
+    // Only the leaf is named: nothing cascades in the manager.
+    a.notices(vec![evicted(3072, v2::Tier::Dram, 1)]).await;
+    assert_eq!(keys(&b.lookup(1, 3072, vec![]).await), vec![2048, 1024]);
+    // The ancestors that left with it arrive as their own notices, one per node.
+    a.notices(vec![
+        evicted(2048, v2::Tier::Dram, 1),
+        evicted(1024, v2::Tier::Dram, 1),
+    ])
+    .await;
+    assert!(b.lookup(2, 3072, vec![]).await.candidates.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn x4_batch_chunk_and_chain_limits_are_enforced() {
+    let mut host = host();
+    host.config.pool.limits.max_notices_per_batch = 2;
+    host.config.pool.limits.max_resync_chunk_entries = 2;
+    host.config.pool.limits.max_chain_nodes = 2;
+    host.start();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    // More notices than a batch may carry closes the session.
+    let mut a = source(&mut pool, &Ident::new("a")).await;
+    a.send_notices_at(
+        1,
+        (1..=3)
+            .map(|n| saved(entry(n * 1024, None, v2::Tier::Dram, 1)))
+            .collect(),
+    )
+    .await;
+    let closing = a.closed().await.expect("closing");
+    assert_eq!(
+        closing.reason,
+        v2::ClosingReason::ClosingProtocolViolation as i32
+    );
+    // So does a resync chunk with too many entries.
+    let mut b = pool.open(&Ident::new("b")).await;
+    b.send(c::M::ResyncBegin(v2::ResyncBegin {
+        resync_id: 1,
+        watermark: 0,
+    }))
+    .await;
+    b.send(c::M::ResyncChunk(v2::ResyncChunk {
+        resync_id: 1,
+        chunk_index: 0,
+        entries: (1..=3)
+            .map(|n| entry(n * 1024, None, v2::Tier::Dram, 1))
+            .collect(),
+    }))
+    .await;
+    let closing = b.closed().await.expect("closing");
+    assert_eq!(
+        closing.reason,
+        v2::ClosingReason::ClosingProtocolViolation as i32
+    );
+    // A chain longer than the node limit is not offered.
+    let mut source_session = source(&mut pool, &Ident::new("c")).await;
+    source_session
+        .notices(
+            chain(&[1024, 2048], v2::Tier::Dram, 1)
+                .into_iter()
+                .map(saved)
+                .collect(),
+        )
+        .await;
+    source_session
+        .notices(
+            chain(&[3072], v2::Tier::Dram, 1)
+                .into_iter()
+                .map(|e| {
+                    let mut e = e;
+                    e.has_parent = true;
+                    e.parent = Some(pool::pkey(2048));
+                    e.tail_pages = 16;
+                    saved(e)
+                })
+                .collect(),
+        )
+        .await;
+    let mut d = source(&mut pool, &Ident::new("d")).await;
+    let reply = d.lookup(1, 3072, vec![]).await;
+    let keys: Vec<u64> = reply
+        .candidates
+        .iter()
+        .map(|c| c.key.as_ref().unwrap().consumed_tokens)
+        .collect();
+    assert!(
+        !keys.contains(&3072),
+        "a three-node chain exceeds max_chain_nodes: {keys:?}"
+    );
+    assert!(keys.contains(&2048));
 }

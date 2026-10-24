@@ -19,7 +19,7 @@ fn start() -> std::io::Result<()> {
         }
         Parsed::Run(config) => {
             let store = control::store_config(&config)?;
-            control::run_peer(config, store, Arc::new(AtomicBool::new(false)))
+            control::serve(config, store, Arc::new(AtomicBool::new(false)))
         }
     }
 }

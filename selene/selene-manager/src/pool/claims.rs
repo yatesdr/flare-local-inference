@@ -323,8 +323,15 @@ impl Core {
             || matches!(level, v2::Level::Unspecified | v2::Level::ThisGpu)
             || mode == v2::CopyMode::Unspecified
             || (mode == v2::CopyMode::SharedWindows && !shm)
-            || mode == v2::CopyMode::DataChannel
         {
+            return refuse(self, v2::ClaimReason::InvalidClaim);
+        }
+        if mode == v2::CopyMode::DataChannel {
+            // Claims carry no detail text; the manager's log says why.
+            eprintln!(
+                "selene: claim {} refused: the data channel is not served by this build",
+                m.claim_id
+            );
             return refuse(self, v2::ClaimReason::InvalidClaim);
         }
         if m.begin_tokens > endpoint.consumed_tokens {
@@ -771,6 +778,7 @@ impl Core {
         };
         let message = self.terminal_message(&claim);
         self.claims.insert(key, claim);
+        self.count("claims_refused_total", format!("reason=\"{reason:?}\""));
         self.send(sid, M::ClaimTerminal(message));
     }
 
@@ -1276,6 +1284,10 @@ impl Core {
                 }
             }
         }
+        self.count(
+            "claims_total",
+            format!("state=\"{state:?}\",reason=\"{reason:?}\""),
+        );
         let requester_gone = self.proc_exited_flag(&(key.0, key.1));
         let source_gone = self
             .claims

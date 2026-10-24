@@ -3,47 +3,18 @@
 //! This module is self-contained so it can be unit-tested without starting a manager.
 
 use serde::Deserialize;
-use std::fmt;
-use std::io;
-use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::{io, net::SocketAddr, path::PathBuf, time::Duration};
 
 pub const DEFAULT_NAME: &str = "default";
 pub const DEFAULT_MEMORY: u64 = 1 << 30;
 pub const DEFAULT_STAGING: u64 = 256 << 20;
-pub const DEFAULT_STREAM_CONNECTIONS: usize = 8;
-pub const DEFAULT_REMOTE_CATALOG_ENTRIES: u64 = 1_000_000;
+pub const DEFAULT_SOURCE_WAIT: Duration = Duration::from_secs(10);
+pub const DEFAULT_INSTANCE_RETENTION: Duration = Duration::from_secs(7 * 86_400);
 pub const MIN_MEMORY: u64 = 4096;
 pub const MIN_STAGING: u64 = 8 << 20;
 pub const MIN_NVME: u64 = 8192;
 pub const MAX_NAME: usize = 64;
 pub const MAX_SOCKET: usize = 107;
-pub const MAX_STREAM_CONNECTIONS: usize = 64;
-pub const MAX_UPSTREAM_WEIGHT: u64 = 1_000_000;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Upstream {
-    pub name: String,
-    pub address: String,
-    pub weight: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PeerTransport {
-    Auto,
-    Stream,
-    Rdma,
-}
-
-impl fmt::Display for PeerTransport {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Auto => "auto",
-            Self::Stream => "stream",
-            Self::Rdma => "rdma",
-        })
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -54,19 +25,22 @@ pub struct Config {
     pub memory: u64,
     pub nvme: u64,
     pub staging: u64,
-    pub listen_peer: Option<SocketAddr>,
-    pub listen_data: Option<SocketAddr>,
-    pub upstreams: Vec<Upstream>,
-    pub peer_transport: PeerTransport,
-    pub stream_connections: usize,
-    pub retain_remote: bool,
-    pub remote_catalog_entries: u64,
+    /// Serve the pool protocol to instances on other hosts at this address.
+    pub listen: Option<SocketAddr>,
+    /// TLS for `listen`: the manager's certificate chain and key. Clients verify the
+    /// certificate against their configured CA; there are no client certificates.
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
-    pub tls_ca: Option<PathBuf>,
-    pub listen_admin: Option<SocketAddr>,
+    /// Offer the RDMA data transport. Experimental; needs the `rdma` build feature and
+    /// cannot be combined with TLS.
+    pub rdma: bool,
     pub metrics: Option<SocketAddr>,
     pub write_budget: u64,
+    /// How long, after start, the manager waits for instances it served before to
+    /// resynchronise before it serves lookups, claims and puts.
+    pub source_wait: Duration,
+    /// Instances not seen for this long are no longer waited for.
+    pub instance_retention: Duration,
 }
 
 impl Default for Config {
@@ -85,19 +59,14 @@ impl Config {
             memory: DEFAULT_MEMORY,
             nvme: 0,
             staging: DEFAULT_STAGING,
-            listen_peer: None,
-            listen_data: None,
-            upstreams: Vec::new(),
-            peer_transport: PeerTransport::Auto,
-            stream_connections: DEFAULT_STREAM_CONNECTIONS,
-            retain_remote: true,
-            remote_catalog_entries: DEFAULT_REMOTE_CATALOG_ENTRIES,
+            listen: None,
             tls_cert: None,
             tls_key: None,
-            tls_ca: None,
-            listen_admin: None,
+            rdma: false,
             metrics: None,
             write_budget: 0,
+            source_wait: DEFAULT_SOURCE_WAIT,
+            instance_retention: DEFAULT_INSTANCE_RETENTION,
         }
     }
 
@@ -106,32 +75,22 @@ impl Config {
         PathBuf::from(format!("/run/selene/{name}.sock"))
     }
 
-    /// Whether this build and configuration may select RDMA for peer transfers.
+    /// Whether this build and configuration offer RDMA.
     pub fn rdma_enabled(&self) -> bool {
-        cfg!(feature = "rdma") && !matches!(self.peer_transport, PeerTransport::Stream)
-    }
-
-    fn tls_configured(&self) -> bool {
-        self.tls_cert.is_some() || self.tls_key.is_some() || self.tls_ca.is_some()
+        cfg!(feature = "rdma") && self.rdma
     }
 
     /// One line per opt-in that widens the manager's exposure, printed once at startup.
     pub fn startup_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
-        if self.listen_peer.is_some() || self.listen_data.is_some() || self.listen_admin.is_some() {
-            let mut listeners = Vec::new();
-            for (label, address) in [
-                ("peer", self.listen_peer),
-                ("data", self.listen_data),
-                ("admin", self.listen_admin),
-            ] {
-                if let Some(address) = address {
-                    listeners.push(format!("{label} {address}"));
-                }
-            }
+        if let Some(address) = self.listen {
+            let mode = if self.tls_cert.is_some() {
+                "TLS"
+            } else {
+                "plaintext"
+            };
             warnings.push(format!(
-                "selene: warning: network listening enabled ({})",
-                listeners.join(", ")
+                "selene: warning: network listening enabled on {address} ({mode})"
             ));
         }
         if self.rdma_enabled() {
@@ -169,59 +128,23 @@ impl Config {
             }
             _ => {}
         }
-        if !(1..=MAX_STREAM_CONNECTIONS).contains(&self.stream_connections) {
-            return Err(invalid("--stream-connections must be 1..=64"));
+        if self.tls_cert.is_some() != self.tls_key.is_some() {
+            return Err(invalid("--tls-cert and --tls-key go together"));
         }
-        if self.remote_catalog_entries == 0 {
-            return Err(invalid("--remote-catalog-entries must be at least 1"));
+        if self.tls_cert.is_some() && self.listen.is_none() {
+            return Err(invalid("--tls-cert and --tls-key apply to --listen"));
         }
-        if self.listen_peer.is_some() {
-            if self.tls_cert.is_none() || self.tls_key.is_none() || self.tls_ca.is_none() {
-                return Err(invalid(
-                    "--listen-peer requires --tls-cert, --tls-key and --tls-ca",
-                ));
-            }
-            if self.listen_data.is_none() {
-                return Err(invalid("--listen-peer requires --listen-data"));
-            }
+        if self.rdma && !cfg!(feature = "rdma") {
+            return Err(invalid("--rdma requires a build with the `rdma` feature"));
         }
-        if self.listen_admin.is_some()
-            && (self.tls_cert.is_none() || self.tls_key.is_none() || self.tls_ca.is_none())
-        {
+        if self.rdma && self.tls_cert.is_some() {
             return Err(invalid(
-                "--listen-admin requires --tls-cert, --tls-key and --tls-ca",
+                "RDMA transfers are not encrypted, so --rdma cannot be combined with TLS; \
+                 drop --rdma to keep TLS, or drop the TLS options to use RDMA",
             ));
         }
-        if matches!(self.peer_transport, PeerTransport::Rdma) && !cfg!(feature = "rdma") {
-            return Err(invalid(
-                "--peer-transport rdma requires a build with the `rdma` feature",
-            ));
-        }
-        if self.rdma_enabled() && self.tls_configured() {
-            return Err(invalid(
-                "RDMA transfers are not encrypted, so RDMA cannot be combined with --tls-*; \
-                 pass --peer-transport stream to keep TLS, or remove the TLS options to use RDMA",
-            ));
-        }
-        let mut names = std::collections::BTreeSet::new();
-        for upstream in &self.upstreams {
-            if !valid_name(&upstream.name) {
-                return Err(invalid(
-                    "--upstream NAME must be 1-64 bytes of letters, digits, '.', '_' or '-'",
-                ));
-            }
-            if upstream.address.is_empty() {
-                return Err(invalid("--upstream address must not be empty"));
-            }
-            if !(1..=MAX_UPSTREAM_WEIGHT).contains(&upstream.weight) {
-                return Err(invalid("--upstream weight must be 1..=1000000"));
-            }
-            if !names.insert(upstream.name.clone()) {
-                return Err(invalid(format!(
-                    "duplicate upstream name {}",
-                    upstream.name
-                )));
-            }
+        if self.rdma && self.listen.is_none() {
+            return Err(invalid("--rdma applies to --listen"));
         }
         Ok(())
     }
@@ -239,24 +162,20 @@ pub fn help_text() -> String {
      \n\
      --name NAME                     default \"default\"\n\
      --socket PATH                   default /run/selene/NAME.sock\n\
-     --root PATH                     NVMe root; omit for a DRAM-only near tier\n\
+     --root PATH                     NVMe directory, owned by this manager alone\n\
      --memory BYTES                  shared arena, default 1G\n\
      --nvme BYTES                    NVMe budget; required with --root\n\
      --staging BYTES                 shared staging, default 256M\n\
-     --listen-peer ADDR:PORT         serve PeerCache; requires TLS and --listen-data\n\
-     --listen-data ADDR:PORT         stream data listener\n\
-     --upstream NAME=ADDR[,WEIGHT]   repeatable; weight default 1\n\
-     --peer-transport auto|stream|rdma\n\
-     --stream-connections N          default 8\n\
-     --retain-remote BOOL            default true\n\
-     --remote-catalog-entries N      default 1000000\n\
-     --write-budget BYTES/s          per-connection write rate; 0 = unlimited\n\
-     --tls-cert PATH --tls-key PATH --tls-ca PATH\n\
-     --listen-admin ADDR:PORT        optional, mTLS\n\
+     --write-budget BYTES/s          per-process write rate; 0 = unlimited\n\
+     --listen ADDR:PORT              serve instances on other hosts\n\
+     --tls-cert PATH --tls-key PATH  TLS for --listen (clients verify against their CA)\n\
+     --rdma                          offer RDMA (experimental; not with TLS)\n\
+     --source-wait DURATION          wait for remembered instances, default 10s\n\
+     --instance-retention DURATION   forget instances unseen this long, default 7d\n\
      --metrics ADDR:PORT\n\
      --config PATH                   TOML defaults; flags override\n\
      \n\
-     Sizes accept binary K, M, G and T suffixes."
+     Sizes accept binary K, M, G and T suffixes; durations accept ms, s, m, h and d."
         .to_string()
 }
 
@@ -285,7 +204,6 @@ where
         None => Config::defaults(),
     };
     let mut explicit_socket = false;
-    let mut upstreams: Option<Vec<Upstream>> = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -322,37 +240,12 @@ where
                 config.staging = parse_size(value(index)?)?;
                 index += 2;
             }
-            "--listen-peer" => {
-                config.listen_peer = Some(parse_address(value(index)?)?);
-                index += 2;
-            }
-            "--listen-data" => {
-                config.listen_data = Some(parse_address(value(index)?)?);
-                index += 2;
-            }
-            "--upstream" => {
-                let upstream = parse_upstream(value(index)?)?;
-                upstreams.get_or_insert_with(Vec::new).push(upstream);
-                index += 2;
-            }
-            "--peer-transport" => {
-                config.peer_transport = parse_transport(value(index)?)?;
-                index += 2;
-            }
-            "--stream-connections" => {
-                config.stream_connections = parse_usize(value(index)?, option)?;
-                index += 2;
-            }
-            "--retain-remote" => {
-                config.retain_remote = parse_bool(value(index)?)?;
-                index += 2;
-            }
-            "--remote-catalog-entries" => {
-                config.remote_catalog_entries = parse_u64(value(index)?, option)?;
-                index += 2;
-            }
             "--write-budget" => {
                 config.write_budget = parse_size(value(index)?)?;
+                index += 2;
+            }
+            "--listen" => {
+                config.listen = Some(parse_address(value(index)?)?);
                 index += 2;
             }
             "--tls-cert" => {
@@ -363,12 +256,16 @@ where
                 config.tls_key = Some(value(index)?.into());
                 index += 2;
             }
-            "--tls-ca" => {
-                config.tls_ca = Some(value(index)?.into());
+            "--rdma" => {
+                config.rdma = true;
+                index += 1;
+            }
+            "--source-wait" => {
+                config.source_wait = parse_duration(value(index)?)?;
                 index += 2;
             }
-            "--listen-admin" => {
-                config.listen_admin = Some(parse_address(value(index)?)?);
+            "--instance-retention" => {
+                config.instance_retention = parse_duration(value(index)?)?;
                 index += 2;
             }
             "--metrics" => {
@@ -383,9 +280,6 @@ where
                 return Err(invalid(format!("unknown option {other}")));
             }
         }
-    }
-    if let Some(upstreams) = upstreams {
-        config.upstreams = upstreams;
     }
     if !explicit_socket && !config.socket_explicit {
         config.socket = Config::default_socket(&config.name);
@@ -421,27 +315,8 @@ impl Config {
         if let Some(size) = raw.staging {
             config.staging = size;
         }
-        if let Some(address) = raw.listen_peer {
-            config.listen_peer = Some(parse_address(&address)?);
-        }
-        if let Some(address) = raw.listen_data {
-            config.listen_data = Some(parse_address(&address)?);
-        }
-        if let Some(upstreams) = raw.upstream {
-            config.upstreams = upstreams;
-        }
-        if let Some(transport) = raw.peer_transport {
-            config.peer_transport = parse_transport(&transport)?;
-        }
-        if let Some(count) = raw.stream_connections {
-            config.stream_connections = usize::try_from(count)
-                .map_err(|_| invalid("stream_connections does not fit usize"))?;
-        }
-        if let Some(retain) = raw.retain_remote {
-            config.retain_remote = retain;
-        }
-        if let Some(count) = raw.remote_catalog_entries {
-            config.remote_catalog_entries = count;
+        if let Some(address) = raw.listen {
+            config.listen = Some(parse_address(&address)?);
         }
         if let Some(path) = raw.tls_cert {
             config.tls_cert = Some(path.into());
@@ -449,17 +324,20 @@ impl Config {
         if let Some(path) = raw.tls_key {
             config.tls_key = Some(path.into());
         }
-        if let Some(path) = raw.tls_ca {
-            config.tls_ca = Some(path.into());
-        }
-        if let Some(address) = raw.listen_admin {
-            config.listen_admin = Some(parse_address(&address)?);
+        if let Some(rdma) = raw.rdma {
+            config.rdma = rdma;
         }
         if let Some(address) = raw.metrics {
             config.metrics = Some(parse_address(&address)?);
         }
         if let Some(size) = raw.write_budget {
             config.write_budget = size;
+        }
+        if let Some(text) = raw.source_wait {
+            config.source_wait = parse_duration(&text)?;
+        }
+        if let Some(text) = raw.instance_retention {
+            config.instance_retention = parse_duration(&text)?;
         }
         Ok(config)
     }
@@ -477,57 +355,15 @@ struct RawConfig {
     nvme: Option<u64>,
     #[serde(default, deserialize_with = "de_size")]
     staging: Option<u64>,
-    #[serde(alias = "listen_peer")]
-    listen_peer: Option<String>,
-    #[serde(alias = "listen_data")]
-    listen_data: Option<String>,
-    upstream: Option<Vec<Upstream>>,
-    #[serde(alias = "peer_transport")]
-    peer_transport: Option<String>,
-    #[serde(alias = "stream_connections")]
-    stream_connections: Option<u64>,
-    #[serde(alias = "retain_remote")]
-    retain_remote: Option<bool>,
-    #[serde(alias = "remote_catalog_entries")]
-    remote_catalog_entries: Option<u64>,
-    #[serde(alias = "tls_cert")]
+    listen: Option<String>,
     tls_cert: Option<String>,
-    #[serde(alias = "tls_key")]
     tls_key: Option<String>,
-    #[serde(alias = "tls_ca")]
-    tls_ca: Option<String>,
-    #[serde(alias = "listen_admin")]
-    listen_admin: Option<String>,
+    rdma: Option<bool>,
     metrics: Option<String>,
     #[serde(default, deserialize_with = "de_size")]
-    #[serde(alias = "write_budget")]
     write_budget: Option<u64>,
-}
-
-impl<'de> Deserialize<'de> for Upstream {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct RawUpstream {
-            name: String,
-            address: String,
-            #[serde(default = "default_weight")]
-            weight: u64,
-        }
-        let raw = RawUpstream::deserialize(deserializer)?;
-        Ok(Upstream {
-            name: raw.name,
-            address: raw.address,
-            weight: raw.weight,
-        })
-    }
-}
-
-fn default_weight() -> u64 {
-    1
+    source_wait: Option<String>,
+    instance_retention: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -569,57 +405,35 @@ pub fn parse_size(text: &str) -> io::Result<u64> {
         .ok_or_else(|| invalid(format!("invalid byte size {text:?}")))
 }
 
+/// Parse a duration such as `250ms`, `10s`, `5m`, `2h` or `7d`; a bare number is seconds.
+pub fn parse_duration(text: &str) -> io::Result<Duration> {
+    let (number, unit_millis) = if let Some(number) = text.strip_suffix("ms") {
+        (number, 1u64)
+    } else if let Some(number) = text.strip_suffix('s') {
+        (number, 1_000)
+    } else if let Some(number) = text.strip_suffix('m') {
+        (number, 60_000)
+    } else if let Some(number) = text.strip_suffix('h') {
+        (number, 3_600_000)
+    } else if let Some(number) = text.strip_suffix('d') {
+        (number, 86_400_000)
+    } else {
+        (text, 1_000)
+    };
+    number
+        .parse::<u64>()
+        .ok()
+        .and_then(|value| value.checked_mul(unit_millis))
+        .map(Duration::from_millis)
+        .ok_or_else(|| invalid(format!("invalid duration {text:?}")))
+}
+
 fn parse_address(text: &str) -> io::Result<SocketAddr> {
     text.parse()
         .map_err(|_| invalid(format!("invalid address {text:?}")))
 }
 
-fn parse_transport(text: &str) -> io::Result<PeerTransport> {
-    match text {
-        "auto" => Ok(PeerTransport::Auto),
-        "stream" => Ok(PeerTransport::Stream),
-        "rdma" => Ok(PeerTransport::Rdma),
-        other => Err(invalid(format!("invalid --peer-transport {other:?}"))),
-    }
-}
-
-fn parse_bool(text: &str) -> io::Result<bool> {
-    match text {
-        "true" | "1" | "yes" => Ok(true),
-        "false" | "0" | "no" => Ok(false),
-        other => Err(invalid(format!("invalid boolean {other:?}"))),
-    }
-}
-
-fn parse_usize(text: &str, option: &str) -> io::Result<usize> {
-    text.parse()
-        .map_err(|_| invalid(format!("invalid value for {option}: {text:?}")))
-}
-
-fn parse_u64(text: &str, option: &str) -> io::Result<u64> {
-    text.parse()
-        .map_err(|_| invalid(format!("invalid value for {option}: {text:?}")))
-}
-
-fn parse_upstream(text: &str) -> io::Result<Upstream> {
-    let (name, rest) = text
-        .split_once('=')
-        .ok_or_else(|| invalid("--upstream requires NAME=ADDR[,WEIGHT]"))?;
-    let (address, weight) = match rest.rsplit_once(',') {
-        Some((address, weight)) => (address, parse_u64(weight, "--upstream weight")?),
-        None => (rest, 1),
-    };
-    if address.is_empty() {
-        return Err(invalid("--upstream address must not be empty"));
-    }
-    Ok(Upstream {
-        name: name.to_string(),
-        address: address.to_string(),
-        weight,
-    })
-}
-
-/// A manager name is also a directory name and a rendezvous node name.
+/// A manager name is also a directory name.
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_NAME
@@ -649,18 +463,14 @@ mod tests {
 
     #[test]
     fn defaults_match_the_spec() {
-        let config = Config::defaults();
+        let config = run(&[]);
         assert_eq!(config.name, "default");
         assert_eq!(config.socket, PathBuf::from("/run/selene/default.sock"));
         assert_eq!(config.memory, 1 << 30);
         assert_eq!(config.staging, 256 << 20);
-        assert_eq!(config.nvme, 0);
-        assert_eq!(config.stream_connections, 8);
-        assert!(config.retain_remote);
-        assert_eq!(config.remote_catalog_entries, 1_000_000);
-        assert_eq!(config.peer_transport, PeerTransport::Auto);
-        assert_eq!(config.write_budget, 0);
-        config.validate().unwrap();
+        assert_eq!(config.source_wait, Duration::from_secs(10));
+        assert_eq!(config.instance_retention, Duration::from_secs(7 * 86_400));
+        assert!(config.listen.is_none() && !config.rdma);
     }
 
     #[test]
@@ -673,6 +483,20 @@ mod tests {
         assert!(parse_size("").is_err());
         assert!(parse_size("1X").is_err());
         assert!(parse_size("K").is_err());
+    }
+
+    #[test]
+    fn durations_parse_with_units() {
+        assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
+        assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
+        assert_eq!(parse_duration("10").unwrap(), Duration::from_secs(10));
+        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(
+            parse_duration("7d").unwrap(),
+            Duration::from_secs(7 * 86_400)
+        );
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("x").is_err());
     }
 
     #[test]
@@ -696,187 +520,98 @@ mod tests {
             "2G",
             "--staging",
             "16M",
-            "--stream-connections",
-            "4",
-            "--retain-remote",
-            "false",
-            "--remote-catalog-entries",
-            "100",
             "--write-budget",
             "8M",
-            "--upstream",
-            "store1=127.0.0.1:9000,3",
-            "--upstream",
-            "store2=127.0.0.1:9001",
+            "--source-wait",
+            "30s",
+            "--instance-retention",
+            "1d",
         ]);
         assert_eq!(config.nvme, 1 << 30);
         assert_eq!(config.memory, 2 << 30);
         assert_eq!(config.staging, 16 << 20);
-        assert_eq!(config.stream_connections, 4);
-        assert!(!config.retain_remote);
         assert_eq!(config.write_budget, 8 << 20);
-        assert_eq!(config.upstreams.len(), 2);
-        assert_eq!(config.upstreams[0].weight, 3);
-        assert_eq!(config.upstreams[1].weight, 1);
-        config.validate().unwrap();
+        assert_eq!(config.source_wait, Duration::from_secs(30));
+        assert_eq!(config.instance_retention, Duration::from_secs(86_400));
     }
 
     #[test]
-    fn toml_then_flags_override() {
-        let text = r#"
-            name = "from-toml"
-            memory = "2G"
-            staging = 16777216
-            retain-remote = false
-            write-budget = "4M"
-            [[upstream]]
-            name = "a"
-            address = "box:9000"
-            weight = 2
-        "#;
-        let config = Config::from_toml(text).unwrap();
-        assert_eq!(config.name, "from-toml");
-        assert_eq!(config.memory, 2 << 30);
-        assert_eq!(config.staging, 16 << 20);
-        assert!(!config.retain_remote);
-        assert_eq!(config.write_budget, 4 << 20);
-        assert_eq!(config.upstreams[0].name, "a");
-
-        let path = std::env::temp_dir().join(format!("selene-config-{}", std::process::id()));
-        std::fs::write(&path, text).unwrap();
-        let config = run(&["--config", path.to_str().unwrap(), "--memory", "1G"]);
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(config.memory, 1 << 30);
-        assert_eq!(config.name, "from-toml");
-    }
-
-    #[test]
-    fn toml_accepts_kebab_case_and_underscore_aliases() {
-        let kebab = "stream-connections = 2\nremote-catalog-entries = 5\nwrite-budget = \"1M\"\n";
-        let config = Config::from_toml(kebab).unwrap();
-        assert_eq!(config.stream_connections, 2);
-        assert_eq!(config.remote_catalog_entries, 5);
-        assert_eq!(config.write_budget, 1 << 20);
-        let underscore = "stream_connections = 3\nretain_remote = false\n";
-        let config = Config::from_toml(underscore).unwrap();
-        assert_eq!(config.stream_connections, 3);
-        assert!(!config.retain_remote);
-    }
-
-    #[test]
-    fn invalid_configurations_are_rejected() {
-        assert!(parse_args(args(&["--name", "bad name"])).is_err());
-        assert!(parse_args(args(&["--name", "x".repeat(65).as_str()])).is_err());
-        assert!(parse_args(args(&["--memory", "1000"])).is_err());
-        assert!(parse_args(args(&["--staging", "1M"])).is_err());
+    fn nvme_and_root_go_together() {
         assert!(parse_args(args(&["--nvme", "1G"])).is_err());
-        assert!(parse_args(args(&["--root", "/x", "--nvme", "1K"])).is_err());
-        assert!(parse_args(args(&["--stream-connections", "0"])).is_err());
-        assert!(parse_args(args(&["--stream-connections", "65"])).is_err());
-        assert!(parse_args(args(&["--remote-catalog-entries", "0"])).is_err());
+        assert!(parse_args(args(&["--root", "/r", "--nvme", "4096"])).is_err());
+        assert!(parse_args(args(&["--root", "/r", "--nvme", "1G"])).is_ok());
+    }
+
+    #[test]
+    fn unknown_options_and_missing_values_are_errors() {
+        assert!(parse_args(args(&["--bogus"])).is_err());
+        assert!(parse_args(args(&["--memory"])).is_err());
+        // The peer options of the first protocol are gone.
+        assert!(parse_args(args(&["--listen-peer", "127.0.0.1:1"])).is_err());
+        assert!(parse_args(args(&["--upstream", "a=b"])).is_err());
+    }
+
+    #[test]
+    fn tls_goes_with_listen_and_in_pairs() {
+        assert!(parse_args(args(&["--tls-cert", "/c", "--tls-key", "/k"])).is_err());
         assert!(
-            parse_args(args(&[
-                "--listen-peer",
-                "127.0.0.1:9000",
-                "--listen-data",
-                "127.0.0.1:9001",
-            ]))
-            .is_err()
+            parse_args(args(&["--listen", "127.0.0.1:9000", "--tls-cert", "/c"])).is_err(),
+            "a certificate needs its key"
         );
-        assert!(parse_args(args(&["--upstream", "a=x"])).is_ok());
-        assert!(parse_args(args(&["--upstream", "a=x", "--upstream", "a=y"])).is_err());
-        assert!(parse_args(args(&["--upstream", "a=x,0"])).is_err());
-        assert!(parse_args(args(&["--upstream", "a=x,1000001"])).is_err());
-        assert!(parse_args(args(&["--retain-remote", "maybe"])).is_err());
-        assert!(parse_args(args(&["--peer-transport", "carrier-pigeon"])).is_err());
-    }
-
-    #[cfg(not(feature = "rdma"))]
-    #[test]
-    fn rdma_transport_requires_the_feature() {
-        assert!(parse_args(args(&["--peer-transport", "rdma"])).is_err());
-    }
-
-    #[test]
-    fn listen_peer_accepts_a_complete_tls_configuration() {
         let config = run(&[
-            "--peer-transport",
-            "stream",
-            "--listen-peer",
+            "--listen",
             "127.0.0.1:9000",
-            "--listen-data",
-            "127.0.0.1:9001",
             "--tls-cert",
             "/c",
             "--tls-key",
             "/k",
-            "--tls-ca",
-            "/a",
         ]);
-        assert!(config.listen_peer.is_some());
-        config.validate().unwrap();
+        assert!(config.listen.is_some() && config.tls_cert.is_some());
     }
 
     #[test]
-    fn upstream_names_are_unique_and_valid() {
-        assert!(parse_args(args(&["--upstream", "a b=x"])).is_err());
-        assert!(parse_args(args(&["--upstream", "a="])).is_err());
-        assert!(parse_args(args(&["--upstream", "a"])).is_err());
+    fn toml_defaults_are_overridden_by_flags() {
+        let config = Config::from_toml(
+            "name = \"a\"\nmemory = \"2G\"\nroot = \"/r\"\nnvme = \"1G\"\nsource-wait = \"5s\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.name, "a");
+        assert_eq!(config.memory, 2 << 30);
+        assert_eq!(config.source_wait, Duration::from_secs(5));
+        assert!(Config::from_toml("bogus = 1").is_err());
     }
 
     #[test]
-    fn help_lists_the_new_options() {
-        let text = help_text();
-        assert!(text.contains("--write-budget"));
-        assert!(text.contains("--remote-catalog-entries"));
-    }
-
-    #[test]
-    fn write_budget_zero_is_unlimited() {
-        assert_eq!(run(&[]).write_budget, 0);
-        assert_eq!(run(&["--write-budget", "0"]).write_budget, 0);
-        assert_eq!(run(&["--write-budget", "1G"]).write_budget, 1 << 30);
-    }
-
-    #[test]
-    fn network_listeners_are_named_in_a_startup_warning() {
+    fn network_listening_is_named_in_a_startup_warning() {
         let mut config = Config::defaults();
-        config.peer_transport = PeerTransport::Stream;
         assert!(config.startup_warnings().is_empty());
-        config.listen_peer = Some("127.0.0.1:9200".parse().unwrap());
-        config.listen_data = Some("127.0.0.1:9201".parse().unwrap());
+        config.listen = Some("127.0.0.1:9200".parse().unwrap());
         let warnings = config.startup_warnings();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("network listening enabled"));
-        assert!(warnings[0].contains("peer 127.0.0.1:9200"));
-        assert!(warnings[0].contains("data 127.0.0.1:9201"));
-        assert!(!warnings[0].contains("admin"));
+        assert!(warnings[0].contains("127.0.0.1:9200"));
+        assert!(warnings[0].contains("plaintext"));
+        config.tls_cert = Some("/c".into());
+        config.tls_key = Some("/k".into());
+        assert!(config.startup_warnings()[0].contains("TLS"));
     }
 
     #[test]
     fn rdma_is_experimental_and_never_combined_with_tls() {
         let mut config = Config::defaults();
-        config.tls_cert = Some("/c".into());
-        config.tls_key = Some("/k".into());
-        config.tls_ca = Some("/a".into());
-        config.peer_transport = PeerTransport::Stream;
-        assert!(!config.rdma_enabled());
-        config.validate().unwrap();
-        assert!(config.startup_warnings().is_empty());
-        config.peer_transport = PeerTransport::Auto;
+        config.listen = Some("127.0.0.1:9200".parse().unwrap());
+        config.rdma = true;
         if cfg!(feature = "rdma") {
-            assert!(config.rdma_enabled());
-            let error = config.validate().unwrap_err().to_string();
-            assert!(error.contains("not encrypted"), "{error}");
-            config.tls_cert = None;
-            config.tls_key = None;
-            config.tls_ca = None;
             config.validate().unwrap();
             let warnings = config.startup_warnings();
-            assert_eq!(warnings, ["selene: warning: RDMA enabled (experimental)"]);
+            assert!(warnings.contains(&"selene: warning: RDMA enabled (experimental)".to_string()));
+            config.tls_cert = Some("/c".into());
+            config.tls_key = Some("/k".into());
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("not encrypted"), "{error}");
         } else {
-            assert!(!config.rdma_enabled());
-            config.validate().unwrap();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("rdma"), "{error}");
         }
     }
 }

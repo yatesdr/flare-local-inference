@@ -39,8 +39,6 @@ pub struct PoolConfig {
     pub store_directory: Option<PathBuf>,
     pub encryption: v2::Encryption,
     pub transports: Vec<v2::DataTransport>,
-    /// The data listener clients are told to connect to, when there is one.
-    pub data_address: Option<String>,
 }
 
 impl Default for PoolConfig {
@@ -53,7 +51,6 @@ impl Default for PoolConfig {
             store_directory: None,
             encryption: v2::Encryption::Plaintext,
             transports: vec![v2::DataTransport::Tcp],
-            data_address: None,
         }
     }
 }
@@ -63,6 +60,8 @@ pub struct Shared {
     pub incarnation: u64,
     pub limits: Limits,
     pub readiness: Mutex<v2::ReadinessInfo>,
+    /// Prometheus text for the pool's own state, refreshed on the manager's clock.
+    pub metrics: Mutex<String>,
     pub shm: v2::SharedMemory,
     pub host_id: [u8; 16],
     pub encryption: v2::Encryption,
@@ -154,6 +153,9 @@ pub(super) struct Proc {
     pub exited: bool,
     pub claim_hw: u64,
     pub put_hw: u64,
+    /// When the process last had no session; a process nobody can watch is forgotten after
+    /// an hour of that.
+    pub idle_since: Option<Instant>,
     /// The process's connection to the manager's store, opened on first use.
     pub link: Option<Link>,
 }
@@ -184,6 +186,8 @@ pub struct Core {
     /// Smoothed microseconds per page by source, from completed claims.
     pub(super) estimates: HashMap<SourceId, u32>,
     pub(super) live_lookups: usize,
+    /// Counters by metric name and label, for the metrics text.
+    pub(super) counters: std::collections::BTreeMap<(&'static str, String), u64>,
     pub(super) lookup_queue: super::lookup::LookupQueue,
     pub(super) state: v2::ReadinessState,
     pub(super) disk_recovered: bool,
@@ -239,6 +243,7 @@ impl Core {
             incarnation,
             limits: cfg.limits.clone(),
             readiness: Mutex::new(v2::ReadinessInfo::default()),
+            metrics: Mutex::new(String::new()),
             shm,
             host_id: host_id(),
             encryption: cfg.encryption,
@@ -281,6 +286,7 @@ impl Core {
             next_export: 0,
             estimates: HashMap::new(),
             live_lookups: 0,
+            counters: Default::default(),
             lookup_queue: Default::default(),
             state: v2::ReadinessState::Recovering,
             disk_recovered,
@@ -465,8 +471,10 @@ impl Core {
             exited: false,
             claim_hw: 0,
             put_hw: 0,
+            idle_since: None,
             link: None,
         });
+        entry.idle_since = None;
         if entry.pid.is_none() {
             if let Some(pid) = started_pid {
                 entry.pid = Some(pid);
@@ -544,6 +552,15 @@ impl Core {
             return;
         };
         let proc_key = (session.instance, session.nonce);
+        if !self
+            .sessions
+            .values()
+            .any(|other| (other.instance, other.nonce) == proc_key)
+        {
+            if let Some(proc) = self.procs.get_mut(&proc_key) {
+                proc.idle_since = Some(Instant::now());
+            }
+        }
         if session.goodbye == Some(true) {
             self.party_quiesced(proc_key);
         }
@@ -745,6 +762,7 @@ impl Core {
         self.poll_exits();
         self.lookup_pass();
         self.claim_timers(now);
+        self.prune_procs();
         self.resync_timers(now);
         // Keep live instances fresh in the persisted list.
         if now.duration_since(self.barrier_saved) >= Duration::from_secs(5) {
@@ -761,7 +779,32 @@ impl Core {
             self.save_barrier(false);
         }
         self.update_readiness();
+        self.refresh_metrics();
         self.flush_overflowed();
+    }
+
+    /// Forgets processes that are gone and that nothing refers to any more.
+    fn prune_procs(&mut self) {
+        let referenced: std::collections::HashSet<ProcKey> = self
+            .sessions
+            .values()
+            .map(|session| (session.instance, session.nonce))
+            .chain(self.claims.keys().map(|key| (key.0, key.1)))
+            .chain(self.claims.values().filter_map(|claim| claim.source_proc))
+            .chain(self.puts.keys().map(|key| (key.0, key.1)))
+            .collect();
+        let now = Instant::now();
+        self.procs.retain(|key, proc| {
+            if referenced.contains(key) {
+                return true;
+            }
+            if proc.pidfd.is_some() || proc.pid.is_some() {
+                return !proc.exited;
+            }
+            // A remote process cannot be watched; forget it after an hour of silence.
+            proc.idle_since
+                .is_none_or(|since| now.duration_since(since) < Duration::from_secs(3600))
+        });
     }
 
     fn poll_exits(&mut self) {
@@ -779,6 +822,40 @@ impl Core {
         for key in exited {
             self.proc_exited(key);
         }
+    }
+
+    // ------------------------------------------------------------------ metrics
+
+    pub(super) fn count(&mut self, name: &'static str, label: impl Into<String>) {
+        *self.counters.entry((name, label.into())).or_insert(0) += 1;
+    }
+
+    fn refresh_metrics(&mut self) {
+        let info = self.readiness_info();
+        let in_flight = self
+            .claims
+            .values()
+            .filter(|claim| !claim.is_terminal())
+            .count();
+        let entries: usize = self.scopes.values().map(|scope| scope.index.len()).sum();
+        let mut text = String::new();
+        let mut gauge =
+            |name: &str, value: u64| text.push_str(&format!("cm_pool_{name} {value}\n"));
+        gauge("state", info.state as u64);
+        gauge("ready", u64::from(self.ready()));
+        gauge("sessions", self.sessions.len() as u64);
+        gauge("sources_synced", u64::from(info.sources_synced));
+        gauge("sources_expected", u64::from(info.sources_expected));
+        gauge("index_entries", entries as u64);
+        gauge("claims_in_flight", in_flight as u64);
+        gauge("claim_records", self.claims.len() as u64);
+        gauge("puts_open", self.puts.len() as u64);
+        gauge("lookups_queued", self.lookup_queue.len() as u64);
+        gauge("quarantined_bytes", info.quarantined_bytes);
+        for ((name, label), value) in &self.counters {
+            text.push_str(&format!("cm_pool_{name}{{{label}}} {value}\n"));
+        }
+        *self.shared.metrics.lock().unwrap() = text;
     }
 
     // ------------------------------------------------------------------ shutdown
