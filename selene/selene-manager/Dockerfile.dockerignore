@@ -1,0 +1,6 @@
+**/target
+**/.git
+selene-manager/tests
+selene-manager/docs
+selene-manager/examples
+selene-manager/deploy
