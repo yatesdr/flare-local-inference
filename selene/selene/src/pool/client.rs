@@ -32,8 +32,12 @@ use super::{
 pub enum PoolAddress {
     /// A Unix-domain socket on this host.
     Unix(PathBuf),
-    /// `host:port` of a manager on the network.
+    /// `host:port` of a manager on the network, reached over TLS. The manager's certificate
+    /// is checked against the CA file when one is configured and the host's trust store
+    /// otherwise.
     Tcp(String),
+    /// `host:port` of a manager on the network, reached without encryption.
+    TcpPlaintext(String),
 }
 
 /// Built from the flags. `start` never blocks on the network.
@@ -75,6 +79,16 @@ impl PoolClient {
         copier: SharedCopier,
         registrar: Arc<dyn HostRegistrar + Send + Sync>,
     ) -> Result<PoolClient> {
+        Self::start_trusting(config, copier, registrar, super::net::Roots::System)
+    }
+
+    /// [`PoolClient::start`] with the trust store named, so a test can give one of its own.
+    pub(crate) fn start_trusting(
+        config: PoolConfig,
+        copier: SharedCopier,
+        registrar: Arc<dyn HostRegistrar + Send + Sync>,
+        roots: super::net::Roots,
+    ) -> Result<PoolClient> {
         let geometry = &config.scope.geometry;
         {
             let layout = copier.lock().unwrap().layout().clone();
@@ -91,9 +105,9 @@ impl PoolClient {
                 "the pool tenant must be set and equal the scope's",
             ));
         }
-        if config.ca.is_some() && matches!(config.address, PoolAddress::Unix(_)) {
+        if config.ca.is_some() && !matches!(config.address, PoolAddress::Tcp(_)) {
             return Err(Error::new(
-                "a CA certificate applies to a network address, not a socket path",
+                "a CA certificate applies to an encrypted network address",
             ));
         }
         let scope_id = identity::scope_id(
@@ -147,6 +161,7 @@ impl PoolClient {
         let link = conn::Link {
             address: config.address,
             ca: config.ca,
+            roots,
             wake,
             stop: stop.clone(),
         };
