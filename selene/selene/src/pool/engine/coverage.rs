@@ -5,7 +5,9 @@ use super::{super::wire, requester::ExpectedRecord};
 /// Tracks which pages and row the windows issued so far have covered. A window
 /// is accepted only if it extends the coverage exactly: ordinal order, inside the
 /// record being filled, the row only in the window that completes the last
-/// record, and a length that matches its pages.
+/// record's pages or in a window of its own after them (the manager keeps a row
+/// out of a window that its pages already fill), and a length that matches its
+/// pages.
 pub(crate) struct Coverage {
     pub(crate) expected: Vec<ExpectedRecord>,
     taken: Vec<u32>,
@@ -49,24 +51,23 @@ impl Coverage {
         let expected = &self.expected[record];
         let taken = self.taken[record];
         let last = record + 1 == self.expected.len();
-        let needs_row = last && expected.row;
         let remaining = expected.pages - taken;
-        // A row-only window follows the last page window when the row did not fit
-        // beside it. It names no page, so its first page is not compared.
-        if (spec.page_count > 0 && spec.first_page != expected.first_page + taken)
+        // A window without pages carries only the row, once every page is in.
+        let row_alone = spec.page_count == 0 && spec.row && last && expected.row && remaining == 0;
+        // A row alone names no page, so no first page is checked for it.
+        if (!row_alone && spec.first_page != expected.first_page + taken)
             || spec.page_count > remaining
-            || (spec.page_count == 0 && !(needs_row && remaining == 0))
+            || (spec.page_count == 0 && !row_alone)
         {
             return Err(format!(
                 "window {} does not extend the coverage",
                 spec.index
             ));
         }
-        let completes_pages = spec.page_count == remaining;
-        if spec.row && !(needs_row && completes_pages) {
+        let completes = spec.page_count == remaining;
+        if spec.row && !(last && completes && expected.row) {
             return Err(format!("window {} carries the row wrongly", spec.index));
         }
-        let completes = completes_pages && (!needs_row || spec.row);
         let row = if spec.row { row_bytes } else { 0 };
         if spec.length != u64::from(spec.page_count) * page_bytes + row {
             return Err(format!("window {} has the wrong length", spec.index));
@@ -76,7 +77,8 @@ impl Coverage {
             .map(|r| u64::from(r.pages))
             .sum();
         self.taken[record] += spec.page_count;
-        if completes {
+        // The record is covered when its pages are in and, for the last, its row too.
+        if completes && (!(last && expected.row) || spec.row) {
             self.cursor += 1;
         }
         self.windows += 1;
