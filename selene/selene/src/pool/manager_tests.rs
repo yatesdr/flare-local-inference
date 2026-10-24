@@ -928,7 +928,7 @@ fn a_record_the_manager_already_holds_is_released_without_waiting_for_a_copy() {
 fn a_record_the_manager_refuses_is_dropped_and_not_retried() {
     // A manager whose store cannot hold a 20-page record at all.
     let manager = Manager::with_memory(160 * 1024);
-    let mut requester = instance(&manager, "requester", 2);
+    let requester = instance(&manager, "requester", 2);
     requester.ready();
     let (mut store, gpu) = memory_instance(&manager, 24);
     let (big, big_history) = publication(&gpu, 1, 20);
@@ -1067,7 +1067,7 @@ fn a_record_cascades_from_memory_to_the_disk_tier_to_the_manager_store() {
     // and pushes the coldest file on to the manager.
     publish(&mut store, &third);
     publish(&mut store, &fourth);
-    drive(&mut store, "the first record's file to go", |store| {
+    drive(&mut store, "the first record's file to go", |_| {
         !directory.join(record::file_name(&first.key)).exists()
     });
     restore_salted(&mut requester, &first_history, 1, 2, &mut store);

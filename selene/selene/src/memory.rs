@@ -37,7 +37,7 @@ use crate::{
     CheckpointId, Error, ExportRefusal, History, PageId, PrefixKey, Result, Scratch, StateSlotId,
     index::{NodeEvent, NodeNotice},
     pool::{
-        Announcer, HostPin, MemoryPin, Releases, Tier as PoolTier, TierView,
+        Announcer, HostPin, IndexEntry, MemoryPin, Releases, Tier as PoolTier, TierView,
         pins::{MemorySpan, host_chain},
         tiers::{HashJob, Hasher, RecordSums},
     },
@@ -1239,6 +1239,7 @@ impl MemoryStore {
     pub fn flush_announcements(
         &mut self,
         parent_of: &dyn Fn(&PrefixKey, Option<PrefixKey>) -> Option<PrefixKey>,
+        spilled_to: &dyn Fn(&PrefixKey) -> Option<IndexEntry>,
     ) {
         let Some(a) = self.announce.as_mut() else {
             return;
@@ -1295,7 +1296,10 @@ impl MemoryStore {
                     a.hashing.remove(&key);
                     a.sums.remove(&key);
                     self.core.generations.remove(&key);
-                    a.view.retire(&key);
+                    match spilled_to(&key) {
+                        Some(to) => a.view.spill(&key, to),
+                        None => a.view.retire(&key),
+                    }
                 }
                 NodeEvent::RowDropped => {
                     if a.sums.contains_key(&key) {
@@ -1473,7 +1477,7 @@ impl HostStore for MemoryStore {
         events.append(&mut self.events);
         // Inside a composite the disk index supplies parents, so it flushes.
         if !self.core.flat {
-            self.flush_announcements(&|_, parent| parent);
+            self.flush_announcements(&|_, parent| parent, &|_| None);
         }
         Ok(())
     }
