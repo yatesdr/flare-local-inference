@@ -11,6 +11,7 @@ mod codec;
 mod conn;
 mod engine;
 mod exporter;
+pub mod frame;
 #[cfg(test)]
 mod host_tests;
 mod identity;
