@@ -427,9 +427,7 @@ impl Core {
     fn complete_record(&mut self, key: &PrefixKey, success: bool) -> Result<()> {
         self.index.unpin(key)?;
         if success {
-            if let Some(node) = self.index.node_mut(key) {
-                node.ready = true;
-            }
+            let _ = self.index.set_ready(key, true);
             return Ok(());
         }
         for node in self.index.remove(key)? {
