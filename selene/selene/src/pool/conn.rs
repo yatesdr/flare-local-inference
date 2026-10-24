@@ -416,15 +416,15 @@ async fn attempt(engine: &mut Engine, link: &Link) -> Attempt {
     engine
         .shared
         .set_topology(topology_of(&hello, regions.is_some()));
+    if let Some(dial) = dial {
+        engine.set_dial(dial);
+    }
     engine.session_opened(
         hello.manager_incarnation,
         &opened,
         limits_or_default(hello.limits),
         regions,
     );
-    if let Some(dial) = dial {
-        engine.set_dial(dial);
-    }
     run_session(engine, link, &mut stream, tx).await;
     Attempt::Ended
 }
@@ -503,7 +503,7 @@ async fn establish(engine: &mut Engine, link: &Link) -> std::result::Result<Esta
         instance_name: st.name.clone(),
         scope: Some(super::codec::scope_to(&st.scope)),
         process_nonce: st.nonce.to_vec(),
-        export_slots: if regions.is_some() {
+        export_slots: if regions.is_some() || dial.is_some() {
             st.export_slots
         } else {
             0

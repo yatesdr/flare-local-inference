@@ -225,7 +225,7 @@ impl Engine {
         limits: wire::Limits,
         regions: Option<Arc<Regions>>,
     ) {
-        let export_slots = if regions.is_some() {
+        let export_slots = if regions.is_some() || self.dial.is_some() {
             opened.export_slots.min(self.st.export_slots)
         } else {
             0

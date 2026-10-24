@@ -21,7 +21,8 @@ use crate::{
 };
 
 use super::tests::{
-    PAGE, ROW, Rig, fetched, gpu_put, pattern, puts, record_len, records, single_part, terminal,
+    PAGE, ROW, Rig, chain, export_request, fetched, gpu_put, gpu_with_chain, pattern, puts,
+    record_len, records, single_part, terminal,
 };
 
 struct Reg;
@@ -57,9 +58,9 @@ impl Dial for FakeDial {
             .lock()
             .unwrap()
             .push((request.id, request.reference.clone()));
-        let put = matches!(request.id, Id::Put(_));
-        let (channel, receiver) = Channel::detached(put);
-        if let (Id::Put(id), Some(receiver)) = (request.id, receiver) {
+        let fills = matches!(request.id, Id::Put(_) | Id::Export(_));
+        let (channel, receiver) = Channel::detached(fills);
+        if let (Id::Put(id) | Id::Export(id), Some(receiver)) = (request.id, receiver) {
             self.filled.lock().unwrap().insert(id, receiver);
         }
         Ok(channel)
@@ -74,11 +75,11 @@ struct NetRig {
 
 fn net_rig() -> NetRig {
     let mut rig = Rig::new();
-    rig.open_session(None);
     let staging = Arc::new(Staging::new(&OkRegistrar, 0, 4, 64 * 1024).unwrap());
     rig.engine.net = Some(staging.clone());
     let dial = Arc::new(FakeDial::default());
     rig.engine.set_dial(dial.clone());
+    rig.open_session(None);
     NetRig { rig, dial, staging }
 }
 
@@ -454,7 +455,7 @@ fn a_put_over_the_data_channel_fills_granted_slots_and_commits_after_the_last_se
     // The task read a grant into a slot and reports it.
     let slot = n.staging.take_now().unwrap();
     let out = n.report(vec![Event::Granted {
-        put: 7,
+        id: Id::Put(7),
         shape: shape(0, 0, 0, 3, true),
         slot,
     }]);
@@ -493,7 +494,7 @@ fn a_put_over_the_data_channel_fills_granted_slots_and_commits_after_the_last_se
     assert!(pick!(out, PutCommit).is_empty());
     assert_eq!(n.staging.free_slots(), 3);
     let out = n.report(vec![Event::Sent {
-        put: 7,
+        id: Id::Put(7),
         index: 0,
         slot,
     }]);
@@ -531,7 +532,7 @@ fn a_put_that_fails_on_the_channel_cancels_frees_its_slots_and_fences_after_the_
         .send(put_accept(8, record_len(3), Some(channel_ref(3))));
     let slot = n.staging.take_now().unwrap();
     n.report(vec![Event::Granted {
-        put: 8,
+        id: Id::Put(8),
         shape: shape(0, 0, 0, 3, true),
         slot,
     }]);
@@ -586,4 +587,175 @@ fn a_put_on_a_session_with_nothing_to_copy_through_fails_at_once() {
             .1
             .contains("neither shared memory nor a data channel")
     );
+}
+
+// ---- exports through the manager --------------------------------------------------
+
+/// An export request of a session without shared memory, naming the channel its windows go to.
+fn channel_export(id: u64) -> In {
+    let In::ExportRequest(mut request) = export_request(id, 3 * PAGE + ROW) else {
+        unreachable!();
+    };
+    request.channel = Some(channel_ref(5));
+    In::ExportRequest(request)
+}
+
+/// The export is pinned and its channel dialed; returns its id.
+fn channel_export_pinned(n: &mut NetRig) -> u64 {
+    gpu_with_chain(&n.rig);
+    n.rig.send(channel_export(40));
+    n.rig.events();
+    let out = n.rig.command(Command::ExportPinned {
+        export: crate::ExportId(40),
+        chain: chain(),
+    });
+    assert_eq!(pick!(out, PinAck)[0].result, wire::PinResult::Pinned as i32);
+    assert_eq!(n.dial.opened.lock().unwrap().len(), 1);
+    assert_eq!(n.dial.opened.lock().unwrap()[0].0, Id::Export(40));
+    assert_eq!(n.dial.opened.lock().unwrap()[0].1, channel_ref(5));
+    40
+}
+
+#[test]
+fn an_export_over_the_data_channel_fills_granted_slots_and_ends_after_the_last_send() {
+    let mut n = net_rig();
+    let id = channel_export_pinned(&mut n);
+    // The manager grants the windows on the channel, not in an ExportFill.
+    let first = n.staging.take_now().unwrap();
+    let second = n.staging.take_now().unwrap();
+    let out = n.report(vec![
+        Event::Granted {
+            id: Id::Export(id),
+            shape: shape(0, 0, 0, 2, false),
+            slot: first,
+        },
+        Event::Granted {
+            id: Id::Export(id),
+            shape: shape(1, 1, 0, 1, true),
+            slot: second,
+        },
+    ]);
+    assert!(pick!(out, WindowFilled).is_empty());
+    n.rig.drain_copies();
+    {
+        let mut receivers = n.dial.filled.lock().unwrap();
+        let receiver = receivers.get_mut(&id).unwrap();
+        let one = receiver.try_recv().expect("the first window");
+        assert_eq!((one.index, one.slot, one.length), (0, first, 2 * PAGE));
+        let bytes = n
+            .staging
+            .region()
+            .bytes(n.staging.offset(first), 2 * PAGE)
+            .unwrap();
+        assert_eq!(bytes[..PAGE as usize], pattern(20, PAGE as usize)[..]);
+        assert_eq!(one.page_xxh3[1], checksum(&bytes[PAGE as usize..]));
+        let two = receiver.try_recv().expect("the second window");
+        assert_eq!((two.index, two.slot, two.length), (1, second, PAGE + ROW));
+        assert!(two.row_xxh3.is_some());
+    }
+    // Nothing ends while a window is still in a slot.
+    let out = n.report(vec![Event::Sent {
+        id: Id::Export(id),
+        index: 0,
+        slot: first,
+    }]);
+    assert!(pick!(out, ExportEnd).is_empty());
+    let out = n.report(vec![Event::Sent {
+        id: Id::Export(id),
+        index: 1,
+        slot: second,
+    }]);
+    assert_eq!(n.staging.free_slots(), 4);
+    // The task is stopped and the export ends when it is gone.
+    assert!(pick!(out, ExportEnd).is_empty());
+    let out = n.report(vec![Event::Closed { id: Id::Export(id) }]);
+    let end = pick!(out, ExportEnd);
+    assert_eq!(end.len(), 1);
+    assert_eq!(end[0].status, wire::ExportEndStatus::ExportComplete as i32);
+    assert_eq!(end[0].fence, wire::FenceOutcome::Drained as i32);
+    assert!(
+        n.rig
+            .events()
+            .iter()
+            .any(|e| matches!(e, crate::pool::PoolEvent::ExportEnded { export } if *export == crate::ExportId(id))),
+        "the checkpoint's pin is released"
+    );
+}
+
+#[test]
+fn an_export_cancelled_mid_relay_stops_its_task_frees_its_slots_and_ends_released() {
+    let mut n = net_rig();
+    let id = channel_export_pinned(&mut n);
+    let slot = n.staging.take_now().unwrap();
+    n.report(vec![Event::Granted {
+        id: Id::Export(id),
+        shape: shape(0, 0, 0, 2, false),
+        slot,
+    }]);
+    n.rig.drain_copies();
+    assert_eq!(n.staging.free_slots(), 3);
+    let out = n.rig.send(In::ExportCancel(wire::ExportCancel {
+        export_id: id,
+        reason: wire::ClaimReason::Cancelled as i32,
+    }));
+    assert!(
+        pick!(out, ExportEnd).is_empty(),
+        "the task may still use the slot"
+    );
+    let out = n.report(vec![Event::Closed { id: Id::Export(id) }]);
+    let end = pick!(out, ExportEnd);
+    assert_eq!(end.len(), 1);
+    assert_eq!(end[0].status, wire::ExportEndStatus::ExportReleased as i32);
+    assert_eq!(
+        n.staging.free_slots(),
+        4,
+        "the unsent window's slot is back"
+    );
+}
+
+#[test]
+fn a_window_out_of_order_on_the_channel_fails_the_export() {
+    let mut n = net_rig();
+    let id = channel_export_pinned(&mut n);
+    let slot = n.staging.take_now().unwrap();
+    let out = n.report(vec![Event::Granted {
+        id: Id::Export(id),
+        shape: shape(1, 1, 0, 1, true),
+        slot,
+    }]);
+    assert!(pick!(out, ExportEnd).is_empty(), "waits for the task");
+    assert_eq!(
+        n.staging.free_slots(),
+        4,
+        "the refused window's slot is back"
+    );
+    let out = n.report(vec![Event::Closed { id: Id::Export(id) }]);
+    let end = pick!(out, ExportEnd);
+    assert_eq!(end[0].status, wire::ExportEndStatus::ExportFailed as i32);
+}
+
+#[test]
+fn an_export_whose_task_fails_is_ended_failed_once_the_task_is_gone() {
+    let mut n = net_rig();
+    let id = channel_export_pinned(&mut n);
+    let out = n.report(vec![Event::Failed {
+        id: Id::Export(id),
+        error: "reset".into(),
+    }]);
+    assert!(pick!(out, ExportEnd).is_empty());
+    let out = n.report(vec![Event::Closed { id: Id::Export(id) }]);
+    assert_eq!(
+        pick!(out, ExportEnd)[0].status,
+        wire::ExportEndStatus::ExportFailed as i32
+    );
+}
+
+#[test]
+fn an_export_naming_a_channel_is_refused_by_a_session_that_cannot_dial() {
+    let mut rig = Rig::new();
+    rig.open_session(None);
+    gpu_with_chain(&rig);
+    let out = rig.send(channel_export(41));
+    let ack = pick!(out, PinAck);
+    assert_eq!(ack[0].result, wire::PinResult::Refused as i32);
 }

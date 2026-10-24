@@ -36,8 +36,8 @@ impl Engine {
         if let Some(staging) = &self.net {
             return Ok(staging.clone());
         }
-        let slots =
-            (self.st.claim_slots + limits.max_open_puts).max(1) * limits.window_credits.max(1);
+        let slots = (self.st.claim_slots + limits.max_open_puts + self.st.export_slots).max(1)
+            * limits.window_credits.max(1);
         let slot_bytes = limits
             .max_window_bytes
             .max(self.st.page_record_bytes())
@@ -102,8 +102,16 @@ impl Engine {
                     slot,
                 } => self.on_net_window(claim, window, slot),
                 Event::End { claim } => self.on_net_end(claim),
-                Event::Granted { put, shape, slot } => self.on_net_grant(put, shape, slot),
-                Event::Sent { put, index, slot } => self.on_net_sent(put, index, slot),
+                Event::Granted { id, shape, slot } => match id {
+                    Id::Export(export) => self.on_export_grant(export, shape, slot),
+                    Id::Put(put) => self.on_net_grant(put, shape, slot),
+                    Id::Claim(_) => self.free_slot(slot),
+                },
+                Event::Sent { id, index, slot } => match id {
+                    Id::Export(export) => self.on_export_sent(export, index, slot),
+                    Id::Put(put) => self.on_net_sent(put, index, slot),
+                    Id::Claim(_) => self.free_slot(slot),
+                },
                 Event::Failed { id, error } => self.on_net_failed(id, error),
                 Event::Closed { id } => self.on_net_closed(id),
             }
