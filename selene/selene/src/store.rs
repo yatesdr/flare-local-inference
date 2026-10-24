@@ -1,6 +1,8 @@
 //! What a host tier is asked to do and what it reports back.
 
-use crate::{CheckpointId, History, PageId, PrefixKey, Result, StateSlotId, index};
+use crate::{
+    CheckpointId, History, PageId, PrefixKey, Result, StateSlotId, index, pool::LookupTicket,
+};
 
 /// Identifies one transfer or disk job issued by a store. Memory and disk
 /// stores own separate transfer queues, so their counters do not intersect.
@@ -70,6 +72,51 @@ pub struct InboundTicket {
     pub slot: StateSlotId,
 }
 
+/// Names one export a manager asked this instance to serve. Assigned by the
+/// manager; unique within one manager incarnation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExportId(pub u64);
+
+/// Why the worker did not pin a GPU checkpoint for an export. Nothing is
+/// pinned after any of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportRefusal {
+    /// The checkpoint is gone or was never ready.
+    NotFound,
+    /// The key was published again under another checkpoint id.
+    GenerationChanged,
+    /// The chain is not contiguous from the physical start, or lacks the wanted row.
+    ChainGap,
+    /// Pinning would leave too little room for running or queued requests.
+    NoHeadroom,
+    /// The chain is larger than the staging the manager reserved for it.
+    NoWindows,
+    /// This instance already serves as many exports as it may.
+    Busy,
+}
+
+/// One record of an exported chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportNode {
+    pub key: PrefixKey,
+    /// The checkpoint id of the record, as the index announced it.
+    pub generation: u64,
+    /// The record's own pages in ascending order.
+    pub pages: Vec<PageId>,
+}
+
+/// The pinned GPU chain an export reads, root first and trimmed to the
+/// physical start: the first record carries all its pages and `skip_pages`
+/// of them precede what the export takes. The last node is the endpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportChain {
+    pub nodes: Vec<ExportNode>,
+    /// Pages of the first node the requester already holds.
+    pub skip_pages: u32,
+    /// The endpoint's state slot when the export carries its row.
+    pub row: Option<StateSlotId>,
+}
+
 /// Completion of work a store accepted earlier.
 #[derive(Debug)]
 pub enum StoreEvent {
@@ -83,6 +130,20 @@ pub enum StoreEvent {
     Fetched { key: PrefixKey, result: Result<u64> },
     /// No copy still reads the GPU checkpoint; retry its publication after progress.
     Deferred { checkpoint: CheckpointId },
+    /// A manager asked this instance to export a GPU checkpoint. The worker
+    /// answers with `export_pinned` or `export_refused` in the same iteration.
+    ExportRequested {
+        export: ExportId,
+        key: PrefixKey,
+        generation: u64,
+        begin_tokens: u64,
+        want_row: bool,
+        /// Bytes of staging the manager reserved for the whole export.
+        reserved_bytes: u64,
+    },
+    /// The export finished or was cancelled and no copy still reads its pages:
+    /// release its pin, once.
+    ExportEnded { export: ExportId },
 }
 
 /// Counters every store maintains; rates are bytes per second of completed transfers.
@@ -152,6 +213,34 @@ pub trait HostStore {
     /// On failure the caller must retain the store: transfer jobs may still
     /// reference its registered host buffers and GPU destinations.
     fn close(&mut self) -> Result<()>;
+
+    /// The worker pinned the checkpoint for `export` and describes its chain.
+    /// An error means the store cannot serve the export; the worker unpins.
+    fn export_pinned(&mut self, _export: ExportId, _chain: ExportChain) -> Result<()> {
+        Ok(())
+    }
+    /// The worker did not pin the checkpoint for `export`.
+    fn export_refused(&mut self, _export: ExportId, _reason: ExportRefusal) {}
+    /// A published GPU checkpoint left the cache, including when compaction
+    /// removed it as an endpoint; `heir` is the single child that took over its
+    /// pages, with its updated publication.
+    fn evicted(&mut self, _key: PrefixKey, _generation: u64, _heir: Option<&PublishedCheckpoint>) {}
+    /// Start looking for pool candidates for a request that just queued. `None`
+    /// when no lookup is wanted or possible.
+    fn begin_lookup(&mut self, _history: &dyn History) -> Option<LookupTicket> {
+        None
+    }
+    /// [`HostStore::lookup`] for a request that holds `ticket`. Without a ticket,
+    /// or while its lookup has no answer, this is the local lookup.
+    fn lookup_for(
+        &mut self,
+        _ticket: Option<&LookupTicket>,
+        history: &dyn History,
+        resident: u64,
+        before: u64,
+    ) -> Option<HostHit> {
+        self.lookup(history, resident, before)
+    }
 }
 
 /// Bytes per second assumed for a tier before its first transfers are measured.
