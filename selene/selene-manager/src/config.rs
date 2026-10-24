@@ -27,6 +27,9 @@ pub struct Config {
     pub staging: u64,
     /// Serve the pool protocol to instances on other hosts at this address.
     pub listen: Option<SocketAddr>,
+    /// Where those instances connect to copy bytes. Defaults to the host of `listen` on
+    /// the next port; set it when that port is taken or when it is not the one clients reach.
+    pub listen_data: Option<SocketAddr>,
     /// TLS for `listen`: the manager's certificate chain and key. Clients verify the
     /// certificate against their configured CA; there are no client certificates.
     pub tls_cert: Option<PathBuf>,
@@ -60,6 +63,7 @@ impl Config {
             nvme: 0,
             staging: DEFAULT_STAGING,
             listen: None,
+            listen_data: None,
             tls_cert: None,
             tls_key: None,
             rdma: false,
@@ -73,6 +77,24 @@ impl Config {
     /// Default socket path for a manager name.
     pub fn default_socket(name: &str) -> PathBuf {
         PathBuf::from(format!("/run/selene/{name}.sock"))
+    }
+
+    /// The data listener's address: `listen_data`, else the next port of `listen`.
+    pub fn data_address(&self) -> io::Result<Option<SocketAddr>> {
+        let Some(listen) = self.listen else {
+            return Ok(None);
+        };
+        if let Some(address) = self.listen_data {
+            return Ok(Some(address));
+        }
+        // Port 0 asks for any free port, and so does its data listener.
+        let port = match listen.port() {
+            0 => 0,
+            port => port.checked_add(1).ok_or_else(|| {
+                invalid("--listen-data is required when --listen's port is 65535")
+            })?,
+        };
+        Ok(Some(SocketAddr::new(listen.ip(), port)))
     }
 
     /// Whether this build and configuration offer RDMA.
@@ -89,8 +111,14 @@ impl Config {
             } else {
                 "plaintext"
             };
+            let data = self
+                .data_address()
+                .ok()
+                .flatten()
+                .map(|data| format!(", data on {data}"))
+                .unwrap_or_default();
             warnings.push(format!(
-                "selene: warning: network listening enabled on {address} ({mode})"
+                "selene: warning: network listening enabled on {address} ({mode}{data})"
             ));
         }
         if self.rdma_enabled() {
@@ -128,6 +156,9 @@ impl Config {
             }
             _ => {}
         }
+        if self.listen_data.is_some() && self.listen.is_none() {
+            return Err(invalid("--listen-data applies to --listen"));
+        }
         if self.tls_cert.is_some() != self.tls_key.is_some() {
             return Err(invalid("--tls-cert and --tls-key go together"));
         }
@@ -146,6 +177,7 @@ impl Config {
         if self.rdma && self.listen.is_none() {
             return Err(invalid("--rdma applies to --listen"));
         }
+        self.data_address()?;
         Ok(())
     }
 }
@@ -168,6 +200,7 @@ pub fn help_text() -> String {
      --staging BYTES                 shared staging, default 256M\n\
      --write-budget BYTES/s          per-process write rate; 0 = unlimited\n\
      --listen ADDR:PORT              serve instances on other hosts\n\
+     --listen-data ADDR:PORT         where they copy bytes, default --listen's next port\n\
      --tls-cert PATH --tls-key PATH  TLS for --listen (clients verify against their CA)\n\
      --rdma                          offer RDMA (experimental; not with TLS)\n\
      --source-wait DURATION          wait for remembered instances, default 10s\n\
@@ -248,6 +281,10 @@ where
                 config.listen = Some(parse_address(value(index)?)?);
                 index += 2;
             }
+            "--listen-data" => {
+                config.listen_data = Some(parse_address(value(index)?)?);
+                index += 2;
+            }
             "--tls-cert" => {
                 config.tls_cert = Some(value(index)?.into());
                 index += 2;
@@ -318,6 +355,9 @@ impl Config {
         if let Some(address) = raw.listen {
             config.listen = Some(parse_address(&address)?);
         }
+        if let Some(address) = raw.listen_data {
+            config.listen_data = Some(parse_address(&address)?);
+        }
         if let Some(path) = raw.tls_cert {
             config.tls_cert = Some(path.into());
         }
@@ -356,6 +396,7 @@ struct RawConfig {
     #[serde(default, deserialize_with = "de_size")]
     staging: Option<u64>,
     listen: Option<String>,
+    listen_data: Option<String>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     rdma: Option<bool>,
@@ -594,6 +635,47 @@ mod tests {
         config.tls_cert = Some("/c".into());
         config.tls_key = Some("/k".into());
         assert!(config.startup_warnings()[0].contains("TLS"));
+    }
+
+    #[test]
+    fn the_data_listener_follows_the_session_listener_unless_told_otherwise() {
+        let mut config = Config::defaults();
+        assert_eq!(config.data_address().unwrap(), None);
+        config.listen = Some("10.0.0.5:9200".parse().unwrap());
+        assert_eq!(
+            config.data_address().unwrap(),
+            Some("10.0.0.5:9201".parse().unwrap())
+        );
+        config.listen_data = Some("10.0.0.5:7000".parse().unwrap());
+        assert_eq!(
+            config.data_address().unwrap(),
+            Some("10.0.0.5:7000".parse().unwrap())
+        );
+        // Port 0 means any free port for both.
+        config.listen = Some("127.0.0.1:0".parse().unwrap());
+        config.listen_data = None;
+        assert_eq!(
+            config.data_address().unwrap(),
+            Some("127.0.0.1:0".parse().unwrap())
+        );
+        // The last port has no next one, and a data port alone names nothing to serve.
+        config.listen = Some("127.0.0.1:65535".parse().unwrap());
+        assert!(config.validate().is_err());
+        config.listen = None;
+        config.listen_data = Some("127.0.0.1:7000".parse().unwrap());
+        assert!(config.validate().is_err());
+        let parsed = run(&[
+            "--listen",
+            "127.0.0.1:9000",
+            "--listen-data",
+            "127.0.0.1:9100",
+        ]);
+        assert_eq!(parsed.listen_data, Some("127.0.0.1:9100".parse().unwrap()));
+        let warnings = parsed.startup_warnings();
+        assert!(
+            warnings[0].contains("data on 127.0.0.1:9100"),
+            "{warnings:?}"
+        );
     }
 
     #[test]

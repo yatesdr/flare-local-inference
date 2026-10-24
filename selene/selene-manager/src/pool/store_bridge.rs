@@ -7,19 +7,21 @@
 //! index, and the store's put and get operations behind PutBegin and claims.
 
 use super::{
-    Checked,
+    Checked, Violation,
     claims::{ClaimKey, Party},
-    core::{Core, Event, Nonce, ProcKey, ScopeId},
+    core::{ChanOwner, Core, Event, Nonce, ProcKey, ScopeId},
     index::{Entry, InstanceId, SourceId, Tier},
     key_from, key_to,
 };
 use crate::{
     Key,
+    data::channel,
     proto::{self, v2, v2::server_message::M},
     record::{Descriptor, HEADER_BYTES, Header, NamespaceId},
     store::{GetAnswer, PutAnswer, Reply, StoreCommand},
 };
-use std::io;
+use flare_selene::pool::frame::Shape;
+use std::{io, time::Instant};
 use tokio::sync::{mpsc, oneshot};
 
 /// A process's connection to the store.
@@ -55,6 +57,21 @@ pub(super) struct PutRec {
     pub chain_pages: u64,
     /// What the store accepted: the parent it will link to and the first page it needs.
     pub accepted: Option<(Option<Key>, u32)>,
+    /// Set when the writer's bytes arrive on the data channel.
+    pub channel: Option<PutChannel>,
+    /// A commit that arrived before the data channel delivered every window: the
+    /// channel and the session are separate streams, so it waits for the last fill.
+    pub deferred_commit: Option<(u64, v2::PutCommit)>,
+}
+
+/// A put's data-channel transfer. Its windows are written only by the manager's
+/// handler, so the handler's exit is what lets them go back to the store.
+pub(super) struct PutChannel {
+    pub transfer: u64,
+    pub token: [u8; flare_selene::pool::frame::TOKEN_BYTES],
+    pub exited: bool,
+    pub stopped_at: Option<Instant>,
+    pub quarantined: bool,
 }
 
 /// Per-scope catalog feed from the store.
@@ -229,24 +246,32 @@ impl Core {
             return Some(link);
         }
         let descriptor: Descriptor = self.scopes.get(&scope)?.valid.descriptor.clone();
-        if pid == 0 {
-            return None;
-        }
         let connection = self.new_store_connection()?;
         let namespace = descriptor.namespace_id();
         let replica = super::barrier::hex(&process.0);
-        let hello = self
-            .store_call(|reply| StoreCommand::Hello {
+        let generation = if pid == 0 {
+            // A process on another host has no pid to watch. It never touches the
+            // manager's memory: the manager's own data-channel handler does.
+            self.store_call(|reply| StoreCommand::PeerHello {
+                connection,
+                node: replica,
+                reply,
+            })
+            .ok()?
+        } else {
+            self.store_call(|reply| StoreCommand::Hello {
                 connection,
                 replica,
                 pid,
                 descriptor,
                 reply,
             })
-            .ok()?;
+            .ok()?
+            .generation
+        };
         let link = Link {
             connection,
-            generation: hello.generation,
+            generation,
             namespace,
         };
         if let Some(proc) = self.procs.get_mut(&process) {
@@ -314,23 +339,31 @@ impl Core {
             return Ok(());
         }
         let mode = v2::CopyMode::try_from(m.mode).unwrap_or(v2::CopyMode::Unspecified);
-        if mode == v2::CopyMode::DataChannel {
-            self.put_refusal(
-                sid,
-                put_id,
-                v2::Reason::Invalid,
-                "the data channel is not served by this build",
-            );
-            return Ok(());
-        }
-        if mode != v2::CopyMode::SharedWindows || !shm {
-            self.put_refusal(
-                sid,
-                put_id,
-                v2::Reason::Invalid,
-                "shared windows need a Unix-socket session of the manager's own user",
-            );
-            return Ok(());
+        match mode {
+            v2::CopyMode::SharedWindows if shm => {}
+            v2::CopyMode::SharedWindows => {
+                self.put_refusal(
+                    sid,
+                    put_id,
+                    v2::Reason::Invalid,
+                    "shared windows need a Unix-socket session of the manager's own user",
+                );
+                return Ok(());
+            }
+            v2::CopyMode::DataChannel if self.cfg.channel.is_some() => {}
+            v2::CopyMode::DataChannel => {
+                self.put_refusal(
+                    sid,
+                    put_id,
+                    v2::Reason::Invalid,
+                    "this manager serves no data channel (it has no network listener)",
+                );
+                return Ok(());
+            }
+            _ => {
+                self.put_refusal(sid, put_id, v2::Reason::Invalid, "bad mode");
+                return Ok(());
+            }
         }
         let Ok(record_key) = key_from(m.key.as_ref()) else {
             self.put_refusal(sid, put_id, v2::Reason::Invalid, "bad key");
@@ -389,6 +422,31 @@ impl Core {
             self.put_refusal(sid, put_id, v2::Reason::Invalid, &error.to_string());
             return Ok(());
         }
+        let hub = self.cfg.channel.clone();
+        let channel = match (mode, hub) {
+            (v2::CopyMode::DataChannel, Some(hub)) => match hub.open(channel::Kind::Put) {
+                Ok((transfer, token)) => Some(PutChannel {
+                    transfer,
+                    token,
+                    exited: false,
+                    stopped_at: None,
+                    quarantined: false,
+                }),
+                Err(error) => {
+                    self.store_send(StoreCommand::Cancel {
+                        connection: link.connection,
+                        generation: link.generation,
+                        transfer: put_id,
+                    });
+                    self.put_refusal(sid, put_id, v2::Reason::Io, &error.to_string());
+                    return Ok(());
+                }
+            },
+            _ => None,
+        };
+        if let Some(open) = &channel {
+            self.channels.insert(open.transfer, ChanOwner::Put(key));
+        }
         self.puts.insert(
             key,
             PutRec {
@@ -400,6 +458,8 @@ impl Core {
                 key: record_key,
                 chain_pages: m.chain_pages,
                 accepted: None,
+                channel,
+                deferred_commit: None,
             },
         );
         let tx = self.self_tx.clone();
@@ -441,6 +501,16 @@ impl Core {
         match answer {
             Ok(PutAnswer::Accept(accept)) => {
                 rec.accepted = Some((accept.parent, accept.first_page));
+                let channel =
+                    rec.channel
+                        .as_ref()
+                        .zip(self.cfg.channel.as_ref())
+                        .map(|(open, hub)| v2::DataChannelRef {
+                            transport: v2::DataTransport::Tcp as i32,
+                            address: hub.address().to_string(),
+                            token: open.token.to_vec(),
+                            rdma: Vec::new(),
+                        });
                 self.send(
                     sid,
                     M::PutAccept(v2::PutAccept {
@@ -449,12 +519,39 @@ impl Core {
                         has_parent: accept.parent.is_some(),
                         parent: accept.parent.map(key_to),
                         record_bytes: accept.record_bytes,
-                        channel: None,
+                        channel,
                     }),
                 );
             }
             Ok(PutAnswer::Grant(grant)) => {
                 rec.unfilled += 1;
+                if let Some((open, hub)) = rec.channel.as_ref().zip(self.cfg.channel.as_ref()) {
+                    // The window is filled by the manager's handler from what the
+                    // instance writes; no one else holds it.
+                    let region = u8::try_from(grant.region)
+                        .ok()
+                        .and_then(crate::data::Region::from_u8);
+                    let Some(region) = region else {
+                        self.put_fail_by_key(key, v2::Reason::Io, "a window in an unknown region");
+                        return;
+                    };
+                    hub.push_grant(
+                        open.transfer,
+                        channel::GrantOut {
+                            shape: Shape {
+                                index: grant.index,
+                                record: grant.record,
+                                first_page: grant.page_first as u32,
+                                page_count: grant.page_count,
+                                row: grant.row,
+                                length: grant.length,
+                            },
+                            region,
+                            offset: grant.offset,
+                        },
+                    );
+                    return;
+                }
                 rec.fence = Party::Pending;
                 let window = v2::WindowSpec {
                     index: grant.index,
@@ -503,12 +600,88 @@ impl Core {
     }
 
     /// A finished put with no window the writer may still hold needs no record.
+    /// One on the data channel is held until its handler has exited.
     fn puts_settle(&mut self, key: PutKey) {
         let Some(rec) = self.puts.get(&key) else {
             return;
         };
-        if rec.phase == PutPhase::Finished && rec.unfilled == 0 {
+        if rec.phase != PutPhase::Finished {
+            return;
+        }
+        if rec.channel.is_some() {
+            return self.put_channel_end(key);
+        }
+        if rec.unfilled == 0 {
             self.puts.remove(&key);
+        }
+    }
+
+    /// The put is over: stop its transfer, and once the handler is gone return
+    /// the windows to the store and drop the record.
+    fn put_channel_end(&mut self, key: PutKey) {
+        let Some(rec) = self.puts.get_mut(&key) else {
+            return;
+        };
+        let Some(open) = rec.channel.as_mut() else {
+            return;
+        };
+        if !open.exited {
+            open.stopped_at.get_or_insert_with(Instant::now);
+            let quiet = self
+                .cfg
+                .channel
+                .as_ref()
+                .is_none_or(|hub| hub.stop(open.transfer));
+            if !quiet {
+                // `Closed` follows when the handler has dropped its connection.
+                return;
+            }
+            open.exited = true;
+            self.channels.remove(&open.transfer);
+        }
+        let link = rec.link;
+        self.puts.remove(&key);
+        self.store_send(StoreCommand::ReleaseTransfer {
+            connection: link.connection,
+            generation: link.generation,
+            transfer: key.2,
+        });
+    }
+
+    /// A put's handler has exited.
+    pub(super) fn put_channel_closed(&mut self, key: PutKey) {
+        let Some(open) = self.puts.get_mut(&key).and_then(|rec| rec.channel.as_mut()) else {
+            return;
+        };
+        open.exited = true;
+        open.quarantined = false;
+        self.puts_settle(key);
+    }
+
+    /// The put's windows that have been filled and written are accounted for; a
+    /// handler that reports an error ends the put.
+    pub(super) fn put_channel_failed(&mut self, key: PutKey, reason: &str) {
+        eprintln!("selene: put {} on the data channel failed: {reason}", key.2);
+        self.put_fail_by_key(key, v2::Reason::Io, reason);
+    }
+
+    /// Fails a put, telling its writer when its session is still there.
+    fn put_fail_by_key(&mut self, key: PutKey, reason: v2::Reason, detail: &str) {
+        match self.proc_session((key.0, key.1)) {
+            Some(sid) => self.put_fail(sid, key, reason, detail),
+            None => {
+                if let Some(rec) = self.puts.get_mut(&key) {
+                    let link = rec.link;
+                    rec.refused = true;
+                    rec.phase = PutPhase::Finished;
+                    self.store_send(StoreCommand::Cancel {
+                        connection: link.connection,
+                        generation: link.generation,
+                        transfer: key.2,
+                    });
+                }
+                self.puts_settle(key);
+            }
         }
     }
 
@@ -523,39 +696,61 @@ impl Core {
         let Some(session) = self.sessions.get(&sid) else {
             return Ok(());
         };
-        let process = (session.instance, session.nonce);
-        let key = (process.0, process.1, m.put_id);
+        let key = (session.instance, session.nonce, m.put_id);
+        // Windows of a put on the data channel are filled there, never reported here.
+        if self.puts.get(&key).is_some_and(|rec| rec.channel.is_some()) {
+            return Err(Violation::new("PutFilled for a put on the data channel"));
+        }
+        self.put_window_filled(key, m.index, m.page_xxh3, m.has_row.then_some(m.row_xxh3));
+        Ok(())
+    }
+
+    /// The writer filled window `index`: the store checks and consumes it.
+    pub(super) fn put_window_filled(
+        &mut self,
+        key: PutKey,
+        index: u32,
+        page_xxh3: Vec<u64>,
+        row_xxh3: Option<u64>,
+    ) {
         let Some(rec) = self.puts.get(&key) else {
-            return Ok(());
+            return;
         };
         if rec.phase != PutPhase::Open {
-            return Ok(());
+            return;
         }
         let link = rec.link;
-        let row = m.has_row.then_some(m.row_xxh3);
         let result = self.store_call(|reply| StoreCommand::WindowFilled {
             connection: link.connection,
             generation: link.generation,
-            transfer: m.put_id,
-            index: m.index,
-            page_xxh3: m.page_xxh3.clone(),
-            row_xxh3: row,
+            transfer: key.2,
+            index,
+            page_xxh3,
+            row_xxh3,
             reply,
         });
         match result {
             Ok(()) => {
+                let mut deferred = None;
                 if let Some(rec) = self.puts.get_mut(&key) {
                     rec.unfilled = rec.unfilled.saturating_sub(1);
                     if rec.unfilled == 0 && rec.fence == Party::Pending {
                         rec.fence = Party::Idle;
                     }
+                    if rec.unfilled == 0 {
+                        deferred = rec.deferred_commit.take();
+                    }
+                }
+                if let Some((sid, commit)) = deferred {
+                    if let Err(violation) = self.put_commit(sid, commit) {
+                        self.violation(sid, violation);
+                    }
                 }
             }
             Err(error) => {
-                self.put_fail(sid, key, v2::Reason::Invalid, &error.to_string());
+                self.put_fail_by_key(key, v2::Reason::Invalid, &error.to_string());
             }
         }
-        Ok(())
     }
 
     fn put_fail(&mut self, sid: u64, key: PutKey, reason: v2::Reason, detail: &str) {
@@ -587,6 +782,10 @@ impl Core {
             return Ok(());
         };
         if rec.phase != PutPhase::Open {
+            return Ok(());
+        }
+        if rec.channel.is_some() && rec.unfilled > 0 {
+            rec.deferred_commit = Some((sid, m));
             return Ok(());
         }
         // The metadata must describe exactly the record that was accepted, in this
@@ -662,6 +861,11 @@ impl Core {
         let Some(rec) = self.puts.get_mut(&key) else {
             return;
         };
+        if rec.channel.is_some() {
+            // The writer touches none of the manager's windows; its handler's exit
+            // is what returns them.
+            return;
+        }
         if party == Party::Drained {
             let link = rec.link;
             self.puts.remove(&key);
@@ -701,8 +905,36 @@ impl Core {
     }
 
     pub(super) fn puts_proc_exited(&mut self, process: ProcKey) {
-        self.puts.retain(|k, _| (k.0, k.1) != process);
-        self.drop_link(process);
+        let keys: Vec<PutKey> = self
+            .puts
+            .keys()
+            .filter(|k| (k.0, k.1) == process)
+            .copied()
+            .collect();
+        let mut waiting = false;
+        for key in keys {
+            let on_channel = self.puts.get(&key).is_some_and(|rec| rec.channel.is_some());
+            if !on_channel {
+                self.puts.remove(&key);
+                continue;
+            }
+            if let Some(rec) = self.puts.get_mut(&key) {
+                let link = rec.link;
+                rec.refused = true;
+                rec.phase = PutPhase::Finished;
+                self.store_send(StoreCommand::Cancel {
+                    connection: link.connection,
+                    generation: link.generation,
+                    transfer: key.2,
+                });
+            }
+            self.puts_settle(key);
+            waiting |= self.puts.contains_key(&key);
+        }
+        // A handler still running holds windows of this connection: it goes last.
+        if !waiting {
+            self.drop_link(process);
+        }
     }
 
     /// `Goodbye{quiesced}`: the writer has stopped touching every window it was leased.
@@ -717,6 +949,10 @@ impl Core {
             let Some(rec) = self.puts.get(&key) else {
                 continue;
             };
+            if rec.channel.is_some() {
+                // Its handler's exit, not the writer's word, returns the windows.
+                continue;
+            }
             let (link, finished) = (rec.link, rec.phase == PutPhase::Finished);
             self.store_send(StoreCommand::ReleaseTransfer {
                 connection: link.connection,

@@ -182,9 +182,11 @@ pub fn serve(
     // Validate TLS before anything is started or accepted: a certificate error must not
     // leave an accepting listener behind.
     validate_tls(&config)?;
+    let data_tls = data_tls(&config)?;
     let pool_settings = store_config.pool.clone();
     let pool_root = store_config.root.clone();
     let store = Store::open(store_config)?;
+    let regions = Arc::new(store.regions());
     let directory = config
         .socket
         .parent()
@@ -215,6 +217,22 @@ pub fn serve(
         ))
     })?;
     let (commands, mut receiver) = mpsc::channel::<StoreCommand>(64);
+    // Instances on other hosts copy through the data channel, which binds before the
+    // pool exists so a taken port fails startup.
+    let (channel, channel_events) = match config.data_address()? {
+        Some(address) => {
+            let listener = std::net::TcpListener::bind(address)?;
+            let (hub, events) = crate::data::channel::Hub::start(
+                runtime.handle(),
+                listener,
+                regions.clone(),
+                data_tls,
+                crate::pool::windows::MAX_WINDOW_PAGES as u32,
+            )?;
+            (Some(hub), Some(events))
+        }
+        None => (None, None),
+    };
     // The pool actor runs on the runtime; its sessions arrive through the gRPC service.
     let (shm, staging_arena, recovered_records) = store.pool_view();
     let pool_config = crate::pool::PoolConfig {
@@ -229,6 +247,7 @@ pub fn serve(
             crate::proto::v2::Encryption::Plaintext
         },
         transports: pool_transports(&config),
+        channel,
     };
     let (pool_core, pool_handle, pool_events) = crate::pool::Core::new(
         pool_config,
@@ -240,6 +259,20 @@ pub fn serve(
     );
     let pool_service = crate::pool::PoolService::new(pool_handle.clone());
     let pool_task = runtime.spawn(pool_core.run(pool_events));
+    if let Some(mut events) = channel_events {
+        let pool_events = pool_handle.events.clone();
+        runtime.spawn(async move {
+            while let Some(event) = events.recv().await {
+                if pool_events
+                    .send(crate::pool::core::Event::Channel(event))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+    }
     // Bind every listener before any thread starts, so a startup failure leaves no threads
     // and no locks behind; the guard below also removes the socket it creates.
     let metrics_text = Arc::new(Mutex::new(String::new()));
@@ -441,6 +474,17 @@ fn validate_tls(config: &crate::config::Config) -> Result<()> {
             .map_err(|error| invalid(format!("TLS: {error}")))?;
     }
     Ok(())
+}
+
+/// The data channel's TLS configuration: the same certificate and key as the session listener.
+fn data_tls(config: &crate::config::Config) -> Result<Option<Arc<rustls::ServerConfig>>> {
+    let (Some(cert), Some(key)) = (&config.tls_cert, &config.tls_key) else {
+        return Ok(None);
+    };
+    Ok(Some(crate::data::channel::server_config(
+        &fs::read(cert)?,
+        &fs::read(key)?,
+    )?))
 }
 
 /// The manager's identity for clients that verify it against their own CA. There are no
