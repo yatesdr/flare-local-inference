@@ -1617,6 +1617,21 @@ fn a_host_record_is_relayed_between_two_instances_on_other_hosts_over_tcp() {
     assert!(bytes >= 2 * (700 * PAGE + ROW) as u64, "{bytes} bytes");
 }
 
+#[cfg(feature = "rdma")]
+#[test]
+fn a_host_record_is_relayed_between_two_instances_on_other_hosts_over_rdma() {
+    let manager = Manager::start_network_with(false, true);
+    relay_host_record(&manager, false, false, 700);
+    let (windows, bytes) = manager.moved("rdma");
+    assert!(windows >= 4, "{windows} windows crossed the manager twice");
+    assert!(bytes >= 2 * (700 * PAGE + ROW) as u64, "{bytes} bytes");
+    assert_eq!(
+        manager.moved("stream"),
+        (0, 0),
+        "nothing went by the stream"
+    );
+}
+
 #[test]
 fn a_host_record_is_relayed_between_two_instances_on_other_hosts_over_tls() {
     let manager = Manager::start_network(true);
