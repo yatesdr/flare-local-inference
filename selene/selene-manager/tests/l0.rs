@@ -1,7 +1,8 @@
 mod support;
 use selene_manager::{
     arena::{Arena, ExtentSlice},
-    control, disk, proto,
+    control, disk,
+    proto::v2::{self, client_message as c, server_message::M},
     record::{self, Header},
     store::Config,
     tree::{Eviction, Tree},
@@ -23,6 +24,46 @@ const CHILD: &str = "SELENE_CHILD_BASE";
 const CHILD_POINT: &str = "SELENE_CHILD_POINT";
 const CHILD_DUMP: &str = "SELENE_CHILD_DUMP";
 const CHILD_QUARANTINE: &str = "SELENE_CHILD_QUARANTINE";
+
+/// Polls until the manager's entry for `tokens` is offered from `tier`.
+async fn wait_tier(client: &mut Client, tokens: u64, tier: v2::Tier) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if client
+            .candidate(tokens)
+            .await
+            .is_some_and(|candidate| candidate.tier == tier as i32)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the entry for {tokens} never moved to {tier:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// selene.v2 pushes no Room: a put refused for budget is simply tried again, and is
+/// admitted once the budget has refilled or the shortage cleared. A debt of several
+/// megabytes takes about fifteen seconds to repay.
+async fn store_when_room(
+    client: &mut Client,
+    key: selene_manager::Key,
+    parent: Option<selene_manager::Key>,
+) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match client.put(key, parent, PutOptions::default()).await {
+            PutOutcome::Stored(bytes) => return bytes,
+            PutOutcome::Refused(reason) if reason == v2::Reason::Budget as u8 => {
+                assert!(Instant::now() < deadline, "the put was never admitted");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            other => panic!("unexpected put outcome: {other:?}"),
+        }
+    }
+}
 
 #[test]
 fn l0_01_tree_insert_chain_remove_parity() {
@@ -82,7 +123,6 @@ fn l0_01_tree_insert_chain_remove_parity() {
     assert_eq!(arena.used(), 0);
     assert!(arena.allocate(1024 * 1024).is_some());
 }
-
 #[test]
 fn l0_02_leaf_lru_compaction_and_cascade() {
     let mut tree = Tree::new(64);
@@ -114,60 +154,58 @@ fn l0_02_leaf_lru_compaction_and_cascade() {
     );
     assert_eq!(tree.len(), 1);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_03_accept_shapes_and_present_inflight() {
     let mut host = Host::new(4 * 1024 * 1024, 4 * 1024 * 1024);
     host.start();
     let mut a = host.client().await;
     let mut b = host.client().await;
-    // A child shaped against a readable parent gets first_page = parent pages.
-    let (sender, replies) = a.raw_begin(key(128), None).await;
-    // A second connection sees INFLIGHT while the first Put is open.
+    // A second writer sees INFLIGHT while the first put is open.
+    let (open, start) = a.start_put(key(128), None).await;
+    assert!(matches!(start, PutStart::Accepted(_)), "{start:?}");
     assert_eq!(
         b.put(key(128), None, PutOptions::default()).await,
-        PutOutcome::Refused(proto::Reason::Inflight as u8)
+        PutOutcome::Refused(v2::Reason::Inflight as u8)
     );
-    sender
-        .send(proto::PutMessage {
-            m: Some(proto::put_message::M::Cancel(proto::Cancel {})),
-        })
-        .await
-        .unwrap();
-    drop(sender);
-    drop(replies);
+    a.abandon_put(open).await;
     host.wait(|host| host.gauge("open_ops") == 0);
     let bytes = b.store(key(128), None).await;
     assert!(!bytes.is_empty());
     assert_eq!(
         b.put(key(128), None, PutOptions::default()).await,
-        PutOutcome::Refused(proto::Reason::Present as u8)
+        PutOutcome::Refused(v2::Reason::Present as u8)
     );
     let mut c = host.client().await;
     let mut open = Vec::new();
     for tokens in [640, 768, 896, 1024] {
-        open.push(c.raw_begin(key(tokens), None).await);
+        let (id, start) = c.start_put(key(tokens), None).await;
+        assert!(
+            matches!(start, PutStart::Accepted(_)),
+            "{tokens}: {start:?}"
+        );
+        open.push(id);
     }
     assert_eq!(
         c.put(key(1152), None, PutOptions::default()).await,
-        PutOutcome::Refused(proto::Reason::Queue as u8)
+        PutOutcome::Refused(v2::Reason::Queue as u8)
     );
-    drop(open);
+    for id in open {
+        c.abandon_put(id).await;
+    }
     host.wait(|host| host.gauge("open_ops") == 0);
     b.store(key(256), Some(key(128))).await;
     b.store(key(512), None).await;
     let mut fresh = host.client().await;
-    let mut leaves = Vec::new();
     for (index, tokens) in [3u64, 5].into_iter().enumerate() {
         let bytes = fresh.store(key(tokens), (index > 0).then(|| key(3))).await;
         assert!(!bytes.is_empty());
-        leaves.push(tokens);
     }
+    // Two row-only records: a restore supplies the endpoint's row and nothing for the
+    // parent, which has no page and whose row is not wanted.
     let data = fresh.fetch(&[key(3), key(5)], 0, 0).await;
-    assert_eq!(data.len(), 2);
-    assert!(!data[0].is_empty() && !data[1].is_empty());
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0].len() as u64, descriptor().row_bytes());
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_04_invalid_checksum_short_payload_and_offsets() {
     let mut host = Host::new(4 * 1024 * 1024, 4 * 1024 * 1024);
@@ -205,17 +243,17 @@ async fn l0_04_invalid_checksum_short_payload_and_offsets() {
         let mut client = host.client().await;
         let outcome = client.put(key(tokens), None, options).await;
         assert!(
-            matches!(outcome, PutOutcome::Refused(reason) if reason == proto::Reason::Invalid as u8),
+            matches!(outcome, PutOutcome::Refused(reason) if reason == v2::Reason::Invalid as u8),
             "{tokens}: {outcome:?}"
         );
     }
     host.wait(|host| host.gauge("nvme_reserved_bytes") == 0);
     assert_eq!(host.gauge("staging_allocated_bytes"), 0);
+    // Nothing the refused puts carried was indexed.
     let mut check = host.client().await;
-    let subscription = check.subscribe().await;
-    assert!(subscription.entries.is_empty());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(check.records().await.is_empty());
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_05_parent_first_chain_closed_durability() {
     let base = base("durable");
@@ -260,13 +298,21 @@ async fn l0_05_parent_first_chain_closed_durability() {
     );
     fs::remove_file(signal).unwrap();
     host.durable(2);
-    let subscription = client.subscribe().await;
-    assert!(
-        subscription.entries.values().all(|entry| entry.durable),
-        "both records must be chain-durable"
-    );
+    // The catalog's durable flag is not on the wire: both records being on disk, the
+    // parent having been written first, is the chain-durable state.
+    for value in [key(128), key(256)] {
+        assert!(
+            host.config
+                .root
+                .as_ref()
+                .unwrap()
+                .join(&namespace)
+                .join(record::file_name(&value))
+                .exists(),
+            "both records must be chain-durable"
+        );
+    }
 }
-
 #[test]
 fn l0_06_multiprocess_kill_recovery() {
     if let Ok(base) = std::env::var(CHILD) {
@@ -390,106 +436,10 @@ fn l0_06_multiprocess_kill_recovery() {
         fs::remove_dir_all(base).unwrap();
     }
 }
-
-/// A startup failure after the store opened must release the instance and root locks and
-/// leave no socket, so the same manager can start again on the same paths immediately.
-#[test]
-fn l0_67_a_failed_start_releases_the_instance_and_root() {
-    let base = base("failed-start");
-    let mut config = Config::new(
-        base.join("records"),
-        base.join("run/m.sock"),
-        65536,
-        64 * 1024 * 1024,
-    );
-    config.name = instance_name("failed-start");
-    let squatter = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut failed = config.clone();
-    failed.metrics = Some(squatter.local_addr().unwrap().to_string());
-    let error = control::run(failed, Arc::new(AtomicBool::new(false)))
-        .expect_err("a taken metrics port must fail the start");
-    assert_eq!(
-        error.kind(),
-        std::io::ErrorKind::AddrInUse,
-        "the metrics refusal is reported: {error}"
-    );
-    assert!(!config.socket.exists(), "a failed start leaves no socket");
-    drop(squatter);
-    // The instance, lock and root are free again: the same manager starts at once.
-    config.metrics = None;
-    let mut host = Host::open_config(config);
-    host.try_start()
-        .expect("the previous attempt released its locks");
-    host.stop();
-    let _ = fs::remove_dir_all(base);
-}
-
-/// Certificate errors are found before the manager opens its store or any listener, so a
-/// failed start leaves no locks, socket or accepting data port behind.
-#[test]
-fn l0_68_a_tls_error_starts_nothing() {
-    let base = base("tls-error");
-    fs::create_dir_all(&base).unwrap();
-    let socket = base.join("run/m.sock");
-    let mut local = selene_manager::config::Config::defaults();
-    local.name = instance_name("tls-error");
-    local.socket = socket.clone();
-    local.socket_explicit = true;
-    local.root = Some(base.join("records"));
-    local.memory = 65536;
-    local.staging = 8 << 20;
-    local.nvme = 64 << 20;
-    local.tls_cert = Some(base.join("missing-cert.pem"));
-    local.tls_key = Some(base.join("missing-key.pem"));
-    local.tls_ca = Some(base.join("missing-ca.pem"));
-    local.peer_transport = selene_manager::config::PeerTransport::Stream;
-    let mut store = Config::new(base.join("records"), socket.clone(), 65536, 64 << 20);
-    store.name = local.name.clone();
-    let error = control::run_peer(local, store, Arc::new(AtomicBool::new(false)))
-        .expect_err("a missing certificate must fail the start");
-    assert_eq!(
-        error.kind(),
-        std::io::ErrorKind::NotFound,
-        "the certificate error is reported: {error}"
-    );
-    assert!(!socket.exists(), "nothing was created");
-    // A key that does not belong to the certificate is only caught by building the full
-    // server configuration, which now happens before anything starts.
-    let good = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let other = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let cert = base.join("cert.pem");
-    let key = base.join("key.pem");
-    let ca = base.join("ca.pem");
-    fs::write(&cert, good.cert.pem()).unwrap();
-    fs::write(&key, other.signing_key.serialize_pem()).unwrap();
-    fs::write(&ca, good.cert.pem()).unwrap();
-    let mut local = selene_manager::config::Config::defaults();
-    local.name = instance_name("tls-mismatch");
-    local.socket = socket.clone();
-    local.socket_explicit = true;
-    local.root = Some(base.join("records"));
-    local.memory = 65536;
-    local.staging = 8 << 20;
-    local.nvme = 64 << 20;
-    local.tls_cert = Some(cert);
-    local.tls_key = Some(key);
-    local.tls_ca = Some(ca);
-    local.peer_transport = selene_manager::config::PeerTransport::Stream;
-    let mut store = Config::new(base.join("records"), socket.clone(), 65536, 64 << 20);
-    store.name = local.name.clone();
-    let error = control::run_peer(local, store, Arc::new(AtomicBool::new(false)))
-        .expect_err("a key that does not match the certificate must fail the start");
-    assert!(
-        error.to_string().contains("TLS"),
-        "the certificate error is named: {error}"
-    );
-    assert!(!socket.exists(), "nothing was created");
-    let _ = fs::remove_dir_all(base);
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_07_streaming_and_nvme_oversize() {
     let mut host = Host::new(65536, 2 * 1024 * 1024);
+    host.config.pool.source_wait = Duration::ZERO;
     host.start();
     let mut client = host.client().await;
     let bytes = client.store(key(128 * 64), None).await;
@@ -501,41 +451,38 @@ async fn l0_07_streaming_and_nvme_oversize() {
         client
             .put(key(1024 * 64), None, PutOptions::default())
             .await,
-        PutOutcome::Refused(proto::Reason::Oversize as u8)
+        PutOutcome::Refused(v2::Reason::Oversize as u8)
     );
+    drop(client);
     host.stop();
     host.start();
     let mut client = host.client().await;
-    let subscription = client.subscribe().await;
-    assert_eq!(subscription.entries.len(), 1);
-    assert_eq!(
-        client.fetch(&[key(128 * 64)], 64, 64).await[0].len(),
-        bytes.len()
-    );
+    assert_eq!(client.wait_records(1).await.len(), 1);
+    // The 64 pages already held are not sent again.
+    let held = 64 * descriptor().page_bytes() as usize;
+    let data = client.fetch(&[key(128 * 64)], 64, 64).await;
+    assert_eq!(data[0], bytes[held..]);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_08_refill_and_split_units() {
     let mut refill = Host::new(65536, 1024 * 1024);
+    refill.config.pool.source_wait = Duration::ZERO;
     refill.start();
     let mut client = refill.client().await;
     client.store(key(128), None).await;
     refill.durable(1);
+    drop(client);
     refill.stop();
     refill.start();
     let mut client = refill.client().await;
-    let subscription = client.subscribe().await;
-    assert_eq!(
-        subscription.entries[&key(128)].tier,
-        proto::Tier::Nvme as i32
-    );
+    let candidate = client
+        .wait_candidate(128, Duration::from_secs(15))
+        .await
+        .expect("the recovered record is offered");
+    assert_eq!(candidate.tier, v2::Tier::Nvme as i32);
     client.fetch(&[key(128)], 0, 2).await;
     refill.wait(|host| host.gauge("memory_allocated_bytes") > 0);
-    let subscription = client.subscribe().await;
-    assert_eq!(
-        subscription.entries[&key(128)].tier,
-        proto::Tier::Dram as i32
-    );
+    wait_tier(&mut client, 128, v2::Tier::Dram).await;
 
     let mut split = Host::new(4096, 32 * 1024 * 1024);
     split.start();
@@ -546,7 +493,6 @@ async fn l0_08_refill_and_split_units() {
     let actual = client.fetch(&[key(128)], 0, 2).await;
     assert_eq!(actual[0], expected);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_09_disk_failure_is_refused_io() {
     let base = base("full");
@@ -567,7 +513,7 @@ async fn l0_09_disk_failure_is_refused_io() {
     // The record does not fit the tiny arena, so it streams through staging.
     assert_eq!(
         client.put(key(512 * 64), None, PutOptions::default()).await,
-        PutOutcome::Refused(proto::Reason::Io as u8)
+        PutOutcome::Refused(v2::Reason::Io as u8)
     );
     host.wait(|host| host.gauge("nvme_errors_total") > 0);
     // A single-window stream must also get its IO refusal: the failing chunk is
@@ -575,13 +521,12 @@ async fn l0_09_disk_failure_is_refused_io() {
     let mut single = host.client().await;
     assert_eq!(
         single.put(key(64 * 64), None, PutOptions::default()).await,
-        PutOutcome::Refused(proto::Reason::Io as u8)
+        PutOutcome::Refused(v2::Reason::Io as u8)
     );
     fs::remove_file(full).unwrap();
     let bytes = client.store(key(128), None).await;
     assert!(!bytes.is_empty());
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_10_cancel_drains_and_staging_gauge() {
     let base = base("cancel");
@@ -596,7 +541,7 @@ async fn l0_10_cancel_drains_and_staging_gauge() {
     let mut host = Host::open_config(config);
     host.start();
     let mut client = host.client().await;
-    // Streaming Put: two pages plus the row, one window of 12288 bytes.
+    // Streaming put: two pages plus the row, one window of 12288 bytes.
     assert_eq!(
         client
             .put(
@@ -616,7 +561,7 @@ async fn l0_10_cancel_drains_and_staging_gauge() {
     assert_eq!(host.gauge("staging_allocated_bytes"), 32768);
     host.wait(|host| host.gauge("staging_allocated_bytes") == 0);
     host.wait(|host| host.gauge("nvme_reserved_bytes") == 0);
-    // A Get is not blocked by a draining Put.
+    // A restore is not blocked by a draining put.
     let stored = client.store(key(128 * 64), None).await;
     let mut getter = host.client().await;
     let start = Instant::now();
@@ -624,7 +569,6 @@ async fn l0_10_cancel_drains_and_staging_gauge() {
     assert!(start.elapsed() < Duration::from_millis(500));
     assert_eq!(data[0], stored);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_12_round_robin_and_dead_client_cleanup() {
     let mut host = Host::new(8 * 1024 * 1024, 64 * 1024 * 1024);
@@ -639,90 +583,37 @@ async fn l0_12_round_robin_and_dead_client_cleanup() {
     }
     host.durable(160);
     let keys: Vec<_> = (1..=160).map(|index| key(index * 64)).collect();
-    let mut dead = host.client().await;
+    // Four requesters that stop in the middle of a 160-record restore.
     for _ in 0..4 {
-        let (sender, receiver) = tokio::sync::mpsc::channel(8);
-        let _replies = dead
-            .inner
-            .get(dead.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-            .await
-            .unwrap();
-        sender
-            .send(proto::GetMessage {
-                m: Some(proto::get_message::M::Begin(proto::GetBegin {
-                    namespace_id: dead.descriptor.namespace_id().to_vec(),
-                    chain: keys.iter().map(|key| key_msg(*key)).collect(),
-                    skip_pages: 0,
-                    expected_pages: 160,
-                    row: true,
-                    destinations: Vec::new(),
-                    transfer: 0,
-                })),
-            })
-            .await
-            .unwrap();
-        drop(sender);
+        let mut dead = host.client().await;
+        let held = dead.hold(&keys, 0, 160).await;
+        assert!(!held.windows.is_empty());
+        dead.goodbye().await;
     }
-    drop(dead);
     let start = Instant::now();
     a.fetch(&[key(64)], 0, 1).await;
     assert!(start.elapsed() < Duration::from_millis(500));
     host.wait(|host| host.gauge("leases") == 0 && host.gauge("cleanup_records") == 0);
-    // Unknown transfers are dropped without disturbing a live connection.
+    // A release for a claim nobody made changes nothing for the session or its live claim.
     let mut unknown = host.client().await;
-    let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    let mut replies = unknown
-        .inner
-        .get(unknown.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-        .await
-        .unwrap()
-        .into_inner();
-    sender
-        .send(proto::GetMessage {
-            m: Some(proto::get_message::M::Begin(proto::GetBegin {
-                namespace_id: unknown.descriptor.namespace_id().to_vec(),
-                chain: vec![key_msg(key(64))],
-                skip_pages: 0,
-                expected_pages: 1,
-                row: true,
-                destinations: Vec::new(),
-                transfer: 0,
-            })),
-        })
-        .await
-        .unwrap();
-    let _leased = loop {
-        let reply = replies.message().await.unwrap().unwrap();
-        if matches!(reply.r, Some(proto::get_reply::R::Leased(_))) {
-            break reply;
-        }
-    };
-    sender
-        .send(proto::GetMessage {
-            m: Some(proto::get_message::M::Released(proto::WindowReleased {
-                transfer: 999_999,
-                index: 0,
-            })),
-        })
-        .await
-        .unwrap();
-    let refused = loop {
-        let reply = replies.message().await.unwrap().unwrap();
-        if matches!(reply.r, Some(proto::get_reply::R::Refused(_))) {
-            break reply;
-        }
-    };
-    assert!(matches!(refused.r, Some(proto::get_reply::R::Refused(_))));
+    let held = unknown.hold(&[key(64)], 0, 1).await;
+    unknown
+        .session
+        .send(c::M::WindowReleased(v2::WindowReleased {
+            claim_id: 999_999,
+            index: 0,
+        }))
+        .await;
+    unknown.session.readiness().await;
     let start = Instant::now();
     a.fetch(&[key(64)], 0, 1).await;
     assert!(start.elapsed() < Duration::from_millis(500));
+    unknown.finish(held).await;
 }
-
 #[test]
 fn l0_14_throughput() {
     support::throughput::smoke();
 }
-
 #[test]
 fn l0_15_namespace_id_vectors() {
     let id = record::namespace_id(&[0x63; 32], &[0x1b; 16], "test");
@@ -736,7 +627,6 @@ fn l0_15_namespace_id_vectors() {
         "6fbf3a101213ca13f48c6ab6ae91e7e1e35fd409de023b30696e32b18c97ed74"
     );
 }
-
 #[test]
 fn l0_16_disk_queue_read_write_interleave() {
     let base = base("disk");
@@ -810,7 +700,6 @@ fn l0_16_disk_queue_read_write_interleave() {
     }
     fs::remove_dir_all(base).unwrap();
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_17_write_budget_and_room() {
     let base = base("budget");
@@ -825,19 +714,17 @@ async fn l0_17_write_budget_and_room() {
     let mut host = Host::open_config(config);
     host.start();
     let mut a = host.client().await;
-    let mut subscription = a.subscribe().await;
     a.store(key(128), None).await;
     a.store(key(2048 * 64), None).await;
-    // Gets are never throttled by the write budget.
+    // Restores are never throttled by the write budget.
     a.fetch(&[key(128)], 0, 2).await;
     assert_eq!(
         a.put(key(256), None, PutOptions::default()).await,
-        PutOutcome::Refused(proto::Reason::Budget as u8)
+        PutOutcome::Refused(v2::Reason::Budget as u8)
     );
-    let room = subscription.until_room().await;
-    assert!(room > 0);
-    let _ = a.store(key(256), None).await;
-    // Buckets are independent per connection.
+    // selene.v2 does not push Room: the budget refills and the same put is admitted.
+    let _ = store_when_room(&mut a, key(256), None).await;
+    // Buckets are independent per writer.
     let mut b = host.client().await;
     b.store(key(384), None).await;
     // 0 means unlimited.
@@ -847,7 +734,6 @@ async fn l0_17_write_budget_and_room() {
     c.store(key(2048 * 64), None).await;
     c.store(key(2048 * 64 + 64), Some(key(2048 * 64))).await;
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_18_descriptor_format_and_recovery_refusal() {
     let mut host = Host::new(1024 * 1024, 1024 * 1024);
@@ -868,6 +754,7 @@ async fn l0_18_descriptor_format_and_recovery_refusal() {
         disk::crc32(&bytes[..12 + length]),
         u32::from_le_bytes(bytes[12 + length..].try_into().unwrap())
     );
+    drop(client);
     host.stop();
     let root = host.config.root.clone().unwrap();
     let v3 = root.join("v3-root");
@@ -888,7 +775,6 @@ async fn l0_18_descriptor_format_and_recovery_refusal() {
     );
     assert!(error.to_string().contains("not migratable"));
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_19_two_managers_one_name() {
     let mut host = Host::new(1024 * 1024, 1024 * 1024);
@@ -904,7 +790,6 @@ async fn l0_19_two_managers_one_name() {
     let mut second = Host::open_config(config);
     assert!(second.try_start().is_err());
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_21_live_disconnected_client_quarantine() {
     if let Ok(socket) = std::env::var(CHILD_QUARANTINE) {
@@ -918,7 +803,7 @@ async fn l0_21_live_disconnected_client_quarantine() {
                 2,
                 GetOptions {
                     cancel: Some(CancelAt::Grant),
-                    ..GetOptions::default()
+                    leave_leased: true,
                 },
             )
             .await;
@@ -946,13 +831,13 @@ async fn l0_21_live_disconnected_client_quarantine() {
         .unwrap();
     let ready = host.config.socket.with_extension("ready");
     wait(|| ready.exists());
-    // The connection is gone but the process lives: the lease is quarantined.
-    host.wait(|host| host.gauge("connections") <= 1);
+    // The child's stream is gone but the process lives: the lease is quarantined.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(host.gauge("memory_allocated_bytes") > 0);
     let mut probe = host.client().await;
     assert_eq!(
         probe.put(key(256), None, PutOptions::default()).await,
-        PutOutcome::Refused(proto::Reason::Budget as u8)
+        PutOutcome::Refused(v2::Reason::Budget as u8)
     );
     child.kill().unwrap();
     child.wait().unwrap();
@@ -960,16 +845,15 @@ async fn l0_21_live_disconnected_client_quarantine() {
     loop {
         match probe.put(key(256), None, PutOptions::default()).await {
             PutOutcome::Stored(_) => break,
-            PutOutcome::Refused(reason) if reason == proto::Reason::Budget as u8 => {
+            PutOutcome::Refused(reason) if reason == v2::Reason::Budget as u8 => {
                 assert!(Instant::now() < deadline, "quarantine was not reclaimed");
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            other => panic!("unexpected Put outcome after exit: {other:?}"),
+            other => panic!("unexpected put outcome after exit: {other:?}"),
         }
     }
     fs::remove_file(ready).ok();
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_22_cancel_every_state_and_commit_wins() {
     let mut host = Host::new(4096, 4 * 1024 * 1024);
@@ -1025,7 +909,6 @@ async fn l0_22_cancel_every_state_and_commit_wins() {
     let mut after = host.client().await;
     assert_eq!(after.fetch(&[key(128)], 0, 2).await[0], bytes);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_23_commit_waits_for_durability() {
     let base = base("commit");
@@ -1056,7 +939,6 @@ async fn l0_23_commit_waits_for_durability() {
     assert!(matches!(task.await.unwrap(), PutOutcome::Stored(_)));
     host.durable(1);
 }
-
 #[test]
 fn l0_24_signal_handling() {
     let base = base("signal");
@@ -1086,7 +968,6 @@ fn l0_24_signal_handling() {
     assert!(!socket.exists());
     let _ = fs::remove_dir_all(base);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_25_verify_before_window_reuse() {
     let mut host = Host::new(4096, 4 * 1024 * 1024);
@@ -1102,14 +983,14 @@ async fn l0_25_verify_before_window_reuse() {
             },
         )
         .await;
-    assert_eq!(outcome, PutOutcome::Refused(proto::Reason::Invalid as u8));
+    assert_eq!(outcome, PutOutcome::Refused(v2::Reason::Invalid as u8));
     host.wait(|host| host.gauge("staging_allocated_bytes") == 0);
     let mut fresh = host.client().await;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         match fresh.put(key(128), None, PutOptions::default()).await {
             PutOutcome::Stored(_) => break,
-            PutOutcome::Refused(reason) if reason == proto::Reason::Inflight as u8 => {
+            PutOutcome::Refused(reason) if reason == v2::Reason::Inflight as u8 => {
                 assert!(Instant::now() < deadline, "inflight did not drain");
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -1117,62 +998,31 @@ async fn l0_25_verify_before_window_reuse() {
         }
     }
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_27_no_progress_timeout_ends_the_call() {
     let mut host = Host::new(1024 * 1024, 1024 * 1024);
     host.start();
     let mut client = host.client().await;
     client.store(key(128), None).await;
-    let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    let mut replies = client
-        .inner
-        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-        .await
-        .unwrap()
-        .into_inner();
-    sender
-        .send(proto::PutMessage {
-            m: Some(client.begin(key(256), None)),
+    let (id, start) = client.start_put(key(256), None).await;
+    assert!(matches!(start, PutStart::Accepted(_)), "{start:?}");
+    // The writer stalls; the manager ends the put when progress stops.
+    let begun = Instant::now();
+    let refused = client
+        .session
+        .take_within(Duration::from_secs(8), &mut |m| match m {
+            M::PutRefused(refused) if refused.put_id == id => Some(refused.clone()),
+            _ => None,
         })
         .await
-        .unwrap();
-    loop {
-        match replies.message().await.unwrap().unwrap().r {
-            Some(proto::put_reply::R::Accept(_)) => break,
-            Some(_) => continue,
-            None => panic!("reply stream ended"),
-        }
-    }
-    let start = Instant::now();
-    let mut timed_out = false;
-    loop {
-        match replies.message().await {
-            Err(status) => {
-                assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
-                timed_out = true;
-                break;
-            }
-            Ok(Some(reply)) => match reply.r {
-                Some(proto::put_reply::R::Refused(refused)) => {
-                    assert_eq!(refused.reason, proto::Reason::Invalid as i32);
-                    timed_out = true;
-                    break;
-                }
-                Some(_) => continue,
-                None => break,
-            },
-            Ok(None) => break,
-        }
-    }
-    assert!(timed_out, "the call did not end on the no-progress timer");
-    assert!(start.elapsed() >= Duration::from_secs(2));
-    assert!(start.elapsed() < Duration::from_secs(8));
-    drop(sender);
+        .expect("the put did not end on the no-progress timer");
+    assert_eq!(refused.reason, v2::Reason::Invalid as i32);
+    assert!(begun.elapsed() >= Duration::from_secs(2));
+    assert!(begun.elapsed() < Duration::from_secs(8));
+    client.fence_put(id).await;
     let mut fresh = host.client().await;
     assert!(!fresh.fetch(&[key(128)], 0, 2).await[0].is_empty());
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_28_rootless_eviction_skips_internal_nodes() {
     let mut host = Host::dram_only(65536);
@@ -1186,10 +1036,13 @@ async fn l0_28_rootless_eviction_skips_internal_nodes() {
         .await
         .expect("rootless eviction must make progress");
     assert!(!stored.is_empty());
-    let subscription = client.subscribe().await;
-    assert!(subscription.entries.contains_key(&key(256)));
+    assert!(
+        client
+            .wait_candidate(256, Duration::from_secs(5))
+            .await
+            .is_some()
+    );
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_29_cancel_retires_blocked_chunks() {
     let base = base("blocked");
@@ -1215,7 +1068,7 @@ async fn l0_29_cancel_retires_blocked_chunks() {
         )
         .await;
     assert_eq!(outcome, PutOutcome::Cancelled);
-    // The cancelled Put must release INFLIGHT and its reservation; blocked
+    // The cancelled put must release INFLIGHT and its reservation; blocked
     // chunks that were never submitted must not hold the drain open.
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut probe = host.client().await;
@@ -1231,7 +1084,7 @@ async fn l0_29_cancel_retires_blocked_chunks() {
             )
             .await;
         match outcome {
-            PutOutcome::Refused(reason) if reason == proto::Reason::Inflight as u8 => {
+            PutOutcome::Refused(reason) if reason == v2::Reason::Inflight as u8 => {
                 assert!(Instant::now() < deadline, "INFLIGHT did not drain");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -1241,7 +1094,6 @@ async fn l0_29_cancel_retires_blocked_chunks() {
     }
     host.wait(|host| host.gauge("open_ops") == 0);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_30_committed_detached_put_finishes() {
     let base = base("detached");
@@ -1270,10 +1122,13 @@ async fn l0_30_committed_detached_put_finishes() {
     drop(client);
     host.wait(|host| host.durable_records() == 1);
     let mut check = host.client().await;
-    let subscription = check.subscribe().await;
-    assert!(subscription.entries.contains_key(&key(512 * 64)));
+    assert!(
+        check
+            .wait_candidate(512 * 64, Duration::from_secs(5))
+            .await
+            .is_some()
+    );
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_31_timed_out_publication_finishes_instead_of_orphaning() {
     let base = base("timeout-publish");
@@ -1284,6 +1139,7 @@ async fn l0_31_timed_out_publication_finishes_instead_of_orphaning() {
         64 * 1024 * 1024,
     );
     config.name = instance_name("timeout-publish");
+    config.pool.source_wait = Duration::ZERO;
     config.faults.pause_at = Some("before_rename".into());
     let signal = base.join("gate");
     config.faults.signal = Some(signal.clone());
@@ -1305,10 +1161,8 @@ async fn l0_31_timed_out_publication_finishes_instead_of_orphaning() {
     fs::remove_file(&signal).unwrap();
     let outcome = task.await.unwrap();
     assert!(
-        matches!(
-            outcome,
-            PutOutcome::Status(_) | PutOutcome::Cancelled | PutOutcome::Abandoned
-        ),
+        matches!(outcome, PutOutcome::Stored(_))
+            || outcome == PutOutcome::Refused(v2::Reason::Invalid as u8),
         "{outcome:?}"
     );
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1317,29 +1171,30 @@ async fn l0_31_timed_out_publication_finishes_instead_of_orphaning() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let mut check = host.client().await;
-    let subscription = check.subscribe().await;
-    assert!(subscription.entries.contains_key(&key(128)));
-    // Recovery must find exactly the record the catalog announced.
-    drop(subscription);
+    assert!(
+        check
+            .wait_candidate(128, Duration::from_secs(5))
+            .await
+            .is_some()
+    );
+    // Recovery must find exactly the record the index announced.
     drop(check);
     host.stop();
-    eprintln!("l0_31: stopped");
     host.start();
     let mut after = host.client().await;
-    let subscription = after.subscribe().await;
-    assert_eq!(subscription.entries.len(), 1);
-    assert!(subscription.entries.contains_key(&key(128)));
+    let records = after.wait_records(1).await;
+    assert_eq!(records[0].key.as_ref().unwrap().consumed_tokens, 128);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_32_streaming_reservation_includes_the_disk_record() {
     let mut host = Host::new(4096, 64 * 1024 * 1024);
     host.start();
     let mut client = host.client().await;
-    let (sender, replies) = client.raw_begin(key(128), None).await;
+    let (id, start) = client.start_put(key(128), None).await;
+    assert!(matches!(start, PutStart::Accepted(_)), "{start:?}");
     // key(128) is 2 pages + row: page_segment 8192, row_segment 16384,
     // row 4096, so envelope + 20480 = 24576 of disk record plus the fixed
-    // 2 x 16 KiB staging hold is reserved before any window is granted.
+    // 2 x 16 KiB staging hold is reserved before any window is filled.
     let deadline = Instant::now() + Duration::from_secs(5);
     while host.gauge("nvme_reserved_bytes") < 24576 + 32768 {
         assert!(
@@ -1350,14 +1205,8 @@ async fn l0_32_streaming_reservation_includes_the_disk_record() {
     }
     let before = host.gauge("nvme_reserved_bytes");
     assert!(before >= 24576 + 32768, "hold was not included: {before}");
-    sender
-        .send(proto::PutMessage {
-            m: Some(proto::put_message::M::Cancel(proto::Cancel {})),
-        })
-        .await
-        .unwrap();
-    drop(sender);
-    drop(replies);
+    // The writer cancels and goes away without fencing: its process lives on.
+    client.cancel_put(id).await;
     drop(client);
     // A quarantine may keep the fixed hold, but the disk record reservation
     // must be released.
@@ -1370,7 +1219,6 @@ async fn l0_32_streaming_reservation_includes_the_disk_record() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_33_write_budget_uses_the_streaming_charge() {
     let base = base("stream-budget");
@@ -1385,18 +1233,14 @@ async fn l0_33_write_budget_uses_the_streaming_charge() {
     let mut host = Host::open_config(config);
     host.start();
     let mut client = host.client().await;
-    let mut subscription = client.subscribe().await;
     // 8 MiB streamed record: admitted with a negative balance.
     client.store(key(2048 * 64), None).await;
     assert_eq!(
         client.put(key(256), None, PutOptions::default()).await,
-        PutOutcome::Refused(proto::Reason::Budget as u8)
+        PutOutcome::Refused(v2::Reason::Budget as u8)
     );
-    let room = subscription.until_room().await;
-    assert!(room > 0);
-    client.store(key(256), None).await;
+    let _ = store_when_room(&mut client, key(256), None).await;
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_34_concurrent_nvme_gets_share_connection_credits() {
     let mut host = Host::new(4096, 64 * 1024 * 1024);
@@ -1412,7 +1256,7 @@ async fn l0_34_concurrent_nvme_gets_share_connection_credits() {
             assert_eq!(records[0], one);
             assert_eq!(other[0], two);
         }
-        other => panic!("concurrent Gets failed: {other:?}"),
+        other => panic!("concurrent restores failed: {other:?}"),
     }
     host.wait(|host| {
         host.gauge("leases") == 0
@@ -1420,7 +1264,6 @@ async fn l0_34_concurrent_nvme_gets_share_connection_credits() {
             && host.gauge("open_ops") == 0
     });
 }
-
 #[test]
 fn l0_38_async_reads_overtake_queued_writes() {
     let base = base("read-priority");
@@ -1483,7 +1326,6 @@ fn l0_38_async_reads_overtake_queued_writes() {
     }
     fs::remove_dir_all(base).unwrap();
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_40_detached_finalization_uses_the_put_namespace() {
     let base = base("detached-ns");
@@ -1494,16 +1336,16 @@ async fn l0_40_detached_finalization_uses_the_put_namespace() {
         64 * 1024 * 1024,
     );
     config.name = instance_name("detached-ns");
+    config.pool.source_wait = Duration::ZERO;
     config.faults.delay_ms = 50;
     let mut host = Host::open_config(config);
     host.start();
     let mut first = host.client().await;
     let mut other_descriptor = descriptor();
     other_descriptor.fingerprint = [9; 16];
-    let mut other = host.client_with(other_descriptor.clone()).await.unwrap();
-    let _other_subscription = other.subscribe().await;
-    // Parent in the first namespace, then a child whose connection goes away
-    // after commit. Finalization must use the Put's namespace, not an
+    let other = host.client_with(other_descriptor.clone()).await.unwrap();
+    // Parent in the first namespace, then a child whose writer goes away
+    // after commit. Finalization must use the put's namespace, not an
     // arbitrary one.
     first.store(key(64), None).await;
     host.wait(|host| host.durable_records() == 1);
@@ -1520,19 +1362,21 @@ async fn l0_40_detached_finalization_uses_the_put_namespace() {
     assert_eq!(outcome, PutOutcome::Abandoned);
     drop(first);
     host.wait(|host| host.durable_records() == 2);
-    drop(_other_subscription);
     drop(other);
     host.stop();
     host.start();
     let mut first = host.client().await;
-    let subscription = first.subscribe().await;
-    assert!(subscription.entries.contains_key(&key(64)));
-    assert!(subscription.entries.contains_key(&key(576 * 64)));
+    let records = first.wait_records(2).await;
+    let tokens: Vec<u64> = records
+        .iter()
+        .map(|record| record.key.as_ref().unwrap().consumed_tokens)
+        .collect();
+    assert!(tokens.contains(&64));
+    assert!(tokens.contains(&(576 * 64)));
     let mut other = host.client_with(other_descriptor.clone()).await.unwrap();
-    let subscription = other.subscribe().await;
-    assert!(subscription.entries.is_empty());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(other.records().await.is_empty());
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_41_streaming_windows_respect_the_nvme_cap() {
     let base = base("staging-cap");
@@ -1551,49 +1395,27 @@ async fn l0_41_streaming_windows_respect_the_nvme_cap() {
     // outright rather than waiting for a Room that cannot arrive.
     assert_eq!(
         client.put(key(128), None, PutOptions::default()).await,
-        PutOutcome::Refused(proto::Reason::Oversize as u8)
+        PutOutcome::Refused(v2::Reason::Oversize as u8)
     );
     assert!(host.gauge("nvme_reserved_bytes") <= 24 * 1024);
     // A row-only record whose window does fit still streams.
     let _ = client.store(key(3), None).await;
     assert!(host.gauge("nvme_reserved_bytes") <= 24 * 1024);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_42_cancel_before_dispatch_withdraws_the_put() {
     let mut host = Host::new(1024 * 1024, 1024 * 1024);
     host.start();
     let mut client = host.client().await;
-    let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    let mut replies = client
-        .inner
-        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-        .await
-        .unwrap()
-        .into_inner();
-    sender
-        .send(proto::PutMessage {
-            m: Some(client.begin(key(128), None)),
-        })
-        .await
-        .unwrap();
-    sender
-        .send(proto::PutMessage {
-            m: Some(proto::put_message::M::Cancel(proto::Cancel {})),
-        })
-        .await
-        .unwrap();
-    while let Ok(Ok(Some(_))) =
-        tokio::time::timeout(Duration::from_millis(200), replies.message()).await
-    {}
-    drop(sender);
-    drop(replies);
+    let id = client.send_begin(key(128), None).await;
+    client.cancel_put(id).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    client.fence_put(id).await;
     host.wait(|host| host.gauge("open_ops") == 0);
     let mut fresh = host.client().await;
-    // The withdrawn Put must not leave INFLIGHT behind.
+    // The withdrawn put must not leave INFLIGHT behind.
     let _ = fresh.store(key(128), None).await;
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_43_failed_get_drains_release_every_pin() {
     let mut host = Host::new(4096, 64 * 1024 * 1024);
@@ -1616,13 +1438,13 @@ async fn l0_43_failed_get_drains_release_every_pin() {
     let outcome = client
         .get(&[key(128), key(256)], 0, 4, GetOptions::default())
         .await;
-    assert!(
-        matches!(outcome, GetOutcome::Refused(reason) if reason == proto::Reason::Io as u8),
+    assert_eq!(
+        outcome,
+        GetOutcome::Refused(v2::ClaimReason::CopyError),
         "{outcome:?}"
     );
     host.wait(|host| host.gauge("cleanup_records") == 0 && host.gauge("leases") == 0);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_45_reserve_before_pin_with_four_open_puts() {
     let base = base("reserve-pin");
@@ -1641,55 +1463,35 @@ async fn l0_45_reserve_before_pin_with_four_open_puts() {
     let mut client = host.client_with(descriptor).await.unwrap();
     client.store(key(64), None).await;
     host.durable(1);
-    // Four open child Puts, as Flare keeps. Before reserve-before-pin all
+    // Four open child puts, as Flare keeps. Before reserve-before-pin all
     // four pinned the parent and BUDGETed; at least the first must be admitted
     // now that the reservation may evict and reshape.
-    let mut streams = Vec::new();
+    let mut ids = Vec::new();
     for index in 0..4u64 {
-        let (sender, receiver) = tokio::sync::mpsc::channel(8);
-        let replies = client
-            .inner
-            .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-            .await
-            .unwrap()
-            .into_inner();
-        sender
-            .send(proto::PutMessage {
-                m: Some(client.begin(key(128 + index * 64), Some(key(64)))),
-            })
-            .await
-            .unwrap();
-        streams.push((sender, replies));
+        ids.push(
+            client
+                .send_begin(key(128 + index * 64), Some(key(64)))
+                .await,
+        );
     }
     let mut accepts = 0;
     let mut budget = 0;
-    for (_, replies) in streams.iter_mut() {
-        loop {
-            match replies.message().await.unwrap().unwrap().r {
-                Some(proto::put_reply::R::Accept(_)) => {
-                    accepts += 1;
-                    break;
-                }
-                Some(proto::put_reply::R::Refused(refused))
-                    if refused.reason == proto::Reason::Budget as i32 =>
-                {
-                    budget += 1;
-                    break;
-                }
-                Some(proto::put_reply::R::Grant(_)) => continue,
-                Some(_) => break,
-                None => break,
-            }
+    for id in &ids {
+        match client.first_answer(*id).await {
+            PutStart::Accepted(_) => accepts += 1,
+            PutStart::Refused(reason) if reason == v2::Reason::Budget as u8 => budget += 1,
+            PutStart::Refused(_) => {}
         }
     }
     assert!(
         accepts >= 1,
-        "no child Put was admitted (accepts={accepts}, budget={budget})"
+        "no child put was admitted (accepts={accepts}, budget={budget})"
     );
-    drop(streams);
+    for id in ids {
+        client.abandon_put(id).await;
+    }
     host.wait(|host| host.gauge("open_ops") == 0);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_46_small_arena_admits_the_record_that_fits_it() {
     // 4 KiB pages/row: a one-page record is a 16 KiB arena extent plus the
@@ -1714,7 +1516,6 @@ async fn l0_46_small_arena_admits_the_record_that_fits_it() {
     assert_eq!(fetched[0], stored);
     host.wait(|host| host.gauge("open_ops") == 0);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_47_dram_only_evicts_the_parent_to_store_the_root() {
     // A 32 KiB arena holds a two-page parent. Its next-page child fits the
@@ -1732,13 +1533,13 @@ async fn l0_47_dram_only_evicts_the_parent_to_store_the_root() {
     };
     let fetched = client.fetch(&[key(192)], 0, 3).await;
     assert_eq!(fetched[0], stored);
-    assert_eq!(
-        client.get(&[key(128)], 0, 2, GetOptions::default()).await,
-        GetOutcome::Refused(proto::Reason::Invalid as u8)
+    // The evicted parent is no longer offered, so it cannot be restored.
+    assert!(
+        client.wait_absent(128, Duration::from_secs(5)).await,
+        "the evicted parent is still offered"
     );
     host.wait(|host| host.gauge("open_ops") == 0);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_48_streaming_reserves_both_grantable_windows() {
     // 128 pages and a 4 KiB row: 528 KiB of disk record plus a fixed 1 MiB
@@ -1757,28 +1558,12 @@ async fn l0_48_streaming_reserves_both_grantable_windows() {
     let mut host = Host::open_config(config);
     host.start();
     let mut client = host.client().await;
-    let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    let mut replies = client
-        .inner
-        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-        .await
-        .unwrap()
-        .into_inner();
-    sender
-        .send(proto::PutMessage {
-            m: Some(client.begin(key(128 * 64), None)),
-        })
-        .await
-        .unwrap();
-    let first = replies.message().await.unwrap().unwrap();
-    match first.r {
-        Some(proto::put_reply::R::Refused(refused)) => {
-            assert_eq!(refused.reason, proto::Reason::Oversize as i32);
-        }
+    let (_, start) = client.start_put(key(128 * 64), None).await;
+    match start {
+        PutStart::Refused(reason) => assert_eq!(reason, v2::Reason::Oversize as u8),
         other => panic!("Put was accepted before its reservation fitted: {other:?}"),
     }
-    drop(sender);
-    drop(replies);
+    drop(client);
 
     let fitted = base("two-windows-fit");
     let mut config = Config::new(
@@ -1796,7 +1581,6 @@ async fn l0_48_streaming_reserves_both_grantable_windows() {
     assert_eq!(fetched[0], stored);
     host.wait(|host| host.gauge("open_ops") == 0);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_49_oversized_window_is_refused_oversize() {
     // A 16 MiB page cannot fit the 8 MiB staging region and the record does
@@ -1818,11 +1602,10 @@ async fn l0_49_oversized_window_is_refused_oversize() {
     let mut client = host.client_with(value).await.unwrap();
     assert_eq!(
         client.put(key(64), None, PutOptions::default()).await,
-        PutOutcome::Refused(proto::Reason::Oversize as u8)
+        PutOutcome::Refused(v2::Reason::Oversize as u8)
     );
     host.wait(|host| host.gauge("open_ops") == 0);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_50_streaming_reserves_the_largest_trailing_window() {
     // 192 pages and a 4 KiB row: 784 KiB of disk record plus a fixed 1 MiB
@@ -1839,28 +1622,12 @@ async fn l0_50_streaming_reserves_the_largest_trailing_window() {
     let mut host = Host::open_config(config);
     host.start();
     let mut client = host.client().await;
-    let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    let mut replies = client
-        .inner
-        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-        .await
-        .unwrap()
-        .into_inner();
-    sender
-        .send(proto::PutMessage {
-            m: Some(client.begin(key(192 * 64), None)),
-        })
-        .await
-        .unwrap();
-    let first = replies.message().await.unwrap().unwrap();
-    match first.r {
-        Some(proto::put_reply::R::Refused(refused)) => {
-            assert_eq!(refused.reason, proto::Reason::Oversize as i32);
-        }
+    let (_, start) = client.start_put(key(192 * 64), None).await;
+    match start {
+        PutStart::Refused(reason) => assert_eq!(reason, v2::Reason::Oversize as u8),
         other => panic!("Put was accepted before the hold fitted: {other:?}"),
     }
-    drop(sender);
-    drop(replies);
+    drop(client);
 
     let fitted = base("trailing-window-fit");
     let mut config = Config::new(
@@ -1878,34 +1645,35 @@ async fn l0_50_streaming_reserves_the_largest_trailing_window() {
     assert_eq!(fetched[0], stored);
     host.wait(|host| host.gauge("open_ops") == 0);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_51_rootless_child_that_cannot_fit_beside_its_parent_waits() {
     // The 32 KiB arena holds a two-page parent, whose rounded extent fills
     // it, so the four-page-tail child cannot be admitted while the parent
     // stays. That shortage depends on what must stay resident, not on the
-    // child's own shape, so it is a Budget rather than an OVERSIZE; no Room
-    // arrives and nothing is stored.
+    // child's own shape, so it is a Budget rather than an OVERSIZE; nothing
+    // is stored. (selene.v2 pushes no Room, so what is checked is that the
+    // shortage persists.)
     let mut host = Host::dram_only(32 * 1024);
     host.start();
     let mut client = host.client().await;
     client.store(key(128), None).await;
-    let mut subscription = client.subscribe().await;
     assert_eq!(
         client
             .put(key(384), Some(key(128)), PutOptions::default())
             .await,
-        PutOutcome::Refused(proto::Reason::Budget as u8)
+        PutOutcome::Refused(v2::Reason::Budget as u8)
     );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
-            .await
-            .is_err(),
-        "Room was offered for an allocation that needs the protected parent"
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        client
+            .put(key(384), Some(key(128)), PutOptions::default())
+            .await,
+        PutOutcome::Refused(v2::Reason::Budget as u8),
+        "the protected parent frees nothing, so the shortage persists"
     );
+    assert!(client.candidate(384).await.is_none());
     host.wait(|host| host.gauge("open_ops") == 0);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_52_hold_slots_stay_busy_until_writes_drain() {
     // With a slow writer, a third window can only be granted after one of
@@ -1924,122 +1692,23 @@ async fn l0_52_hold_slots_stay_busy_until_writes_drain() {
     host.start();
     let mut client = host.client().await;
     let record = key(192 * 64);
-    let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    let mut replies = client
-        .inner
-        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-        .await
-        .unwrap()
-        .into_inner();
-    sender
-        .send(proto::PutMessage {
-            m: Some(client.begin(record, None)),
-        })
-        .await
-        .unwrap();
-    let mut header: Option<Header> = None;
-    let mut source: Option<Vec<u8>> = None;
-    let mut first = 0u32;
-    let mut grants = Vec::new();
-    let mut fills = Vec::new();
-    let mut covered = 0u64;
-    let mut commit_sent = false;
-    let mut stored = false;
-    while !stored {
-        let reply = replies.message().await.unwrap().unwrap();
-        match reply.r {
-            Some(proto::put_reply::R::Accept(accept)) => {
-                first = u32::try_from(accept.first_page).unwrap();
-                let parent = accept.parent.as_ref().map(key_from_msg);
-                let (value, data, _) = client.content(record, parent, first);
-                header = Some(value);
-                source = Some(data);
-            }
-            Some(proto::put_reply::R::Grant(grant)) => {
-                grants.push(Instant::now());
-                let value = header.as_ref().unwrap();
-                let data = source.as_mut().unwrap();
-                let memory = grant.memory.as_ref().unwrap();
-                let region = if memory.region == proto::Region::Arena as i32 {
-                    Reg::Arena
-                } else {
-                    Reg::Staging
-                };
-                let length = usize::try_from(grant.length).unwrap();
-                let start = usize::try_from(grant.record_offset).unwrap();
-                let page_bytes = value.page_record_bytes() as usize;
-                let mut hashes = Vec::new();
-                for position in 0..grant.page_count as usize {
-                    let relative = (grant.page_first - u64::from(first)) as usize + position;
-                    let page = value.page_segment as usize + relative * page_bytes;
-                    hashes.push(record::checksum(&data[page..page + page_bytes]));
-                }
-                let row_hash = if grant.row {
-                    Some(record::checksum(&data[value.row_segment as usize..]))
-                } else {
-                    None
-                };
-                client.write(region, memory.offset, &data[start..start + length]);
-                sender
-                    .send(proto::PutMessage {
-                        m: Some(proto::put_message::M::Filled(proto::WindowFilled {
-                            transfer: grant.transfer,
-                            index: grant.index,
-                            page_xxh3: hashes,
-                            row_xxh3: row_hash.unwrap_or(0),
-                            has_row: grant.row,
-                        })),
-                    })
-                    .await
-                    .unwrap();
-                covered += grant.length;
-                fills.push(Instant::now());
-                let value = header.as_ref().unwrap();
-                let payload = value.length_with_row() - value.page_segment;
-                if !commit_sent && covered >= payload {
-                    for (index, chunk) in source.as_ref().unwrap()[..value.page_segment as usize]
-                        .chunks(4096)
-                        .enumerate()
-                    {
-                        sender
-                            .send(proto::PutMessage {
-                                m: Some(proto::put_message::M::Commit(proto::PutCommit {
-                                    transfer: grant.transfer,
-                                    metadata_offset: (index * 4096) as u64,
-                                    metadata: chunk.to_vec(),
-                                })),
-                            })
-                            .await
-                            .unwrap();
-                    }
-                    commit_sent = true;
-                }
-            }
-            Some(proto::put_reply::R::Stored(_)) => stored = true,
-            Some(proto::put_reply::R::Refused(refused)) => {
-                panic!("streamed Put refused: {refused:?}")
-            }
-            None => break,
-        }
-    }
-    let data = source.unwrap();
-    assert_eq!(grants.len(), 3);
-    assert_eq!(fills.len(), 3);
+    let data = client.store(record, None).await;
+    assert_eq!(client.grants.len(), 3);
+    assert_eq!(client.fills.len(), 3);
     assert!(
-        grants[2].duration_since(fills[1]) >= Duration::from_millis(150),
+        client.grants[2].duration_since(client.fills[1]) >= Duration::from_millis(150),
         "the third window was granted before a slow write drained"
     );
     let fetched = client.fetch(&[record], 0, 192).await;
     assert_eq!(fetched[0], data);
     host.wait(|host| host.gauge("open_ops") == 0);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_53_room_reconsiders_the_arena_after_a_lease_releases() {
     // 16 MiB arena, 8 MiB staging. An 8 MiB page record needs a 16 MiB
     // arena extent but its streaming hold would be 16 MiB. While the
-    // resident record is leased the Put is refused; after the lease
-    // releases, Room must offer the arena retry and the Put must complete.
+    // resident record is leased the put is refused; after the lease
+    // releases, the arena must be reconsidered and the put must complete.
     let base = base("room-arena-retry");
     let mut config = Config::new(
         base.join("records"),
@@ -2056,171 +1725,38 @@ async fn l0_53_room_reconsiders_the_arena_after_a_lease_releases() {
     let mut resident = host.client_with(geometry.clone()).await.unwrap();
     let stored = resident.store(key(64), None).await;
     host.durable(1);
-    // A second namespace (same geometry) for the Put that has to wait.
+    // A second namespace (same geometry) for the put that has to wait.
     let mut other = geometry;
     other.identity = [9; 32];
     other.fingerprint = [4; 16];
     let mut waiter = host.client_with(other).await.unwrap();
-    let mut subscription = waiter.subscribe().await;
-    // Lease the resident record and hold the window.
-    let (lease_sender, lease_receiver) = tokio::sync::mpsc::channel(8);
-    let mut lease_replies = resident
-        .inner
-        .get(resident.request(tokio_stream::wrappers::ReceiverStream::new(lease_receiver)))
-        .await
-        .unwrap()
-        .into_inner();
-    lease_sender
-        .send(proto::GetMessage {
-            m: Some(proto::get_message::M::Begin(proto::GetBegin {
-                namespace_id: resident.descriptor.namespace_id().to_vec(),
-                chain: vec![key_msg(key(64))],
-                skip_pages: 0,
-                expected_pages: 1,
-                row: true,
-                destinations: Vec::new(),
-                transfer: 0,
-            })),
-        })
-        .await
-        .unwrap();
-    // Hold every lease window the record's Get grants (the 8 MiB page and
+    // Lease the resident record and hold the windows (the 8 MiB page and
     // the row arrive as separate windows).
-    let mut held = Vec::new();
-    while let Ok(Ok(Some(reply))) =
-        tokio::time::timeout(Duration::from_millis(100), lease_replies.message()).await
-    {
-        match reply.r {
-            Some(proto::get_reply::R::Ready(grant)) => {
-                held.push((grant.transfer, grant.index));
-            }
-            Some(proto::get_reply::R::Refused(refused)) => {
-                panic!("lease Get refused: {refused:?}")
-            }
-            Some(proto::get_reply::R::Done(_)) | None => break,
-            Some(_) => continue,
-        }
-    }
-    assert!(!held.is_empty(), "lease Get granted no window");
+    let held = resident.hold(&[key(64)], 0, 1).await;
+    assert!(!held.windows.is_empty(), "lease granted no window");
     assert_eq!(
         waiter.put(key(64), None, PutOptions::default()).await,
-        PutOutcome::Refused(proto::Reason::Budget as u8)
+        PutOutcome::Refused(v2::Reason::Budget as u8)
     );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
-            .await
-            .is_err(),
-        "Room was offered while the arena record was still leased"
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        waiter.put(key(64), None, PutOptions::default()).await,
+        PutOutcome::Refused(v2::Reason::Budget as u8),
+        "the arena record was still leased"
     );
-    for (transfer, index) in held {
-        lease_sender
-            .send(proto::GetMessage {
-                m: Some(proto::get_message::M::Released(proto::WindowReleased {
-                    transfer,
-                    index,
-                })),
-            })
-            .await
-            .unwrap();
-    }
-    loop {
-        match lease_replies.message().await.unwrap().unwrap().r {
-            Some(proto::get_reply::R::Done(_)) | None => break,
-            Some(_) => continue,
-        }
-    }
-    drop(lease_sender);
-    drop(lease_replies);
-    tokio::time::timeout(Duration::from_secs(2), subscription.until_room())
-        .await
-        .expect("Room never reconsidered the arena after the lease released");
-    let stored_again = waiter.store(key(64), None).await;
+    resident.finish(held).await;
+    let stored_again = store_when_room(&mut waiter, key(64), None).await;
     let fetched = waiter.fetch(&[key(64)], 0, 1).await;
     assert_eq!(fetched[0], stored_again);
     assert!(!stored.is_empty());
     host.wait(|host| host.gauge("open_ops") == 0);
 }
-
-async fn diagnostic_lease_all(
-    client: &mut Client,
-    keys: Vec<selene_manager::Key>,
-    pages: u32,
-) -> (
-    tokio::sync::mpsc::Sender<proto::GetMessage>,
-    tonic::Streaming<proto::GetReply>,
-    Vec<(u64, u32)>,
-) {
-    let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    let mut replies = client
-        .inner
-        .get(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-        .await
-        .unwrap()
-        .into_inner();
-    sender
-        .send(proto::GetMessage {
-            m: Some(proto::get_message::M::Begin(proto::GetBegin {
-                namespace_id: client.descriptor.namespace_id().to_vec(),
-                chain: keys.iter().map(|key| key_msg(*key)).collect(),
-                skip_pages: 0,
-                expected_pages: u64::from(pages),
-                row: true,
-                destinations: Vec::new(),
-                transfer: 0,
-            })),
-        })
-        .await
-        .unwrap();
-    let mut held = Vec::new();
-    while let Ok(Ok(Some(reply))) =
-        tokio::time::timeout(Duration::from_millis(100), replies.message()).await
-    {
-        match reply.r {
-            Some(proto::get_reply::R::Ready(grant)) => {
-                held.push((grant.transfer, grant.index));
-            }
-            Some(proto::get_reply::R::Refused(refused)) => {
-                panic!("diagnostic lease Get refused: {refused:?}")
-            }
-            Some(proto::get_reply::R::Done(_)) | None => break,
-            Some(_) => continue,
-        }
-    }
-    (sender, replies, held)
-}
-
-async fn diagnostic_release_all(
-    sender: tokio::sync::mpsc::Sender<proto::GetMessage>,
-    mut replies: tonic::Streaming<proto::GetReply>,
-    held: Vec<(u64, u32)>,
-) {
-    for (transfer, index) in held {
-        sender
-            .send(proto::GetMessage {
-                m: Some(proto::get_message::M::Released(proto::WindowReleased {
-                    transfer,
-                    index,
-                })),
-            })
-            .await
-            .unwrap();
-    }
-    while let Ok(Ok(Some(reply))) =
-        tokio::time::timeout(Duration::from_millis(100), replies.message()).await
-    {
-        if matches!(reply.r, Some(proto::get_reply::R::Done(_)) | None) {
-            break;
-        }
-    }
-    drop(sender);
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_54_get_sources_survive_eviction_pressure() {
-    // Diagnostic: a Get's delivered bytes must be the bytes the manager
+    // Diagnostic: a restore's delivered bytes must be the bytes the manager
     // verified when it read the record. Hold leases on every arena record,
-    // force a streamed Put, release the leases so the read refills the
-    // arena, and apply Put pressure while the slow read is in flight. Then
+    // force a streamed put, release the leases so the read refills the
+    // arena, and apply put pressure while the slow read is in flight. Then
     // repeat with a record too large for the arena so the header and the
     // payload windows are read at different times.
     let base = base("get-pressure");
@@ -2238,13 +1774,14 @@ async fn l0_54_get_sources_survive_eviction_pressure() {
     let first = client.store(key(64), None).await;
     let second = client.store(key(128), Some(key(64))).await;
     host.durable(2);
-    let (one_sender, one_replies, one) = diagnostic_lease_all(&mut client, vec![key(64)], 1).await;
-    let (two_sender, two_replies, two) = diagnostic_lease_all(&mut client, vec![key(128)], 1).await;
-    assert!(!one.is_empty() && !two.is_empty());
+    // The second record alone: its parent's page is already held.
+    let one = client.hold(&[key(64)], 0, 1).await;
+    let two = client.hold(&[key(128)], 1, 1).await;
+    assert!(!one.windows.is_empty() && !two.windows.is_empty());
     // Both arena records are pinned, so this three-page root streams to disk.
     let streamed = client.store(key(192), None).await;
-    diagnostic_release_all(one_sender, one_replies, one).await;
-    diagnostic_release_all(two_sender, two_replies, two).await;
+    client.finish(one).await;
+    client.finish(two).await;
     // The arena is now free for the read to verify and refill the record.
     let mut reader = host.client().await;
     let mut pressure = host.client().await;
@@ -2260,7 +1797,7 @@ async fn l0_54_get_sources_survive_eviction_pressure() {
     assert!(!first.is_empty() && !second.is_empty());
 
     // 128 pages do not fit the arena: the header is read once and each
-    // payload window later, while another Put adds eviction pressure.
+    // payload window later, while another put adds eviction pressure.
     let large = client.store(key(128 * 64), None).await;
     let large_key = [key(128 * 64)];
     let fetch = reader.fetch(&large_key, 0, 128);
@@ -2273,86 +1810,30 @@ async fn l0_54_get_sources_survive_eviction_pressure() {
     assert!(!pressed.is_empty());
     host.wait(|host| host.gauge("open_ops") == 0);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_55_cancelled_get_lease_keeps_its_bytes() {
-    // Diagnostic: after a Get is cancelled its tree pins are released, but
-    // the client still holds the granted window. Eviction pressure must not
-    // free or reuse that arena extent before the client reads it.
+    // Diagnostic: after a claim is cancelled its tree pins are released, but
+    // the requester still holds the granted window. Eviction pressure must not
+    // free or reuse that arena extent before the requester reads it.
     let mut host = Host::new(32 * 1024, 4 * 1024 * 1024);
     host.start();
     let mut client = host.client().await;
     let stored = client.store(key(64), None).await;
     host.durable(1);
-    let (sender, receiver) = tokio::sync::mpsc::channel(8);
-    let mut replies = client
-        .inner
-        .get(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-        .await
-        .unwrap()
-        .into_inner();
-    sender
-        .send(proto::GetMessage {
-            m: Some(proto::get_message::M::Begin(proto::GetBegin {
-                namespace_id: client.descriptor.namespace_id().to_vec(),
-                chain: vec![key_msg(key(64))],
-                skip_pages: 0,
-                expected_pages: 1,
-                row: true,
-                destinations: Vec::new(),
-                transfer: 0,
-            })),
-        })
-        .await
-        .unwrap();
-    let (region, offset, length, record_offset) = loop {
-        match replies.message().await.unwrap().unwrap().r {
-            Some(proto::get_reply::R::Ready(grant)) => {
-                let memory = grant.memory.unwrap();
-                let region = if memory.region == proto::Region::Arena as i32 {
-                    Reg::Arena
-                } else {
-                    Reg::Staging
-                };
-                break (
-                    region,
-                    memory.offset,
-                    usize::try_from(memory.length).unwrap(),
-                    usize::try_from(grant.record_offset).unwrap(),
-                );
-            }
-            Some(proto::get_reply::R::Refused(refused)) => {
-                panic!("diagnostic Get refused: {refused:?}")
-            }
-            Some(_) => continue,
-            None => panic!("diagnostic Get ended before a window"),
-        }
-    };
-    sender
-        .send(proto::GetMessage {
-            m: Some(proto::get_message::M::Cancel(proto::Cancel {})),
-        })
-        .await
-        .unwrap();
-    while let Ok(Ok(Some(reply))) =
-        tokio::time::timeout(Duration::from_millis(200), replies.message()).await
-    {
-        if matches!(
-            reply.r,
-            Some(proto::get_reply::R::Done(_)) | Some(proto::get_reply::R::Refused(_)) | None
-        ) {
-            break;
-        }
-    }
+    let held = client.hold(&[key(64)], 0, 1).await;
+    let window = held.windows[0].window.unwrap();
+    assert!(window.page_count > 0 && window.first_page == 0);
+    // Cancelled; the window is neither released nor fenced.
+    let terminal = client.drop_held(&held).await;
+    assert_eq!(terminal.state, v2::ClaimState::Failed as i32);
     // Pressure: a 32 KiB root cannot fit beside the leased 16 KiB extent, so
-    // eviction must either skip the lease or corrupt the client's window.
+    // eviction must either skip the lease or corrupt the requester's window.
     let pressed = client.store(key(128), None).await;
     assert!(!pressed.is_empty());
-    let window = client.read(region, offset, length);
-    assert_eq!(window, stored[record_offset..record_offset + length]);
+    let bytes = client.session.shm.as_ref().unwrap().read(&window);
+    assert_eq!(bytes, stored[..window.length as usize]);
     host.wait(|host| host.gauge("open_ops") == 0);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_56_dram_only_arena_boundary_ignores_the_envelope() {
     // The 4 KiB disk envelope lives outside the arena. The record's buddy
@@ -2385,10 +1866,9 @@ async fn l0_56_dram_only_arena_boundary_ignores_the_envelope() {
     assert!(header.length_with_row() > 16 * 1024 * 1024);
     assert_eq!(
         client.put(larger, None, PutOptions::default()).await,
-        PutOutcome::Refused(proto::Reason::Oversize as u8)
+        PutOutcome::Refused(v2::Reason::Oversize as u8)
     );
 }
-
 #[test]
 fn l0_57_sigkill_never_blocks_a_restart_on_the_same_instance() {
     let base = base("sigkill-restart");
@@ -2447,7 +1927,6 @@ fn l0_57_sigkill_never_blocks_a_restart_on_the_same_instance() {
     );
     let _ = fs::remove_dir_all(base);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_58_dram_only_refuses_a_record_whose_rounded_extent_cannot_fit() {
     // The arena rounds a record's length up to a power of two. A 12 MiB arena
@@ -2464,7 +1943,7 @@ async fn l0_58_dram_only_refuses_a_record_whose_rounded_extent_cannot_fit() {
     assert!(header.length_with_row().max(4096).next_power_of_two() > 12 * 1024 * 1024);
     assert_eq!(
         client.put(large, None, PutOptions::default()).await,
-        PutOutcome::Refused(proto::Reason::Oversize as u8)
+        PutOutcome::Refused(v2::Reason::Oversize as u8)
     );
     // A record whose rounded extent fits is still admitted.
     let fits = key(1024 * 64);
@@ -2473,7 +1952,6 @@ async fn l0_58_dram_only_refuses_a_record_whose_rounded_extent_cannot_fit() {
         PutOutcome::Stored(_)
     ));
 }
-
 fn streaming_host(staging: usize) -> Host {
     let base = base("staging-oversize");
     let mut config = Config::new(
@@ -2489,7 +1967,7 @@ fn streaming_host(staging: usize) -> Host {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_59_refuses_a_streamed_record_whose_staging_hold_cannot_fit() {
-    // The row is one indivisible window, and a streamed Put reserves a hold of
+    // The row is one indivisible window, and a streamed put reserves a hold of
     // two of its largest windows. An 8 MiB row in an 8 MiB staging region has
     // a 16 MiB hold, so the record can never be admitted: OVERSIZE, not
     // BUDGET. A 16 MiB region holds the same record.
@@ -2501,14 +1979,14 @@ async fn l0_59_refuses_a_streamed_record_whose_staging_hold_cannot_fit() {
             planes: vec![4000],
             row_bytes: 8 * 1024 * 1024,
         }],
-        tenant: String::new(),
+        tenant: "tenant".into(),
     };
     let mut host = streaming_host(8 * 1024 * 1024);
     host.start();
     let mut client = host.client_with(value.clone()).await.unwrap();
     assert_eq!(
         client.put(key(64), None, PutOptions::default()).await,
-        PutOutcome::Refused(proto::Reason::Oversize as u8)
+        PutOutcome::Refused(v2::Reason::Oversize as u8)
     );
     drop(client);
     drop(host);
@@ -2521,7 +1999,6 @@ async fn l0_59_refuses_a_streamed_record_whose_staging_hold_cannot_fit() {
         PutOutcome::Stored(_)
     ));
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_60_restore_is_not_refused_when_the_nvme_budget_is_full() {
     // One streamed record and two arena records fill the durable budget close
@@ -2549,11 +2026,10 @@ async fn l0_60_restore_is_not_refused_when_the_nvme_budget_is_full() {
     );
     assert_eq!(client.fetch(&[key(512 * 64)], 0, 512).await[0], streamed);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_61_rootless_temporary_pressure_waits_instead_of_oversize() {
     // A 48 KiB arena: a 16 KiB parent and a 32 KiB child fit together once
-    // nothing else holds memory. An accepted but uncommitted Put holds an
+    // nothing else holds memory. An accepted but uncommitted put holds an
     // unrelated 32 KiB extent, so the child cannot be allocated now and its
     // six-page full-chain fallback would need 64 KiB. That is temporary
     // pressure, not an impossible shape, so the child is refused BUDGET: it
@@ -2564,37 +2040,15 @@ async fn l0_61_rootless_temporary_pressure_waits_instead_of_oversize() {
     host.start();
     let mut client = host.client().await;
     client.store(key(64), None).await;
-
-    let (sender, receiver) = tokio::sync::mpsc::channel(4);
-    let mut replies = client
-        .inner
-        .clone()
-        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-        .await
-        .unwrap()
-        .into_inner();
-    sender
-        .send(proto::PutMessage {
-            m: Some(client.begin(key(3 * 64), None)),
-        })
-        .await
-        .unwrap();
-    let accept = replies.message().await.unwrap().unwrap();
-    assert!(
-        matches!(accept.r, Some(proto::put_reply::R::Accept(_))),
-        "{accept:?}"
-    );
-
+    let (_open, start) = client.start_put(key(3 * 64), None).await;
+    assert!(matches!(start, PutStart::Accepted(_)), "{start:?}");
     assert_eq!(
         client
             .put(key(6 * 64), Some(key(64)), PutOptions::default())
             .await,
-        PutOutcome::Refused(proto::Reason::Budget as u8)
+        PutOutcome::Refused(v2::Reason::Budget as u8)
     );
-    drop(sender);
-    drop(replies);
 }
-
 #[test]
 fn l0_62_socket_directory_modes() {
     // The manager sets a mode only on a directory it created. An existing
@@ -2643,74 +2097,53 @@ fn l0_62_socket_directory_modes() {
     assert_eq!(mode, 0o770, "a created socket directory gets 0770");
     let _ = fs::remove_dir_all(base);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_63_a_paused_put_keeps_its_window_past_the_deadline() {
-    // A Put that stalls past the no-progress deadline is failed, but its
-    // granted window stays leased: the client may still be writing into it.
-    // A later Put cannot take the extent, and bytes written after the deadline
+    // A put that stalls past the no-progress deadline is failed, but its
+    // granted window stays leased: the writer may still be writing into it.
+    // A later put cannot take the extent, and bytes written after the deadline
     // are intact.
-    use std::os::unix::fs::FileExt;
     let mut host = Host::dram_only(32 * 1024);
     host.start();
-    let client = host.client().await;
-    let (sender, receiver) = tokio::sync::mpsc::channel(4);
-    let mut replies = client
-        .inner
-        .clone()
-        .put(client.request(tokio_stream::wrappers::ReceiverStream::new(receiver)))
-        .await
-        .unwrap()
-        .into_inner();
-    sender
-        .send(proto::PutMessage {
-            m: Some(client.begin(key(3 * 64), None)),
+    let mut client = host.client().await;
+    let (id, start) = client.start_put(key(3 * 64), None).await;
+    assert!(matches!(start, PutStart::Accepted(_)), "{start:?}");
+    let grant = client
+        .session
+        .take(|m| match m {
+            M::PutGrant(grant) if grant.put_id == id => Some(*grant),
+            _ => None,
+        })
+        .await;
+    let window = grant.window.unwrap();
+    // Stall until the manager ends the put for no progress.
+    let refused = client
+        .session
+        .take_within(Duration::from_secs(10), &mut |m| match m {
+            M::PutRefused(refused) if refused.put_id == id => Some(refused.clone()),
+            _ => None,
         })
         .await
-        .unwrap();
-    let (offset, length) = loop {
-        match replies.message().await.unwrap().unwrap().r {
-            Some(proto::put_reply::R::Grant(grant)) => {
-                let memory = grant.memory.unwrap();
-                break (memory.offset, memory.length);
-            }
-            Some(proto::put_reply::R::Refused(refused)) => panic!("refused: {refused:?}"),
-            Some(_) => continue,
-            None => panic!("the Put ended before a grant"),
-        }
-    };
-    // Stall until the manager ends the operation for no progress: the stream
-    // task fails it with DEADLINE_EXCEEDED and the store timer refuses it with
-    // INVALID, and either may reach the client first.
-    match tokio::time::timeout(Duration::from_secs(10), replies.message())
-        .await
-        .expect("the no-progress deadline did not fire")
-    {
-        Ok(None) => {}
-        Ok(Some(reply)) => {
-            let refused = matches!(
-                &reply.r,
-                Some(proto::put_reply::R::Refused(refused))
-                    if refused.reason == proto::Reason::Invalid as i32
-            );
-            assert!(refused, "unexpected reply after the deadline: {reply:?}");
-        }
-        Err(status) => assert!(status.message().contains("no progress"), "{status:?}"),
-    }
+        .expect("the no-progress deadline did not fire");
+    assert_eq!(refused.reason, v2::Reason::Invalid as i32, "{refused:?}");
     // Resume writing into the window; the extent must not be reusable.
-    let pattern: Vec<u8> = (0..length as usize)
+    let pattern: Vec<u8> = (0..window.length as usize)
         .map(|index| (index % 251) as u8)
         .collect();
-    client.arena.write_all_at(&pattern, offset).unwrap();
+    client
+        .session
+        .shm
+        .as_ref()
+        .unwrap()
+        .write(&window, &pattern);
     let mut other = host.client().await;
     assert_eq!(
         other.put(key(64), None, PutOptions::default()).await,
-        PutOutcome::Refused(proto::Reason::Budget as u8),
-        "the stalled Put's extent must stay leased"
+        PutOutcome::Refused(v2::Reason::Budget as u8),
+        "the stalled put's extent must stay leased"
     );
-    assert_eq!(client.read(Reg::Arena, offset, length as usize), pattern);
+    assert_eq!(client.session.shm.as_ref().unwrap().read(&window), pattern);
 }
-
 fn charge_host(nvme: u64) -> Host {
     let base = base("charge-oversize");
     let mut config = Config::new(
@@ -2736,7 +2169,7 @@ async fn l0_64_refuses_a_record_whose_admission_charge_cannot_fit() {
     let mut client = host.client().await;
     assert_eq!(
         client.put(record, None, PutOptions::default()).await,
-        PutOutcome::Refused(proto::Reason::Oversize as u8)
+        PutOutcome::Refused(v2::Reason::Oversize as u8)
     );
     drop(client);
     drop(host);
@@ -2750,40 +2183,40 @@ async fn l0_64_refuses_a_record_whose_admission_charge_cannot_fit() {
         PutOutcome::Stored(_)
     ));
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_65_rootless_tail_shortage_waits_without_room() {
     // A 64 KiB arena holds a five-page root and a five-page tail. The next
     // four-page tail needs 32 KiB beside both retained ancestors (96 KiB in
     // total), which depends on what must stay resident rather than on the
-    // record's own shape: it is a Budget, and no Room can arrive.
+    // record's own shape: it is a Budget, and nothing can free the space.
     let mut host = Host::dram_only(64 * 1024);
     host.start();
     let mut client = host.client().await;
     client.store(key(5 * 64), None).await;
     client.store(key(10 * 64), Some(key(5 * 64))).await;
-    let mut subscription = client.subscribe().await;
     assert_eq!(
         client
             .put(key(14 * 64), Some(key(10 * 64)), PutOptions::default())
             .await,
-        PutOutcome::Refused(proto::Reason::Budget as u8)
+        PutOutcome::Refused(v2::Reason::Budget as u8)
     );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
-            .await
-            .is_err(),
-        "Room was offered for an allocation the retained chain can never free"
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        client
+            .put(key(14 * 64), Some(key(10 * 64)), PutOptions::default())
+            .await,
+        PutOutcome::Refused(v2::Reason::Budget as u8),
+        "the retained chain can never free the space"
     );
+    assert!(client.candidate(14 * 64).await.is_none());
     host.wait(|host| host.gauge("open_ops") == 0);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_66_protected_parent_shortage_is_a_budget() {
     // The parent's reservation and the child's together exceed --nvme, and
     // the parent is protected by this admission. That is a capacity shortage
     // caused by what must stay resident, not by the record's own charge: it
-    // is a Budget with no Room, and nothing is stored.
+    // is a Budget and nothing is stored.
     let base = base("protected-ancestry");
     let mut config = Config::new(
         base.join("records"),
@@ -2796,18 +2229,114 @@ async fn l0_66_protected_parent_shortage_is_a_budget() {
     host.start();
     let mut client = host.client().await;
     client.store(key(5 * 64), None).await;
-    let mut subscription = client.subscribe().await;
     assert_eq!(
         client
             .put(key(10 * 64), Some(key(5 * 64)), PutOptions::default())
             .await,
-        PutOutcome::Refused(proto::Reason::Budget as u8)
+        PutOutcome::Refused(v2::Reason::Budget as u8)
     );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), subscription.until_room())
-            .await
-            .is_err(),
-        "Room was offered for a charge the protected parent keeps occupied"
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        client
+            .put(key(10 * 64), Some(key(5 * 64)), PutOptions::default())
+            .await,
+        PutOutcome::Refused(v2::Reason::Budget as u8),
+        "the protected parent keeps the charge occupied"
     );
+    assert!(client.candidate(10 * 64).await.is_none());
     host.wait(|host| host.gauge("open_ops") == 0);
+}
+/// A startup failure after the store opened must release the instance and root locks and
+/// leave no socket, so the same manager can start again on the same paths immediately.
+#[test]
+fn l0_67_a_failed_start_releases_the_instance_and_root() {
+    let base = base("failed-start");
+    let mut config = Config::new(
+        base.join("records"),
+        base.join("run/m.sock"),
+        65536,
+        64 * 1024 * 1024,
+    );
+    config.name = instance_name("failed-start");
+    let squatter = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut failed = config.clone();
+    failed.metrics = Some(squatter.local_addr().unwrap().to_string());
+    let error = control::run(failed, Arc::new(AtomicBool::new(false)))
+        .expect_err("a taken metrics port must fail the start");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::AddrInUse,
+        "the metrics refusal is reported: {error}"
+    );
+    assert!(!config.socket.exists(), "a failed start leaves no socket");
+    drop(squatter);
+    // The instance, lock and root are free again: the same manager starts at once.
+    config.metrics = None;
+    let mut host = Host::open_config(config);
+    host.try_start()
+        .expect("the previous attempt released its locks");
+    host.stop();
+    let _ = fs::remove_dir_all(base);
+}
+/// Certificate errors are found before the manager opens its store or any listener, so a
+/// failed start leaves no locks, socket or accepting data port behind.
+#[test]
+fn l0_68_a_tls_error_starts_nothing() {
+    let base = base("tls-error");
+    fs::create_dir_all(&base).unwrap();
+    let socket = base.join("run/m.sock");
+    let mut local = selene_manager::config::Config::defaults();
+    local.name = instance_name("tls-error");
+    local.socket = socket.clone();
+    local.socket_explicit = true;
+    local.root = Some(base.join("records"));
+    local.memory = 65536;
+    local.staging = 8 << 20;
+    local.nvme = 64 << 20;
+    local.tls_cert = Some(base.join("missing-cert.pem"));
+    local.tls_key = Some(base.join("missing-key.pem"));
+    local.tls_ca = Some(base.join("missing-ca.pem"));
+    local.peer_transport = selene_manager::config::PeerTransport::Stream;
+    let mut store = Config::new(base.join("records"), socket.clone(), 65536, 64 << 20);
+    store.name = local.name.clone();
+    let error = control::run_peer(local, store, Arc::new(AtomicBool::new(false)))
+        .expect_err("a missing certificate must fail the start");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::NotFound,
+        "the certificate error is reported: {error}"
+    );
+    assert!(!socket.exists(), "nothing was created");
+    // A key that does not belong to the certificate is only caught by building the full
+    // server configuration, which now happens before anything starts.
+    let good = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let other = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert = base.join("cert.pem");
+    let key = base.join("key.pem");
+    let ca = base.join("ca.pem");
+    fs::write(&cert, good.cert.pem()).unwrap();
+    fs::write(&key, other.signing_key.serialize_pem()).unwrap();
+    fs::write(&ca, good.cert.pem()).unwrap();
+    let mut local = selene_manager::config::Config::defaults();
+    local.name = instance_name("tls-mismatch");
+    local.socket = socket.clone();
+    local.socket_explicit = true;
+    local.root = Some(base.join("records"));
+    local.memory = 65536;
+    local.staging = 8 << 20;
+    local.nvme = 64 << 20;
+    local.tls_cert = Some(cert);
+    local.tls_key = Some(key);
+    local.tls_ca = Some(ca);
+    local.peer_transport = selene_manager::config::PeerTransport::Stream;
+    let mut store = Config::new(base.join("records"), socket.clone(), 65536, 64 << 20);
+    store.name = local.name.clone();
+    let error = control::run_peer(local, store, Arc::new(AtomicBool::new(false)))
+        .expect_err("a key that does not match the certificate must fail the start");
+    assert!(
+        error.to_string().contains("TLS"),
+        "the certificate error is named: {error}"
+    );
+    assert!(!socket.exists(), "nothing was created");
+    let _ = fs::remove_dir_all(base);
 }

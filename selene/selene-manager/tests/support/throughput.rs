@@ -91,13 +91,13 @@ async fn benchmark(enforce: bool, profile: &Profile) {
         descriptor.ranks[0].planes = vec![profile.page_bytes];
         let mut client = Client::connect(&host.config, descriptor).await.unwrap();
         let key = key(u64::from(profile.pages) * 64);
-        let (_, bytes, _) = client.content(key, None, 0);
+        let (header, record, _) = client.content(key, None, 0);
+        // What a restore carries: the pages and the row, not the header.
+        let payload = record.len() - header.page_segment as usize;
         if profile.report {
             println!(
                 "L0 {mode} bytes={} pages={} page_bytes={}",
-                bytes.len(),
-                profile.pages,
-                profile.page_bytes
+                payload, profile.pages, profile.page_bytes
             );
         }
         let mut puts = Vec::new();
@@ -111,7 +111,8 @@ async fn benchmark(enforce: bool, profile: &Profile) {
             let put = started.elapsed().as_secs_f64();
             let started = Instant::now();
             let actual = client.fetch(&[sample_key], 0, profile.pages).await;
-            let get = started.elapsed().as_secs_f64();
+            // A restore ends with the client's settle delay, which is not transfer time.
+            let get = (started.elapsed() - SETTLE).as_secs_f64();
             assert_eq!(actual[0], value);
             polls.push(get);
             if sample == 0 {
@@ -132,7 +133,7 @@ async fn benchmark(enforce: bool, profile: &Profile) {
         gets.sort_by(f64::total_cmp);
         let median_put = puts[puts.len() / 2];
         let median_get = gets[gets.len() / 2];
-        let cpu_s_per_gb = cpu / ((bytes.len() as f64 * 10.0) / 1e9);
+        let cpu_s_per_gb = cpu / ((payload as f64 * 10.0) / 1e9);
         if profile.report {
             println!(
                 "L0 {mode} median_put_GB_s={median_put:.3} median_get_GB_s={median_get:.3} \
