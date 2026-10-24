@@ -1249,6 +1249,7 @@ struct FakeStore {
     evictions_lost: usize,
     needs_characterization: bool,
     characterize_fails: bool,
+    undrained: bool,
     characterized: Vec<crate::offload::Scratch>,
     /// Each eviction notice with the number of `store` calls made before it.
     evicted: Vec<(
@@ -1284,6 +1285,7 @@ impl FakeStore {
             evictions_lost: 0,
             needs_characterization: false,
             characterize_fails: false,
+            undrained: false,
             characterized: Vec::new(),
             evicted: Vec::new(),
         }
@@ -1349,6 +1351,9 @@ impl crate::offload::PrefixStore for FakeStore {
     }
     fn needs_characterization(&self) -> bool {
         self.needs_characterization
+    }
+    fn copies_drained(&self) -> bool {
+        !self.undrained
     }
     fn characterize(&mut self, scratch: &crate::offload::Scratch) -> Result<Option<String>> {
         self.characterized.push(scratch.clone());
@@ -2076,7 +2081,7 @@ fn the_pool_is_characterized_once_with_idle_ids_that_come_back() {
         worker.scheduler.free_page_count(),
         worker.scheduler.free_snapshot_count(),
     );
-    worker.characterize_pool().unwrap();
+    worker.characterize_pool();
     let seen = &fake_store(&mut worker).characterized;
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].pages.len(), CHARACTERIZATION_PAGES);
@@ -2088,11 +2093,11 @@ fn the_pool_is_characterized_once_with_idle_ids_that_come_back() {
         free
     );
     // Once measured, and nothing changed, it is not measured again.
-    worker.characterize_pool().unwrap();
+    worker.characterize_pool();
     assert_eq!(fake_store(&mut worker).characterized.len(), 1);
     // A topology change asks again.
     fake_store(&mut worker).needs_characterization = true;
-    worker.characterize_pool().unwrap();
+    worker.characterize_pool();
     assert_eq!(fake_store(&mut worker).characterized.len(), 2);
 }
 
@@ -2110,7 +2115,7 @@ fn characterization_waits_for_an_idle_worker_and_a_pooled_store() {
     worker.attach_store(Some(Box::new(store)));
     worker.admit().unwrap();
     assert!(worker.active[0].is_some());
-    worker.characterize_pool().unwrap();
+    worker.characterize_pool();
     assert!(fake_store(&mut worker).characterized.is_empty());
 
     let (_sender, receiver) = mpsc::channel();
@@ -2118,12 +2123,12 @@ fn characterization_waits_for_an_idle_worker_and_a_pooled_store() {
     let mut store = FakeStore::new(None);
     store.needs_characterization = true;
     local.attach_store(Some(Box::new(store)));
-    local.characterize_pool().unwrap();
+    local.characterize_pool();
     assert!(fake_store(&mut local).characterized.is_empty());
 }
 
 #[test]
-fn too_few_idle_ids_skip_characterization_without_retrying_and_failure_withholds_them() {
+fn too_few_idle_ids_skip_characterization_without_retrying() {
     let fixture = Fixture::new();
     let (_sender, receiver) = mpsc::channel();
     let mut worker = fixture.worker(receiver);
@@ -2131,10 +2136,13 @@ fn too_few_idle_ids_skip_characterization_without_retrying_and_failure_withholds
     store.pooled = true;
     store.needs_characterization = true;
     worker.attach_store(Some(Box::new(store)));
-    worker.characterize_pool().unwrap();
+    worker.characterize_pool();
     assert!(fake_store(&mut worker).characterized.is_empty());
-    assert!(worker.scratch_unavailable);
+    assert!(worker.characterization_off);
+}
 
+#[test]
+fn a_failed_probe_that_drained_returns_its_ids_keeps_serving_and_is_not_retried() {
     let mut fixture = Fixture::new();
     fixture.config.limits.pages = 96;
     let (_sender, receiver) = mpsc::channel();
@@ -2144,11 +2152,53 @@ fn too_few_idle_ids_skip_characterization_without_retrying_and_failure_withholds
     store.needs_characterization = true;
     store.characterize_fails = true;
     worker.attach_store(Some(Box::new(store)));
-    assert!(worker.characterize_pool().is_err());
-    assert_eq!(
-        worker.scheduler.free_page_count(),
-        96 - CHARACTERIZATION_PAGES
-    );
+    worker.characterize_pool();
+    assert_eq!(fake_store(&mut worker).characterized.len(), 1);
+    assert_eq!(worker.scheduler.free_page_count(), 96);
+    assert_eq!(worker.scheduler.stats().quarantined_pages, 0);
+    worker.characterize_pool();
+    assert_eq!(fake_store(&mut worker).characterized.len(), 1);
+    // The worker still admits requests.
+    let (sender, receiver) = mpsc::channel();
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    sender.send(vec![incoming]).unwrap();
+    let mut worker = fixture.worker(receiver);
+    worker.attach_store(Some(Box::new(FakeStore::new(None))));
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+}
+
+#[test]
+fn a_probe_whose_copies_cannot_be_shown_to_have_stopped_quarantines_its_ids() {
+    for fails in [true, false] {
+        let mut fixture = Fixture::new();
+        fixture.config.limits.pages = 96;
+        let (sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        let mut store = FakeStore::new(None);
+        store.pooled = true;
+        store.needs_characterization = true;
+        store.characterize_fails = fails;
+        store.undrained = true;
+        worker.attach_store(Some(Box::new(store)));
+        worker.characterize_pool();
+        assert_eq!(
+            worker.scheduler.free_page_count(),
+            96 - CHARACTERIZATION_PAGES
+        );
+        assert_eq!(
+            worker.scheduler.stats().quarantined_pages,
+            CHARACTERIZATION_PAGES
+        );
+        assert_eq!(worker.scheduler.free_snapshot_count(), 15);
+        // Serving continues on what is left, and the probe is not run again.
+        fake_store(&mut worker).needs_characterization = true;
+        worker.characterize_pool();
+        assert_eq!(fake_store(&mut worker).characterized.len(), 1);
+        let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+        sender.send(vec![incoming]).unwrap();
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        assert!(worker.active[0].is_some());
+    }
 }
 
 fn group_runtime(
