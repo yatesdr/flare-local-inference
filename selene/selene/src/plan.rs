@@ -4,7 +4,9 @@
 //! sources. Part A is the longest prefix held at the closest level that has any
 //! of it. Part B is one source at a strictly farther level, starting exactly
 //! where A ends and reaching the endpoint, kept only if its pages are worth
-//! fetching against recomputing them. The parts are disjoint and contiguous from
+//! fetching against recomputing them. Part A is chosen longest first, with cost
+//! only breaking ties, so the least has to come from farther away. A part that
+//! would supply no pages and no row is left out. The parts are disjoint and contiguous from
 //! the resident prefix, and the endpoint's continuation row comes from whichever
 //! part ends last.
 //!
@@ -198,7 +200,15 @@ fn search(
         .copied()
         .filter(|c| c.begin_tokens <= request.resident)
         .collect();
-    firsts.sort_by_key(|c| preference(request, c));
+    firsts.sort_by_key(|c| {
+        (
+            request.ranking.rank(c.level),
+            Reverse(c.key.consumed_tokens),
+            c.us_per_page == 0,
+            c.us_per_page,
+            c.source.0,
+        )
+    });
     for first in firsts {
         let mut a = part(request, first, request.resident, 0, true);
         if endpoint == Some(first.key) {
@@ -221,6 +231,11 @@ fn search(
         for second in seconds {
             let b = part(request, second, a_end, a.pages, true);
             if worth(request, second, &b, a_end) {
+                if a.pages == 0 {
+                    // A supplies nothing: B reads from the resident page itself.
+                    let only = part(request, second, request.resident, 0, true);
+                    return Some(request.plan(only, None));
+                }
                 return Some(request.plan(a, Some(b)));
             }
         }
@@ -243,7 +258,7 @@ impl Request<'_> {
     }
 }
 
-/// Closest level first, then the cheapest known source, then the longest match.
+/// Among sources for B: closest level first, then the cheapest known source, then the longest match.
 fn preference(request: &Request, c: &Candidate) -> (usize, bool, u32, Reverse<u64>, u64) {
     (
         request.ranking.rank(c.level),
@@ -583,25 +598,53 @@ mod tests {
     }
 
     #[test]
-    fn within_a_level_the_cheapest_source_wins_then_the_longest() {
+    fn a_is_the_longest_match_at_its_level_and_b_the_cheapest() {
         let f = Fixture::new();
         let slow = f.candidate(HostDram, 1, 0, 0, &[800], 50);
         let fast = f.candidate(HostDram, 2, 0, 0, &[400], 20);
         let unknown = f.candidate(HostDram, 3, 0, 0, &[1200], 0);
         let plan = f
-            .plan(0, &[slow.clone(), unknown.clone(), fast.clone()])
+            .plan(0, &[slow.clone(), fast.clone(), unknown.clone()])
             .unwrap();
-        assert_eq!(plan.a.source, SourceId(2));
-        // Equal cost: the longer match. Unknown cost ranks after known.
-        let twin = f.candidate(HostDram, 4, 0, 0, &[1200], 20);
-        let plan = f.plan(0, &[fast, twin, slow, unknown]).unwrap();
+        assert_eq!(plan.a.source, SourceId(3));
+        // Equal length: the cheapest known source, unknown last.
+        let twin = f.candidate(HostDram, 4, 0, 0, &[800], 20);
+        let plan = f
+            .plan(0, &[unknown.clone(), twin, slow.clone(), fast])
+            .unwrap();
+        assert_eq!(plan.a.source, SourceId(3));
+        let plan = f
+            .plan(
+                0,
+                &[slow.clone(), f.candidate(HostDram, 4, 0, 0, &[800], 20)],
+            )
+            .unwrap();
         assert_eq!(plan.a.source, SourceId(4));
-        // The same rule picks among B candidates.
+        let plan = f
+            .plan(0, &[f.candidate(HostDram, 5, 0, 0, &[800], 0), slow])
+            .unwrap();
+        assert_eq!(plan.a.source, SourceId(1));
+        // B takes the cheapest source, then the longest.
         let dram = f.candidate(HostDram, 1, 0, 0, &[400], 0);
         let b_slow = f.candidate(RemoteNvme, 5, 400, 25, &[1600], 90);
         let b_fast = f.candidate(RemoteNvme, 6, 400, 25, &[1200], 30);
         let plan = f.plan(0, &[dram, b_slow, b_fast]).unwrap();
         assert_eq!(plan.b.unwrap().source, SourceId(6));
+    }
+
+    #[test]
+    fn an_a_that_supplies_nothing_is_left_out() {
+        let f = Fixture::new();
+        // A ends inside the first page: no pages, no row for B to follow.
+        let dram = f.candidate(HostDram, 1, 0, 0, &[8], 0);
+        let remote = f.candidate(RemoteNvme, 2, 8, 0, &[800], 0);
+        let plan = f.plan(0, &[dram, remote]).unwrap();
+        assert!(plan.b.is_none());
+        assert_eq!(
+            (plan.a.source, plan.a.begin_tokens, plan.a.pages),
+            (SourceId(2), 0, 50)
+        );
+        assert!(plan.a.row);
     }
 
     #[test]
