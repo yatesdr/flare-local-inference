@@ -13,10 +13,13 @@
 //! reports `Closed`: the engine frees nothing a task could still touch.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -33,6 +36,7 @@ use crate::{Error, HostRegistrar, Result};
 
 use super::{
     frame::{Carrier, NO_SLOT, Shape, TOKEN_BYTES, ToInstance, ToManager, Window},
+    rdma,
     shm::Region,
     wire,
 };
@@ -49,6 +53,9 @@ const ALIGN: u64 = 4096;
 
 /// Fixed-size slots in one registered region, for windows in transit.
 pub(crate) struct Staging {
+    /// The region registered for RDMA, once it was asked for. Declared first so it is
+    /// unregistered before the region is unmapped.
+    rdma: OnceLock<Option<Arc<rdma::Device>>>,
     region: Region,
     slot_bytes: u64,
     free: Mutex<Vec<u32>>,
@@ -71,6 +78,7 @@ impl Staging {
         let mut region = Region::anonymous(total)?;
         region.register(registrar, context)?;
         Ok(Self {
+            rdma: OnceLock::new(),
             region,
             slot_bytes,
             free: Mutex::new((0..slots).rev().collect()),
@@ -81,6 +89,28 @@ impl Staging {
 
     pub(crate) fn region(&self) -> &Region {
         &self.region
+    }
+
+    /// The staging registered for RDMA: opened on first use, `None` (with one warning)
+    /// when this host has no usable device or the build has no RDMA.
+    fn rdma(&self) -> Option<Arc<rdma::Device>> {
+        self.rdma
+            .get_or_init(|| {
+                // SAFETY: the region stays mapped at this address for as long as `self`
+                // lives, and the device is dropped first (field order).
+                match unsafe {
+                    rdma::Device::open(self.region.base() as *mut u8, self.region.len())
+                } {
+                    Ok(device) => Some(device),
+                    Err(error) => {
+                        eprintln!(
+                            "warning: RDMA is not available for the pool's data channel ({error}); using the stream"
+                        );
+                        None
+                    }
+                }
+            })
+            .clone()
     }
 
     pub(crate) fn slot_bytes(&self) -> u64 {
@@ -307,13 +337,18 @@ pub(crate) trait Dial: Send + Sync {
     fn open(&self, request: Open) -> io::Result<Channel>;
 }
 
-/// Opens transfers over TCP, with TLS when the manager declared it.
+/// Opens transfers over TCP, with TLS when the manager declared it, and over RDMA when
+/// the manager offers it.
 pub(crate) struct Tcp {
     /// The host the session was opened to, for a data address that names none.
     pub host: String,
     pub tls: Option<(TlsConnector, rustls::pki_types::ServerName<'static>)>,
     pub staging: Arc<Staging>,
     pub events: Arc<Events>,
+    /// The manager lists RDMA among its data transports.
+    pub rdma_offered: bool,
+    /// An RDMA transfer failed: the rest of this process's transfers use the stream.
+    pub rdma_broken: Arc<AtomicBool>,
 }
 
 impl Dial for Tcp {
@@ -324,8 +359,13 @@ impl Dial for Tcp {
             .as_slice()
             .try_into()
             .map_err(|_| invalid("the data channel's token is not 32 bytes"))?;
-        if request.reference.transport != wire::DataTransport::Tcp as i32 {
-            return Err(invalid("the data channel is not offered over TCP"));
+        let transport = request.reference.transport;
+        if transport != wire::DataTransport::Tcp as i32
+            && transport != wire::DataTransport::Rdma as i32
+        {
+            return Err(invalid(
+                "the data channel names no transport this client knows",
+            ));
         }
         let target = Target {
             host: self.host.clone(),
@@ -334,6 +374,10 @@ impl Dial for Tcp {
             token,
             staging: self.staging.clone(),
             events: self.events.clone(),
+            rdma: transport == wire::DataTransport::Rdma as i32
+                && self.rdma_offered
+                && !self.rdma_broken.load(Ordering::Relaxed),
+            rdma_broken: self.rdma_broken.clone(),
         };
         let (events, id) = (self.events.clone(), request.id);
         match request.id {
@@ -418,6 +462,9 @@ struct Target {
     token: [u8; TOKEN_BYTES],
     staging: Arc<Staging>,
     events: Arc<Events>,
+    /// Try RDMA for this transfer.
+    rdma: bool,
+    rdma_broken: Arc<AtomicBool>,
 }
 
 trait Conn: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -431,7 +478,14 @@ fn timed_out(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, what.to_string())
 }
 
-async fn connect(target: &Target) -> io::Result<Box<dyn Conn>> {
+/// A connection, and the queue pair that carries its payload when the manager and this
+/// host agreed on RDMA.
+struct Link {
+    conn: Box<dyn Conn>,
+    pair: Option<rdma::Pair>,
+}
+
+async fn connect(target: &Target) -> io::Result<Link> {
     let (host, port) = target
         .address
         .rsplit_once(':')
@@ -458,9 +512,59 @@ async fn connect(target: &Target) -> io::Result<Box<dyn Conn>> {
         None => Box::new(stream),
     };
     conn.write_all(&target.token).await?;
-    ToManager::Hello(Carrier::Stream).write(&mut conn).await?;
-    conn.flush().await?;
-    Ok(conn)
+    // The payload goes by RDMA when the manager offered it and a pair can be made here;
+    // otherwise on this connection. Say which, once.
+    let pair = if target.rdma && target.tls.is_none() {
+        target
+            .staging
+            .rdma()
+            .and_then(|device| match rdma::Pair::new(&device) {
+                Ok(pair) => Some(pair),
+                Err(error) => {
+                    if !target.rdma_broken.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "warning: cannot make an RDMA queue pair ({error}); the data channel uses the stream"
+                        );
+                    }
+                    None
+                }
+            })
+    } else {
+        None
+    };
+    match &pair {
+        Some(pair) => {
+            let hello = Carrier::Rdma(pair.handshake().encode().to_vec());
+            ToManager::Hello(hello).write(&mut conn).await?;
+            conn.flush().await?;
+            let accepted = timeout(CONNECT_TIMEOUT, ToInstance::read(&mut conn, MAX_PAGES))
+                .await
+                .map_err(|_| timed_out("the manager did not answer the RDMA hello"))??;
+            let ToInstance::Accept(theirs) = accepted else {
+                return Err(invalid("the manager did not accept the RDMA carrier"));
+            };
+            pair.connect(&rdma::Handshake::decode(&theirs)?)?;
+        }
+        None => {
+            ToManager::Hello(Carrier::Stream).write(&mut conn).await?;
+            conn.flush().await?;
+        }
+    }
+    Ok(Link { conn, pair })
+}
+
+/// A transfer that used RDMA and failed leaves the rest of the process on the stream.
+fn note_failure(target: &Target, link_was_rdma: bool, result: &io::Result<()>) {
+    if link_was_rdma && result.is_err() && !target.rdma_broken.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "warning: an RDMA transfer of the pool's data channel failed; later transfers use the stream"
+        );
+    }
+}
+
+/// The length of a window must fit a slot and the page grid.
+fn usable_length(target: &Target, length: u64) -> bool {
+    length != 0 && length.is_multiple_of(ALIGN) && length <= target.staging.slot_bytes()
 }
 
 /// A claim: windows arrive until the manager ends the transfer.
@@ -468,7 +572,17 @@ async fn receive(target: &Target, id: Id) -> io::Result<()> {
     let Id::Claim(claim) = id else {
         unreachable!("receive serves claims");
     };
-    let mut conn = connect(target).await?;
+    let link = connect(target).await?;
+    let rdma = link.pair.is_some();
+    let result = match link.pair {
+        Some(pair) => receive_rdma(target, claim, link.conn, pair).await,
+        None => receive_stream(target, claim, link.conn).await,
+    };
+    note_failure(target, rdma, &result);
+    result
+}
+
+async fn receive_stream(target: &Target, claim: u64, mut conn: Box<dyn Conn>) -> io::Result<()> {
     loop {
         let frame = timeout(IDLE_TIMEOUT, ToInstance::read(&mut conn, MAX_PAGES))
             .await
@@ -479,7 +593,7 @@ async fn receive(target: &Target, id: Id) -> io::Result<()> {
                 if window.slot != NO_SLOT {
                     return Err(invalid("a window names a slot on the stream carrier"));
                 }
-                if length == 0 || length % ALIGN != 0 || length > target.staging.slot_bytes() {
+                if !usable_length(target, length) {
                     return Err(invalid(format!(
                         "window {} has an unusable length ({length})",
                         window.shape.index
@@ -512,17 +626,98 @@ async fn receive(target: &Target, id: Id) -> io::Result<()> {
     }
 }
 
-/// A put: the manager grants windows and the engine fills and returns them.
-async fn fill(
+/// How many slots a claim lends the manager at once.
+const CREDIT_DEPTH: usize = 2;
+
+/// The queue pair and the slots lent to the manager. The pair is declared first so it is
+/// destroyed first: no write for a lent slot can land after the slot is given back.
+struct Lent {
+    /// Held for its drop.
+    _pair: rdma::Pair,
+    slots: VecDeque<Held>,
+}
+
+async fn lend(target: &Target, conn: &mut Box<dyn Conn>, lent: &mut Lent) -> io::Result<()> {
+    let held = target.staging.take().await;
+    ToManager::Credit {
+        offset: target.staging.offset(held.slot()),
+        length: target.staging.slot_bytes(),
+    }
+    .write(conn)
+    .await?;
+    conn.flush().await?;
+    lent.slots.push_back(held);
+    Ok(())
+}
+
+/// A claim over RDMA: the manager writes each window into a slot this side lent it,
+/// then says which.
+async fn receive_rdma(
     target: &Target,
-    id: Id,
-    mut filled: mpsc::UnboundedReceiver<Filled>,
+    claim: u64,
+    mut conn: Box<dyn Conn>,
+    pair: rdma::Pair,
 ) -> io::Result<()> {
+    let mut lent = Lent {
+        _pair: pair,
+        slots: VecDeque::new(),
+    };
+    for _ in 0..CREDIT_DEPTH {
+        lend(target, &mut conn, &mut lent).await?;
+    }
+    loop {
+        let frame = timeout(IDLE_TIMEOUT, ToInstance::read(&mut conn, MAX_PAGES))
+            .await
+            .map_err(|_| timed_out("the manager sent nothing"))??;
+        match frame {
+            ToInstance::Window(window) => {
+                let length = window.shape.length;
+                let front = lent.slots.front().map(|held| held.slot());
+                if front.map(|slot| target.staging.offset(slot)) != Some(window.slot) {
+                    return Err(invalid(format!(
+                        "window {} was written to a slot that was not the next one lent",
+                        window.shape.index
+                    )));
+                }
+                if !usable_length(target, length) {
+                    return Err(invalid(format!(
+                        "window {} has an unusable length ({length})",
+                        window.shape.index
+                    )));
+                }
+                // The manager's completion of its write came before this frame.
+                let held = lent.slots.pop_front().expect("checked above");
+                target.events.push(Event::Window {
+                    claim,
+                    window,
+                    slot: held.give(),
+                });
+                lend(target, &mut conn, &mut lent).await?;
+            }
+            ToInstance::End => {
+                target.events.push(Event::End { claim });
+                return Ok(());
+            }
+            ToInstance::Abort(text) => {
+                return Err(io::Error::other(format!(
+                    "the manager ended the transfer: {text}"
+                )));
+            }
+            _ => return Err(invalid("a claim's channel carries only windows")),
+        }
+    }
+}
+
+/// A put: the manager grants windows and the engine fills and returns them.
+async fn fill(target: &Target, id: Id, filled: mpsc::UnboundedReceiver<Filled>) -> io::Result<()> {
     let Id::Put(put) = id else {
         unreachable!("fill serves puts");
     };
-    let conn = connect(target).await?;
-    let (mut reader, mut writer) = tokio::io::split(conn);
+    let link = connect(target).await?;
+    let rdma = link.pair.is_some();
+    // The pair, if any, outlives the reading and writing: it is the fence.
+    let (mut reader, mut writer) = tokio::io::split(link.conn);
+    let in_flight: Arc<Mutex<HashMap<u32, u32>>> = Arc::default();
     let reading = async {
         loop {
             // Grants come as the manager's store makes them: no deadline. A manager
@@ -534,7 +729,7 @@ async fn fill(
             match frame {
                 ToInstance::Grant(shape) => {
                     let length = shape.length;
-                    if length == 0 || length % ALIGN != 0 || length > target.staging.slot_bytes() {
+                    if !usable_length(target, length) {
                         return Err(invalid(format!(
                             "window {} has an unusable length ({length})",
                             shape.index
@@ -546,6 +741,15 @@ async fn fill(
                         shape,
                         slot: held.give(),
                     });
+                }
+                // The manager has read the window out of its slot over RDMA.
+                ToInstance::Taken(index) if rdma => {
+                    let slot = in_flight
+                        .lock()
+                        .unwrap()
+                        .remove(&index)
+                        .ok_or_else(|| invalid("a window was taken that was not offered"))?;
+                    target.events.push(Event::Sent { put, index, slot });
                 }
                 ToInstance::Abort(text) => {
                     return Err(io::Error::other(format!(
@@ -559,16 +763,32 @@ async fn fill(
         Ok::<(), io::Error>(())
     };
     let writing = async {
+        let mut filled = filled;
         while let Some(window) = filled.recv().await {
-            // SAFETY: the engine handed the slot over with the window and does not touch
-            // it until `Sent`.
-            let bytes = unsafe { target.staging.bytes(window.slot, window.length)? };
             let frame = ToManager::Filled {
                 index: window.index,
                 row_xxh3: window.row_xxh3,
                 page_xxh3: window.page_xxh3,
-                slot: NO_SLOT,
+                slot: if rdma {
+                    target.staging.offset(window.slot)
+                } else {
+                    NO_SLOT
+                },
             };
+            if rdma {
+                // The manager reads the slot over RDMA: say which, and wait for TAKEN.
+                in_flight.lock().unwrap().insert(window.index, window.slot);
+                timeout(IDLE_TIMEOUT, async {
+                    frame.write(&mut writer).await?;
+                    writer.flush().await
+                })
+                .await
+                .map_err(|_| timed_out("the manager stopped reading a window"))??;
+                continue;
+            }
+            // SAFETY: the engine handed the slot over with the window and does not touch
+            // it until `Sent`.
+            let bytes = unsafe { target.staging.bytes(window.slot, window.length)? };
             timeout(IDLE_TIMEOUT, async {
                 frame.write(&mut writer).await?;
                 writer.write_all(bytes).await?;
@@ -585,10 +805,14 @@ async fn fill(
         Ok::<(), io::Error>(())
     };
     // Either side ending, cleanly or not, ends the transfer.
-    tokio::select! {
+    let result = tokio::select! {
         result = reading => result,
         result = writing => result,
-    }
+    };
+    note_failure(target, rdma, &result);
+    // Dropped after both halves: the pair's destruction stops any read of a slot.
+    drop(link.pair);
+    result
 }
 
 #[cfg(test)]
@@ -652,6 +876,8 @@ mod tests {
             tls,
             staging: staging.clone(),
             events: events.clone(),
+            rdma_offered: false,
+            rdma_broken: Arc::default(),
         };
         Rig {
             listener,
@@ -997,7 +1223,7 @@ mod tests {
                 .is_err()
         );
         let mut reference = rig.reference(1);
-        reference.transport = wire::DataTransport::Rdma as i32;
+        reference.transport = wire::DataTransport::Unspecified as i32;
         assert!(
             rig.dial
                 .open(Open {

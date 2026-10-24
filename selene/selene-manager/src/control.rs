@@ -228,6 +228,7 @@ pub fn serve(
                 regions.clone(),
                 data_tls,
                 crate::pool::windows::MAX_WINDOW_PAGES as u32,
+                rdma_device(&config, &regions)?,
             )?;
             (Some(hub), Some(events))
         }
@@ -474,6 +475,29 @@ fn validate_tls(config: &crate::config::Config) -> Result<()> {
             .map_err(|error| invalid(format!("TLS: {error}")))?;
     }
     Ok(())
+}
+
+/// The RDMA device the data channel offers, when `--rdma` asks for it. A manager that was asked
+/// for RDMA and cannot have it does not start.
+#[cfg(feature = "rdma")]
+fn rdma_device(
+    config: &crate::config::Config,
+    regions: &Arc<crate::regions::LocalRegions>,
+) -> Result<Option<Arc<dyn crate::data::channel::Rdma>>> {
+    if !config.rdma_enabled() {
+        return Ok(None);
+    }
+    let device = crate::data::ibv::Device::open(regions.clone())
+        .map_err(|error| invalid(format!("--rdma: {error}")))?;
+    Ok(Some(Arc::new(device)))
+}
+
+#[cfg(not(feature = "rdma"))]
+fn rdma_device(
+    _: &crate::config::Config,
+    _: &Arc<crate::regions::LocalRegions>,
+) -> Result<Option<Arc<dyn crate::data::channel::Rdma>>> {
+    Ok(None)
 }
 
 /// The data channel's TLS configuration: the same certificate and key as the session listener.

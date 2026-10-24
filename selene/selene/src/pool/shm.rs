@@ -118,6 +118,14 @@ impl Region {
         Ok(())
     }
 
+    pub(crate) fn base(&self) -> usize {
+        self.base
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
     /// The address of `[offset, offset + len)` if it lies inside the region.
     pub(crate) fn address(&self, offset: u64, len: u64) -> Option<usize> {
         let end = offset.checked_add(len)?;

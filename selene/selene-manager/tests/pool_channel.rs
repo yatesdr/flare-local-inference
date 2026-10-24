@@ -546,3 +546,125 @@ async fn d9_the_data_channel_needs_a_listener() {
         other => panic!("{other:?}"),
     }
 }
+
+// ---- RDMA (experimental, behind the `rdma` feature) ---------------------------------
+
+#[cfg(feature = "rdma")]
+mod over_rdma {
+    use super::*;
+    use support::rdma::{self as r, Instance};
+
+    fn rdma_net() -> Net {
+        Net::start_with(
+            |config| config.rdma = true,
+            |store| store.pool.limits.progress_timeout_ms = 600,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn r1_a_chain_is_stored_and_restored_over_rdma() {
+        let net = rdma_net();
+        let mut tcp = net.tcp().await;
+        assert!(
+            tcp.hello
+                .data_transports
+                .contains(&(v2::DataTransport::Rdma as i32))
+        );
+        let instance = Instance::new();
+        let mut writer = open(&mut tcp, "writer").await;
+        let tokens = [1024u64, 2048];
+        let mut parent: Option<Key> = None;
+        for (index, token) in tokens.iter().enumerate() {
+            let record = key(*token);
+            match r::put_record(
+                &instance,
+                &mut writer,
+                1 + index as u64,
+                record,
+                parent,
+                Damage::default(),
+            )
+            .await
+            {
+                PutResult::Stored(bytes) => assert!(bytes > 0),
+                other => panic!("{other:?}"),
+            }
+            parent = Some(record);
+        }
+        let mut reader = open(&mut tcp, "reader").await;
+        let candidate = reader.manager_candidate(1, 2048).await;
+        reader.claim(data_claim(&reader, 1, &candidate, 0)).await;
+        let granted = reader.claim_granted(1).await;
+        let reference = granted.channel.clone().unwrap();
+        assert_eq!(reference.transport, v2::DataTransport::Rdma as i32);
+        let mut dialed = instance.dial(&reference).await;
+        let (windows, ended) = instance.read_windows(&mut dialed).await;
+        assert!(ended);
+        let mut got = vec![Vec::new(); 2];
+        for received in &windows {
+            for (page, sum) in received.window.page_xxh3.iter().enumerate() {
+                let at = page * PAGE_BYTES as usize;
+                assert_eq!(
+                    *sum,
+                    pool::xxh3(&received.payload[at..at + PAGE_BYTES as usize])
+                );
+            }
+            got[received.window.shape.record as usize].extend_from_slice(&received.payload);
+        }
+        assert_eq!(got, expected(&tokens, 1, 0, true));
+        reader.copy_result(1, v2::CopyOutcome::CopyOk).await;
+        assert_eq!(
+            reader.claim_terminal(1).await.state,
+            v2::ClaimState::Copied as i32
+        );
+        reader.fence(1, v2::FenceOutcome::Drained).await;
+        assert_eq!(reader.readiness().await.quarantined_bytes, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn r2_an_instance_that_dies_mid_transfer_frees_the_manager() {
+        let net = rdma_net();
+        let mut tcp = net.tcp().await;
+        let instance = Instance::new();
+        let mut writer = open(&mut tcp, "writer").await;
+        match r::put_record(
+            &instance,
+            &mut writer,
+            1,
+            key(2048),
+            None,
+            Damage::default(),
+        )
+        .await
+        {
+            PutResult::Stored(_) => {}
+            other => panic!("{other:?}"),
+        }
+        let mut reader = open(&mut tcp, "reader").await;
+        let candidate = reader.manager_candidate(1, 2048).await;
+        reader.claim(data_claim(&reader, 1, &candidate, 0)).await;
+        let granted = reader.claim_granted(1).await;
+        // Connect, lend a slot and die before reading anything: queue pair and socket both go.
+        let dialed = instance.dial(granted.channel.as_ref().unwrap()).await;
+        drop(dialed);
+        let terminal = reader.claim_terminal(1).await;
+        assert!(
+            terminal.state == v2::ClaimState::Failed as i32
+                || terminal.state == v2::ClaimState::Expired as i32,
+            "{terminal:?}"
+        );
+        reader.fence(1, v2::FenceOutcome::Drained).await;
+        // The windows came back and the manager's regions are not quarantined: it serves again.
+        reader.claim(data_claim(&reader, 2, &candidate, 0)).await;
+        let granted = reader.claim_granted(2).await;
+        let mut dialed = instance.dial(granted.channel.as_ref().unwrap()).await;
+        let (windows, ended) = instance.read_windows(&mut dialed).await;
+        assert!(ended && !windows.is_empty());
+        reader.copy_result(2, v2::CopyOutcome::CopyOk).await;
+        assert_eq!(
+            reader.claim_terminal(2).await.state,
+            v2::ClaimState::Copied as i32
+        );
+        assert_eq!(reader.readiness().await.quarantined_bytes, 0);
+    }
+}

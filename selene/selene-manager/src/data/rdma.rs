@@ -603,6 +603,42 @@ mod tests {
     }
 
     #[test]
+    fn the_instances_handshake_is_the_same_bytes() {
+        // The instance crate encodes its end with its own type; the manager reads it with this one.
+        let theirs = flare_selene::pool::rdma::Handshake {
+            qpn: 17,
+            psn: 0x1234_5678,
+            gid: [0xab; 16],
+            lid: 0x0102,
+            rkey_arena: 0,
+            rkey_staging: 0x3333_4444,
+            arena_base: 0,
+            staging_base: 0x7f00_1000_0000,
+        };
+        let ours = Handshake::decode(&theirs.encode()).unwrap();
+        assert_eq!(
+            (
+                ours.qpn,
+                ours.psn,
+                ours.gid,
+                ours.lid,
+                ours.rkey_staging,
+                ours.staging_base
+            ),
+            (
+                17,
+                0x1234_5678,
+                [0xab; 16],
+                0x0102,
+                0x3333_4444,
+                0x7f00_1000_0000
+            )
+        );
+        assert_eq!(ours.encode(), theirs.encode());
+        assert_eq!(HANDSHAKE_BYTES, flare_selene::pool::rdma::HANDSHAKE_BYTES);
+    }
+
+    #[test]
     fn handshake_rejects_short_and_unknown_versions() {
         assert!(Handshake::decode(&[0u8; HANDSHAKE_BYTES - 1]).is_err());
         let mut bytes = handshake().encode();
