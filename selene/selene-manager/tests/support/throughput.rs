@@ -75,8 +75,11 @@ async fn benchmark(enforce: bool, profile: &Profile) {
         ("stream-nvme", 4096, scratch.clone()),
     ] {
         let base = base("bench");
+        // The fixture removes the parent of the store root when it is dropped, so the
+        // root gets a parent of its own: never a shared directory like /dev/shm.
         let mut config = Config::new(
-            root.join(format!("selene-bench-{}-{mode}", std::process::id())),
+            root.join(format!("selene-bench-{}-{mode}", std::process::id()))
+                .join("records"),
             base.join("run/m.sock"),
             memory,
             profile.nvme,
