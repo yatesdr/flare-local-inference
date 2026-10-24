@@ -61,12 +61,20 @@ impl HostRegistrar for OkRegistrar {
     }
 }
 
+/// A manager that also listens for instances on other hosts, on loopback.
+struct Network {
+    config: selene_manager::config::Config,
+    /// The certificate to trust, when the manager serves TLS.
+    ca: Option<PathBuf>,
+}
+
 struct Manager {
     socket: PathBuf,
     base: PathBuf,
     config: Config,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
+    network: Option<Network>,
 }
 
 impl Manager {
@@ -90,16 +98,72 @@ impl Manager {
             config,
             stop: Arc::new(AtomicBool::new(false)),
             thread: None,
+            network: None,
         };
         manager.run();
         manager
     }
 
+    /// A manager reached over TCP, with TLS when `tls`.
+    fn start_network(tls: bool) -> Self {
+        let mut manager = Self::start();
+        manager.stop();
+        let _ = std::fs::remove_file(&manager.socket);
+        let free = || {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let mut net = selene_manager::config::Config::defaults();
+        net.name = manager.config.name.clone();
+        net.socket = manager.socket.clone();
+        net.socket_explicit = true;
+        net.memory = 16 << 20;
+        net.listen = Some(free());
+        net.listen_data = Some(free());
+        let mut ca = None;
+        if tls {
+            let generated =
+                rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+            let (cert, key) = (
+                manager.base.join("server.pem"),
+                manager.base.join("server-key.pem"),
+            );
+            std::fs::write(&cert, generated.cert.pem()).unwrap();
+            std::fs::write(&key, generated.signing_key.serialize_pem()).unwrap();
+            net.tls_cert = Some(cert.clone());
+            net.tls_key = Some(key);
+            ca = Some(cert);
+        }
+        manager.network = Some(Network { config: net, ca });
+        manager.run();
+        manager
+    }
+
+    /// Where an instance on another host reaches the manager, and the CA it trusts.
+    fn remote(&self) -> Option<(PoolAddress, Option<PathBuf>)> {
+        let network = self.network.as_ref()?;
+        let port = network.config.listen.unwrap().port();
+        let host = if network.ca.is_some() {
+            "localhost"
+        } else {
+            "127.0.0.1"
+        };
+        Some((
+            PoolAddress::Tcp(format!("{host}:{port}")),
+            network.ca.clone(),
+        ))
+    }
+
     fn run(&mut self) {
         self.stop.store(false, Ordering::Release);
         let (config, stop) = (self.config.clone(), self.stop.clone());
+        let network = self.network.as_ref().map(|n| n.config.clone());
         self.thread = Some(thread::spawn(move || {
-            if let Err(error) = control::run(config, stop) {
+            let result = match network {
+                Some(net) => control::serve(net, config, stop),
+                None => control::run(config, stop),
+            };
+            if let Err(error) = result {
                 eprintln!("manager exited: {error}");
             }
         }));
@@ -107,6 +171,13 @@ impl Manager {
         while !self.socket.exists() {
             assert!(Instant::now() < deadline, "the manager did not start");
             thread::sleep(Duration::from_millis(5));
+        }
+        if let Some((PoolAddress::Tcp(address), _)) = self.remote() {
+            let port = address.rsplit_once(':').unwrap().1.to_string();
+            while std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_err() {
+                assert!(Instant::now() < deadline, "the manager did not listen");
+                thread::sleep(Duration::from_millis(5));
+            }
         }
     }
 
@@ -138,10 +209,13 @@ fn geo() -> Vec<crate::CacheGeometry> {
 
 fn config(manager: &Manager, name: &str, gpu: u8) -> PoolConfig {
     let geometry = geo();
+    let (address, ca) = manager
+        .remote()
+        .unwrap_or_else(|| (PoolAddress::Unix(manager.socket.clone()), None));
     PoolConfig {
-        address: PoolAddress::Unix(manager.socket.clone()),
+        address,
         tenant: "t".into(),
-        ca: None,
+        ca,
         scope: Scope::new("t", [7; 32], fingerprint(&geometry), &geometry).unwrap(),
         instance_name: name.into(),
         gpu_uuids: vec![[gpu; 16]],
@@ -1074,4 +1148,139 @@ fn a_record_cascades_from_memory_to_the_disk_tier_to_the_manager_store() {
     crate::HostStore::close(&mut store).unwrap();
     drop(store);
     let _ = std::fs::remove_dir_all(&directory);
+}
+
+// ---- instances on other hosts: the data channel ---------------------------------
+
+/// Put a record through `writer`, restore it through `requester`, and check the level
+/// the lookup gave it.
+fn put_then_restore(manager: &Manager) {
+    let mut writer = instance(manager, "writer", 1);
+    let mut requester = instance(manager, "requester", 2);
+    writer.ready();
+    requester.ready();
+    // Neither instance has shared memory with the manager: no neighbour is offered.
+    let history = history();
+    let (request, _) = put_request(&history, 5);
+    writer.client.put(request).unwrap();
+    let outcome = writer.event("the put", |e| match e {
+        PoolEvent::Put { outcome, .. } => Some(format!("{outcome:?}")),
+        _ => None,
+    });
+    assert!(outcome.starts_with("Stored"), "{outcome}");
+    let scratch = [200, 201, 202, 203, 204];
+    let fetch = fetch_for(&mut requester, &history, 5, &scratch);
+    assert_eq!(
+        fetch.parts[0].candidate.plan.level,
+        crate::characterize::Level::RemoteNvme,
+        "a manager on another host is the remote level"
+    );
+    requester.client.fetch(fetch).unwrap();
+    let result = requester.event("the restore", |e| match e {
+        PoolEvent::Fetched { result, .. } => {
+            Some(result.as_ref().map(|b| *b).map_err(|f| f.error.to_string()))
+        }
+        _ => None,
+    });
+    assert_eq!(result, Ok((5 * PAGE + ROW) as u64));
+    let gpu = requester.gpu.pages.lock().unwrap();
+    for page in 0..5 {
+        assert_eq!(gpu[&scratch[page]], expected_page(page), "page {page}");
+    }
+    assert_eq!(
+        requester.gpu.rows.lock().unwrap()[&9],
+        (5 * PAGE..5 * PAGE + ROW)
+            .map(|i| (i * 13 + 5) as u8)
+            .collect::<Vec<u8>>()
+    );
+    drop(gpu);
+    // The same record again is a successful deduplication, and a second restore works.
+    let (request, _) = put_request(&history, 5);
+    writer.client.put(request).unwrap();
+    let outcome = writer.event("the second put", |e| match e {
+        PoolEvent::Put { outcome, .. } => Some(format!("{outcome:?}")),
+        _ => None,
+    });
+    assert_eq!(outcome, "Present");
+    restore(&mut requester, &history, 5, &[300, 301, 302, 303, 304]);
+    writer.client.close().unwrap();
+    requester.client.close().unwrap();
+}
+
+#[test]
+fn a_record_put_into_a_manager_on_another_host_is_restored_over_tcp() {
+    let manager = Manager::start_network(false);
+    put_then_restore(&manager);
+}
+
+#[test]
+fn a_record_put_into_a_manager_on_another_host_is_restored_over_tls() {
+    let manager = Manager::start_network(true);
+    put_then_restore(&manager);
+}
+
+#[test]
+fn the_remote_level_is_timed_by_the_probe_through_a_real_claim() {
+    let manager = Manager::start_network(false);
+    let (copier, _gpu) = SimulatedGpu::shared(&geo()).unwrap();
+    let mut store = PooledStore::connect(
+        NoStore,
+        config(&manager, "probe", 1),
+        copier,
+        Arc::new(OkRegistrar),
+    )
+    .unwrap();
+    wait("Ready", || store.pool().status() == PoolStatus::Ready);
+    let scratch = Scratch {
+        pages: (0..64).map(PageId).collect(),
+        slot: StateSlotId(0),
+    };
+    assert!(store.needs_characterization());
+    let line = store.characterize(&scratch).unwrap().expect("measured");
+    let ranking = store.pool().ranking();
+    assert!(
+        ranking
+            .us_per_page(crate::characterize::Level::RemoteNvme)
+            .is_some(),
+        "the manager's records are the remote level: {line}"
+    );
+    assert!(
+        ranking
+            .us_per_page(crate::characterize::Level::HostDram)
+            .is_none(),
+        "a manager on another host serves no same-host level: {line}"
+    );
+    assert!(!store.needs_characterization());
+    crate::HostStore::close(&mut store).unwrap();
+}
+
+#[test]
+fn instances_on_other_hosts_come_back_and_copy_after_the_manager_restarts() {
+    let mut manager = Manager::start_network(false);
+    let mut writer = instance(&manager, "writer", 1);
+    writer.ready();
+    let history = history();
+    let (request, _) = put_request(&history, 3);
+    writer.client.put(request).unwrap();
+    writer.event("the put", |e| match e {
+        PoolEvent::Put { outcome, .. } => Some(format!("{outcome:?}")),
+        _ => None,
+    });
+    manager.restart();
+    wait("the instance to reconnect", || {
+        writer.client.status() == PoolStatus::Ready
+    });
+    // The restarted manager starts empty: the put works again, and a second instance restores it.
+    let (request, _) = put_request(&history, 3);
+    writer.client.put(request).unwrap();
+    let outcome = writer.event("the put after the restart", |e| match e {
+        PoolEvent::Put { outcome, .. } => Some(format!("{outcome:?}")),
+        _ => None,
+    });
+    assert!(outcome.starts_with("Stored"), "{outcome}");
+    let mut requester = instance(&manager, "requester", 2);
+    requester.ready();
+    restore(&mut requester, &history, 3, &[400, 401, 402]);
+    writer.client.close().unwrap();
+    requester.client.close().unwrap();
 }

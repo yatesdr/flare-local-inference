@@ -395,6 +395,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_close_between_frames_is_an_end_and_a_close_inside_one_is_not() {
+        let mut empty: &[u8] = &[];
+        assert_eq!(ToInstance::read_or_end(&mut empty, 64).await.unwrap(), None);
+        let bytes = ToInstance::End.encode();
+        let mut reader = &bytes[..];
+        assert_eq!(
+            ToInstance::read_or_end(&mut reader, 64).await.unwrap(),
+            Some(ToInstance::End)
+        );
+        let cut = ToInstance::Grant(shape()).encode();
+        let mut reader = &cut[..5];
+        assert!(ToInstance::read_or_end(&mut reader, 64).await.is_err());
+    }
+
+    #[tokio::test]
     async fn hostile_frames_are_refused_without_allocating_what_they_claim() {
         // More pages than the reader allows.
         let mut bytes = ToInstance::Window(Window {
