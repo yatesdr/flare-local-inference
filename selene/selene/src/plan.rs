@@ -522,7 +522,7 @@ mod tests {
     fn a_candidate_starting_above_the_resident_prefix_is_a_hole() {
         let f = Fixture::new();
         let late = f.candidate(HostDram, 1, 800, 50, &[1600], 0);
-        assert!(f.plan(0, &[late.clone()]).is_none());
+        assert!(f.plan(0, std::slice::from_ref(&late)).is_none());
         // Nothing at all is a miss too.
         assert!(f.plan(0, &[]).is_none());
         // A hole after A leaves A alone, with its own row.
