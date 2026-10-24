@@ -5,6 +5,7 @@
 //! or allocation.
 
 mod announce;
+mod cascade;
 mod client;
 mod codec;
 mod conn;

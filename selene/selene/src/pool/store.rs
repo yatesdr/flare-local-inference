@@ -29,6 +29,7 @@ use crate::{
 
 use super::{
     announce::{Announcer, IndexEntry},
+    cascade::Cascade,
     client::PoolClient,
     exporter::HostPin,
     lookup::{LookupState, LookupTicket},
@@ -55,6 +56,8 @@ pub trait PoolPort {
     fn host_pinned(&mut self, export: ExportId, pin: Box<dyn HostPin>);
     fn export_pinned(&mut self, export: ExportId, chain: ExportChain);
     fn export_refused(&mut self, export: ExportId, reason: ExportRefusal);
+    /// Whether a put can be accepted now: the session is open and the manager ready.
+    fn ready(&self) -> bool;
     fn close(&mut self) -> Result<()>;
 }
 
@@ -103,6 +106,9 @@ impl PoolPort for PoolClient {
     }
     fn export_refused(&mut self, export: ExportId, reason: ExportRefusal) {
         PoolClient::export_refused(self, export, reason)
+    }
+    fn ready(&self) -> bool {
+        PoolClient::status(self) == super::shared::PoolStatus::Ready
     }
     fn close(&mut self) -> Result<()> {
         PoolClient::close(self)
@@ -183,6 +189,8 @@ pub struct PooledStore<S: HostStore, P: PoolPort = PoolClient> {
     pool_events: Vec<PoolEvent>,
     /// How the puts started through this store ended, until collected.
     puts: Vec<(u64, PutOutcome)>,
+    /// Moves of the last local tier's records to the manager.
+    cascade: Cascade,
     characterizer: Option<Characterizer>,
     characterized_for: Option<crate::characterize::Topology>,
     model: [u8; 32],
@@ -214,6 +222,7 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
     pub fn new(mut inner: S, pool: P, identity: Identity, layout: &crate::Layout) -> Self {
         let identity_model = identity.model;
         inner.announce_to(pool.announcer());
+        inner.cascade();
         Self {
             inner,
             pool,
@@ -228,6 +237,7 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             inner_events: Vec::new(),
             pool_events: Vec::new(),
             puts: Vec::new(),
+            cascade: Cascade::new(layout),
             characterizer: Characterizer::new(PROBE_PAGES, None).ok(),
             characterized_for: None,
             model: identity_model,
@@ -744,11 +754,16 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
                     events.push(StoreEvent::ExportEnded { export })
                 }
                 PoolEvent::Fetched { id, result } => self.pool_finished(id, result, events),
-                PoolEvent::Put { id, outcome } => self.puts.push((id, outcome)),
+                PoolEvent::Put { id, outcome } => {
+                    if !self.cascade.ended(&mut self.inner, id, &outcome) {
+                        self.puts.push((id, outcome));
+                    }
+                }
                 PoolEvent::Status(_) => {}
             }
         }
         self.pool_events = pool_events;
+        self.cascade.pump(&mut self.inner, &mut self.pool);
         inner?;
         pool
     }
@@ -810,9 +825,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        CheckpointId, Layout, PageId, StateSlotId,
+        CheckpointId, Layout, PageId, Retirement, Retiring, StateSlotId,
         characterize::Ranking,
-        pool::{Answer, shared::FetchFailure},
+        pool::{
+            Answer,
+            shared::{FetchFailure, PutRefusal, PutSource},
+        },
         testing::{TestHistory, geometry},
     };
 
@@ -851,6 +869,12 @@ mod tests {
         announced: bool,
         /// Microseconds per page this store's own `tier` takes to restore.
         probe: Option<(Local, u64)>,
+        /// What the last local tier offers for a move, coldest first.
+        retiring: Vec<Retiring>,
+        /// How each offered record's move ended, in order.
+        retired: Vec<(PrefixKey, Retirement)>,
+        spill: Option<bool>,
+        cascaded: bool,
     }
 
     #[derive(Clone, Default)]
@@ -889,6 +913,18 @@ mod tests {
         fn announce_to(&mut self, _: Announcer) {
             self.0.lock().unwrap().announced = true;
         }
+        fn cascade(&mut self) {
+            self.0.lock().unwrap().cascaded = true;
+        }
+        fn set_spill(&mut self, enabled: bool) {
+            self.0.lock().unwrap().spill = Some(enabled);
+        }
+        fn take_retiring(&mut self) -> Vec<Retiring> {
+            std::mem::take(&mut self.0.lock().unwrap().retiring)
+        }
+        fn retired(&mut self, key: PrefixKey, _: Tier, how: Retirement) {
+            self.0.lock().unwrap().retired.push((key, how));
+        }
         fn probe(
             &mut self,
             tier: Local,
@@ -924,7 +960,19 @@ mod tests {
     struct NoPin(PrefixKey);
     impl HostPin for NoPin {
         fn chain(&self) -> &crate::pool::HostChain {
-            unreachable!("the fake pool never reads it {:?}", self.0)
+            // The chain a put asks the pin for: a single record of 10 pages.
+            static CHAIN: std::sync::OnceLock<crate::pool::HostChain> = std::sync::OnceLock::new();
+            CHAIN.get_or_init(|| crate::pool::HostChain {
+                records: vec![crate::pool::HostRecord {
+                    key: self.0,
+                    generation: 1,
+                    first_page: 0,
+                    pages: 10,
+                    row: true,
+                }],
+                total_pages: 10,
+                row: true,
+            })
         }
         fn read(
             &mut self,
@@ -951,6 +999,11 @@ mod tests {
         saved: Vec<IndexEntry>,
         evicted: Vec<(PrefixKey, Tier, u64, Option<IndexEntry>)>,
         lost: usize,
+        ready: bool,
+        /// Puts accepted, by id; the test ends them with a [`PoolEvent::Put`].
+        puts: Vec<(u64, PutRequest)>,
+        /// Refuse every put as a pool whose command queue is full does.
+        put_error: bool,
     }
 
     #[derive(Clone)]
@@ -1042,9 +1095,16 @@ mod tests {
         fn put(&mut self, request: PutRequest) -> Result<u64> {
             let mut state = self.0.lock().unwrap();
             if state.manager_level.is_none() {
-                return Err("the fake pool takes no puts".into());
+                if !state.ready {
+                    return Err("the fake pool takes no puts".into());
+                }
+                if state.put_error {
+                    return Err("the pool's command queue is full".into());
+                }
+                let id = state.puts.len() as u64 + 1;
+                state.puts.push((id, request));
+                return Ok(id);
             }
-            let _ = request;
             let id = 77;
             state.events.push(PoolEvent::Put {
                 id,
@@ -1062,6 +1122,9 @@ mod tests {
         fn export_pinned(&mut self, _: ExportId, _: ExportChain) {}
         fn export_refused(&mut self, export: ExportId, reason: ExportRefusal) {
             self.0.lock().unwrap().refused.push((export, reason));
+        }
+        fn ready(&self) -> bool {
+            self.0.lock().unwrap().ready
         }
         fn close(&mut self) -> Result<()> {
             Ok(())
@@ -1722,5 +1785,280 @@ mod tests {
         let mut bare = rig();
         let line = bare.store.characterize(&scratch()).unwrap().unwrap();
         assert!(line.contains("default order"), "{line}");
+    }
+
+    // ---- the eviction cascade ----
+
+    impl Rig {
+        fn retiring(&self, page: u64) -> Retiring {
+            Retiring {
+                tier: Tier::Nvme,
+                key: self.key(page * PT),
+                generation: page,
+                parent: (page > 1).then(|| self.key((page - 1) * PT)),
+                bucket: [page as u8; 16],
+                tail_pages: 1,
+                row: true,
+            }
+        }
+
+        fn offer(&self, records: &[Retiring]) {
+            self.local
+                .0
+                .lock()
+                .unwrap()
+                .retiring
+                .extend(records.iter().cloned());
+        }
+
+        fn ready(&self, ready: bool) {
+            self.pool.lock().unwrap().ready = ready;
+        }
+
+        /// The ids of the puts started and not yet answered, with their keys.
+        fn started(&self) -> Vec<(u64, PrefixKey)> {
+            self.pool
+                .lock()
+                .unwrap()
+                .puts
+                .iter()
+                .map(|(id, request)| (*id, request.key))
+                .collect()
+        }
+
+        fn end(&self, id: u64, outcome: PutOutcome) {
+            self.pool
+                .lock()
+                .unwrap()
+                .events
+                .push(PoolEvent::Put { id, outcome });
+        }
+
+        fn retired(&self) -> Vec<(PrefixKey, Retirement)> {
+            std::mem::take(&mut self.local.0.lock().unwrap().retired)
+        }
+    }
+
+    #[test]
+    fn a_retiring_record_is_put_and_released_only_when_the_manager_commits_it() {
+        let mut rig = rig();
+        assert!(rig.local.0.lock().unwrap().cascaded);
+        rig.ready(true);
+        let record = rig.retiring(5);
+        rig.offer(std::slice::from_ref(&record));
+        rig.poll();
+        assert_eq!(rig.local.0.lock().unwrap().spill, Some(true));
+        // The put describes the record and its pinned chain.
+        {
+            let state = rig.pool.lock().unwrap();
+            let [(_, request)] = &state.puts[..] else {
+                panic!("one put expected");
+            };
+            assert_eq!(
+                (request.key, request.parent, request.bucket),
+                (record.key, record.parent, record.bucket)
+            );
+            assert_eq!(
+                (request.chain_pages, request.tail_pages, request.row),
+                (10, 1, true)
+            );
+            assert_eq!(request.generation, 5);
+            assert!(matches!(request.source, PutSource::Host(_)));
+        }
+        assert_eq!(
+            rig.local.0.lock().unwrap().pinned,
+            [(Tier::Nvme, record.key)]
+        );
+        // Until the manager answers, the source keeps the record.
+        rig.poll();
+        assert!(rig.retired().is_empty());
+        let (id, _) = rig.started()[0];
+        rig.end(id, PutOutcome::Stored { bytes: 1 });
+        rig.poll();
+        assert_eq!(rig.retired(), [(record.key, Retirement::Moved)]);
+    }
+
+    #[test]
+    fn a_record_the_manager_already_holds_is_released_without_another_copy() {
+        let mut rig = rig();
+        rig.ready(true);
+        let record = rig.retiring(3);
+        rig.offer(std::slice::from_ref(&record));
+        rig.poll();
+        let (id, _) = rig.started()[0];
+        rig.end(id, PutOutcome::Present);
+        rig.poll();
+        assert_eq!(rig.retired(), [(record.key, Retirement::Moved)]);
+    }
+
+    #[test]
+    fn a_refusal_for_room_or_readiness_drops_the_record_at_once_and_is_not_retried() {
+        for refusal in [
+            PutRefusal::Budget,
+            PutRefusal::Queue,
+            PutRefusal::NotReady,
+            PutRefusal::Quota,
+            PutRefusal::Oversize,
+        ] {
+            let mut rig = rig();
+            rig.ready(true);
+            let record = rig.retiring(4);
+            rig.offer(std::slice::from_ref(&record));
+            rig.poll();
+            let (id, _) = rig.started()[0];
+            rig.end(id, PutOutcome::Refused(refusal));
+            rig.poll();
+            assert_eq!(rig.retired(), [(record.key, Retirement::Dropped)]);
+            rig.poll();
+            assert_eq!(rig.started().len(), 1, "{refusal:?} is not retried");
+        }
+    }
+
+    #[test]
+    fn a_failed_write_keeps_the_record_for_one_more_try_and_the_second_failure_drops_it() {
+        for failure in [
+            PutOutcome::Failed("the session was lost".into()),
+            PutOutcome::Cancelled,
+            PutOutcome::Refused(PutRefusal::Io),
+            PutOutcome::Refused(PutRefusal::Invalid),
+            PutOutcome::Refused(PutRefusal::Inflight),
+        ] {
+            let mut rig = rig();
+            rig.ready(true);
+            let record = rig.retiring(6);
+            rig.offer(std::slice::from_ref(&record));
+            rig.poll();
+            rig.end(rig.started()[0].0, failure);
+            rig.poll();
+            assert_eq!(rig.retired(), [(record.key, Retirement::Failed)]);
+            // The tier offers it again at its next pass.
+            rig.offer(std::slice::from_ref(&record));
+            rig.poll();
+            let started = rig.started();
+            assert_eq!(started.len(), 2);
+            rig.end(started[1].0, PutOutcome::Failed("again".into()));
+            rig.poll();
+            assert_eq!(rig.retired(), [(record.key, Retirement::Dropped)]);
+        }
+        // A success in between clears the count.
+        let mut rig = rig();
+        rig.ready(true);
+        let record = rig.retiring(6);
+        rig.offer(std::slice::from_ref(&record));
+        rig.poll();
+        rig.end(rig.started()[0].0, PutOutcome::Cancelled);
+        rig.poll();
+        rig.offer(std::slice::from_ref(&record));
+        rig.poll();
+        rig.end(rig.started()[1].0, PutOutcome::Present);
+        rig.poll();
+        rig.offer(std::slice::from_ref(&record));
+        rig.poll();
+        rig.end(rig.started()[2].0, PutOutcome::Cancelled);
+        rig.poll();
+        assert_eq!(
+            rig.retired(),
+            [
+                (record.key, Retirement::Failed),
+                (record.key, Retirement::Moved),
+                (record.key, Retirement::Failed)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_source_that_cannot_be_pinned_counts_as_a_failed_write() {
+        let mut rig = rig();
+        rig.ready(true);
+        rig.local.0.lock().unwrap().refuse_pin = Some(ExportRefusal::ChainGap);
+        let record = rig.retiring(2);
+        for expected in [Retirement::Failed, Retirement::Dropped] {
+            rig.offer(std::slice::from_ref(&record));
+            rig.poll();
+            assert_eq!(rig.retired(), [(record.key, expected)]);
+        }
+        assert!(rig.started().is_empty());
+    }
+
+    #[test]
+    fn an_unavailable_manager_passes_records_on_at_once_and_the_tier_stops_spilling() {
+        let mut rig = rig();
+        // Not ready: nothing is put, and every offered record is dropped.
+        let records: Vec<_> = (1..=3).map(|n| rig.retiring(n)).collect();
+        rig.offer(&records);
+        rig.poll();
+        assert_eq!(rig.local.0.lock().unwrap().spill, Some(false));
+        assert!(rig.started().is_empty());
+        assert_eq!(
+            rig.retired(),
+            records
+                .iter()
+                .map(|r| (r.key, Retirement::Dropped))
+                .collect::<Vec<_>>()
+        );
+        // A pool whose command queue refuses the put does the same.
+        rig.ready(true);
+        rig.pool.lock().unwrap().put_error = true;
+        rig.offer(&records[..1]);
+        rig.poll();
+        assert_eq!(rig.retired(), [(records[0].key, Retirement::Dropped)]);
+        assert_eq!(rig.local.0.lock().unwrap().spill, Some(true));
+        // A manager that goes away while records wait drops them too.
+        rig.pool.lock().unwrap().put_error = false;
+        let many: Vec<_> = (1..=10).map(|n| rig.retiring(n)).collect();
+        rig.offer(&many);
+        rig.poll();
+        assert_eq!(rig.started().len(), 4);
+        rig.ready(false);
+        rig.poll();
+        assert_eq!(rig.retired().len(), 6);
+    }
+
+    #[test]
+    fn a_full_queue_drops_the_coldest_waiting_records_and_never_blocks() {
+        use super::super::cascade::{MOVES_MAX, PENDING_MAX};
+        let mut rig = rig();
+        rig.ready(true);
+        let total = MOVES_MAX + PENDING_MAX + 3;
+        let records: Vec<_> = (1..=total as u64).map(|n| rig.retiring(n)).collect();
+        rig.offer(&records);
+        rig.poll();
+        // The coldest four were started; of those left waiting, the three
+        // that overflowed the queue were the coldest.
+        assert_eq!(
+            rig.started()
+                .iter()
+                .map(|(_, key)| *key)
+                .collect::<Vec<_>>(),
+            records[..MOVES_MAX]
+                .iter()
+                .map(|r| r.key)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rig.retired(),
+            records[MOVES_MAX..MOVES_MAX + 3]
+                .iter()
+                .map(|r| (r.key, Retirement::Dropped))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(rig.store.cascade.in_progress(), MOVES_MAX + PENDING_MAX);
+        // As moves end, the waiting records start in order.
+        let first = rig.started()[0];
+        rig.end(first.0, PutOutcome::Stored { bytes: 1 });
+        rig.poll();
+        assert_eq!(rig.started().len(), MOVES_MAX + 1);
+        assert_eq!(rig.started()[MOVES_MAX].1, records[MOVES_MAX + 3].key);
+    }
+
+    #[test]
+    fn puts_the_cascade_did_not_start_are_left_for_their_owner() {
+        let mut rig = rig();
+        rig.ready(true);
+        rig.end(900, PutOutcome::Present);
+        rig.poll();
+        let puts = rig.store.take_puts();
+        assert!(matches!(puts.as_slice(), [(900, PutOutcome::Present)]));
+        assert!(rig.retired().is_empty());
     }
 }
