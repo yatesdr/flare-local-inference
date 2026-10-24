@@ -93,6 +93,18 @@ impl LookupTicket {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl LookupTicket {
+    /// A ticket in `state` that runs `withdraw` when it is dropped, for tests of
+    /// the code that holds tickets.
+    pub fn watched(state: LookupState, withdraw: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            inner: TicketInner::new(state),
+            withdraw: Some(Box::new(withdraw)),
+        }
+    }
+}
+
 impl Drop for LookupTicket {
     fn drop(&mut self) {
         if let Some(withdraw) = self.withdraw.take() {
