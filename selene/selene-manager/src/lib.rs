@@ -11,6 +11,7 @@ pub mod peer;
 pub mod peer_client;
 pub mod peer_runtime;
 pub mod placement;
+pub mod pool;
 pub mod proto;
 pub mod record;
 pub mod regions;

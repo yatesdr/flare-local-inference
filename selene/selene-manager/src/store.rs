@@ -42,6 +42,7 @@ pub struct Config {
     pub remote_catalog_entries: usize,
     /// Keep a fetched remote record after the Get completes.
     pub retain_remote: bool,
+    pub pool: crate::pool::limits::PoolSettings,
 }
 
 impl Config {
@@ -59,6 +60,7 @@ impl Config {
             max_window_bytes: DEFAULT_MAX_WINDOW,
             remote_catalog_entries: DEFAULT_REMOTE_CATALOG,
             retain_remote: true,
+            pool: Default::default(),
         }
     }
 
@@ -76,6 +78,7 @@ impl Config {
             max_window_bytes: DEFAULT_MAX_WINDOW,
             remote_catalog_entries: DEFAULT_REMOTE_CATALOG,
             retain_remote: true,
+            pool: Default::default(),
         }
     }
 }
@@ -928,6 +931,26 @@ impl Store {
     pub fn config(&self) -> &Config {
         &self.config
     }
+    /// What the pool service needs from the store: the shared region files, a handle on the
+    /// staging region, and how many records recovery found.
+    pub fn pool_view(&self) -> (crate::proto::v2::SharedMemory, crate::arena::Arena, u64) {
+        let records = self
+            .namespaces
+            .values()
+            .map(|namespace| namespace.tree.len() as u64)
+            .sum();
+        (
+            crate::proto::v2::SharedMemory {
+                arena_path: self.local.arena_path().display().to_string(),
+                arena_bytes: self.local.arena_size(),
+                staging_path: self.local.staging_path().display().to_string(),
+                staging_bytes: self.local.staging_size(),
+            },
+            self.local.staging(),
+            records,
+        )
+    }
+
     pub fn shm_directory(&self) -> PathBuf {
         self.local.directory().to_path_buf()
     }

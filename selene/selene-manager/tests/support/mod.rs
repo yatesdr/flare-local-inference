@@ -32,6 +32,8 @@ use tonic::{
     transport::{Channel, Endpoint, Uri},
 };
 
+pub mod pool;
+
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 static HOST_BUSY: AtomicBool = AtomicBool::new(false);
 

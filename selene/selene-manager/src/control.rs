@@ -55,6 +55,8 @@ type GetStream =
 #[derive(Clone)]
 pub struct PeerInfo {
     pub connection: u64,
+    /// A Unix-domain connection, whose credentials are the kernel's.
+    pub unix: bool,
     pub pid: u32,
     pub uid: u32,
     pub gid: u32,
@@ -1701,6 +1703,7 @@ pub fn store_config(config: &crate::config::Config) -> Result<Config> {
         remote_catalog_entries: usize::try_from(config.remote_catalog_entries)
             .unwrap_or(usize::MAX),
         retain_remote: config.retain_remote,
+        pool: Default::default(),
     })
 }
 
@@ -1784,6 +1787,8 @@ pub fn run_peer(
     // Validate TLS before anything is started or accepted: a certificate error must not
     // leave an accepting data listener behind.
     validate_tls(&config)?;
+    let pool_settings = store_config.pool.clone();
+    let pool_root = store_config.root.clone();
     let store = Store::open(store_config)?;
     let regions = Arc::new(store.regions());
     let grants = Arc::new(SharedGrants::default());
@@ -1816,6 +1821,26 @@ pub fn run_peer(
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
         ))
     })?;
+    // The pool actor runs on the runtime; its sessions arrive through the gRPC service.
+    let (shm, staging_arena, recovered_records) = store.pool_view();
+    let pool_config = crate::pool::PoolConfig {
+        limits: pool_settings.limits.clone(),
+        reply_retention: pool_settings.reply_retention,
+        source_wait: pool_settings.source_wait,
+        instance_retention: pool_settings.instance_retention,
+        store_directory: pool_root,
+        encryption: if config.tls_cert.is_some() {
+            crate::proto::v2::Encryption::Tls
+        } else {
+            crate::proto::v2::Encryption::Plaintext
+        },
+        transports: pool_transports(&config),
+        data_address: None,
+    };
+    let (pool_core, pool_handle, pool_events) =
+        crate::pool::Core::new(pool_config, shm, staging_arena, true, recovered_records);
+    let pool_service = crate::pool::PoolService::new(pool_handle.clone());
+    let pool_task = runtime.spawn(pool_core.run(pool_events));
     // Bind every listener before any thread starts, so a startup failure leaves no threads
     // and no locks behind; the guard below also removes the socket it creates.
     let metrics_text = Arc::new(Mutex::new(String::new()));
@@ -2034,6 +2059,7 @@ pub fn run_peer(
                 _slot: ConnectionSlot(connections.clone()),
                 info: PeerInfo {
                     connection,
+                    unix: true,
                     pid: credentials.pid().unwrap_or(0) as u32,
                     uid,
                     gid,
@@ -2053,7 +2079,12 @@ pub fn run_peer(
             )
             .add_service(crate::proto::admin_server::AdminServer::new(
                 crate::admin::AdminService::new(admin_backend.clone()),
-            ));
+            ))
+            .add_service(
+                crate::proto::v2::pool_server::PoolServer::new(pool_service.clone())
+                    .max_decoding_message_size(MAX_MESSAGE)
+                    .max_encoding_message_size(MAX_MESSAGE),
+            );
         let peer_task = match peer_listener {
             Some(listener) => {
                 let listener = tokio::net::TcpListener::from_std(listener)?;
@@ -2064,6 +2095,7 @@ pub fn run_peer(
                         inner: stream,
                         info: PeerInfo {
                             connection,
+                            unix: false,
                             pid: 0,
                             uid: 0,
                             gid: 0,
@@ -2076,6 +2108,7 @@ pub fn run_peer(
                     })
                 });
                 let service = service.clone();
+                let peer_pool_service = pool_service.clone();
                 let mut builder = Server::builder()
                     .http2_keepalive_interval(Some(Duration::from_secs(10)))
                     .http2_keepalive_timeout(Some(Duration::from_secs(20)));
@@ -2089,6 +2122,11 @@ pub fn run_peer(
                     let server = builder
                         .add_service(
                             PeerCacheServer::new(service)
+                                .max_decoding_message_size(MAX_MESSAGE)
+                                .max_encoding_message_size(MAX_MESSAGE),
+                        )
+                        .add_service(
+                            crate::proto::v2::pool_server::PoolServer::new(peer_pool_service)
                                 .max_decoding_message_size(MAX_MESSAGE)
                                 .max_encoding_message_size(MAX_MESSAGE),
                         )
@@ -2148,6 +2186,16 @@ pub fn run_peer(
         // A local-server error must not leave the TCP listeners waiting for a stop that no
         // signal will set.
         final_stop.store(true, Ordering::Release);
+        let (done, finished) = oneshot::channel();
+        if pool_handle
+            .events
+            .send(crate::pool::core::Event::Shutdown { done })
+            .await
+            .is_ok()
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(5), finished).await;
+        }
+        pool_task.abort();
         if let Some(task) = peer_task {
             let _ = task.await;
         }
@@ -2184,6 +2232,15 @@ fn server_tls(config: &crate::config::Config) -> Result<Option<tonic::transport:
             ))
             .client_ca_root(tonic::transport::Certificate::from_pem(fs::read(ca)?)),
     ))
+}
+
+fn pool_transports(config: &crate::config::Config) -> Vec<crate::proto::v2::DataTransport> {
+    use crate::proto::v2::DataTransport;
+    let mut transports = vec![DataTransport::Tcp];
+    if config.rdma_enabled() {
+        transports.push(DataTransport::Rdma);
+    }
+    transports
 }
 
 fn random_token() -> Result<[u8; 32]> {
