@@ -182,8 +182,13 @@ impl Manager {
         } else {
             "127.0.0.1"
         };
+        let address = format!("{host}:{port}");
         Some((
-            PoolAddress::Tcp(format!("{host}:{port}")),
+            if network.ca.is_some() {
+                PoolAddress::Tcp(address)
+            } else {
+                PoolAddress::TcpPlaintext(address)
+            },
             network.ca.clone(),
         ))
     }
@@ -206,7 +211,9 @@ impl Manager {
             assert!(Instant::now() < deadline, "the manager did not start");
             thread::sleep(Duration::from_millis(5));
         }
-        if let Some((PoolAddress::Tcp(address), _)) = self.remote() {
+        if let Some((PoolAddress::Tcp(address) | PoolAddress::TcpPlaintext(address), _)) =
+            self.remote()
+        {
             let port = address.rsplit_once(':').unwrap().1.to_string();
             while std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_err() {
                 assert!(Instant::now() < deadline, "the manager did not listen");

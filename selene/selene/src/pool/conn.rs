@@ -29,6 +29,8 @@ use super::{
 pub(crate) struct Link {
     pub address: PoolAddress,
     pub ca: Option<std::path::PathBuf>,
+    /// Where the trusted certificates come from when there is no CA file.
+    pub roots: net::Roots,
     pub wake: Arc<Notify>,
     pub stop: Arc<AtomicBool>,
 }
@@ -219,7 +221,94 @@ async fn shutdown(engine: &mut Engine, link: &Link) -> Result<()> {
     }
 }
 
-async fn connect(link: &Link) -> std::result::Result<(Channel, wire::Encryption), String> {
+/// Why the manager could not be reached.
+enum Unreachable {
+    /// Possibly for now.
+    Retry(String),
+    /// For as long as this process runs: its certificate cannot be verified.
+    Untrusted(String),
+}
+
+impl From<String> for Unreachable {
+    fn from(why: String) -> Self {
+        Unreachable::Retry(why)
+    }
+}
+
+/// The failure of a TLS handshake in a connection error's causes, if that is what failed.
+fn tls_failure(error: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = cause {
+        let found = current.downcast_ref::<rustls::Error>().or_else(|| {
+            current
+                .downcast_ref::<std::io::Error>()
+                .and_then(|io| io.get_ref())
+                .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        });
+        if let Some(found) = found {
+            return Some(match found {
+                rustls::Error::InvalidCertificate(why) => {
+                    use rustls::CertificateError as Cert;
+                    match why {
+                        Cert::UnknownIssuer => {
+                            "the manager's certificate was issued by a CA that is not trusted"
+                                .to_string()
+                        }
+                        Cert::BadSignature => {
+                            "the manager's certificate was not signed by a trusted CA".to_string()
+                        }
+                        Cert::Expired | Cert::ExpiredContext { .. } => {
+                            "the manager's certificate has expired".to_string()
+                        }
+                        Cert::NotValidYet | Cert::NotValidYetContext { .. } => {
+                            "the manager's certificate is not valid yet".to_string()
+                        }
+                        Cert::NotValidForName | Cert::NotValidForNameContext { .. } => {
+                            "the manager's certificate is not valid for the name it was reached by"
+                                .to_string()
+                        }
+                        other => format!("the manager's certificate is not valid: {other:?}"),
+                    }
+                }
+                other => format!("the TLS handshake failed: {other}"),
+            });
+        }
+        cause = current.source();
+    }
+    None
+}
+
+/// PEM text for a DER certificate, which tonic takes.
+fn pem_of(der: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut text = String::from("-----BEGIN CERTIFICATE-----\n");
+    let mut line = 0;
+    for chunk in der.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        for i in 0..4 {
+            text.push(if i <= chunk.len() {
+                ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
+            line += 1;
+            if line == 64 {
+                text.push('\n');
+                line = 0;
+            }
+        }
+    }
+    if line != 0 {
+        text.push('\n');
+    }
+    text.push_str("-----END CERTIFICATE-----\n");
+    text
+}
+
+async fn connect(link: &Link) -> std::result::Result<(Channel, wire::Encryption), Unreachable> {
     match &link.address {
         PoolAddress::Unix(path) => {
             let path = path.clone();
@@ -238,27 +327,32 @@ async fn connect(link: &Link) -> std::result::Result<(Channel, wire::Encryption)
                 .map_err(|e| e.to_string())?;
             Ok((channel, wire::Encryption::Plaintext))
         }
-        PoolAddress::Tcp(address) => {
-            let tls = link.ca.is_some();
+        PoolAddress::Tcp(address) | PoolAddress::TcpPlaintext(address) => {
+            let tls = matches!(link.address, PoolAddress::Tcp(_));
             let scheme = if tls { "https" } else { "http" };
             let mut endpoint = Endpoint::from_shared(format!("{scheme}://{address}"))
                 .map_err(|e| e.to_string())?
                 .connect_timeout(Duration::from_secs(2))
                 .tcp_nodelay(true);
-            if let Some(ca) = &link.ca {
-                let pem = std::fs::read(ca).map_err(|e| format!("cannot read the CA file: {e}"))?;
+            if tls {
+                let certificates = net::trusted(link.ca.as_deref(), &link.roots)
+                    .map_err(|e| Unreachable::Untrusted(e.to_string()))?;
                 let host = address
                     .rsplit_once(':')
                     .map_or(address.as_str(), |(h, _)| h);
-                endpoint = endpoint
-                    .tls_config(
-                        ClientTlsConfig::new()
-                            .ca_certificate(Certificate::from_pem(pem))
-                            .domain_name(host.trim_matches(['[', ']'])),
-                    )
-                    .map_err(|e| e.to_string())?;
+                let mut config = ClientTlsConfig::new().domain_name(host.trim_matches(['[', ']']));
+                for certificate in &certificates {
+                    config = config.ca_certificate(Certificate::from_pem(pem_of(certificate)));
+                }
+                endpoint = endpoint.tls_config(config).map_err(|e| e.to_string())?;
             }
-            let channel = endpoint.connect().await.map_err(|e| e.to_string())?;
+            let channel = endpoint
+                .connect()
+                .await
+                .map_err(|e| match tls_failure(&e) {
+                    Some(why) => Unreachable::Untrusted(why),
+                    None => Unreachable::Retry(e.to_string()),
+                })?;
             Ok((
                 channel,
                 if tls {
@@ -338,7 +432,12 @@ async fn attempt(engine: &mut Engine, link: &Link) -> Attempt {
 async fn establish(engine: &mut Engine, link: &Link) -> std::result::Result<Established, Attempt> {
     let (channel, connected_with) = match connect(link).await {
         Ok(connected) => connected,
-        Err(why) => return Err(Attempt::Retry(why)),
+        Err(Unreachable::Retry(why)) => return Err(Attempt::Retry(why)),
+        Err(Unreachable::Untrusted(why)) => {
+            return Err(Attempt::Disabled(format!(
+                "cannot verify the pool manager over TLS ({why}); trust its CA on this host or give the CA file; using local tiers only"
+            )));
+        }
     };
     let mut client = wire::pool_client::PoolClient::new(channel);
     let hello = tokio::time::timeout(
@@ -373,7 +472,9 @@ async fn establish(engine: &mut Engine, link: &Link) -> std::result::Result<Esta
     // Without shared memory, windows pass through this process's own staging and the
     // manager's data channel, if it offers one.
     let dial = match (&regions, &link.address) {
-        (None, PoolAddress::Tcp(address)) if !hello.data_transports.is_empty() => {
+        (None, PoolAddress::Tcp(address) | PoolAddress::TcpPlaintext(address))
+            if !hello.data_transports.is_empty() =>
+        {
             match net_dial(
                 engine,
                 link,
@@ -477,9 +578,13 @@ fn net_dial(
         .rsplit_once(':')
         .map_or(address, |(host, _)| host)
         .to_string();
-    let tls = match &link.ca {
-        Some(ca) => Some(net::tls_for(ca, &host)?),
-        None => None,
+    let tls = if matches!(link.address, PoolAddress::Tcp(_)) {
+        Some(net::tls_trusting(
+            net::trusted(link.ca.as_deref(), &link.roots)?,
+            &host,
+        )?)
+    } else {
+        None
     };
     let staging = engine.net_staging(&limits)?;
     Ok(Arc::new(net::Tcp {

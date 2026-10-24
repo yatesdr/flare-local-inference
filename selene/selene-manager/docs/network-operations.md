@@ -20,10 +20,19 @@ selene --name pool --root /var/lib/selene --memory 16G --nvme 1T --staging 1G \
   port 0). The address a grant names is the one the listener bound; when it is the unspecified
   address (`0.0.0.0`), the instance connects to the host it reached the manager by. Publish this
   port as you publish the first.
-- `--tls-cert` and `--tls-key` give the manager a TLS identity. A client that was given a CA
-  verifies the manager against it and refuses a plaintext manager; a client without a CA speaks
-  plaintext. `Hello.encryption` tells the client what the manager was started with, and a client
-  whose setting differs disables the pool for that process rather than downgrading. There are no
+- `--tls-cert` and `--tls-key` give the manager a TLS identity. A client reaches a network
+  address over TLS by default and verifies the manager's certificate against the host's CA
+  bundle, so a certificate from a public or organisation CA needs no client setting. The bundle
+  is the first of `/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`,
+  `/etc/ssl/ca-bundle.pem`, `/etc/ssl/cert.pem` and
+  `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem` that is a file; these paths are fixed and
+  no environment variable moves them (a host that keeps its bundle elsewhere gives the CA file); a CA file
+  (the pool CA setting) replaces the bundle for a private CA. Plaintext over the network is an
+  explicit client choice (`PoolAddress::TcpPlaintext`), not a fallback. `Hello.encryption` tells
+  the client what the manager was started with, and a client whose setting differs disables the
+  pool for that process rather than downgrading. A client that cannot verify the manager logs one
+  error naming the cause (an untrusted issuer, an expired certificate, a name that does not
+  match, a manager that does not speak TLS) and runs on its local tiers; it does not retry. There are no
   client certificates: an instance is identified by its session, not by a credential.
 - Without TLS the listener is plaintext. Put it on a trusted network, or use TLS.
 - Keep the key out of the image and mount it read-only (`deploy/compose-network.yaml`).
@@ -73,8 +82,8 @@ openssl x509 -req -in server.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial \
   -days 3650 -extfile server.ext -out server.pem
 ```
 
-Hand `ca.pem` to the instances (their pool CA setting), `server.pem` and `server-key.pem` to
-the manager.
+Hand `ca.pem` to the instances (their pool CA setting) unless the host already trusts the CA,
+and `server.pem` and `server-key.pem` to the manager.
 
 ## RDMA (experimental)
 
@@ -107,7 +116,7 @@ ibv_devices                                    # rxe0 should appear
 
 | Symptom | Check |
 |---|---|
-| Remote instances run on local tiers only | The address and firewall; whether the instance has the CA for a TLS manager (or none for a plaintext one); `Hello.encryption`. |
+| Remote instances run on local tiers only | The address and firewall; whether the instance trusts the manager's CA (the host's CA bundle or its CA file), and the one-line error it logged at start; `Hello.encryption`. |
 | `DATA_CHANNEL` claims or puts refused | The manager has no network listener (`INVALID_CLAIM`, or `PutRefused{INVALID}` saying so); or the claim is not for the manager's own records. |
 | Claims expire with `NO_PROGRESS` | The instance cannot reach `--listen-data` (firewall, a published port that is not the bound one), or it does not read fast enough. |
 | Windows quarantined (`quarantined_bytes`) | A data handler did not exit after its transfer was stopped; the manager logs the claim. They return if the exit is seen, else at restart. |

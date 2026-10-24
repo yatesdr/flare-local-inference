@@ -19,6 +19,7 @@ use crate::{
     pool::{
         IndexEntry, PoolAddress, PoolClient, PoolConfig, PoolStatus, Tier,
         identity::{Geometry, RankPlanes, Scope, scope_id},
+        net,
         wire::{self, client_message::M as Out, server_message::M as In},
     },
     testing::{StoppedCopier, geometry},
@@ -331,6 +332,7 @@ fn a_scope_id_the_manager_computes_differently_disables_the_pool() {
 // ---- TLS ----------------------------------------------------------------------
 
 struct Pki {
+    ca_der: Vec<u8>,
     ca_pem: String,
     cert_pem: String,
     key_pem: String,
@@ -352,6 +354,7 @@ fn pki() -> Pki {
         .signed_by(&leaf_key, &issuer)
         .unwrap();
     Pki {
+        ca_der: ca.der().to_vec(),
         ca_pem: ca.pem(),
         cert_pem: leaf.pem(),
         key_pem: leaf_key.serialize_pem(),
@@ -432,15 +435,82 @@ fn a_client_with_a_ca_requires_tls_and_connects_to_a_tls_manager() {
     client.close().unwrap();
 }
 
+/// The reason a client gave for turning the pool off, once it has.
+fn disabled_reason(client: &PoolClient) -> String {
+    let mut reason = None;
+    wait_for("the pool to be turned off", || {
+        if let PoolStatus::Disabled(why) = client.status() {
+            reason = Some(why);
+            true
+        } else {
+            false
+        }
+    });
+    reason.unwrap()
+}
+
 #[test]
-fn a_client_without_a_ca_never_gets_a_session_from_a_tls_manager() {
+fn a_client_without_a_ca_file_trusts_the_hosts_store_and_connects() {
     let pki = pki();
     let (server, port) = serve_tcp(tls_hello(), Some(&pki));
     let (config, copier) = tcp_config(port, None, &std::env::temp_dir());
-    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar)).unwrap();
-    std::thread::sleep(Duration::from_millis(500));
-    assert_ne!(client.status(), PoolStatus::Ready);
+    // The host's store, here a test's, holds the CA: no flag names it.
+    let roots = net::Roots::Fixed(vec![pki.ca_der.clone().into()]);
+    let mut client =
+        PoolClient::start_trusting(config, copier, Arc::new(NoRegistrar), roots).unwrap();
+    wait_for("Ready over TLS", || client.status() == PoolStatus::Ready);
+    assert_eq!(*server.opened.lock().unwrap(), 1);
+    client.close().unwrap();
+}
+
+#[test]
+fn a_client_whose_store_does_not_trust_the_manager_says_why_once_and_stays_local() {
+    let pki = pki();
+    let other = self::pki();
+    let (server, port) = serve_tcp(tls_hello(), Some(&pki));
+    let (config, copier) = tcp_config(port, None, &std::env::temp_dir());
+    // A store that holds a different CA: the manager's certificate has no path to it.
+    let roots = net::Roots::Fixed(vec![other.ca_der.clone().into()]);
+    let mut client =
+        PoolClient::start_trusting(config, copier, Arc::new(NoRegistrar), roots).unwrap();
+    let reason = disabled_reason(&client);
+    assert!(
+        reason.contains("cannot verify the pool manager over TLS")
+            && reason.contains("not signed by a trusted CA"),
+        "{reason}"
+    );
+    // It does not keep trying: the manager sees no session now or later.
+    std::thread::sleep(Duration::from_millis(600));
     assert_eq!(*server.opened.lock().unwrap(), 0);
+    assert_eq!(client.status(), PoolStatus::Disabled(reason));
+    client.close().unwrap();
+}
+
+#[test]
+fn a_ca_file_overrides_the_hosts_store() {
+    let pki = pki();
+    let other = self::pki();
+    let (server, port) = serve_tcp(tls_hello(), Some(&pki));
+    let (config, copier) = tcp_config(port, Some(&pki), &std::env::temp_dir());
+    // The store trusts something else; the file names the right CA.
+    let roots = net::Roots::Fixed(vec![other.ca_der.clone().into()]);
+    let mut client =
+        PoolClient::start_trusting(config, copier, Arc::new(NoRegistrar), roots).unwrap();
+    wait_for("Ready with the CA file", || {
+        client.status() == PoolStatus::Ready
+    });
+    assert_eq!(*server.opened.lock().unwrap(), 1);
+    client.close().unwrap();
+}
+
+#[test]
+fn a_plaintext_network_address_is_explicit() {
+    let (server, port) = serve_tcp(hello(2, wire::HelloStatus::HelloOk), None);
+    let (mut config, copier) = tcp_config(port, None, &std::env::temp_dir());
+    config.address = PoolAddress::TcpPlaintext(format!("localhost:{port}"));
+    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar)).unwrap();
+    wait_for("Ready without TLS", || client.status() == PoolStatus::Ready);
+    assert_eq!(*server.opened.lock().unwrap(), 1);
     client.close().unwrap();
 }
 
