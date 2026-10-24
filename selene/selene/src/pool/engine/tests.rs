@@ -193,10 +193,6 @@ fn settings(export_slots: u32) -> Arc<Settings> {
 
 impl Rig {
     pub fn new() -> Self {
-        Self::with(None)
-    }
-
-    pub fn with(exporter: Option<Arc<dyn super::super::exporter::HostExporter>>) -> Self {
         let copier = Arc::new(Mutex::new(FakeCopier::new()));
         let shared_copier: SharedCopier = copier.clone();
         let wake = Arc::new(Notify::new());
@@ -208,7 +204,6 @@ impl Rig {
             announce.clone(),
             shared_copier,
             Arc::new(NoRegistrar),
-            exporter,
         );
         Rig {
             engine,
@@ -1501,13 +1496,20 @@ fn a_failed_d2h_fails_the_fill_and_ends_the_export_after_the_drain() {
 
 mod host {
     use super::*;
-    use crate::pool::{Checksums, HostChain, HostExporter, HostPin, HostRecord, HostWindow};
+    use crate::pool::{Checksums, HostChain, HostPin, HostRecord, HostWindow};
 
     pub struct Pin {
         chain: HostChain,
         /// Checksums the record was committed with.
         persisted: Vec<u64>,
         data: Vec<u8>,
+        pub dropped: Arc<Mutex<bool>>,
+    }
+
+    impl Drop for Pin {
+        fn drop(&mut self) {
+            *self.dropped.lock().unwrap() = true;
+        }
     }
 
     impl HostPin for Pin {
@@ -1527,68 +1529,72 @@ mod host {
         }
     }
 
-    pub struct Exporter {
-        pub corrupt: bool,
-    }
-
-    impl HostExporter for Exporter {
-        fn pin(
-            &self,
-            _: Tier,
-            key: PrefixKey,
-            generation: u64,
-            _: u64,
-            _: bool,
-        ) -> std::result::Result<Box<dyn HostPin>, crate::ExportRefusal> {
-            let data = pattern(3, 2 * PAGE as usize);
-            let persisted = (0..2)
-                .map(|i| checksum(&data[i * PAGE as usize..(i + 1) * PAGE as usize]))
-                .collect();
-            let mut stored = data;
-            if self.corrupt {
-                stored[10] ^= 1;
-            }
-            Ok(Box::new(Pin {
-                chain: HostChain {
-                    records: vec![HostRecord {
-                        key,
-                        generation,
-                        first_page: 0,
-                        pages: 2,
-                        row: false,
-                    }],
-                    total_pages: 2,
-                    row: false,
-                },
-                persisted,
-                data: stored,
-            }))
+    /// A pinned two-page chain whose bytes may have rotted since its checksums
+    /// were committed.
+    pub fn pin(corrupt: bool, dropped: Arc<Mutex<bool>>) -> Box<dyn HostPin> {
+        let data = pattern(3, 2 * PAGE as usize);
+        let persisted = (0..2)
+            .map(|i| checksum(&data[i * PAGE as usize..(i + 1) * PAGE as usize]))
+            .collect();
+        let mut stored = data;
+        if corrupt {
+            stored[10] ^= 1;
         }
+        Box::new(Pin {
+            chain: HostChain {
+                records: vec![HostRecord {
+                    key: key(192, 2),
+                    generation: 4,
+                    first_page: 0,
+                    pages: 2,
+                    row: false,
+                }],
+                total_pages: 2,
+                row: false,
+            },
+            persisted,
+            data: stored,
+            dropped,
+        })
     }
 }
 
 #[test]
-fn a_host_export_serves_the_persisted_checksums_even_when_the_bytes_are_corrupt() {
+fn a_host_export_is_answered_by_the_store_and_serves_the_persisted_checksums() {
     for corrupt in [false, true] {
-        let mut rig = Rig::with(Some(Arc::new(host::Exporter { corrupt })));
+        let mut rig = Rig::new();
         rig.open();
         let mut request = export_request(50, 0);
         if let In::ExportRequest(r) = &mut request {
             r.tier = wire::Tier::Dram as i32;
             r.want_row = false;
         }
-        let out = rig.send(request);
+        assert!(
+            pick!(rig.send(request), PinAck).is_empty(),
+            "the store answers"
+        );
+        let events = rig.events();
+        assert!(matches!(&events[..], [PoolEvent::Export(r)] if r.tier == Tier::Dram));
+        let dropped = Arc::new(Mutex::new(false));
+        let out = rig.command(Command::HostPinned {
+            export: ExportId(50),
+            pin: host::pin(corrupt, dropped.clone()),
+        });
         let ack = pick!(out, PinAck);
         assert_eq!(ack[0].result, wire::PinResult::Pinned as i32);
+        assert_eq!(ack[0].total_pages, 2);
         rig.send(In::ExportFill(wire::ExportFill {
             export_id: 50,
             windows: vec![window(0, 0, 0, 2, false, 0)],
         }));
         let mut filled = Vec::new();
+        let mut ended = Vec::new();
         for _ in 0..200 {
             std::thread::sleep(Duration::from_millis(5));
-            filled = pick!(rig.tick(Duration::ZERO), WindowFilled);
-            if !filled.is_empty() {
+            let out = rig.tick(Duration::ZERO);
+            filled.extend(pick!(out, WindowFilled));
+            ended.extend(pick!(out, ExportEnd));
+            if !ended.is_empty() {
                 break;
             }
         }
@@ -1598,6 +1604,11 @@ fn a_host_export_serves_the_persisted_checksums_even_when_the_bytes_are_corrupt(
         assert_eq!(filled[0].page_xxh3[0], checksum(&served[..PAGE as usize]));
         let in_window = rig.regions.staging.bytes(0, PAGE).unwrap();
         assert_eq!(checksum(in_window) == filled[0].page_xxh3[0], !corrupt);
+        assert_eq!(ended[0].fence, wire::FenceOutcome::Drained as i32);
+        assert!(
+            *dropped.lock().unwrap(),
+            "the pin is released with the export"
+        );
         // A host export never produces a worker event.
         assert!(
             rig.events()
@@ -1605,6 +1616,37 @@ fn a_host_export_serves_the_persisted_checksums_even_when_the_bytes_are_corrupt(
                 .all(|e| !matches!(e, PoolEvent::ExportEnded { .. }))
         );
     }
+}
+
+#[test]
+fn a_host_pin_the_export_cannot_use_is_dropped() {
+    let mut rig = Rig::new();
+    rig.open();
+    let mut request = export_request(51, 0);
+    if let In::ExportRequest(r) = &mut request {
+        r.tier = wire::Tier::Nvme as i32;
+        r.want_row = false;
+        r.reserved_bytes = PAGE;
+    }
+    rig.send(request);
+    rig.events();
+    let dropped = Arc::new(Mutex::new(false));
+    let out = rig.command(Command::HostPinned {
+        export: ExportId(51),
+        pin: host::pin(false, dropped.clone()),
+    });
+    assert_eq!(
+        pick!(out, PinAck)[0].refusal,
+        wire::ClaimReason::NoWindows as i32
+    );
+    assert!(*dropped.lock().unwrap());
+    // A pin for an export nobody waits for is dropped too.
+    let dropped = Arc::new(Mutex::new(false));
+    rig.command(Command::HostPinned {
+        export: ExportId(99),
+        pin: host::pin(false, dropped.clone()),
+    });
+    assert!(*dropped.lock().unwrap());
 }
 
 // ---- expected records -------------------------------------------------------

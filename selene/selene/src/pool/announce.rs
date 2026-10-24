@@ -9,7 +9,10 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use tokio::sync::Notify;
@@ -125,6 +128,8 @@ impl State {
 pub struct Announcer {
     state: Arc<Mutex<State>>,
     wake: Arc<Notify>,
+    /// Next generation to hand out in the DRAM and NVMe tiers.
+    generations: Arc<[AtomicU64; 2]>,
 }
 
 impl Announcer {
@@ -139,7 +144,19 @@ impl Announcer {
                 max_entries: DEFAULT_MAX_ENTRIES,
             })),
             wake,
+            generations: Arc::new([AtomicU64::new(1), AtomicU64::new(1)]),
         }
+    }
+
+    /// A generation for a new holding in a host tier: strictly increasing per
+    /// tier for the life of the process. GPU generations are the checkpoint ids.
+    pub fn next_generation(&self, tier: Tier) -> u64 {
+        let counter = match tier {
+            Tier::Dram => &self.generations[0],
+            Tier::Nvme => &self.generations[1],
+            Tier::Gpu => panic!("GPU generations are checkpoint ids"),
+        };
+        counter.fetch_add(1, Ordering::Relaxed)
     }
 
     /// A holding appeared. Never blocks and never fails the caller.

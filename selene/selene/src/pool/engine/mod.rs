@@ -23,7 +23,6 @@ use crate::{CLOSE_TIMEOUT, HostRegistrar, Job, JobId, SharedCopier};
 use super::{
     announce::Announcer,
     codec::{self, Sources},
-    exporter::HostExporter,
     identity::Scope,
     shared::{Command, PoolEvent, PoolStatus, Shared},
     shm::Regions,
@@ -104,7 +103,6 @@ pub(crate) struct Engine {
     announce: Announcer,
     copier: SharedCopier,
     registrar: Arc<dyn HostRegistrar + Send + Sync>,
-    pub(crate) exporter: Option<Arc<dyn HostExporter>>,
     sources: Sources,
     pub(crate) sess: Option<Session>,
     /// Regions of a lost session, kept mapped until its copies have drained.
@@ -130,7 +128,6 @@ impl Engine {
         announce: Announcer,
         copier: SharedCopier,
         registrar: Arc<dyn HostRegistrar + Send + Sync>,
-        exporter: Option<Arc<dyn HostExporter>>,
     ) -> Self {
         Self {
             st,
@@ -138,7 +135,6 @@ impl Engine {
             announce,
             copier,
             registrar,
-            exporter,
             sources: Sources::default(),
             sess: None,
             draining: Vec::new(),
@@ -413,6 +409,7 @@ impl Engine {
             }
             Command::Fetch(fetch) => self.start_fetch(now, fetch),
             Command::ExportPinned { export, chain } => self.on_export_pinned(export, chain),
+            Command::HostPinned { export, pin } => self.on_host_pinned(export, pin),
             Command::ExportRefused { export, reason } => self.on_export_refused(export, reason),
         }
     }
