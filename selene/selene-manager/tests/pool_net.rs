@@ -1,112 +1,20 @@
 //! Pool protocol over the network listener: sessions without shared memory, TLS, RDMA
-//! and the startup warnings. The data channel is not served yet, so claims and puts that
-//! need it are refused with a reason; everything else works as on the Unix socket.
+//! and the startup warnings. What moves bytes over the data channel is in `pool_channel`.
 
 mod support;
 
-use selene_manager::{
-    config::Config as NetConfig,
-    control,
-    proto::v2::{self, client_message as c, server_message::M},
-    store::Config,
-};
+use selene_manager::proto::v2::{self, client_message as c, server_message::M};
 use std::{
-    net::{SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
     process::{Command, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
     thread,
     time::{Duration, Instant},
 };
-use support::pool::{self, Ident, Pool, Session, chain, saved};
+use support::{
+    net::{Net, free_address},
+    pool::{self, Ident, Pool, Session, chain, saved},
+};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
-
-/// A manager with a network listener, started the way the binary starts it.
-struct Net {
-    socket: PathBuf,
-    address: SocketAddr,
-    base: PathBuf,
-    name: String,
-    stop: Arc<AtomicBool>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-fn free_address() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
-}
-
-impl Net {
-    fn start(tweak: impl FnOnce(&mut NetConfig)) -> Self {
-        let base = std::env::temp_dir().join(format!(
-            "selene-net-{}-{}",
-            std::process::id(),
-            support::instance_name("n")
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        let socket = base.join("run/m.sock");
-        let address = free_address();
-        let mut store = Config::dram_only(socket.clone(), 8 * 1024 * 1024);
-        let net_name = support::instance_name("net");
-        store.name = net_name.clone();
-        store.pool.source_wait = Duration::ZERO;
-        let mut net = NetConfig::defaults();
-        net.name = store.name.clone();
-        net.socket = socket.clone();
-        net.socket_explicit = true;
-        net.memory = 8 * 1024 * 1024;
-        net.listen = Some(address);
-        tweak(&mut net);
-        let stop = Arc::new(AtomicBool::new(false));
-        let flag = stop.clone();
-        let thread = thread::spawn(move || {
-            if let Err(error) = control::serve(net, store, flag) {
-                eprintln!("manager exited: {error}");
-            }
-        });
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while TcpStream::connect(address).is_err() {
-            assert!(Instant::now() < deadline, "the listener never came up");
-            thread::sleep(Duration::from_millis(10));
-        }
-        Self {
-            socket,
-            address,
-            base,
-            name: net_name,
-            stop,
-            thread: Some(thread),
-        }
-    }
-
-    async fn unix(&self) -> Pool {
-        Pool::connect(&self.socket).await
-    }
-
-    async fn tcp(&self) -> Pool {
-        let channel = Endpoint::from_shared(format!("http://{}", self.address))
-            .unwrap()
-            .connect()
-            .await
-            .expect("connect over TCP");
-        Pool::over(channel, &self.socket).await
-    }
-}
-
-impl Drop for Net {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        let _ = std::fs::remove_dir_all(&self.base);
-        let _ = std::fs::remove_dir_all(std::path::Path::new("/dev/shm/selene").join(&self.name));
-    }
-}
 
 async fn open(pool: &mut Pool, name: &str) -> Session {
     let mut session = pool.open(&Ident::new(name)).await;
@@ -184,12 +92,11 @@ async fn l4_and_a22_remote_sessions_see_only_the_managers_records_as_level_five(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_data_channel_is_refused_with_a_reason() {
+async fn a_remote_session_cannot_use_shared_windows() {
     let net = Net::start(|_| {});
     let mut tcp = net.tcp().await;
     let mut far = open(&mut tcp, "far").await;
-    // A claim in the channel mode, and one in the mode this session cannot use.
-    let mut claim = v2::Claim {
+    let claim = v2::Claim {
         claim_id: 1,
         level: v2::Level::RemoteNvme as i32,
         source: Some(v2::SourceRef::default()),
@@ -198,50 +105,42 @@ async fn the_data_channel_is_refused_with_a_reason() {
         generation: 1,
         begin_tokens: 0,
         want_row: true,
-        mode: v2::CopyMode::DataChannel as i32,
+        mode: v2::CopyMode::SharedWindows as i32,
         deadline_ms: 0,
         plan_id: 0,
         part: 1,
     };
-    far.claim(claim.clone()).await;
+    far.claim(claim).await;
     assert_eq!(
         far.claim_terminal(1).await.reason,
         v2::ClaimReason::InvalidClaim as i32
     );
-    claim.claim_id = 2;
-    claim.mode = v2::CopyMode::SharedWindows as i32;
-    far.claim(claim).await;
-    assert_eq!(
-        far.claim_terminal(2).await.reason,
-        v2::ClaimReason::InvalidClaim as i32
-    );
     // The same for a put, with the reason in the detail.
-    for (id, mode, needle) in [
-        (1, v2::CopyMode::DataChannel, "data channel"),
-        (2, v2::CopyMode::SharedWindows, "shared windows"),
-    ] {
-        far.send(c::M::PutBegin(v2::PutBegin {
-            put_id: id,
-            key: Some(pool::pkey(1024)),
-            chain_pages: 16,
-            row: true,
-            has_published_parent: false,
-            published_parent: None,
-            bucket: vec![4; 16],
-            published_tail_pages: 16,
-            mode: mode as i32,
-            generation: 1,
-        }))
+    far.send(c::M::PutBegin(v2::PutBegin {
+        put_id: 1,
+        key: Some(pool::pkey(1024)),
+        chain_pages: 16,
+        row: true,
+        has_published_parent: false,
+        published_parent: None,
+        bucket: vec![4; 16],
+        published_tail_pages: 16,
+        mode: v2::CopyMode::SharedWindows as i32,
+        generation: 1,
+    }))
+    .await;
+    let refused = far
+        .take(|m| match m {
+            M::PutRefused(refused) if refused.put_id == 1 => Some(refused.clone()),
+            _ => None,
+        })
         .await;
-        let refused = far
-            .take(|m| match m {
-                M::PutRefused(refused) if refused.put_id == id => Some(refused.clone()),
-                _ => None,
-            })
-            .await;
-        assert_eq!(refused.reason, v2::Reason::Invalid as i32);
-        assert!(refused.detail.contains(needle), "{}", refused.detail);
-    }
+    assert_eq!(refused.reason, v2::Reason::Invalid as i32);
+    assert!(
+        refused.detail.contains("shared windows"),
+        "{}",
+        refused.detail
+    );
 }
 
 /// A self-signed certificate for `localhost`, as PEM files in `dir`.
@@ -359,6 +258,8 @@ fn startup_names_each_option_that_widens_the_exposure() {
             "8M",
             "--listen",
             &address.to_string(),
+            "--listen-data",
+            &free_address().to_string(),
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

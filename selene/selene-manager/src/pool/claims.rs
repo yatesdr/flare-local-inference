@@ -7,7 +7,7 @@
 
 use super::{
     Checked, Violation,
-    core::{Core, Nonce, ProcKey, Session},
+    core::{ChanOwner, Core, Nonce, ProcKey, Session},
     index::{InstanceId, SourceId, Tier, walk_chain},
     key_from, key_to,
     store_bridge::persisted_checksums,
@@ -17,9 +17,11 @@ use super::{
 use crate::{
     Key,
     arena::Extent,
+    data::channel,
     proto::v2::{self, server_message::M},
     store::GetAnswer,
 };
+use flare_selene::pool::frame::Shape;
 use std::time::{Duration, Instant};
 
 pub type ClaimKey = (InstanceId, Nonce, u64);
@@ -97,7 +99,26 @@ pub struct Claim {
     pub row_bytes: u64,
     /// Set when the manager's own store is the source.
     pub manager: Option<ManagerGet>,
+    /// Set when the bytes move on the data channel instead of shared windows.
+    pub channel: Option<Channel>,
 }
+
+/// A claim's data-channel transfer. The manager's handler is the only party that
+/// reads the claim's windows, so its exit is what lets them go back to the store.
+pub struct Channel {
+    pub transfer: u64,
+    /// What the requester presents to be served this transfer.
+    pub token: [u8; flare_selene::pool::frame::TOKEN_BYTES],
+    /// The handler has exited (or never ran) and its connection is closed.
+    pub exited: bool,
+    /// When the transfer was stopped, to bound the wait for the handler.
+    pub stopped_at: Option<Instant>,
+    /// The handler did not exit in time: its windows are never reused.
+    pub quarantined: bool,
+}
+
+/// How long a stopped handler may take to exit before its windows are quarantined.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// What a claim on the manager's store tracks beyond the common state.
 pub struct ManagerGet {
@@ -219,7 +240,12 @@ impl Core {
     pub(super) fn quarantined_bytes(&self) -> u64 {
         let mut total = 0;
         for claim in self.claims.values().filter(|claim| claim.is_terminal()) {
+            let stuck = claim.channel.as_ref().is_some_and(|open| open.quarantined);
             for window in &claim.windows {
+                if stuck && window.phase == Phase::RequesterRead {
+                    total += window.plan.length;
+                    continue;
+                }
                 let (party, proc) = match window.phase {
                     Phase::SourceWrite => (claim.source_fence, claim.source_proc),
                     Phase::RequesterRead => {
@@ -326,10 +352,10 @@ impl Core {
         {
             return refuse(self, v2::ClaimReason::InvalidClaim);
         }
-        if mode == v2::CopyMode::DataChannel {
+        if mode == v2::CopyMode::DataChannel && self.cfg.channel.is_none() {
             // Claims carry no detail text; the manager's log says why.
             eprintln!(
-                "selene: claim {} refused: the data channel is not served by this build",
+                "selene: claim {} refused: this manager serves no data channel (it has no network listener)",
                 m.claim_id
             );
             return refuse(self, v2::ClaimReason::InvalidClaim);
@@ -412,9 +438,13 @@ impl Core {
         let total = windows::total_bytes(&plan);
         if source == SourceId::Manager {
             let _ = &plan;
-            return self.manager_claim(sid, key, &m, endpoint, &entry, walk, &geometry);
+            return self.manager_claim(sid, key, &m, endpoint, &entry, walk, &geometry, mode);
         }
 
+        if mode == v2::CopyMode::DataChannel {
+            // Only the manager's own store is served over the data channel.
+            return refuse(self, v2::ClaimReason::InvalidClaim);
+        }
         // Retained staging: required for a GPU export, preferred for host tiers.
         let mut block = None;
         let mut retained = false;
@@ -467,6 +497,7 @@ impl Core {
             page_bytes: geometry.page_bytes,
             row_bytes: geometry.row_bytes,
             manager: None,
+            channel: None,
         };
         let reserved = claim.reserved_bytes;
         self.claims.insert(key, claim);
@@ -502,6 +533,7 @@ impl Core {
         entry: &super::index::Entry,
         walk: super::index::ChainWalk,
         geometry: &super::ScopeGeometry,
+        mode: v2::CopyMode,
     ) -> Checked<()> {
         let refuse = |core: &mut Core, reason: v2::ClaimReason| {
             core.refused_claim(sid, key, m, reason);
@@ -517,6 +549,21 @@ impl Core {
         if self.link_for((key.0, key.1), scope, pid).is_none() {
             return refuse(self, v2::ClaimReason::SourceBusy);
         }
+        let channel = if mode == v2::CopyMode::DataChannel {
+            let hub = self.cfg.channel.as_ref().expect("checked by the caller");
+            match hub.open(channel::Kind::Get) {
+                Ok((transfer, token)) => Some((transfer, token)),
+                Err(error) => {
+                    eprintln!(
+                        "selene: claim {} refused: no data-channel token: {error}",
+                        m.claim_id
+                    );
+                    return refuse(self, v2::ClaimReason::NoWindows);
+                }
+            }
+        } else {
+            None
+        };
         let last = walk.nodes.len() - 1;
         let records: Vec<v2::Record> = walk
             .nodes
@@ -582,7 +629,17 @@ impl Core {
                 copied: false,
                 transfer_released: false,
             }),
+            channel: channel.map(|(transfer, token)| Channel {
+                transfer,
+                token,
+                exited: false,
+                stopped_at: None,
+                quarantined: false,
+            }),
         };
+        if let Some(open) = &claim.channel {
+            self.channels.insert(open.transfer, ChanOwner::Claim(key));
+        }
         self.claims.insert(key, claim);
         let chain: Vec<Key> = walk.nodes.iter().map(|node| node.key).collect();
         if let Err(reason) = self.manager_get(key, chain, walk.skip_pages, walk.pages, m.want_row) {
@@ -610,12 +667,23 @@ impl Core {
                 claim.granted_at = Some(now);
                 claim.last_progress = now;
                 claim.requester_fence = Party::Pending;
+                let channel =
+                    claim
+                        .channel
+                        .as_ref()
+                        .zip(self.cfg.channel.as_ref())
+                        .map(|(open, hub)| v2::DataChannelRef {
+                            transport: v2::DataTransport::Tcp as i32,
+                            address: hub.address().to_string(),
+                            token: open.token.to_vec(),
+                            rdma: Vec::new(),
+                        });
                 let granted = v2::ClaimGranted {
                     claim_id: key.2,
                     records: claim.records.clone(),
                     total_pages: claim.total_pages,
                     row: claim.row,
-                    channel: None,
+                    channel,
                     window_credits: self.cfg.limits.window_credits,
                     retained: false,
                 };
@@ -703,6 +771,35 @@ impl Core {
                 claim.last_progress = Instant::now();
                 let spec = claim.spec(index);
                 let sid = claim.requester_sid;
+                if let Some((open, hub)) = claim.channel.as_ref().zip(self.cfg.channel.as_ref()) {
+                    // The window goes to the requester on the data channel; the claim
+                    // learns it is free when the handler reports it sent.
+                    let region = u8::try_from(grant.region)
+                        .ok()
+                        .and_then(crate::data::Region::from_u8);
+                    let Some(region) = region else {
+                        self.cancel_get_and_fail(key, v2::ClaimReason::CopyError);
+                        return;
+                    };
+                    hub.push_window(
+                        open.transfer,
+                        channel::WindowOut {
+                            shape: Shape {
+                                index: grant.index,
+                                record: grant.record,
+                                first_page: first as u32,
+                                page_count: grant.page_count,
+                                row: grant.row,
+                                length: grant.length,
+                            },
+                            page_xxh3,
+                            row_xxh3,
+                            region,
+                            offset: grant.offset,
+                        },
+                    );
+                    return;
+                }
                 self.send(
                     sid,
                     M::WindowReady(v2::WindowReady {
@@ -719,6 +816,10 @@ impl Core {
                 if let Some(manager) = claim.manager.as_mut() {
                     manager.done = true;
                     copied = manager.copied;
+                }
+                // Every window is queued: the handler ends the transfer after them.
+                if let Some((open, hub)) = claim.channel.as_ref().zip(self.cfg.channel.as_ref()) {
+                    hub.finish(open.transfer);
                 }
                 if copied && !terminal {
                     self.finish(key, v2::ClaimState::Copied, v2::ClaimReason::ReasonNone);
@@ -775,6 +876,7 @@ impl Core {
             page_bytes: 0,
             row_bytes: 0,
             manager: None,
+            channel: None,
         };
         let message = self.terminal_message(&claim);
         self.claims.insert(key, claim);
@@ -1108,8 +1210,18 @@ impl Core {
                     .sum();
                 let exact = pages == claim.total_pages
                     && (!claim.want_row || claim.windows.iter().any(|window| window.plan.row));
-                let complete =
-                    covered && exact && claim.all_windows_done() && !claim.windows.is_empty();
+                // On the data channel the claim's windows are freed as the handler reports
+                // them sent, on another path than this message. The requester's verdict
+                // proves it read them all, so windows still marked sent-or-sending count.
+                let windows_done = if claim.channel.is_some() {
+                    claim
+                        .windows
+                        .iter()
+                        .all(|window| matches!(window.phase, Phase::RequesterRead | Phase::Free))
+                } else {
+                    claim.all_windows_done()
+                };
+                let complete = covered && exact && windows_done && !claim.windows.is_empty();
                 let store_done = claim.manager.as_ref().is_none_or(|manager| manager.done);
                 if complete && store_done {
                     self.finish(key, v2::ClaimState::Copied, v2::ClaimReason::ReasonNone);
@@ -1311,7 +1423,109 @@ impl Core {
         if self.claims[&key].manager.is_some() {
             self.store_cancel_get(key);
         }
+        self.stop_channel(key);
         self.reclaim(key);
+    }
+
+    /// The claim is over: end its data-channel transfer. The claim's windows go back
+    /// only when the handler has exited, which `reclaim` checks.
+    fn stop_channel(&mut self, key: ClaimKey) {
+        let Some(open) = self
+            .claims
+            .get_mut(&key)
+            .and_then(|claim| claim.channel.as_mut())
+        else {
+            return;
+        };
+        if open.exited {
+            return;
+        }
+        open.stopped_at.get_or_insert_with(Instant::now);
+        let quiet = self
+            .cfg
+            .channel
+            .as_ref()
+            .is_none_or(|hub| hub.stop(open.transfer));
+        if quiet {
+            open.exited = true;
+            self.channels.remove(&open.transfer);
+        }
+    }
+
+    // ------------------------------------------------------------------ data channel
+
+    /// What a data-channel handler reported.
+    pub(super) fn channel_event(&mut self, event: channel::Event) {
+        use channel::Event as E;
+        match event {
+            E::Sent { transfer, index } => {
+                if let Some(ChanOwner::Claim(key)) = self.channels.get(&transfer).copied() {
+                    self.claim_window_sent(key, index);
+                }
+            }
+            E::Filled {
+                transfer,
+                index,
+                row_xxh3,
+                page_xxh3,
+            } => {
+                if let Some(ChanOwner::Put(key)) = self.channels.get(&transfer).copied() {
+                    self.put_window_filled(key, index, page_xxh3, row_xxh3);
+                }
+            }
+            E::Failed { transfer, reason } => match self.channels.get(&transfer).copied() {
+                Some(ChanOwner::Claim(key)) => {
+                    eprintln!(
+                        "selene: claim {} on the data channel failed: {reason}",
+                        key.2
+                    );
+                    self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
+                }
+                Some(ChanOwner::Put(key)) => self.put_channel_failed(key, &reason),
+                None => {}
+            },
+            E::Closed { transfer } => {
+                if let Some(hub) = &self.cfg.channel {
+                    hub.forget(transfer);
+                }
+                match self.channels.remove(&transfer) {
+                    Some(ChanOwner::Claim(key)) => {
+                        if let Some(open) = self
+                            .claims
+                            .get_mut(&key)
+                            .and_then(|claim| claim.channel.as_mut())
+                        {
+                            open.exited = true;
+                            open.quarantined = false;
+                        }
+                        self.reclaim(key);
+                    }
+                    Some(ChanOwner::Put(key)) => self.put_channel_closed(key),
+                    None => {}
+                }
+            }
+        }
+    }
+
+    /// A window is in the socket: the handler will not read it again.
+    fn claim_window_sent(&mut self, key: ClaimKey, index: u32) {
+        let Some(claim) = self.claims.get_mut(&key) else {
+            return;
+        };
+        let Some(window) = claim.windows.get_mut(index as usize) else {
+            return;
+        };
+        if window.phase != Phase::RequesterRead {
+            return;
+        }
+        window.phase = Phase::Free;
+        window.extent = None;
+        claim.last_progress = Instant::now();
+        let terminal = claim.is_terminal();
+        self.store_release_window(key, index);
+        if terminal {
+            self.reclaim(key);
+        }
     }
 
     /// Tells the source to stop and release, if its export is still open.
@@ -1364,8 +1578,12 @@ impl Core {
             .as_ref()
             .is_none_or(|proc| self.proc_exited_flag(proc));
         let source_ok = matches!(claim.source_fence, Party::Drained | Party::Idle) || source_gone;
-        let requester_ok =
-            matches!(claim.requester_fence, Party::Drained | Party::Idle) || requester_gone;
+        // On the data channel the requester never touches the claim's windows: the
+        // manager's handler does, and its exit is the fence.
+        let requester_ok = match &claim.channel {
+            Some(open) => open.exited,
+            None => matches!(claim.requester_fence, Party::Drained | Party::Idle) || requester_gone,
+        };
         let claim = self.claims.get_mut(&key).expect("claim exists");
         for window in &mut claim.windows {
             match window.phase {
@@ -1406,8 +1624,19 @@ impl Core {
         let retention = self.cfg.reply_retention;
         let mut expire = Vec::new();
         let mut forget = Vec::new();
+        let mut quarantine = Vec::new();
         for (key, claim) in &self.claims {
             if claim.is_terminal() {
+                if let Some(open) = &claim.channel {
+                    if !open.exited
+                        && !open.quarantined
+                        && open
+                            .stopped_at
+                            .is_some_and(|at| now.duration_since(at) >= DRAIN_GRACE)
+                    {
+                        quarantine.push(*key);
+                    }
+                }
                 let settled = claim.block.is_none()
                     && claim
                         .windows
@@ -1415,7 +1644,8 @@ impl Core {
                         .all(|window| window.phase == Phase::Free)
                     && !matches!(claim.export, ExportState::Requested | ExportState::Pinned)
                     && !matches!(claim.export, ExportState::Ended(Party::Quarantined))
-                    && !matches!(claim.requester_fence, Party::Pending | Party::Quarantined)
+                    && (claim.channel.is_some()
+                        || !matches!(claim.requester_fence, Party::Pending | Party::Quarantined))
                     && !matches!(claim.source_fence, Party::Pending);
                 let source_gone = claim
                     .source_proc
@@ -1443,6 +1673,22 @@ impl Core {
             {
                 expire.push((*key, v2::ClaimReason::NoProgress));
             }
+        }
+        for key in quarantine {
+            // The handler did not exit: it may still read the claim's windows, so they
+            // stay out of service until the manager exits.
+            if let Some(open) = self
+                .claims
+                .get_mut(&key)
+                .and_then(|claim| claim.channel.as_mut())
+            {
+                open.quarantined = true;
+                eprintln!(
+                    "selene: claim {} windows quarantined: its data handler did not exit",
+                    key.2
+                );
+            }
+            self.count("quarantined_total", "kind=\"channel\"");
         }
         for (key, reason) in expire {
             let state = if reason == v2::ClaimReason::SourceTimeout {
@@ -1585,8 +1831,12 @@ mod tests {
     const NONCE: Nonce = [2; 16];
 
     fn core() -> (Core, mpsc::Receiver<v2::ServerMessage>) {
+        core_with(PoolConfig::default())
+    }
+
+    fn core_with(config: PoolConfig) -> (Core, mpsc::Receiver<v2::ServerMessage>) {
         let (mut core, _handle, _events) = Core::new(
-            PoolConfig::default(),
+            config,
             v2::SharedMemory::default(),
             Arena::new(1 << 20).unwrap(),
             true,
@@ -1678,6 +1928,7 @@ mod tests {
                     copied: false,
                     transfer_released: false,
                 }),
+                channel: None,
             },
         );
         key
@@ -1737,5 +1988,84 @@ mod tests {
         core.get_answer(key, Ok(GetAnswer::Done));
         core.copy_result(1, copy_ok()).unwrap();
         assert_eq!(core.claims[&key].state, v2::ClaimState::Failed);
+    }
+
+    /// A handler whose exit is never seen: the claim's windows stay out of service, are
+    /// counted as quarantined once the grace passes, and return only when the exit is seen.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn windows_of_a_handler_that_cannot_be_seen_to_exit_are_quarantined() {
+        use crate::{arena::Arena, data::channel::Hub, regions::LocalRegions};
+        use flare_selene::pool::frame::{Carrier, ToManager};
+        use tokio::io::AsyncWriteExt;
+        let regions = std::sync::Arc::new(LocalRegions::new(
+            Arena::new(1 << 20).unwrap(),
+            Arena::new(1 << 20).unwrap(),
+        ));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (hub, _events) = Hub::start(
+            &tokio::runtime::Handle::current(),
+            listener,
+            regions,
+            None,
+            64,
+        )
+        .unwrap();
+        hub.delay_closed(Duration::from_secs(60));
+        let config = PoolConfig {
+            channel: Some(hub.clone()),
+            ..PoolConfig::default()
+        };
+        let (mut core, _out) = core_with(config);
+        let key = delivered(&mut core);
+        let (transfer, token) = hub.open(channel::Kind::Get).unwrap();
+        // The instance is connected and quiet: a handler is attached.
+        let mut socket = tokio::net::TcpStream::connect(hub.address()).await.unwrap();
+        socket.write_all(&token).await.unwrap();
+        ToManager::Hello(Carrier::Tcp)
+            .write(&mut socket)
+            .await
+            .unwrap();
+        while hub.handlers() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let claim = core.claims.get_mut(&key).unwrap();
+        claim.windows[0].phase = Phase::RequesterRead;
+        claim.channel = Some(Channel {
+            transfer,
+            token,
+            exited: false,
+            stopped_at: None,
+            quarantined: false,
+        });
+        core.channels.insert(transfer, ChanOwner::Claim(key));
+        core.finish(key, v2::ClaimState::Failed, v2::ClaimReason::Cancelled);
+        let claim = &core.claims[&key];
+        assert!(!claim.channel.as_ref().unwrap().exited);
+        assert_eq!(
+            claim.windows[0].phase,
+            Phase::RequesterRead,
+            "the handler may still read the window"
+        );
+        assert_eq!(
+            core.quarantined_bytes(),
+            0,
+            "not yet: it may still be exiting"
+        );
+        // The grace passes with no exit seen.
+        core.claims
+            .get_mut(&key)
+            .unwrap()
+            .channel
+            .as_mut()
+            .unwrap()
+            .stopped_at = Some(Instant::now() - DRAIN_GRACE - Duration::from_secs(1));
+        core.claim_timers(Instant::now());
+        assert_eq!(core.quarantined_bytes(), 6 * 4096);
+        assert_eq!(core.claims[&key].windows[0].phase, Phase::RequesterRead);
+        // Seeing the exit is the proof that nothing reads the window any more.
+        core.channel_event(channel::Event::Closed { transfer });
+        assert_eq!(core.quarantined_bytes(), 0);
+        assert_eq!(core.claims[&key].windows[0].phase, Phase::Free);
+        assert!(core.channels.is_empty());
     }
 }

@@ -19,7 +19,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod channel;
 pub mod compat;
+pub mod net;
 pub mod pool;
 pub mod throughput;
 
