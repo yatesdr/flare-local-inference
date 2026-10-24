@@ -7142,6 +7142,12 @@ pub enum StoreCommand {
     ReleaseFetch {
         token: u64,
     },
+    /// Release the windows of one transfer once the party that held them has drained.
+    ReleaseTransfer {
+        connection: u64,
+        generation: u64,
+        transfer: u64,
+    },
     /// Install bytes fetched from an upstream as a local DRAM record. `row` records whether the
     /// fetch delivered the endpoint row or only the pages.
     AdoptRemote {
@@ -7621,6 +7627,19 @@ impl Store {
                 let _ = reply.send(result);
             }
             StoreCommand::ReleaseFetch { token } => self.release_fetch(token),
+            StoreCommand::ReleaseTransfer {
+                connection,
+                generation,
+                transfer,
+            } => {
+                if self
+                    .sessions
+                    .get(&connection)
+                    .is_some_and(|session| session.generation == generation)
+                {
+                    self.local.release_transfer(connection, transfer);
+                }
+            }
             StoreCommand::AdoptRemote {
                 namespace,
                 key,

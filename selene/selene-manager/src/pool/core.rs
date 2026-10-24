@@ -6,6 +6,7 @@ use super::{
     claims::Claim,
     index::{InstanceId, ScopeIndex, SourceId, Staged},
     limits::Limits,
+    store_bridge::{CatalogFeed, Link, PutKey, PutRec, StoreHandle},
     validate_scope,
 };
 use crate::{
@@ -94,6 +95,19 @@ pub enum Event {
     Closed {
         sid: u64,
     },
+    PutAnswer {
+        process: ProcKey,
+        put_id: u64,
+        answer: std::io::Result<crate::store::PutAnswer>,
+    },
+    GetAnswer {
+        key: super::claims::ClaimKey,
+        answer: std::io::Result<crate::store::GetAnswer>,
+    },
+    Catalog {
+        scope: ScopeId,
+        event: crate::proto::CatalogEvent,
+    },
     Shutdown {
         done: oneshot::Sender<()>,
     },
@@ -112,6 +126,7 @@ pub(super) struct Session {
     pub scope: ScopeId,
     pub tx: mpsc::Sender<v2::ServerMessage>,
     pub shm: bool,
+    pub pid: u32,
     pub export_slots: u32,
     pub claim_slots: u32,
     /// The manager holds no entries for this session until a snapshot installs.
@@ -138,6 +153,9 @@ pub(super) struct Proc {
     pub pidfd: Option<OwnedFd>,
     pub exited: bool,
     pub claim_hw: u64,
+    pub put_hw: u64,
+    /// The process's connection to the manager's store, opened on first use.
+    pub link: Option<Link>,
 }
 
 pub(super) struct ScopeState {
@@ -147,6 +165,10 @@ pub(super) struct ScopeState {
 
 pub struct Core {
     pub(super) cfg: PoolConfig,
+    pub(super) store: Option<StoreHandle>,
+    pub(super) self_tx: mpsc::Sender<Event>,
+    pub(super) puts: HashMap<PutKey, PutRec>,
+    pub(super) catalogs: HashMap<ScopeId, CatalogFeed>,
     pub(super) shared: Arc<Shared>,
     pub(super) incarnation: u64,
     pub(super) staging: Arena,
@@ -208,6 +230,7 @@ impl Core {
         staging: Arena,
         disk_recovered: bool,
         recovered_records: u64,
+        store: Option<mpsc::Sender<crate::store::StoreCommand>>,
     ) -> (Self, PoolHandle, mpsc::Receiver<Event>) {
         let incarnation = random_incarnation();
         let euid = unsafe { libc::geteuid() };
@@ -237,6 +260,13 @@ impl Core {
         let (events, receiver) = mpsc::channel(4096);
         let mut core = Self {
             cfg,
+            store: store.map(|commands| StoreHandle {
+                commands,
+                next_connection: 1 << 40,
+            }),
+            self_tx: events.clone(),
+            puts: HashMap::new(),
+            catalogs: HashMap::new(),
             shared: shared.clone(),
             incarnation,
             staging,
@@ -300,6 +330,13 @@ impl Core {
             }
             Event::Message { sid, message } => self.message(sid, *message),
             Event::Closed { sid } => self.session_lost(sid),
+            Event::PutAnswer {
+                process,
+                put_id,
+                answer,
+            } => self.put_answer(process, put_id, answer),
+            Event::GetAnswer { key, answer } => self.get_answer(key, answer),
+            Event::Catalog { scope, event } => self.catalog_event(scope, event),
             Event::Shutdown { done } => self.begin_shutdown(done),
         }
         self.flush_overflowed();
@@ -427,6 +464,8 @@ impl Core {
             pidfd: None,
             exited: false,
             claim_hw: 0,
+            put_hw: 0,
+            link: None,
         });
         if entry.pid.is_none() {
             if let Some(pid) = started_pid {
@@ -438,12 +477,14 @@ impl Core {
                 }
             }
         }
-        self.scopes
-            .entry(scope.id)
-            .or_insert_with(|| super::core::ScopeState {
-                valid: scope.clone(),
-                index: ScopeIndex::default(),
-            });
+        let fresh = !self.scopes.contains_key(&scope.id);
+        self.scopes.entry(scope.id).or_insert_with(|| ScopeState {
+            valid: scope.clone(),
+            index: ScopeIndex::default(),
+        });
+        if fresh {
+            self.watch_catalog(scope.id);
+        }
         self.instances.insert(
             instance,
             Instance {
@@ -460,6 +501,7 @@ impl Core {
                 scope: scope.id,
                 tx,
                 shm,
+                pid: peer.pid,
                 export_slots,
                 claim_slots,
                 need_resync: true,
@@ -704,7 +746,6 @@ impl Core {
         self.lookup_pass();
         self.claim_timers(now);
         self.resync_timers(now);
-        self.put_timers(now);
         // Keep live instances fresh in the persisted list.
         if now.duration_since(self.barrier_saved) >= Duration::from_secs(5) {
             let live: Vec<InstanceId> = self
@@ -752,6 +793,10 @@ impl Core {
     }
 
     fn finish_shutdown(&mut self) {
+        let processes: Vec<ProcKey> = self.procs.keys().copied().collect();
+        for process in processes {
+            self.drop_link(process);
+        }
         let sids: Vec<u64> = self.sessions.keys().copied().collect();
         for sid in sids {
             self.close_session(

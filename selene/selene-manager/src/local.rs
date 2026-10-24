@@ -717,6 +717,17 @@ impl Local {
             .ok_or(ReleaseError::UnknownWindow)
     }
 
+    /// Releases every window of one transfer, whatever its state. Used when the party that
+    /// may still touch them has proven it stopped.
+    pub fn release_transfer(&mut self, connection: u64, transfer: u64) -> usize {
+        let Some(record) = self.connections.get_mut(&connection) else {
+            return 0;
+        };
+        let before = record.windows.len();
+        record.windows.retain(|(id, _), _| *id != transfer);
+        before - record.windows.len()
+    }
+
     pub fn window_bytes(&self, connection: u64, transfer: u64, index: u32) -> Option<&[u8]> {
         let window = self
             .connections

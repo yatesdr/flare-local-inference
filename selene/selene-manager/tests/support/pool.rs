@@ -793,3 +793,187 @@ pub fn records_for(
     }
     records
 }
+
+/// The outcome of a scripted put.
+#[derive(Debug)]
+pub enum PutResult {
+    Stored(u64),
+    Refused(v2::PutRefused),
+}
+
+/// Deliberate damage for the put tests.
+#[derive(Clone, Copy, Default)]
+pub struct Damage {
+    /// Flip a bit in this record-relative page of the payload before checksumming.
+    pub corrupt_page: Option<usize>,
+    /// Commit metadata whose header names another key.
+    pub wrong_key: bool,
+    /// Stop after the accept and cancel.
+    pub cancel_after_accept: bool,
+}
+
+impl Session {
+    /// Writes one record into the manager's store through shared windows.
+    pub async fn put_record(
+        &mut self,
+        put_id: u64,
+        key: Key,
+        parent: Option<Key>,
+        damage: Damage,
+    ) -> PutResult {
+        let parent_key = parent.map(|parent| v2::PrefixKey {
+            consumed_tokens: parent.consumed_tokens,
+            digest: parent.digest.to_vec(),
+        });
+        self.send(c::M::PutBegin(v2::PutBegin {
+            put_id,
+            key: Some(v2::PrefixKey {
+                consumed_tokens: key.consumed_tokens,
+                digest: key.digest.to_vec(),
+            }),
+            chain_pages: key.consumed_tokens / PAGE_TOKENS,
+            row: true,
+            has_published_parent: parent.is_some(),
+            published_parent: parent_key,
+            bucket: vec![4; 16],
+            published_tail_pages: key.consumed_tokens / PAGE_TOKENS
+                - parent.map_or(0, |parent| parent.consumed_tokens / PAGE_TOKENS),
+            mode: v2::CopyMode::SharedWindows as i32,
+            generation: 1,
+        }))
+        .await;
+        enum First {
+            Accept(v2::PutAccept),
+            Refused(v2::PutRefused),
+        }
+        let first = self
+            .take(|m| match m {
+                M::PutAccept(accept) if accept.put_id == put_id => {
+                    Some(First::Accept(accept.clone()))
+                }
+                M::PutRefused(refused) if refused.put_id == put_id => {
+                    Some(First::Refused(refused.clone()))
+                }
+                _ => None,
+            })
+            .await;
+        let accept = match first {
+            First::Accept(accept) => accept,
+            First::Refused(refused) => return PutResult::Refused(refused),
+        };
+        if damage.cancel_after_accept {
+            self.send(c::M::PutCancel(v2::PutCancel { put_id })).await;
+            return PutResult::Refused(v2::PutRefused {
+                put_id,
+                reason: 0,
+                detail: "cancelled by the test".into(),
+            });
+        }
+        let first = accept.first_page as u32;
+        let accepted_parent = accept.parent.as_ref().map(|parent| Key {
+            consumed_tokens: parent.consumed_tokens,
+            digest: parent.digest.as_slice().try_into().unwrap(),
+        });
+        let (header, mut bytes, _) =
+            super::content_for(&super::descriptor(), key, accepted_parent, first);
+        let payload = header.length_with_row() - header.page_segment;
+        let mut covered = 0u64;
+        loop {
+            enum Next {
+                Grant(v2::PutGrant),
+                Stored(v2::Stored),
+                Refused(v2::PutRefused),
+            }
+            let next = self
+                .take(|m| match m {
+                    M::PutGrant(grant) if grant.put_id == put_id => Some(Next::Grant(*grant)),
+                    M::Stored(stored) if stored.put_id == put_id => Some(Next::Stored(*stored)),
+                    M::PutRefused(refused) if refused.put_id == put_id => {
+                        Some(Next::Refused(refused.clone()))
+                    }
+                    _ => None,
+                })
+                .await;
+            let grant = match next {
+                Next::Stored(stored) => return PutResult::Stored(stored.bytes),
+                Next::Refused(refused) => return PutResult::Refused(refused),
+                Next::Grant(grant) => grant,
+            };
+            let window = grant.window.unwrap();
+            let page_bytes = header.page_record_bytes() as usize;
+            let start = if window.page_count > 0 {
+                header.page_segment as usize + (window.first_page - first) as usize * page_bytes
+            } else {
+                header.row_segment as usize
+            };
+            let mut hashes = Vec::new();
+            for position in 0..window.page_count as usize {
+                let relative = (window.first_page - first) as usize + position;
+                let page = header.page_segment as usize + relative * page_bytes;
+                if damage.corrupt_page == Some(relative) {
+                    bytes[page] ^= 1;
+                }
+                hashes.push(selene_manager::record::checksum(
+                    &bytes[page..page + page_bytes],
+                ));
+            }
+            let row_hash = window
+                .row
+                .then(|| selene_manager::record::checksum(&bytes[header.row_segment as usize..]));
+            let length = window.length as usize;
+            self.shm
+                .as_ref()
+                .unwrap()
+                .write(&window, &bytes[start..start + length]);
+            self.send(c::M::PutFilled(v2::PutFilled {
+                put_id,
+                index: window.index,
+                page_xxh3: hashes,
+                row_xxh3: row_hash.unwrap_or(0),
+                has_row: window.row,
+            }))
+            .await;
+            covered += window.length;
+            if covered >= payload {
+                let mut metadata = bytes[..header.page_segment as usize].to_vec();
+                if damage.wrong_key {
+                    metadata[40] ^= 0xff;
+                }
+                self.send(c::M::PutCommit(v2::PutCommit {
+                    put_id,
+                    metadata_offset: 0,
+                    metadata,
+                }))
+                .await;
+            }
+        }
+    }
+
+    /// Waits until the manager's own entry for `tokens` shows up in lookups.
+    pub async fn manager_candidate(&mut self, id: u64, tokens: u64) -> v2::Candidate {
+        for round in 0..200 {
+            let reply = self
+                .lookup_request(v2::LookupRequest {
+                    lookup_id: id * 1000 + round,
+                    boundaries: vec![v2::PrefixKey {
+                        consumed_tokens: 0,
+                        digest: vec![4; 16],
+                    }],
+                    before_tokens: tokens + 1,
+                    held: vec![],
+                    level_order: default_order(),
+                    max_candidates: 0,
+                })
+                .await;
+            if let Some(found) = reply
+                .candidates
+                .iter()
+                .find(|c| c.key.as_ref().unwrap().consumed_tokens == tokens)
+            {
+                return found.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the manager never offered {tokens}");
+    }
+}
