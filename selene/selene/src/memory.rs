@@ -38,7 +38,7 @@ use crate::{
     index::{NodeEvent, NodeNotice},
     pool::{
         Announcer, HostPin, IndexEntry, MemoryPin, Releases, Tier as PoolTier, TierView,
-        pins::{MemorySpan, host_chain},
+        pins::{MemorySpan, host_chain_kept},
         tiers::{HashJob, Hasher, RecordSums},
     },
 };
@@ -1357,12 +1357,15 @@ impl MemoryStore {
             });
         }
         let page_tokens = self.core.layout.page_tokens;
-        let chain = host_chain(page_tokens, begin_tokens, want_row, &nodes);
+        let (chain, kept) = host_chain_kept(page_tokens, begin_tokens, want_row, &nodes);
         if chain.total_pages
             != (endpoint.consumed_tokens / page_tokens).saturating_sub(begin_tokens / page_tokens)
         {
             return Err(ExportRefusal::ChainGap);
         }
+        // Windows name records by their place in the chain, which leaves out nodes with no page.
+        let mut spans: Vec<Option<MemorySpan>> = spans.into_iter().map(Some).collect();
+        let spans: Vec<MemorySpan> = kept.iter().filter_map(|&i| spans[i].take()).collect();
         for (position, key) in keys.iter().enumerate() {
             if self.core.index.pin(key).is_err() {
                 for pinned in &keys[..position] {
