@@ -1,23 +1,29 @@
 //! The Helios tiering interface over selene's host tiers.
 
 use flare_selene::{
-    HostHit, HostStore, InboundTicket, PublishedCheckpoint, StoreOutcome, StoreStats,
+    ExportChain, ExportId, ExportRefusal, HostHit, HostStore, InboundTicket, PublishedCheckpoint,
+    StoreOutcome, StoreStats, pool::LookupTicket,
 };
 
 use super::{PrefixStore, StoreEvent};
-use crate::{Result, cache::PrefixHistory};
+use crate::{
+    Result,
+    cache::{PrefixHistory, PrefixKey},
+};
 
 /// Drives a selene store as the worker's [`PrefixStore`].
 pub(super) struct Host {
     store: Box<dyn HostStore>,
+    pooled: bool,
     /// Event scratch reused across polls.
     events: Vec<flare_selene::StoreEvent>,
 }
 
 impl Host {
-    pub(super) fn new(store: Box<dyn HostStore>) -> Self {
+    pub(super) fn new(store: Box<dyn HostStore>, pooled: bool) -> Self {
         Self {
             store,
+            pooled,
             events: Vec::new(),
         }
     }
@@ -38,29 +44,75 @@ impl PrefixStore for Host {
 
     fn poll(&mut self, events: &mut Vec<StoreEvent>) -> Result<()> {
         let polled = self.store.poll(&mut self.events);
-        events.extend(self.events.drain(..).filter_map(|event| match event {
+        events.extend(self.events.drain(..).map(|event| match event {
             flare_selene::StoreEvent::Stored {
                 checkpoint,
                 key,
                 result,
-            } => Some(StoreEvent::Stored {
+            } => StoreEvent::Stored {
                 checkpoint,
                 key,
                 result: result.map_err(Into::into),
-            }),
-            flare_selene::StoreEvent::Fetched { key, result } => Some(StoreEvent::Fetched {
+            },
+            flare_selene::StoreEvent::Fetched { key, result } => StoreEvent::Fetched {
                 key,
                 result: result.map_err(Into::into),
-            }),
+            },
             flare_selene::StoreEvent::Deferred { checkpoint } => {
-                Some(StoreEvent::Deferred { checkpoint })
+                StoreEvent::Deferred { checkpoint }
             }
-            // Only a store attached to a pool produces export events, and the
-            // worker does not serve exports yet.
-            flare_selene::StoreEvent::ExportRequested { .. }
-            | flare_selene::StoreEvent::ExportEnded { .. } => None,
+            flare_selene::StoreEvent::ExportRequested {
+                export,
+                key,
+                generation,
+                begin_tokens,
+                want_row,
+                reserved_bytes,
+            } => StoreEvent::ExportRequested {
+                export,
+                key,
+                generation,
+                begin_tokens,
+                want_row,
+                reserved_bytes,
+            },
+            flare_selene::StoreEvent::ExportEnded { export } => StoreEvent::ExportEnded { export },
         }));
         Ok(polled?)
+    }
+
+    fn pooled(&self) -> bool {
+        self.pooled
+    }
+
+    fn begin_lookup(&mut self, history: &PrefixHistory) -> Option<LookupTicket> {
+        self.store.begin_lookup(history)
+    }
+
+    fn lookup_for(
+        &mut self,
+        ticket: Option<&LookupTicket>,
+        history: &PrefixHistory,
+        resident: u64,
+        before: u64,
+    ) -> Option<HostHit> {
+        self.store.lookup_for(ticket, history, resident, before)
+    }
+
+    fn export_pinned(&mut self, export: ExportId, chain: ExportChain) -> Result<()> {
+        Ok(self.store.export_pinned(export, chain)?)
+    }
+
+    fn export_refused(&mut self, export: ExportId, reason: ExportRefusal) {
+        self.store.export_refused(export, reason);
+    }
+
+    fn evicted(&mut self, key: PrefixKey, generation: u64, heir: Option<&PublishedCheckpoint>) {
+        self.store.evicted(key, generation, heir);
+    }
+
+    fn evictions_lost(&mut self) {
+        self.store.evictions_lost();
     }
 
     fn stats(&self) -> StoreStats {

@@ -225,6 +225,10 @@ pub trait HostStore {
     /// removed it as an endpoint; `heir` is the single child that took over its
     /// pages, with its updated publication.
     fn evicted(&mut self, _key: PrefixKey, _generation: u64, _heir: Option<&PublishedCheckpoint>) {}
+    /// Some eviction notices were dropped because they queued faster than the
+    /// worker delivered them, so the announced holdings may be stale and must be
+    /// announced again in full.
+    fn evictions_lost(&mut self) {}
     /// Start looking for pool candidates for a request that just queued. `None`
     /// when no lookup is wanted or possible.
     fn begin_lookup(&mut self, _history: &dyn History) -> Option<LookupTicket> {

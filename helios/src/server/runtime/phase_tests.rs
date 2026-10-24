@@ -217,6 +217,7 @@ impl Fixture {
                 prompt_score_end: 0,
                 prompt_scored: 0,
                 blocked: None,
+                pool_lookup: None,
             },
             Generation {
                 events: receiver,
@@ -1183,6 +1184,20 @@ struct FakeStore {
     close_panics: bool,
     close_calls: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
+    /// Shares prefixes through a pool: lookups begin at arrival and evictions are reported.
+    pooled: bool,
+    /// Token counts of the histories `begin_lookup` received.
+    begun: Vec<u64>,
+    /// Whether each `lookup_for` call carried a ticket.
+    tickets_seen: Vec<bool>,
+    /// Tickets dropped without an answer.
+    withdrawn: Arc<AtomicUsize>,
+    exports: Vec<(crate::offload::ExportId, crate::offload::ExportChain)>,
+    refused: Vec<(crate::offload::ExportId, crate::offload::ExportRefusal)>,
+    reject_export: bool,
+    evictions_lost: usize,
+    /// Each eviction notice with the number of `store` calls made before it.
+    evicted: Vec<(crate::cache::PrefixKey, u64, Option<crate::offload::PublishedCheckpoint>, usize)>,
 }
 
 impl FakeStore {
@@ -1200,11 +1215,76 @@ impl FakeStore {
             close_panics: false,
             close_calls: Arc::new(AtomicUsize::new(0)),
             drops: Arc::new(AtomicUsize::new(0)),
+            pooled: false,
+            begun: Vec::new(),
+            tickets_seen: Vec::new(),
+            withdrawn: Arc::new(AtomicUsize::new(0)),
+            exports: Vec::new(),
+            refused: Vec::new(),
+            reject_export: false,
+            evictions_lost: 0,
+            evicted: Vec::new(),
         }
     }
 }
 
 impl crate::offload::PrefixStore for FakeStore {
+    fn pooled(&self) -> bool {
+        self.pooled
+    }
+    fn begin_lookup(
+        &mut self,
+        history: &crate::cache::PrefixHistory,
+    ) -> Option<crate::offload::LookupTicket> {
+        self.begun.push(history.token_count());
+        let withdrawn = self.withdrawn.clone();
+        Some(crate::offload::LookupTicket::watched(
+            flare_selene::pool::LookupState::Pending,
+            move || {
+                withdrawn.fetch_add(1, Ordering::Relaxed);
+            },
+        ))
+    }
+    fn lookup_for(
+        &mut self,
+        ticket: Option<&crate::offload::LookupTicket>,
+        history: &crate::cache::PrefixHistory,
+        resident: u64,
+        before: u64,
+    ) -> Option<crate::offload::HostHit> {
+        self.tickets_seen.push(ticket.is_some());
+        self.lookup(history, resident, before)
+    }
+    fn export_pinned(
+        &mut self,
+        export: crate::offload::ExportId,
+        chain: crate::offload::ExportChain,
+    ) -> Result<()> {
+        if self.reject_export {
+            return Err("export rejected".into());
+        }
+        self.exports.push((export, chain));
+        Ok(())
+    }
+    fn export_refused(
+        &mut self,
+        export: crate::offload::ExportId,
+        reason: crate::offload::ExportRefusal,
+    ) {
+        self.refused.push((export, reason));
+    }
+    fn evicted(
+        &mut self,
+        key: crate::cache::PrefixKey,
+        generation: u64,
+        heir: Option<&crate::offload::PublishedCheckpoint>,
+    ) {
+        self.evicted
+            .push((key, generation, heir.cloned(), self.stored.len()));
+    }
+    fn evictions_lost(&mut self) {
+        self.evictions_lost += 1;
+    }
     fn lookup(
         &mut self,
         history: &crate::cache::PrefixHistory,
@@ -1598,6 +1678,315 @@ fn failed_restores_readmit_the_request_without_the_host_store() {
         assert_eq!(worker.scheduler.free_page_count(), free_pages);
         assert_eq!(worker.scheduler.free_snapshot_count(), free_snapshots);
     }
+}
+
+/// A worker over a pooled fake store whose scripted hit restores a 70-token prompt,
+/// leaving a GPU-ready one-page checkpoint. Returns the sender that keeps the
+/// worker's channel open, the request's handle, the checkpoint and its key.
+fn worker_with_checkpoint(
+    fixture: &Fixture,
+    pooled: bool,
+) -> (
+    Worker<'_>,
+    mpsc::Sender<Vec<Incoming>>,
+    RequestHandle,
+    crate::cache::CheckpointId,
+    crate::cache::PrefixKey,
+) {
+    let (sender, receiver) = mpsc::channel();
+    let (incoming, generation) = fixture.incoming(vec![0; 70], 4);
+    std::mem::forget(generation);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&incoming.prompt.tokens, &[]).unwrap();
+    sender.send(vec![incoming]).unwrap();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(Some(host_hit(&history, 70)));
+    store.pooled = pooled;
+    worker.attach_store(Some(Box::new(store)));
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    let handle = worker.active[0].as_ref().unwrap().request;
+    let (_, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
+    fake_store(&mut worker)
+        .events
+        .push_back(crate::offload::StoreEvent::Fetched {
+            key: ticket.key,
+            result: Ok(1 << 20),
+        });
+    assert!(worker.service_store().unwrap());
+    let id = worker.scheduler.request(handle).unwrap().prefix().unwrap();
+    (worker, sender, handle, id, history.key_at(70).unwrap())
+}
+
+fn pins(worker: &Worker<'_>, id: crate::cache::CheckpointId) -> u64 {
+    worker.scheduler.cache().checkpoint(id).unwrap().pin_count()
+}
+
+fn export_request(
+    export: u64,
+    key: crate::cache::PrefixKey,
+    generation: u64,
+    begin_tokens: u64,
+) -> crate::offload::StoreEvent {
+    crate::offload::StoreEvent::ExportRequested {
+        export: crate::offload::ExportId(export),
+        key,
+        generation,
+        begin_tokens,
+        want_row: true,
+        reserved_bytes: 1 << 20,
+    }
+}
+
+fn export_ended(export: u64) -> crate::offload::StoreEvent {
+    crate::offload::StoreEvent::ExportEnded {
+        export: crate::offload::ExportId(export),
+    }
+}
+
+#[test]
+fn an_export_pins_its_checkpoint_until_it_ends_and_releases_once() {
+    let fixture = Fixture::new();
+    let (mut worker, _sender, _handle, id, key) = worker_with_checkpoint(&fixture, true);
+    let base = pins(&worker, id);
+    fake_store(&mut worker)
+        .events
+        .push_back(export_request(7, key, id.value(), 0));
+    worker.service_store().unwrap();
+    // The answer comes in the iteration of the request, after the pin.
+    assert_eq!(pins(&worker, id), base + 1);
+    let store = fake_store(&mut worker);
+    assert!(store.refused.is_empty());
+    let (export, chain) = store.exports.pop().unwrap();
+    assert_eq!(export, crate::offload::ExportId(7));
+    assert_eq!(chain.nodes.len(), 1);
+    assert_eq!(chain.nodes[0].generation, id.value());
+    assert_eq!(chain.nodes[0].key, key);
+    assert!(chain.row.is_some());
+    assert_eq!(worker.exports.len(), 1);
+    // A duplicate end for the same export finds nothing: one unpin.
+    fake_store(&mut worker).events.push_back(export_ended(7));
+    fake_store(&mut worker).events.push_back(export_ended(7));
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, id), base);
+    assert!(worker.exports.is_empty());
+}
+
+#[test]
+fn an_export_without_an_end_keeps_its_pin() {
+    // A quarantined export never reports an end: its pin must outlive everything else.
+    let fixture = Fixture::new();
+    let (mut worker, _sender, handle, id, key) = worker_with_checkpoint(&fixture, true);
+    let store = fake_store(&mut worker);
+    store
+        .events
+        .push_back(export_request(1, key, id.value(), 0));
+    store.events.push_back(crate::offload::StoreEvent::Stored {
+        checkpoint: id,
+        key,
+        result: Ok(1 << 20),
+    });
+    worker.service_store().unwrap();
+    worker.retire(&[handle]).unwrap();
+    for _ in 0..3 {
+        worker.service_store().unwrap();
+    }
+    // The request's and the copy-out's pins are gone; the export's remains.
+    assert_eq!(pins(&worker, id), 1);
+    assert_eq!(worker.exports.len(), 1);
+}
+
+#[test]
+fn exports_that_cannot_be_served_are_refused_without_a_pin() {
+    use crate::offload::ExportRefusal::*;
+    let fixture = Fixture::new();
+    let (mut worker, _sender, _handle, id, key) = worker_with_checkpoint(&fixture, true);
+    let base = pins(&worker, id);
+    let mut other = crate::cache::PrefixHistory::new(fixture.config.identity);
+    other.append(&[9; 70], &[]).unwrap();
+    let store = fake_store(&mut worker);
+    store
+        .events
+        .push_back(export_request(1, other.key_at(70).unwrap(), id.value(), 0));
+    store
+        .events
+        .push_back(export_request(2, key, id.value() + 1, 0));
+    store
+        .events
+        .push_back(export_request(3, key, id.value(), 10_000));
+    store
+        .events
+        .push_back(export_request(4, key, id.value(), 0));
+    store
+        .events
+        .push_back(export_request(4, key, id.value(), 0));
+    worker.service_store().unwrap();
+    let store = fake_store(&mut worker);
+    let refused: Vec<_> = store.refused.iter().map(|(e, r)| (e.0, *r)).collect();
+    assert_eq!(
+        refused,
+        [
+            (1, NotFound),
+            (2, GenerationChanged),
+            (3, ChainGap),
+            (4, Busy)
+        ]
+    );
+    assert_eq!(store.exports.len(), 1);
+    assert_eq!(pins(&worker, id), base + 1);
+}
+
+#[test]
+fn a_store_that_rejects_a_pinned_export_gets_the_pin_back() {
+    let fixture = Fixture::new();
+    let (mut worker, _sender, _handle, id, key) = worker_with_checkpoint(&fixture, true);
+    let base = pins(&worker, id);
+    let store = fake_store(&mut worker);
+    store.reject_export = true;
+    store
+        .events
+        .push_back(export_request(1, key, id.value(), 0));
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, id), base);
+    assert!(worker.exports.is_empty());
+}
+
+#[test]
+fn an_export_is_refused_when_the_next_admission_would_no_longer_fit() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 4;
+    fixture.config.limits.max_sequence_tokens = 192;
+    let (mut worker, _sender, _handle, id, key) = worker_with_checkpoint(&fixture, true);
+    let base = pins(&worker, id);
+    // With nothing queued the export fits.
+    fake_store(&mut worker)
+        .events
+        .push_back(export_request(1, key, id.value(), 0));
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, id), base + 1);
+    fake_store(&mut worker).events.push_back(export_ended(1));
+    worker.service_store().unwrap();
+    // A queued three-page request would not fit, once the checkpoint's page is protected.
+    let (queued, _generation) = fixture.incoming(vec![9; 150], 4);
+    std::mem::forget(_generation);
+    worker.pending.push_back(queued);
+    fake_store(&mut worker)
+        .events
+        .push_back(export_request(2, key, id.value(), 0));
+    worker.service_store().unwrap();
+    assert_eq!(
+        fake_store(&mut worker)
+            .refused
+            .last()
+            .map(|(e, r)| (e.0, *r)),
+        Some((2, crate::offload::ExportRefusal::NoHeadroom))
+    );
+    assert_eq!(pins(&worker, id), base);
+}
+
+#[test]
+fn a_pooled_store_hears_of_evictions_and_a_local_one_does_not() {
+    for pooled in [true, false] {
+        let mut fixture = Fixture::new();
+        fixture.config.limits.pages = 3;
+        fixture.config.limits.max_sequence_tokens = 192;
+        let (mut worker, _sender, handle, id, key) = worker_with_checkpoint(&fixture, pooled);
+        // Release the request's and the copy-out's pins so the checkpoint can be evicted.
+        worker.retire(&[handle]).unwrap();
+        let publication = fake_store(&mut worker).stored[0].clone();
+        fake_store(&mut worker)
+            .events
+            .push_back(crate::offload::StoreEvent::Stored {
+                checkpoint: id,
+                key,
+                result: Ok(1 << 20),
+            });
+        worker.service_store().unwrap();
+        let (queued, generation) = fixture.incoming(vec![9; 150], 4);
+        std::mem::forget(generation);
+        worker.pending.push_back(queued);
+        worker.admit().unwrap();
+        worker.service_store().unwrap();
+        let evicted = &fake_store(&mut worker).evicted;
+        if pooled {
+            assert_eq!(evicted.len(), 1);
+            assert_eq!((evicted[0].0, evicted[0].1), (key, id.value()));
+            assert!(evicted[0].2.is_none());
+            assert_eq!(publication.key, key);
+        } else {
+            assert!(evicted.is_empty());
+        }
+    }
+}
+
+#[test]
+fn a_pooled_lookup_starts_at_arrival_and_ends_at_admission() {
+    let fixture = Fixture::new();
+    let (sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.pooled = true;
+    let withdrawn = store.withdrawn.clone();
+    worker.attach_store(Some(Box::new(store)));
+    // Five requests arrive for four slots; the fifth keeps waiting.
+    let mut generations = Vec::new();
+    let mut group = Vec::new();
+    for fill in 0..5 {
+        let (incoming, generation) = fixture.incoming(vec![fill; 70], 4);
+        generations.push(generation);
+        group.push(incoming);
+    }
+    sender.send(group).unwrap();
+    worker.admit().unwrap();
+    assert_eq!(fake_store(&mut worker).begun, [70; 5]);
+    // Admission consulted the ticket and then released it.
+    assert_eq!(fake_store(&mut worker).tickets_seen, [true; 4]);
+    assert_eq!(withdrawn.load(Ordering::Relaxed), 4);
+    assert!(
+        worker
+            .active
+            .iter()
+            .flatten()
+            .all(|a| a.incoming.pool_lookup.is_none())
+    );
+    assert_eq!(worker.pending.len(), 1);
+    assert!(worker.pending[0].pool_lookup.is_some());
+    // Cancelling the waiting request withdraws its lookup with it.
+    generations[4].cancelled.store(true, Ordering::Release);
+    worker.admit().unwrap();
+    assert!(worker.pending.is_empty());
+    assert_eq!(withdrawn.load(Ordering::Relaxed), 5);
+}
+
+#[test]
+fn a_local_store_builds_no_lookup_and_a_failed_restore_starts_none() {
+    let fixture = Fixture::new();
+    let (mut worker, _sender, _handle, _id, _key) = worker_with_checkpoint(&fixture, false);
+    assert!(fake_store(&mut worker).begun.is_empty());
+    assert_eq!(fake_store(&mut worker).tickets_seen, [false]);
+
+    // A pooled request whose restore fails is readmitted without the store, and
+    // without a new lookup.
+    let (sender, receiver) = mpsc::channel();
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&incoming.prompt.tokens, &[]).unwrap();
+    sender.send(vec![incoming]).unwrap();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(Some(host_hit(&history, 70)));
+    store.pooled = true;
+    worker.attach_store(Some(Box::new(store)));
+    worker.admit().unwrap();
+    let (_, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
+    fake_store(&mut worker)
+        .events
+        .push_back(crate::offload::StoreEvent::Fetched {
+            key: ticket.key,
+            result: Err("transfer failed".into()),
+        });
+    worker.service_store().unwrap();
+    assert_eq!(worker.parked.len(), 1);
+    assert!(worker.parked[0].0.pool_lookup.is_none());
+    assert_eq!(fake_store(&mut worker).begun, [70]);
 }
 
 fn group_runtime(

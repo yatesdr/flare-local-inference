@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -154,6 +154,10 @@ struct Incoming {
     prompt_scored: usize,
     /// Retry capacity admission only after the scheduler's resources change.
     blocked: Option<(crate::cache::Fence, usize, usize, usize)>,
+    /// Pool lookup started when the request reached the worker. The worker clears
+    /// it when the request is admitted, which withdraws a lookup still on the
+    /// wire; a cancelled or failed request drops it with the `Incoming`.
+    pool_lookup: Option<crate::offload::LookupTicket>,
 }
 impl Incoming {
     fn prompt_score_range(&self, start: usize, tokens: usize) -> std::ops::Range<usize> {
@@ -714,6 +718,7 @@ impl ModelRuntime {
                 host_lookup: true,
                 readmitted: false,
                 blocked: None,
+                pool_lookup: None,
             };
             let enqueue_ns = observation
                 .filter(|timestamps| *timestamps)
@@ -855,6 +860,9 @@ struct Worker<'a> {
     queue_capacity: usize,
     store: Option<Box<dyn crate::offload::PrefixStore>>,
     deferred_stores: Vec<crate::cache::CheckpointId>,
+    /// The checkpoint each served export pins, until its `ExportEnded`: the only
+    /// place an export's pin is released.
+    exports: HashMap<crate::offload::ExportId, crate::cache::CheckpointId>,
     store_progress: u64,
     /// Prefill tokens per second measured from completed prefill frames, which
     /// the host-store fetch policy compares with transfer time.
@@ -885,6 +893,7 @@ impl<'a> Worker<'a> {
             queue_capacity,
             store: None,
             deferred_stores: Vec::new(),
+            exports: HashMap::new(),
             store_progress: 0,
             pending: VecDeque::with_capacity(queue_capacity),
             parked: VecDeque::new(),
@@ -961,7 +970,7 @@ impl<'a> Worker<'a> {
                         .receiver
                         .recv_timeout(std::time::Duration::from_millis(2))
                     {
-                        Ok(request) => self.pending.extend(request),
+                        Ok(request) => self.enqueue(request),
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                     }
@@ -975,7 +984,36 @@ impl<'a> Worker<'a> {
         if store.is_some() {
             self.scheduler.enable_publications();
         }
+        if store.as_ref().is_some_and(|store| store.pooled()) {
+            self.scheduler.enable_evictions();
+        }
         self.store = store;
+    }
+
+    /// Queue arriving requests, starting each one's pool lookup so its answer is
+    /// ready by admission.
+    fn enqueue(&mut self, mut requests: Vec<Incoming>) {
+        self.begin_pool_lookups(&mut requests);
+        self.pending.extend(requests);
+    }
+
+    /// Starts a pool lookup for each request that will consult the store. Nothing
+    /// is built unless the store shares prefixes.
+    fn begin_pool_lookups(&mut self, requests: &mut [Incoming]) {
+        let Some(store) = self.store.as_mut().filter(|store| store.pooled()) else {
+            return;
+        };
+        for incoming in requests.iter_mut().filter(|incoming| {
+            incoming.host_lookup && incoming.prompt_scored >= incoming.prompt_score_end
+        }) {
+            let mut history = crate::cache::PrefixHistory::new(self.config.identity);
+            if history
+                .append(&incoming.prompt.tokens, &incoming.prompt.conditioning)
+                .is_ok()
+            {
+                incoming.pool_lookup = store.begin_lookup(&history);
+            }
+        }
     }
 
     fn close_store(&mut self, shutdown: &mut Shutdown) {
@@ -1058,7 +1096,7 @@ impl<'a> Worker<'a> {
         while self.pending.len() < self.queue_capacity {
             match self.receiver.try_recv() {
                 Ok(request) => {
-                    self.pending.extend(request);
+                    self.enqueue(request);
                     progress = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -1141,6 +1179,7 @@ impl<'a> Worker<'a> {
                 admit_with_host_store(
                     &mut self.scheduler,
                     store.as_mut(),
+                    incoming.pool_lookup.as_ref(),
                     spec,
                     self.prefill_rate,
                     self.metrics,
@@ -1243,6 +1282,8 @@ impl<'a> Worker<'a> {
                 self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
             }
             self.scheduler.resume_decoded_sequence(handle, parked.carried.decoded_sequence)?;
+            // The lookup has served its admission; this withdraws one still pending.
+            incoming.pool_lookup = None;
             incoming.notify_admission(Ok(()));
             self.active[slot] = Some(Active {
                 request: handle,
@@ -1733,6 +1774,7 @@ impl<'a> Worker<'a> {
         incoming.prompt.tokens = tokens;
         incoming.prompt.max_new_tokens -= generated;
         incoming.readmitted = true;
+        self.begin_pool_lookups(std::slice::from_mut(&mut incoming));
         let seed = active.carried.seed.unwrap_or(incoming.prompt.sampling.seed);
         let generated_tokens = active.carried.generated_tokens + generated;
         incoming.prompt.sampling.seed = continuation_seed(seed, generated_tokens);
@@ -1997,7 +2039,40 @@ impl<'a> Worker<'a> {
                 StoreEvent::Fetched { key, result } => {
                     requeued.extend(self.scheduler.finish_inbound(key, result.is_ok())?);
                 }
+                StoreEvent::ExportRequested {
+                    export,
+                    key,
+                    generation,
+                    begin_tokens,
+                    want_row,
+                    ..
+                } => {
+                    let next = next_admission(&self.scheduler, &self.parked, &self.pending);
+                    serve_export(
+                        &mut self.scheduler,
+                        store.as_mut(),
+                        &mut self.exports,
+                        next,
+                        export,
+                        (key, generation, begin_tokens, want_row),
+                    )?;
+                }
+                StoreEvent::ExportEnded { export } => {
+                    // A second end for the same export finds nothing: one unpin.
+                    if let Some(id) = self.exports.remove(&export) {
+                        self.scheduler.unpin_checkpoint(id)?;
+                        released = true;
+                    }
+                }
             }
+        }
+        // Eviction notices precede the next `store`, so a pool never learns of a
+        // replacement before the removal it replaces.
+        for evicted in self.scheduler.take_evictions() {
+            store.evicted(evicted.key, evicted.generation, evicted.heir.as_ref());
+        }
+        if self.scheduler.take_evictions_lost() {
+            store.evictions_lost();
         }
         if released {
             for incoming in self
@@ -2124,11 +2199,79 @@ impl<'a> Worker<'a> {
     }
 }
 
+/// The request admission would take next, as the export headroom check sees it:
+/// the first eligible one, parked before pending, as the admission loop picks.
+fn next_admission(
+    scheduler: &RequestScheduler,
+    parked: &VecDeque<(Incoming, Parked<'_>)>,
+    pending: &VecDeque<Incoming>,
+) -> Option<crate::scheduler::NextAdmission> {
+    let stats = scheduler.stats();
+    let resources = (
+        scheduler.completed(),
+        stats.free_pages,
+        stats.free_snapshots,
+        stats.free_slots,
+    );
+    parked
+        .iter()
+        .map(|(incoming, _)| incoming)
+        .chain(pending)
+        .find(|incoming| incoming.blocked != Some(resources))
+        .map(|incoming| crate::scheduler::NextAdmission {
+            prompt_tokens: incoming.prompt.tokens.len(),
+            max_new_tokens: incoming.prompt.max_new_tokens,
+            growable: true,
+        })
+}
+
+/// Answers one export request in the iteration it arrived: validate, check
+/// headroom, pin, then describe the chain to the store. Nothing is pinned after
+/// a refusal, and the pin is recorded before the store hears of the export.
+fn serve_export(
+    scheduler: &mut RequestScheduler,
+    store: &mut dyn crate::offload::PrefixStore,
+    exports: &mut HashMap<crate::offload::ExportId, crate::cache::CheckpointId>,
+    next: Option<crate::scheduler::NextAdmission>,
+    export: crate::offload::ExportId,
+    (key, generation, begin_tokens, want_row): (crate::cache::PrefixKey, u64, u64, bool),
+) -> Result<()> {
+    use crate::offload::ExportRefusal;
+    use crate::scheduler::ExportLookup;
+    let refuse = |store: &mut dyn crate::offload::PrefixStore, reason| {
+        store.export_refused(export, reason);
+        Ok(())
+    };
+    if exports.contains_key(&export) {
+        return refuse(store, ExportRefusal::Busy);
+    }
+    let id = match scheduler.checkpoint_by_generation(&key, generation) {
+        ExportLookup::Found(id) => id,
+        ExportLookup::Missing => return refuse(store, ExportRefusal::NotFound),
+        ExportLookup::Changed => return refuse(store, ExportRefusal::GenerationChanged),
+    };
+    let Some(chain) = scheduler.export_chain(id, begin_tokens, want_row) else {
+        return refuse(store, ExportRefusal::ChainGap);
+    };
+    if !scheduler.export_fits(id, next) {
+        return refuse(store, ExportRefusal::NoHeadroom);
+    }
+    scheduler.pin_checkpoint(id)?;
+    exports.insert(export, id);
+    if store.export_pinned(export, chain).is_err() {
+        // The store will not serve it and sends no end: release the pin here.
+        exports.remove(&export);
+        scheduler.unpin_checkpoint(id)?;
+    }
+    Ok(())
+}
+
 /// Plan the admission, look the history up in the host store above the GPU
 /// checkpoint, and start a restore when the transfer beats recomputation.
 fn admit_with_host_store(
     scheduler: &mut RequestScheduler,
     store: &mut dyn crate::offload::PrefixStore,
+    pool_lookup: Option<&crate::offload::LookupTicket>,
     spec: RequestSpec,
     prefill_rate: f64,
     metrics: &super::metrics::Metrics,
@@ -2137,7 +2280,9 @@ fn admit_with_host_store(
     use crate::offload::LookupOutcome;
     let mut before = u64::MAX;
     let hit = loop {
-        let Some(hit) = store.lookup(plan.history(), plan.resident_tokens(), before) else {
+        let Some(hit) =
+            store.lookup_for(pool_lookup, plan.history(), plan.resident_tokens(), before)
+        else {
             if before == u64::MAX {
                 metrics.host_lookup_outcome(LookupOutcome::NoMatch);
             }
@@ -2574,6 +2719,7 @@ mod tests {
             prompt_score_end: 0,
             prompt_scored: 0,
             blocked: None,
+            pool_lookup: None,
         };
         (
             incoming,

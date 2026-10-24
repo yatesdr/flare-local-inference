@@ -22,10 +22,11 @@ pub mod shard;
 pub mod transfer;
 
 pub use flare_selene::{
-    CacheGeometry, HostHit, INITIAL_DIRECT_DISK_RATE, INITIAL_MEMORY_RATE, INITIAL_PREFILL_RATE,
-    INITIAL_STAGED_DISK_RATE, InboundTicket, JobId, Layout, Plane, PublishedCheckpoint,
-    StoreOutcome, StoreReason, StoreStats, Tier, Transport, disk, disk_store, geometry, index,
-    input, record, slab, worth_fetching,
+    CacheGeometry, ExportChain, ExportId, ExportNode, ExportRefusal, HostHit,
+    INITIAL_DIRECT_DISK_RATE, INITIAL_MEMORY_RATE, INITIAL_PREFILL_RATE, INITIAL_STAGED_DISK_RATE,
+    InboundTicket, JobId, Layout, Plane, PublishedCheckpoint, StoreOutcome, StoreReason,
+    StoreStats, Tier, Transport, disk, disk_store, geometry, index, input, pool::LookupTicket,
+    record, slab, worth_fetching,
 };
 use flare_selene::{HostStore, composite, memory};
 
@@ -616,7 +617,7 @@ pub fn open(prepared: Prepared) -> Result<Box<dyn PrefixStore>> {
         (None, Some(disk)) => Box::new(disk),
         (None, None) => return Err("no prefix store tier is configured".into()),
     };
-    Ok(Box::new(adapter::Host::new(store)))
+    Ok(Box::new(adapter::Host::new(store, false)))
 }
 
 /// Completion of work a store accepted earlier.
@@ -632,6 +633,20 @@ pub enum StoreEvent {
     Fetched { key: PrefixKey, result: Result<u64> },
     /// No copy still reads the GPU checkpoint; retry its publication after progress.
     Deferred { checkpoint: CheckpointId },
+    /// A pool manager asked this instance to export a GPU checkpoint. The worker
+    /// answers with `export_pinned` or `export_refused` in the same iteration.
+    ExportRequested {
+        export: ExportId,
+        key: PrefixKey,
+        generation: u64,
+        begin_tokens: u64,
+        want_row: bool,
+        /// Bytes of staging the manager reserved for the whole export.
+        reserved_bytes: u64,
+    },
+    /// The export finished or was cancelled and no copy still reads its pages;
+    /// the worker releases its pin, once.
+    ExportEnded { export: ExportId },
 }
 
 #[derive(Clone, Copy)]
@@ -668,6 +683,40 @@ pub trait PrefixStore {
     /// On failure the caller must retain the store: transfer jobs may still
     /// reference its registered host buffers and GPU destinations.
     fn close(&mut self) -> Result<()>;
+
+    /// Whether this store shares prefixes through a pool. When it does not, the
+    /// worker builds no lookup history, tracks no evictions and sees no exports.
+    fn pooled(&self) -> bool {
+        false
+    }
+    /// Start looking for pool candidates for a request that just queued.
+    /// `None` when no lookup is possible.
+    fn begin_lookup(&mut self, _history: &PrefixHistory) -> Option<LookupTicket> {
+        None
+    }
+    /// `lookup` for a request that holds `ticket`. Without a ticket, or while
+    /// its lookup has no answer, this is the local lookup.
+    fn lookup_for(
+        &mut self,
+        _ticket: Option<&LookupTicket>,
+        history: &PrefixHistory,
+        resident: u64,
+        before: u64,
+    ) -> Option<HostHit> {
+        self.lookup(history, resident, before)
+    }
+    /// The worker pinned the checkpoint for `export` and describes its chain.
+    /// An error means the store will not serve the export; the worker unpins.
+    fn export_pinned(&mut self, _export: ExportId, _chain: ExportChain) -> Result<()> {
+        Ok(())
+    }
+    /// The worker did not pin a checkpoint for `export`.
+    fn export_refused(&mut self, _export: ExportId, _reason: ExportRefusal) {}
+    /// A published GPU checkpoint left the cache; `heir` is the child that took
+    /// over its pages when compaction removed it.
+    fn evicted(&mut self, _key: PrefixKey, _generation: u64, _heir: Option<&PublishedCheckpoint>) {}
+    /// Eviction notices were dropped before delivery; announce holdings again.
+    fn evictions_lost(&mut self) {}
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ mod utility;
 pub(crate) use cost::observed_duration_ns;
 pub use policy::{PolicyConfig, RequestAccounting};
 use refresh::PlanOrigin;
-pub use sharing::{EvictedCheckpoint, ExportChain, ExportLookup, ExportNode, NextAdmission};
+pub use sharing::{EvictedCheckpoint, ExportLookup, NextAdmission};
 pub mod speculation;
 pub(crate) mod decoded_history;
 pub mod split;
@@ -628,7 +628,9 @@ pub struct RequestScheduler {
     tickets: HashMap<PrefixKey, Ticket>,
     track_publications: bool,
     publications: Vec<CheckpointId>,
+    track_evictions: bool,
     evictions: Vec<EvictedCheckpoint>,
+    evictions_lost: bool,
     admissions: u64,
 }
 
@@ -702,7 +704,9 @@ impl RequestScheduler {
             tickets: HashMap::new(),
             track_publications: false,
             publications: Vec::new(),
+            track_evictions: false,
             evictions: Vec::new(),
+            evictions_lost: false,
             admissions: 0,
         })
     }
