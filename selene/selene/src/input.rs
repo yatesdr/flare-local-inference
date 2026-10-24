@@ -137,7 +137,7 @@ impl DiskBudget {
     fn clear_checkpoint_pressure(&self) {
         self.usage.lock().unwrap().checkpoint_pressure = 0;
     }
-    pub(crate) fn progress(&self) -> u64 {
+    pub fn progress(&self) -> u64 {
         self.usage.lock().unwrap().progress
     }
     fn release_input(&self, bytes: u64) {
@@ -225,7 +225,7 @@ pub struct InputStore {
     owner: Arc<Owner>,
 }
 impl InputStore {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn start(
         memory: u64,
         directory: Option<PathBuf>,
