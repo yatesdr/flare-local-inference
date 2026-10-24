@@ -184,6 +184,7 @@ fn storage(
     config.tls_cert = Some(tls.server_cert.clone());
     config.tls_key = Some(tls.server_key.clone());
     config.tls_ca = Some(tls.ca.clone());
+    config.peer_transport = PeerTransport::Stream;
     config
 }
 
@@ -382,38 +383,37 @@ fn peer_l0_forwards_fetches_and_misses_after_loss() {
     let _ = std::fs::remove_dir_all(base);
 }
 
+/// RDMA bytes are not encrypted, so a manager that has RDMA enabled refuses TLS options.
 #[cfg(feature = "rdma")]
 #[test]
-fn peer_l0_rdma_moves_a_forwarded_record() {
-    let _serial = SERIAL.lock().unwrap_or_else(|error| error.into_inner());
-    let (mut near, mut storage, base, peer, _data, tls) =
-        two_managers("peer-rdma", PeerTransport::Auto);
-    let record_key = key(128);
-    runtime().block_on(async {
-        let mut client = Client::connect(&local(&near.socket), descriptor())
-            .await
-            .unwrap();
-        client.store(record_key, None).await;
-    });
-    wait_slow(|| {
-        runtime().block_on(async {
-            let mut client = Client::connect(&local(&storage.socket), descriptor())
-                .await
-                .unwrap();
-            let subscription = client.subscribe().await;
-            subscription.entries.contains_key(&record_key)
-        })
-    });
-    let (metadata, rdma) = remote_fetch(peer, record_key, "rdma", &tls);
-    let header = record::Header::decode(&metadata).unwrap();
-    assert_eq!(header.key, record_key);
-    assert_eq!(
-        rdma,
-        Some(true),
-        "the storage manager did not accept an RDMA session"
+fn peer_l0_rdma_with_tls_is_refused_at_startup() {
+    let base = base("peer-rdma-refused");
+    std::fs::create_dir_all(&base).unwrap();
+    let tls = make_tls(&base);
+    let name = instance_name("peer-rdma-refused");
+    let mut storage = storage(&base, &name, port(), port(), port(), &tls);
+    storage.peer_transport = PeerTransport::Auto;
+    let error = storage.validate().unwrap_err().to_string();
+    assert!(
+        error.contains("RDMA") && error.contains("not encrypted"),
+        "{error}"
     );
-    near.stop();
-    storage.stop();
+    let mut near = near(
+        &base,
+        &name,
+        port(),
+        port(),
+        PeerTransport::Rdma,
+        true,
+        &tls,
+    );
+    let error = near.validate().unwrap_err().to_string();
+    assert!(
+        error.contains("RDMA") && error.contains("not encrypted"),
+        "{error}"
+    );
+    near.peer_transport = PeerTransport::Stream;
+    near.validate().unwrap();
     let _ = std::fs::remove_dir_all(base);
 }
 
