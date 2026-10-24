@@ -38,23 +38,27 @@ impl PrefixStore for Host {
 
     fn poll(&mut self, events: &mut Vec<StoreEvent>) -> Result<()> {
         let polled = self.store.poll(&mut self.events);
-        events.extend(self.events.drain(..).map(|event| match event {
+        events.extend(self.events.drain(..).filter_map(|event| match event {
             flare_selene::StoreEvent::Stored {
                 checkpoint,
                 key,
                 result,
-            } => StoreEvent::Stored {
+            } => Some(StoreEvent::Stored {
                 checkpoint,
                 key,
                 result: result.map_err(Into::into),
-            },
-            flare_selene::StoreEvent::Fetched { key, result } => StoreEvent::Fetched {
+            }),
+            flare_selene::StoreEvent::Fetched { key, result } => Some(StoreEvent::Fetched {
                 key,
                 result: result.map_err(Into::into),
-            },
+            }),
             flare_selene::StoreEvent::Deferred { checkpoint } => {
-                StoreEvent::Deferred { checkpoint }
+                Some(StoreEvent::Deferred { checkpoint })
             }
+            // Only a store attached to a pool produces export events, and the
+            // worker does not serve exports yet.
+            flare_selene::StoreEvent::ExportRequested { .. }
+            | flare_selene::StoreEvent::ExportEnded { .. } => None,
         }));
         Ok(polled?)
     }
