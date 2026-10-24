@@ -116,11 +116,11 @@ refusal as a normal outcome and move to another candidate, another tier, or reco
 
 | Reason | Meaning | Operator action |
 |---|---|---|
-| `NOT_READY` | The manager is recovering, waiting for sources, or draining. | None; check `cm_pool_state`. |
+| `NOT_READY` | The manager is recovering, waiting for sources, or draining. | None; check `selene_pool_state`. |
 | `CLAIM_LIMIT` | The requester already has its claim slots in flight (default 2). | None; limits do not scale with concurrency. |
 | `SOURCE_LIMIT` / `SOURCE_BUSY` | The source already serves its export slots (default 2). | None. |
 | `UNKNOWN_SOURCE` / `STALE_SOURCE` | The named source or entry is gone, or the source reconnected. | None; the index catches up. |
-| `NO_WINDOWS` | Staging cannot hold the export, or too much of it is quarantined. | Raise `--staging`; look at `cm_pool_quarantined_bytes`. |
+| `NO_WINDOWS` | Staging cannot hold the export, or too much of it is quarantined. | Raise `--staging`; look at `selene_pool_quarantined_bytes`. |
 | `NOT_FOUND`, `GENERATION_CHANGED`, `CHAIN_GAP`, `NO_HEADROOM` | The source no longer has it, or has no room to pin it. | None. |
 | `SOURCE_TIMEOUT` | The source did not answer within `pin_deadline_ms` (default 250). | Look at the source's load. |
 | `SOURCE_LOST` / `REQUESTER_LOST` | The other side's stream ended. | Look at the instance that went. |
@@ -139,32 +139,32 @@ refusal as a normal outcome and move to another candidate, another tier, or reco
 Memory is reused only when every process that could still touch it has said it stopped, or is
 confirmed gone. If a process cannot say so (it reports `QUARANTINED`, or its stream ended while the
 process lives and it has not reported on a new session), the windows it held stay out of service
-until it exits, or until the manager does. `cm_pool_quarantined_bytes` and `ReadinessInfo` show
+until it exits, or until the manager does. `selene_pool_quarantined_bytes` and `ReadinessInfo` show
 the total; a nonzero value that does not fall means an instance is hung, not a leak.
 
 ## Metrics
 
-`GET /metrics` on `--metrics HOST:PORT` returns Prometheus text (`cm_` prefix, content type
+`GET /metrics` on `--metrics HOST:PORT` returns Prometheus text (`selene_` prefix, content type
 `text/plain; version=0.0.4`); only that path is served.
 
 | Series | Meaning | Alert on |
 |---|---|---|
-| `cm_pool_state`, `cm_pool_ready` | 1 recovering, 2 awaiting sources, 3 ready, 4 draining; and 1 when ready. | Not ready for longer than `--source-wait`. |
-| `cm_pool_sessions` | Live instance sessions. | Dropping to zero while instances serve. |
-| `cm_pool_sources_synced`, `cm_pool_sources_expected` | Sources with an installed snapshot; remembered ones still awaited. | `expected` that does not reach 0. |
-| `cm_pool_index_entries` | Entries announced to the index. | Unbounded growth. |
-| `cm_pool_claims_in_flight`, `cm_pool_claim_records`, `cm_pool_lookups_queued` | Work in flight and records kept for fences and replies. | Records that never fall. |
-| `cm_pool_claims_total{state,reason}`, `cm_pool_claims_refused_total{reason}`, `cm_pool_lookups_total{status}` | Outcomes. | `COPY_ERROR`, `CHECKSUM`, `NO_WINDOWS` rising. |
-| `cm_pool_puts_open` | Puts in flight. | |
-| `cm_pool_quarantined_bytes` | Window bytes out of service. | Anything sustained. |
-| `cm_puts_total{outcome}` | `ok`, `error`, `present`, `queue`, `budget`, `inflight`, `oversize` for the store's puts. | Any `error`; `budget` growing faster than `ok`. |
-| `cm_gets_total{outcome}` | `ok`, `error` for the store's reads. | Any `error`. |
-| `cm_nvme_errors_total` | NVMe read and write failures. | Any increase. |
-| `cm_nvme_bytes_total`, `cm_nvme_seconds_total` | Durable bytes written and disk time. | Disk time growing faster than bytes. |
-| `cm_memory_allocated_bytes`, `cm_staging_allocated_bytes` | Arena and staging in use. | Near `--memory` / `--staging`. |
-| `cm_nvme_reserved_bytes` | Rounded reservations in force. | Near `--nvme`: DRAM eviction stops. |
-| `cm_evictions_total`, `cm_compactions_total` | DRAM evictions and row compactions. | Hot set not staying resident. |
-| `cm_hits_total{namespace,tier}`, `cm_records{namespace,tier}`, `cm_bytes{namespace,tier}` | Hits and inventory of the manager's own records. | Hit rate collapse. |
+| `selene_pool_state`, `selene_pool_ready` | 1 recovering, 2 awaiting sources, 3 ready, 4 draining; and 1 when ready. | Not ready for longer than `--source-wait`. |
+| `selene_pool_sessions` | Live instance sessions. | Dropping to zero while instances serve. |
+| `selene_pool_sources_synced`, `selene_pool_sources_expected` | Sources with an installed snapshot; remembered ones still awaited. | `expected` that does not reach 0. |
+| `selene_pool_index_entries` | Entries announced to the index. | Unbounded growth. |
+| `selene_pool_claims_in_flight`, `selene_pool_claim_records`, `selene_pool_lookups_queued` | Work in flight and records kept for fences and replies. | Records that never fall. |
+| `selene_pool_claims_total{state,reason}`, `selene_pool_claims_refused_total{reason}`, `selene_pool_lookups_total{status}` | Outcomes. | `COPY_ERROR`, `CHECKSUM`, `NO_WINDOWS` rising. |
+| `selene_pool_puts_open` | Puts in flight. | |
+| `selene_pool_quarantined_bytes` | Window bytes out of service. | Anything sustained. |
+| `selene_puts_total{outcome}` | `ok`, `error`, `present`, `queue`, `budget`, `inflight`, `oversize` for the store's puts. | Any `error`; `budget` growing faster than `ok`. |
+| `selene_gets_total{outcome}` | `ok`, `error` for the store's reads. | Any `error`. |
+| `selene_nvme_errors_total` | NVMe read and write failures. | Any increase. |
+| `selene_nvme_bytes_total`, `selene_nvme_seconds_total` | Durable bytes written and disk time. | Disk time growing faster than bytes. |
+| `selene_memory_allocated_bytes`, `selene_staging_allocated_bytes` | Arena and staging in use. | Near `--memory` / `--staging`. |
+| `selene_nvme_reserved_bytes` | Rounded reservations in force. | Near `--nvme`: DRAM eviction stops. |
+| `selene_evictions_total`, `selene_compactions_total` | DRAM evictions and row compactions. | Hot set not staying resident. |
+| `selene_hits_total{namespace,tier}`, `selene_records{namespace,tier}`, `selene_bytes{namespace,tier}` | Hits and inventory of the manager's own records. | Hit rate collapse. |
 
 ## Recovery on disk
 
@@ -194,7 +194,7 @@ the old directory is safe to delete and cannot be reused by accident.
 | Symptom | Check |
 |---|---|
 | Manager exits at startup | Another manager on the same root or `--name`; a root that cannot do `O_DIRECT`; a certificate and key that do not match; `--rdma` with TLS. |
-| Instances run on local tiers only | The pool address, socket permissions, uid/gid equality, `/dev/shm/selene` mounted at the same path in both containers, `cm_pool_ready`. |
-| `NO_WINDOWS` | `--staging`; `cm_pool_quarantined_bytes`; many large exports at once. |
-| Sustained `NOT_READY` | `cm_pool_sources_expected`: a remembered instance is not coming back; it clears after `--source-wait`. |
+| Instances run on local tiers only | The pool address, socket permissions, uid/gid equality, `/dev/shm/selene` mounted at the same path in both containers, `selene_pool_ready`. |
+| `NO_WINDOWS` | `--staging`; `selene_pool_quarantined_bytes`; many large exports at once. |
+| Sustained `NOT_READY` | `selene_pool_sources_expected`: a remembered instance is not coming back; it clears after `--source-wait`. |
 | Quarantined bytes do not fall | A hung instance (it will clear when the process exits). |

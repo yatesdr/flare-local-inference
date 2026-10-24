@@ -941,7 +941,7 @@ impl Core {
         let entries: usize = self.scopes.values().map(|scope| scope.index.len()).sum();
         let mut text = String::new();
         let mut gauge =
-            |name: &str, value: u64| text.push_str(&format!("cm_pool_{name} {value}\n"));
+            |name: &str, value: u64| text.push_str(&format!("selene_pool_{name} {value}\n"));
         gauge("state", info.state as u64);
         gauge("ready", u64::from(self.ready()));
         gauge("sessions", self.sessions.len() as u64);
@@ -954,13 +954,13 @@ impl Core {
         gauge("lookups_queued", self.lookup_queue.len() as u64);
         gauge("quarantined_bytes", info.quarantined_bytes);
         for ((name, label), value) in &self.counters {
-            text.push_str(&format!("cm_pool_{name}{{{label}}} {value}\n"));
+            text.push_str(&format!("selene_pool_{name}{{{label}}} {value}\n"));
         }
         if let Some(hub) = &self.cfg.channel {
             let moved = hub.moved();
             for (index, carrier) in ["stream", "rdma"].into_iter().enumerate() {
                 text.push_str(&format!(
-                    "cm_pool_channel_windows_total{{carrier=\"{carrier}\"}} {}\ncm_pool_channel_bytes_total{{carrier=\"{carrier}\"}} {}\n",
+                    "selene_pool_channel_windows_total{{carrier=\"{carrier}\"}} {}\nselene_pool_channel_bytes_total{{carrier=\"{carrier}\"}} {}\n",
                     moved.windows[index], moved.bytes[index]
                 ));
             }
