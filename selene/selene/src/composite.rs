@@ -1009,9 +1009,7 @@ impl HostStore for CompositeStore {
                     result,
                 } => self.memory_stored(checkpoint, key, result, events),
                 StoreEvent::Fetched { key, result } => self.memory_fetched(key, result, events),
-                StoreEvent::Deferred { checkpoint } => {
-                    events.push(StoreEvent::Deferred { checkpoint })
-                }
+                other => events.push(other),
             }
         }
         self.memory_events = memory_events;
@@ -1358,7 +1356,7 @@ mod tests {
             .map(|event| match event {
                 StoreEvent::Stored { key, result, .. } => (*key, result.is_ok()),
                 StoreEvent::Fetched { .. } => panic!("unexpected fetch event"),
-                StoreEvent::Deferred { .. } => panic!("unexpected deferred event"),
+                _ => panic!("unexpected event"),
             })
             .collect()
     }
@@ -1369,7 +1367,7 @@ mod tests {
             .map(|event| match event {
                 StoreEvent::Fetched { key, result } => (*key, result.is_ok()),
                 StoreEvent::Stored { .. } => panic!("unexpected store event"),
-                StoreEvent::Deferred { .. } => panic!("unexpected deferred event"),
+                _ => panic!("unexpected event"),
             })
             .collect()
     }

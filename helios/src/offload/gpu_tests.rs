@@ -1449,7 +1449,7 @@ mod composite {
                     assert_eq!(key, first.key);
                     assert_eq!(result.unwrap(), record_bytes);
                 }
-                StoreEvent::Deferred { .. } => panic!("unexpected deferred event"),
+                _ => panic!("unexpected event"),
             }
         }
         assert!(stored_keys.contains(&short.key) && stored_keys.contains(&large.key));

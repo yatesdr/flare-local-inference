@@ -1186,7 +1186,7 @@ mod tests {
             .map(|event| match event {
                 StoreEvent::Stored { key, result, .. } => (*key, result.as_ref().ok().copied()),
                 StoreEvent::Fetched { .. } => panic!("unexpected fetch event"),
-                StoreEvent::Deferred { .. } => panic!("unexpected deferred event"),
+                _ => panic!("unexpected event"),
             })
             .collect()
     }
