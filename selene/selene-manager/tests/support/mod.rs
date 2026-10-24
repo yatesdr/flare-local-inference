@@ -23,6 +23,8 @@ pub mod channel;
 pub mod compat;
 pub mod net;
 pub mod pool;
+#[cfg(feature = "rdma")]
+pub mod rdma;
 pub mod throughput;
 
 pub use compat::*;

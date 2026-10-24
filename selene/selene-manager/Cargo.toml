@@ -15,7 +15,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-rdma = ["dep:ibverbs-sys"]
+rdma = ["dep:ibverbs-sys", "flare-selene/rdma"]
 
 [dependencies]
 flare-selene = { path = "../selene" }

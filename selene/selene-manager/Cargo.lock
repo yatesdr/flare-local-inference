@@ -339,10 +339,13 @@ version = "0.1.0"
 dependencies = [
  "blake2",
  "hyper-util",
+ "ibverbs-sys",
  "io-uring",
  "libc",
  "prost",
+ "rustls",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tonic",
  "tonic-prost",

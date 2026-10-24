@@ -1,8 +1,10 @@
 //! libibverbs transport glue.
 //!
-//! `LocalRdma::open` registers both region files on the first active device and leaves an RC
-//! queue pair in INIT. After `PeerHello` exchanges handshakes, `connect` moves the pair through
-//! RTR and RTS, and the resulting `RdmaChannel` posts one-sided RDMA writes and reads.
+//! A [`Device`] registers both region files once on the first active device. Each transfer
+//! takes a [`LocalRdma`] from it: an RC queue pair in INIT, with its own completion queue.
+//! After the two ends exchange handshakes, `connect` moves the pair through RTR and RTS, and
+//! the resulting `RdmaChannel` posts one-sided RDMA writes and reads. Dropping the channel
+//! moves the pair to the error state and destroys it; the registered regions stay.
 //!
 //! The unsafe surface is limited to the libibverbs calls; each block has a safety comment.
 
@@ -23,39 +25,17 @@ const SEND_WR: u32 = 64;
 const PSN: u32 = 0x1234_5678;
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// A device context with both regions registered and a queue pair in INIT.
+/// A queue pair in INIT on a [`Device`], ready to be connected.
 pub struct LocalRdma {
     verbs: IbvVerbs,
 }
 
 impl LocalRdma {
-    /// Open the first device whose port is active and register both mapped regions.
-    ///
-    /// The channel retains `regions` for its whole lifetime, so the mappings stay alive while the
-    /// memory regions and queue pair refer to them, and every bound is taken from the registered
-    /// lengths rather than from a caller-supplied size.
+    /// Open the first device whose port is active, register both mapped regions and make
+    /// one queue pair. For a manager that serves many transfers, open a [`Device`] once
+    /// and take a pair from it per transfer.
     pub fn open(regions: Arc<dyn RegionAccess>) -> io::Result<Self> {
-        let arena = regions
-            .mapping(Region::Arena)
-            .ok_or_else(|| invalid("the arena region is not mapped"))?;
-        let staging = regions
-            .mapping(Region::Staging)
-            .ok_or_else(|| invalid("the staging region is not mapped"))?;
-        if arena.1 == 0 || staging.1 == 0 || arena.0.is_null() || staging.0.is_null() {
-            return Err(invalid("both RDMA regions must be mapped"));
-        }
-        let (context, lid) = open_active_device()?;
-        match IbvVerbs::build(context, lid, regions, arena, staging) {
-            Ok(verbs) => Ok(Self { verbs }),
-            Err(error) => {
-                // SAFETY: `build` released every handle it took except the device context, which
-                // came from `ibv_open_device` and is owned by this function.
-                unsafe {
-                    ffi::ibv_close_device(context);
-                }
-                Err(error)
-            }
-        }
+        Device::open(regions)?.pair()
     }
 
     pub fn handshake(&self) -> Handshake {
@@ -70,6 +50,164 @@ impl LocalRdma {
     ) -> io::Result<Box<dyn DataChannel>> {
         self.verbs.connect(peer)?;
         Ok(Box::new(RdmaChannel::new(self.verbs, peer, peer_sizes)?))
+    }
+}
+
+/// The device context, protection domain and both registered regions. Shared by every
+/// queue pair made from it, and closed when the last of them is gone.
+pub struct Device {
+    /// Keeps the mappings alive while the memory regions refer to them.
+    _regions: Arc<dyn RegionAccess>,
+    sizes: (u64, u64),
+    context: *mut ffi::ibv_context,
+    pd: *mut ffi::ibv_pd,
+    arena: *mut ffi::ibv_mr,
+    staging: *mut ffi::ibv_mr,
+    lid: u16,
+    gid: [u8; 16],
+    bases: (u64, u64),
+}
+
+// SAFETY: libibverbs objects may be used from any thread; the handles are never changed after
+// `open` and are released once, when the last queue pair and the device itself are gone.
+unsafe impl Send for Device {}
+// SAFETY: as above.
+unsafe impl Sync for Device {}
+
+impl Device {
+    /// Open the first device whose port is active and register both mapped regions.
+    ///
+    /// The device retains `regions` for its whole lifetime, so the mappings stay alive while the
+    /// memory regions refer to them, and every bound is taken from the registered lengths rather
+    /// than from a caller-supplied size.
+    pub fn open(regions: Arc<dyn RegionAccess>) -> io::Result<Arc<Self>> {
+        let arena = regions
+            .mapping(Region::Arena)
+            .ok_or_else(|| invalid("the arena region is not mapped"))?;
+        let staging = regions
+            .mapping(Region::Staging)
+            .ok_or_else(|| invalid("the staging region is not mapped"))?;
+        if arena.1 == 0 || staging.1 == 0 || arena.0.is_null() || staging.0.is_null() {
+            return Err(invalid("both RDMA regions must be mapped"));
+        }
+        let (context, lid) = open_active_device()?;
+        match Self::register(context, lid, regions, arena, staging) {
+            Ok(device) => Ok(Arc::new(device)),
+            Err(error) => {
+                // SAFETY: `register` released every handle it took except the device context,
+                // which came from `ibv_open_device` and is owned by this function.
+                unsafe {
+                    ffi::ibv_close_device(context);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn register(
+        context: *mut ffi::ibv_context,
+        lid: u16,
+        regions: Arc<dyn RegionAccess>,
+        arena: (*mut u8, usize),
+        staging: (*mut u8, usize),
+    ) -> io::Result<Self> {
+        // SAFETY: the context is open and owned by the caller.
+        let pd = unsafe { ffi::ibv_alloc_pd(context) };
+        if pd.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let access = (ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
+            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
+            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0) as i32;
+        // SAFETY: both ranges are mapped by `regions`, which this value retains.
+        let arena_mr = unsafe { ffi::ibv_reg_mr(pd, arena.0.cast(), arena.1, access) };
+        if arena_mr.is_null() {
+            let error = io::Error::last_os_error();
+            release_device(pd, ptr::null_mut(), ptr::null_mut());
+            return Err(error);
+        }
+        // SAFETY: as above for the staging range.
+        let staging_mr = unsafe { ffi::ibv_reg_mr(pd, staging.0.cast(), staging.1, access) };
+        if staging_mr.is_null() {
+            let error = io::Error::last_os_error();
+            release_device(pd, arena_mr, ptr::null_mut());
+            return Err(error);
+        }
+        let mut gid = unsafe { mem::zeroed::<ffi::ibv_gid>() };
+        // SAFETY: the context and port are valid; GID index 0 is queried by libibverbs.
+        let status = unsafe { ffi::ibv_query_gid(context, PORT, 0, &mut gid) };
+        if status != 0 {
+            let error = io::Error::last_os_error();
+            release_device(pd, arena_mr, staging_mr);
+            return Err(error);
+        }
+        Ok(Self {
+            _regions: regions,
+            sizes: (arena.1 as u64, staging.1 as u64),
+            context,
+            pd,
+            arena: arena_mr,
+            staging: staging_mr,
+            lid,
+            // SAFETY: the union was zeroed and filled by `ibv_query_gid`.
+            gid: unsafe { gid.raw },
+            bases: (arena.0 as u64, staging.0 as u64),
+        })
+    }
+
+    /// A queue pair for one transfer, in INIT.
+    pub fn pair(self: &Arc<Self>) -> io::Result<LocalRdma> {
+        Ok(LocalRdma {
+            verbs: IbvVerbs::build(self)?,
+        })
+    }
+}
+
+impl super::channel::Rdma for Arc<Device> {
+    fn pair(&self) -> io::Result<Box<dyn super::channel::Pair>> {
+        Ok(Box::new(Device::pair(self)?))
+    }
+}
+
+impl super::channel::Pair for LocalRdma {
+    fn handshake(&self) -> Vec<u8> {
+        self.verbs.handshake.encode().to_vec()
+    }
+
+    fn connect(self: Box<Self>, peer: &[u8]) -> io::Result<Box<dyn DataChannel>> {
+        let peer = Handshake::decode(peer)?;
+        if peer.rkey(Region::Staging).is_none() {
+            return Err(invalid("the instance registered no staging"));
+        }
+        // The instance's staging is bounded by its registration: the device refuses an
+        // access outside it, so no size is taken on its word.
+        (*self).connect(peer, (0, u64::MAX / 2))
+    }
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        release_device(self.pd, self.arena, self.staging);
+        // SAFETY: the context was opened by `Device::open` and is closed exactly once here.
+        unsafe {
+            ffi::ibv_close_device(self.context);
+        }
+    }
+}
+
+/// Release the memory regions and the protection domain; the device context stays with its owner.
+fn release_device(pd: *mut ffi::ibv_pd, arena: *mut ffi::ibv_mr, staging: *mut ffi::ibv_mr) {
+    // SAFETY: each pointer is either null or a live libibverbs handle released exactly once.
+    unsafe {
+        if !arena.is_null() {
+            ffi::ibv_dereg_mr(arena);
+        }
+        if !staging.is_null() {
+            ffi::ibv_dereg_mr(staging);
+        }
+        if !pd.is_null() {
+            ffi::ibv_dealloc_pd(pd);
+        }
     }
 }
 
@@ -118,67 +256,36 @@ fn open_active_device() -> io::Result<(*mut ffi::ibv_context, u16)> {
 }
 
 struct IbvVerbs {
-    /// Keeps the mappings alive while the memory regions and queue pair refer to them.
-    _regions: Arc<dyn RegionAccess>,
-    sizes: (u64, u64),
-    context: *mut ffi::ibv_context,
-    pd: *mut ffi::ibv_pd,
+    /// Keeps the device, and with it the registered regions, alive.
+    device: Arc<Device>,
     cq: *mut ffi::ibv_cq,
     qp: *mut ffi::ibv_qp,
-    arena: *mut ffi::ibv_mr,
-    staging: *mut ffi::ibv_mr,
     handshake: Handshake,
     transfers: HashMap<u64, u64>,
     outstanding: HashMap<u64, u32>,
 }
 
-// SAFETY: every handle is used from the single peer thread that owns the channel.
+// SAFETY: every handle is used from the single task that owns the channel.
 unsafe impl Send for IbvVerbs {}
 
 impl IbvVerbs {
-    fn build(
-        context: *mut ffi::ibv_context,
-        lid: u16,
-        regions: Arc<dyn RegionAccess>,
-        arena: (*mut u8, usize),
-        staging: (*mut u8, usize),
-    ) -> io::Result<Self> {
-        // SAFETY: the context is open and owned by this builder.
-        let pd = unsafe { ffi::ibv_alloc_pd(context) };
-        if pd.is_null() {
-            return Err(io::Error::last_os_error());
-        }
+    fn build(device: &Arc<Device>) -> io::Result<Self> {
         // SAFETY: the PD is valid; the completion queue has no context or channel.
-        let cq =
-            unsafe { ffi::ibv_create_cq(context, CQ_ENTRIES, ptr::null_mut(), ptr::null_mut(), 0) };
+        let cq = unsafe {
+            ffi::ibv_create_cq(
+                device.context,
+                CQ_ENTRIES,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+            )
+        };
         if cq.is_null() {
-            let error = io::Error::last_os_error();
-            release(
-                pd,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-            );
-            return Err(error);
+            return Err(io::Error::last_os_error());
         }
         let access = (ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0) as i32;
-        // SAFETY: both ranges are mapped by `regions`, which this value retains.
-        let arena_mr = unsafe { ffi::ibv_reg_mr(pd, arena.0.cast(), arena.1, access) };
-        if arena_mr.is_null() {
-            let error = io::Error::last_os_error();
-            release(pd, cq, ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
-            return Err(error);
-        }
-        // SAFETY: as above for the staging range.
-        let staging_mr = unsafe { ffi::ibv_reg_mr(pd, staging.0.cast(), staging.1, access) };
-        if staging_mr.is_null() {
-            let error = io::Error::last_os_error();
-            release(pd, cq, ptr::null_mut(), arena_mr, ptr::null_mut());
-            return Err(error);
-        }
         let mut init = ffi::ibv_qp_init_attr {
             send_cq: cq,
             recv_cq: cq,
@@ -194,10 +301,10 @@ impl IbvVerbs {
             ..Default::default()
         };
         // SAFETY: the PD is valid and `init` describes a valid RC queue pair.
-        let qp = unsafe { ffi::ibv_create_qp(pd, &mut init) };
+        let qp = unsafe { ffi::ibv_create_qp(device.pd, &mut init) };
         if qp.is_null() {
             let error = io::Error::last_os_error();
-            release(pd, cq, ptr::null_mut(), arena_mr, staging_mr);
+            release_pair(ptr::null_mut(), cq);
             return Err(error);
         }
         let mut attr = ffi::ibv_qp_attr {
@@ -215,37 +322,22 @@ impl IbvVerbs {
         let status = unsafe { ffi::ibv_modify_qp(qp, &mut attr, mask as i32) };
         if status != 0 {
             let error = io::Error::last_os_error();
-            release(pd, cq, qp, arena_mr, staging_mr);
+            release_pair(qp, cq);
             return Err(error);
         }
-        let mut gid = unsafe { mem::zeroed::<ffi::ibv_gid>() };
-        // SAFETY: the context and port are valid; GID index 0 is queried by libibverbs.
-        let status = unsafe { ffi::ibv_query_gid(context, PORT, 0, &mut gid) };
-        if status != 0 {
-            let error = io::Error::last_os_error();
-            release(pd, cq, qp, arena_mr, staging_mr);
-            return Err(error);
-        }
-        // SAFETY: the union was zeroed and filled by `ibv_query_gid`.
-        let gid = unsafe { gid.raw };
         Ok(Self {
-            _regions: regions,
-            sizes: (arena.1 as u64, staging.1 as u64),
-            context,
-            pd,
+            device: device.clone(),
             cq,
             qp,
-            arena: arena_mr,
-            staging: staging_mr,
             handshake: Handshake {
                 qpn: unsafe { (*qp).qp_num },
                 psn: PSN,
-                gid,
-                lid,
-                rkey_arena: unsafe { (*arena_mr).rkey },
-                rkey_staging: unsafe { (*staging_mr).rkey },
-                arena_base: arena.0 as u64,
-                staging_base: staging.0 as u64,
+                gid: device.gid,
+                lid: device.lid,
+                rkey_arena: unsafe { (*device.arena).rkey },
+                rkey_staging: unsafe { (*device.staging).rkey },
+                arena_base: device.bases.0,
+                staging_base: device.bases.1,
             },
             transfers: HashMap::new(),
             outstanding: HashMap::new(),
@@ -311,8 +403,8 @@ impl IbvVerbs {
 
     fn region_mr(&self, region: Region) -> *mut ffi::ibv_mr {
         match region {
-            Region::Arena => self.arena,
-            Region::Staging => self.staging,
+            Region::Arena => self.device.arena,
+            Region::Staging => self.device.staging,
         }
     }
 
@@ -327,10 +419,10 @@ impl IbvVerbs {
         remote: Remote,
         read: bool,
     ) -> io::Result<()> {
-        let mr = if unsafe { (*self.arena).lkey } == local_key {
-            self.arena
+        let mr = if unsafe { (*self.device.arena).lkey } == local_key {
+            self.device.arena
         } else {
-            self.staging
+            self.device.staging
         };
         // SAFETY: the MR is registered for the channel's lifetime.
         let base = unsafe { (*mr).addr as u64 };
@@ -419,8 +511,8 @@ impl Verbs for IbvVerbs {
 
     fn local_size(&self, region: Region) -> u64 {
         match region {
-            Region::Arena => self.sizes.0,
-            Region::Staging => self.sizes.1,
+            Region::Arena => self.device.sizes.0,
+            Region::Staging => self.device.sizes.1,
         }
     }
 
@@ -516,44 +608,35 @@ impl Verbs for IbvVerbs {
 
 impl Drop for IbvVerbs {
     fn drop(&mut self) {
-        release(self.pd, self.cq, self.qp, self.arena, self.staging);
-        // SAFETY: the context was opened by `LocalRdma::open` and is closed exactly once here.
+        // The error state flushes every request still on the queue and stops the peer's packets
+        // for this pair; destroying it then leaves nothing that can touch the regions.
+        let mut attr = ffi::ibv_qp_attr {
+            qp_state: ffi::ibv_qp_state::IBV_QPS_ERR,
+            ..Default::default()
+        };
+        // SAFETY: the pair is live; a transition to ERROR is always permitted.
         unsafe {
-            ffi::ibv_close_device(self.context);
+            ffi::ibv_modify_qp(
+                self.qp,
+                &mut attr,
+                ffi::ibv_qp_attr_mask::IBV_QP_STATE.0 as i32,
+            );
         }
-        self.context = ptr::null_mut();
-        self.pd = ptr::null_mut();
-        self.cq = ptr::null_mut();
+        release_pair(self.qp, self.cq);
         self.qp = ptr::null_mut();
-        self.arena = ptr::null_mut();
-        self.staging = ptr::null_mut();
+        self.cq = ptr::null_mut();
     }
 }
 
-/// Release every handle except the device context, whose ownership stays with `LocalRdma::open`.
-fn release(
-    pd: *mut ffi::ibv_pd,
-    cq: *mut ffi::ibv_cq,
-    qp: *mut ffi::ibv_qp,
-    arena: *mut ffi::ibv_mr,
-    staging: *mut ffi::ibv_mr,
-) {
+/// Destroy a pair's queue pair and completion queue; the device keeps the rest.
+fn release_pair(qp: *mut ffi::ibv_qp, cq: *mut ffi::ibv_cq) {
     // SAFETY: each pointer is either null or a live libibverbs handle destroyed exactly once.
     unsafe {
         if !qp.is_null() {
             ffi::ibv_destroy_qp(qp);
         }
-        if !arena.is_null() {
-            ffi::ibv_dereg_mr(arena);
-        }
-        if !staging.is_null() {
-            ffi::ibv_dereg_mr(staging);
-        }
         if !cq.is_null() {
             ffi::ibv_destroy_cq(cq);
-        }
-        if !pd.is_null() {
-            ffi::ibv_dealloc_pd(pd);
         }
     }
 }

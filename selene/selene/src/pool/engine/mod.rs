@@ -130,6 +130,8 @@ pub(crate) struct Engine {
     /// The registered slots windows of a session without shared memory pass through.
     pub(crate) net: Option<Arc<Staging>>,
     pub(crate) net_events: Arc<net::Events>,
+    /// An RDMA transfer failed: the rest of this process's transfers use the stream.
+    pub(crate) rdma_broken: Arc<std::sync::atomic::AtomicBool>,
     /// How the open session opens data-channel transfers, when it has no shared memory.
     pub(crate) dial: Option<Arc<dyn Dial>>,
 }
@@ -167,6 +169,7 @@ impl Engine {
             filler: None,
             net: None,
             net_events,
+            rdma_broken: Arc::default(),
             dial: None,
         }
     }
