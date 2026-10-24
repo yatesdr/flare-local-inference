@@ -385,9 +385,13 @@ impl Session {
 
     /// The next message matching `pick`; others wait in the backlog.
     pub async fn take<T>(&mut self, mut pick: impl FnMut(&M) -> Option<T>) -> T {
-        self.take_within(Duration::from_secs(5), &mut pick)
-            .await
-            .expect("the expected message did not arrive")
+        match self.take_within(Duration::from_secs(5), &mut pick).await {
+            Some(found) => found,
+            None => panic!(
+                "the expected message did not arrive (stream ended: {}); unmatched: {:?}",
+                self.ended, self.backlog
+            ),
+        }
     }
 
     pub async fn take_within<T>(
