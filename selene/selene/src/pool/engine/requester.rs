@@ -132,7 +132,12 @@ impl Engine {
             }
             Err(error) => self.event(PoolEvent::Fetched {
                 id,
-                result: Err(FetchFailure { error, part: None }),
+                result: Err(FetchFailure {
+                    error,
+                    part: None,
+                    source: None,
+                    no_headroom: false,
+                }),
             }),
         }
     }
@@ -504,6 +509,16 @@ impl Engine {
                 error,
                 wire::CopyOutcome::CopyAbandoned,
             );
+            if terminal.reason == wire::ClaimReason::NoHeadroom as i32
+                && let Some(failure) = self
+                    .requester
+                    .restores
+                    .get_mut(&restore)
+                    .and_then(|r| r.failure.as_mut())
+                && failure.part == Some(part)
+            {
+                failure.no_headroom = true;
+            }
         }
         self.drive_claim(id);
     }
@@ -597,7 +612,15 @@ impl Engine {
         let Some(restore) = self.requester.restores.get_mut(&id) else {
             return;
         };
-        restore.failure.get_or_insert(FetchFailure { error, part });
+        let source = part
+            .and_then(|p| restore.parts.get(p))
+            .map(|p| (p.fetch.candidate.source.clone(), p.fetch.candidate.tier));
+        restore.failure.get_or_insert(FetchFailure {
+            error,
+            part,
+            source,
+            no_headroom: false,
+        });
         let claims: Vec<u64> = self
             .requester
             .claims

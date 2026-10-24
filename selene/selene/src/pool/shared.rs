@@ -19,7 +19,7 @@ use crate::{
 
 use super::{
     lookup::{Answer, LookupState, LookupTicket, TicketInner},
-    types::{HeldRange, PoolCandidate},
+    types::{HeldRange, PoolCandidate, SourceRef, Tier},
 };
 
 /// Commands the worker may queue before new lookups and fetches are refused.
@@ -59,6 +59,11 @@ pub struct FetchFailure {
     pub error: Error,
     /// The part whose claim or copy failed, if one part is to blame.
     pub part: Option<usize>,
+    /// The source of that part.
+    pub source: Option<(SourceRef, Tier)>,
+    /// The source refused because pinning would not leave it enough room: skip
+    /// it for a moment and try another source for the same endpoint.
+    pub no_headroom: bool,
 }
 
 #[derive(Debug)]
@@ -180,7 +185,9 @@ impl Shared {
         if *held != status {
             *held = status.clone();
             drop(held);
-            self.push_event(PoolEvent::Status(status));
+            let mut events = self.events.lock().unwrap();
+            events.retain(|e| !matches!(e, PoolEvent::Status(_)));
+            events.push_back(PoolEvent::Status(status));
         }
     }
 
