@@ -87,6 +87,67 @@ mod verbs {
     const CQ_ENTRIES: i32 = 16;
     const PSN: u32 = 0x1234_5678;
 
+    /// The GID this host should advertise on `port`: RoCE v2 over a routable (IPv4-mapped or
+    /// global) address, else RoCE v2 over a link-local one, else any other valid entry. Two
+    /// ends can only talk if they use the same RoCE version, and a device lists several, so
+    /// index 0 is not a safe default. Returns the index and the GID.
+    ///
+    /// # Safety
+    ///
+    /// `context` must be an open device context.
+    pub unsafe fn pick_gid(
+        context: *mut ffi::ibv_context,
+        port: u8,
+    ) -> io::Result<(u32, [u8; 16])> {
+        let mut attr = ffi::ibv_port_attr::default();
+        // SAFETY: the same cast libibverbs' inline wrapper performs.
+        let status = unsafe {
+            ffi::ibv_query_port(
+                context,
+                port,
+                &mut attr as *mut ffi::ibv_port_attr as *mut ffi::_compat_ibv_port_attr,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut best: Option<(u32, [u8; 16], u8)> = None;
+        for index in 0..attr.gid_tbl_len.max(1) as u32 {
+            let mut entry = unsafe { std::mem::zeroed::<ffi::ibv_gid_entry>() };
+            // SAFETY: the context is open and `entry` is the size passed.
+            let status = unsafe {
+                ffi::_ibv_query_gid_ex(
+                    context,
+                    u32::from(port),
+                    index,
+                    &mut entry,
+                    0,
+                    std::mem::size_of::<ffi::ibv_gid_entry>(),
+                )
+            };
+            if status != 0 {
+                continue;
+            }
+            // SAFETY: the union was zeroed and filled by libibverbs.
+            let gid = unsafe { entry.gid.raw };
+            if gid == [0; 16] {
+                continue;
+            }
+            let link_local = gid[0] == 0xfe && gid[1] == 0x80;
+            let rank = match (entry.gid_type, link_local) {
+                (ffi::IBV_GID_TYPE_ROCE_V2, false) => 4,
+                (ffi::IBV_GID_TYPE_ROCE_V2, true) => 3,
+                (_, false) => 2,
+                (_, true) => 1,
+            };
+            if best.is_none_or(|(_, _, held)| rank > held) {
+                best = Some((index, gid, rank));
+            }
+        }
+        best.map(|(index, gid, _)| (index, gid))
+            .ok_or_else(|| invalid("the device has no usable GID"))
+    }
+
     /// A device context with the staging region registered for remote access.
     pub struct Device {
         context: *mut ffi::ibv_context,
@@ -94,6 +155,7 @@ mod verbs {
         mr: *mut ffi::ibv_mr,
         lid: u16,
         gid: [u8; 16],
+        gid_index: u32,
         base: u64,
     }
 
@@ -170,20 +232,22 @@ mod verbs {
             if mr.is_null() {
                 return Err(fail(io::Error::last_os_error(), pd));
             }
-            let mut gid = unsafe { std::mem::zeroed::<ffi::ibv_gid>() };
-            // SAFETY: valid context and port; index 0.
-            if unsafe { ffi::ibv_query_gid(context, PORT, 0, &mut gid) } != 0 {
-                // SAFETY: registered above.
-                unsafe { ffi::ibv_dereg_mr(mr) };
-                return Err(fail(io::Error::last_os_error(), pd));
-            }
+            // SAFETY: the context is open.
+            let (gid_index, gid) = match unsafe { pick_gid(context, PORT) } {
+                Ok(picked) => picked,
+                Err(error) => {
+                    // SAFETY: registered above.
+                    unsafe { ffi::ibv_dereg_mr(mr) };
+                    return Err(fail(error, pd));
+                }
+            };
             Ok(Arc::new(Self {
                 context,
                 pd,
                 mr,
                 lid,
-                // SAFETY: filled by `ibv_query_gid`.
-                gid: unsafe { gid.raw },
+                gid,
+                gid_index,
                 base: base as u64,
             }))
         }
@@ -304,8 +368,8 @@ mod verbs {
                     is_global: u8::from(peer.gid != [0; 16]),
                     grh: ffi::ibv_global_route {
                         dgid: ffi::ibv_gid { raw: peer.gid },
-                        sgid_index: 0,
-                        hop_limit: 1,
+                        sgid_index: self.device.gid_index as u8,
+                        hop_limit: 64,
                         ..Default::default()
                     },
                     ..Default::default()
@@ -368,7 +432,7 @@ mod verbs {
 }
 
 #[cfg(feature = "rdma")]
-pub use verbs::{Device, Pair};
+pub use verbs::{Device, Pair, pick_gid};
 
 /// Without the `rdma` feature there is no device: opening one says so.
 #[cfg(not(feature = "rdma"))]

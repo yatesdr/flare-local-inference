@@ -298,6 +298,7 @@ impl Core {
     // ------------------------------------------------------------------ put
 
     fn put_refusal(&mut self, sid: u64, put_id: u64, reason: v2::Reason, detail: &str) {
+        eprintln!("selene: put {put_id} refused ({reason:?}): {detail}");
         self.send(
             sid,
             M::PutRefused(v2::PutRefused {
