@@ -1237,10 +1237,14 @@ impl HostStore for CompositeStore {
         self.drop_evicted_copies();
         self.retry_stale();
         // The flat memory records are announced under their parents in the disk index.
-        let disk = &self.disk;
-        self.memory
-            .flush_announcements(&|key, _| disk.index().node(key).and_then(|node| node.parent));
+        // The disk tier announces first, so a record leaving memory for a file
+        // is announced as one spill.
         self.disk.flush_announcements();
+        let disk = &self.disk;
+        self.memory.flush_announcements(
+            &|key, _| disk.index().node(key).and_then(|node| node.parent),
+            &|key| disk.announced_entry(key),
+        );
         polled
     }
 
@@ -2835,6 +2839,102 @@ mod tests {
             store.memory.record(&roots[0].key).is_none()
         });
         assert!(store.disk.index().contains(&roots[1].key));
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn a_record_leaving_memory_for_its_file_is_announced_as_one_spill() {
+        use crate::pool::{Announcer, Notice, Tier as Pool};
+        let Some(directory) = test_directory("composite", "pooled-spill-notice") else {
+            return;
+        };
+        let mut store = composite(&directory, 12, 4, 1 << 30);
+        store.cascade();
+        let announcer = Announcer::new(std::sync::Arc::new(tokio::sync::Notify::new()));
+        announcer.begin_session();
+        store.announce_to(announcer.clone());
+        let mut ids = Ids::new();
+        let root = parked_root(&mut store, &mut ids, 1, 640);
+        let mut notices = Vec::new();
+        let collect = |store: &mut CompositeStore,
+                       notices: &mut Vec<Notice>,
+                       done: &dyn Fn(&[Notice]) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !done(notices) {
+                assert!(Instant::now() < deadline, "notices: {notices:?}");
+                store.poll(&mut Vec::new()).unwrap();
+                if let Some((_, batch)) = announcer.take_batch(100) {
+                    notices.extend(batch);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        // Hashed, the memory copy is announced; the file does not exist yet.
+        collect(&mut store, &mut notices, &|notices| {
+            notices
+                .iter()
+                .any(|n| matches!(n, Notice::Saved(e) if e.tier == Pool::Dram && e.key == root.key))
+        });
+        assert!(
+            !notices
+                .iter()
+                .any(|n| matches!(n, Notice::Saved(e) if e.tier == Pool::Nvme))
+        );
+        // Memory needs the room: the file is written and announced...
+        let mut other_history = PrefixHistory::new(IDENTITY);
+        let list: Vec<u32> = (0..640u32)
+            .map(|t| t.wrapping_mul(2654435761).wrapping_add(2))
+            .collect();
+        other_history.append(&list, &[]).unwrap();
+        let other = checkpoint(
+            &mut ids,
+            &other_history,
+            640,
+            None,
+            pages(0..10),
+            10,
+            StateSlotId(2),
+        );
+        assert_eq!(
+            store.store(&other).unwrap(),
+            StoreOutcome::Retry(StoreReason::Slabs)
+        );
+        collect(&mut store, &mut notices, &|notices| {
+            notices
+                .iter()
+                .any(|n| matches!(n, Notice::Saved(e) if e.tier == Pool::Nvme && e.key == root.key))
+        });
+        // ...and when the memory copy gives way, the move is one notice.
+        assert_eq!(store.store(&other).unwrap(), StoreOutcome::Queued);
+        collect(&mut store, &mut notices, &|notices| {
+            notices.iter().any(|n| matches!(n, Notice::Spilled { .. }))
+        });
+        let spills: Vec<_> = notices
+            .iter()
+            .filter_map(|n| match n {
+                Notice::Spilled {
+                    to,
+                    from_tier,
+                    from_generation,
+                } => Some((to.key, to.tier, *from_tier, *from_generation)),
+                _ => None,
+            })
+            .collect();
+        let dram_generation = notices
+            .iter()
+            .find_map(|n| match n {
+                Notice::Saved(e) if e.tier == Pool::Dram && e.key == root.key => Some(e.generation),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            spills,
+            [(root.key, Pool::Nvme, Pool::Dram, dram_generation)]
+        );
+        assert!(!notices.iter().any(|n| matches!(
+            n,
+            Notice::Evicted { key, tier, .. } if *key == root.key && *tier == Pool::Dram
+        )));
         store.close().unwrap();
     }
 }
