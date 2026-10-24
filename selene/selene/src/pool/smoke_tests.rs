@@ -25,6 +25,8 @@ use crate::{
 };
 
 struct Server {
+    /// A scope id to answer with instead of the right one.
+    wrong_scope: bool,
     hello: wire::HelloReply,
     seen: Arc<Mutex<Vec<wire::ClientMessage>>>,
     opened: Arc<Mutex<u32>>,
@@ -52,6 +54,7 @@ impl wire::pool_server::Pool for Server {
         let mut incoming = request.into_inner();
         let seen = self.seen.clone();
         let incarnation = self.hello.manager_incarnation;
+        let wrong_scope = self.wrong_scope;
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         tokio::spawn(async move {
             let header = Some(wire::Header {
@@ -87,7 +90,11 @@ impl wire::pool_server::Pool for Server {
                             m: Some(In::Opened(wire::SessionOpened {
                                 status: wire::OpenStatus::OpenOk as i32,
                                 session_incarnation: 1,
-                                scope_id: id.to_vec(),
+                                scope_id: if wrong_scope {
+                                    vec![0; 32]
+                                } else {
+                                    id.to_vec()
+                                },
                                 export_slots: 0,
                                 claim_slots: 0,
                                 readiness: Some(wire::ReadinessInfo {
@@ -139,6 +146,10 @@ struct Fixture {
 }
 
 fn serve(name: &str, hello: wire::HelloReply) -> Fixture {
+    serve_with(name, hello, false)
+}
+
+fn serve_with(name: &str, hello: wire::HelloReply, wrong_scope: bool) -> Fixture {
     let path =
         std::env::temp_dir().join(format!("selene-smoke-{name}-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -146,6 +157,7 @@ fn serve(name: &str, hello: wire::HelloReply) -> Fixture {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let opened = Arc::new(Mutex::new(0));
     let server = Server {
+        wrong_scope,
         hello,
         seen: seen.clone(),
         opened: opened.clone(),
@@ -301,5 +313,145 @@ fn an_unreachable_manager_leaves_the_client_local_and_close_returns() {
     assert_ne!(client.status(), PoolStatus::Ready);
     let mut events = Vec::new();
     client.poll(&mut events).unwrap();
+    client.close().unwrap();
+}
+
+#[test]
+fn a_scope_id_the_manager_computes_differently_disables_the_pool() {
+    let server = serve_with("scope", hello(2, wire::HelloStatus::HelloOk), true);
+    let (config, copier) = config(&server.path);
+    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar), None).unwrap();
+    wait_for("Disabled", || {
+        matches!(client.status(), PoolStatus::Disabled(_))
+    });
+    client.close().unwrap();
+    let _ = std::fs::remove_file(&server.path);
+}
+
+// ---- TLS ----------------------------------------------------------------------
+
+struct Pki {
+    ca_pem: String,
+    cert_pem: String,
+    key_pem: String,
+}
+
+fn pki() -> Pki {
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+    let ca_key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "selene test ca");
+    let ca = params.self_signed(&ca_key).unwrap();
+    let issuer = Issuer::new(params, ca_key);
+    let leaf_key = KeyPair::generate().unwrap();
+    let leaf = CertificateParams::new(vec!["localhost".into()])
+        .unwrap()
+        .signed_by(&leaf_key, &issuer)
+        .unwrap();
+    Pki {
+        ca_pem: ca.pem(),
+        cert_pem: leaf.pem(),
+        key_pem: leaf_key.serialize_pem(),
+    }
+}
+
+/// A server on a TCP port, with TLS when `pki` is given.
+fn serve_tcp(hello: wire::HelloReply, pki: Option<&Pki>) -> (Fixture, u16) {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let opened = Arc::new(Mutex::new(0));
+    let server = Server {
+        wrong_scope: false,
+        hello,
+        seen: seen.clone(),
+        opened: opened.clone(),
+    };
+    let listener = {
+        let _guard = runtime.enter();
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        tokio::net::TcpListener::from_std(std_listener).unwrap()
+    };
+    let port = listener.local_addr().unwrap().port();
+    let mut builder = tonic::transport::Server::builder();
+    if let Some(pki) = pki {
+        builder = builder
+            .tls_config(tonic::transport::ServerTlsConfig::new().identity(
+                tonic::transport::Identity::from_pem(&pki.cert_pem, &pki.key_pem),
+            ))
+            .unwrap();
+    }
+    runtime.spawn(
+        builder
+            .add_service(wire::pool_server::PoolServer::new(server))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    (
+        Fixture {
+            seen,
+            opened,
+            path: std::path::PathBuf::new(),
+            _runtime: runtime,
+        },
+        port,
+    )
+}
+
+fn tcp_config(
+    port: u16,
+    ca: Option<&Pki>,
+    dir: &std::path::Path,
+) -> (PoolConfig, crate::SharedCopier) {
+    let (mut config, copier) = config(&dir.join("unused"));
+    config.address = PoolAddress::Tcp(format!("localhost:{port}"));
+    config.ca = ca.map(|pki| {
+        let path = dir.join(format!("ca-{port}.pem"));
+        std::fs::write(&path, &pki.ca_pem).unwrap();
+        path
+    });
+    (config, copier)
+}
+
+fn tls_hello() -> wire::HelloReply {
+    let mut reply = hello(2, wire::HelloStatus::HelloOk);
+    reply.encryption = wire::Encryption::Tls as i32;
+    reply
+}
+
+#[test]
+fn a_client_with_a_ca_requires_tls_and_connects_to_a_tls_manager() {
+    let pki = pki();
+    let (server, port) = serve_tcp(tls_hello(), Some(&pki));
+    let (config, copier) = tcp_config(port, Some(&pki), &std::env::temp_dir());
+    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar), None).unwrap();
+    wait_for("Ready over TLS", || client.status() == PoolStatus::Ready);
+    assert_eq!(*server.opened.lock().unwrap(), 1);
+    client.close().unwrap();
+}
+
+#[test]
+fn a_client_without_a_ca_never_gets_a_session_from_a_tls_manager() {
+    let pki = pki();
+    let (server, port) = serve_tcp(tls_hello(), Some(&pki));
+    let (config, copier) = tcp_config(port, None, &std::env::temp_dir());
+    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar), None).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_ne!(client.status(), PoolStatus::Ready);
+    assert_eq!(*server.opened.lock().unwrap(), 0);
+    client.close().unwrap();
+}
+
+#[test]
+fn a_client_with_a_ca_never_downgrades_to_a_plaintext_manager() {
+    let pki = pki();
+    let (server, port) = serve_tcp(hello(2, wire::HelloStatus::HelloOk), None);
+    let (config, copier) = tcp_config(port, Some(&pki), &std::env::temp_dir());
+    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar), None).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_ne!(client.status(), PoolStatus::Ready);
+    assert_eq!(*server.opened.lock().unwrap(), 0);
     client.close().unwrap();
 }
