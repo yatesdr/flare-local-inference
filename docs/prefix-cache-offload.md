@@ -591,8 +591,8 @@ Offload limits interference through bounded work and explicit ownership:
   the GPU has already lost; the derived default's lower clamp exists for the
   staging minimum, and the sizing guidance for operators is a pool whose row
   slabs exceed the GPU's state rows.
-- Pool: `--prefix-cache-pool ADDRESS` and `--prefix-cache-pool-tenant NAME`,
-  the tenant only with the pool; see
+- Pool: `--prefix-cache-pool ADDRESS`, `--prefix-cache-pool-tenant NAME` and
+  `--prefix-cache-pool-ca FILE`, the tenant and the CA only with the pool; see
   [section 2.15](#215-sharing-through-a-pool). Unset, the instance uses its
   local tiers only.
 - `LoadOptions` gains `prefix_cache: PrefixCacheOffload` with the resolved
@@ -858,6 +858,23 @@ memory, mapped and registered here once a session opens. Startup budgets the
 copier's streams and events on each device, like each local tier's, and adds no
 host bytes; the device cost of registering the manager's regions, about 2 MiB
 per GiB, depends on sizes the manager announces and is not included.
+
+A manager on another host shares no memory, so its restores and puts pass through
+**staging of the instance's own**: slots of one registered region, one window each, made
+when the first such session opens and kept across reconnects. Their count is the claims
+and open puts the manager allows times its window credits (twelve with the defaults) and
+their size is its window limit (4 MiB), so about 48 MiB of registered host memory, not
+counted in the startup budget. A claim arrives window by window on the manager's data
+channel into those slots, each page and the row is checked against the checksums stored
+with the record before it is copied to the GPU, and the slot is freed only when its copy
+has drained; a put hands filled slots to the channel and commits after the last one has
+left. The connection is TLS exactly when `--prefix-cache-pool-ca` names the manager's CA,
+and a manager that declares the other setting disables the pool for the process. With the
+`rdma` cargo feature, a manager started with `--rdma` is reached by RDMA instead: the
+manager writes into slots the instance lends and reads the slots a put fills; an instance
+without a device, or after one failed RDMA transfer, uses the stream. The remote level is
+timed by the same probe as the others, through a real put and claim on the manager, and
+ranks by that measurement.
 
 The store measures what each copy level costs, end to end, before ranking them.
 The worker runs that probe only when nothing is running: once at startup,

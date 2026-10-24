@@ -48,6 +48,7 @@ Options accept bytes with binary K/M/G/T suffixes, and durations with ms/s/m/h/d
 | `--staging` | 256 MiB (minimum 8 MiB) |
 | `--write-budget` | 0 (unlimited) |
 | `--listen` | none; serve instances on other hosts at ADDR:PORT |
+| `--listen-data` | the host of `--listen`, next port; where those instances copy bytes |
 | `--tls-cert`, `--tls-key` | none; TLS for `--listen` |
 | `--rdma` | off; experimental, needs the `rdma` feature, not with TLS |
 | `--source-wait` | 10s; wait for remembered instances before serving |
@@ -93,7 +94,9 @@ experimental RDMA variant.
 | `src/store.rs`, `src/disk.rs`, `src/tree.rs`, `src/record.rs`, `src/arena.rs` | The manager's own store: DRAM arena, NVMe records, eviction, durability, recovery. |
 | `src/local.rs` | Shared-memory regions, windows and process-exit (pidfd) reclaim. |
 | `src/control.rs`, `src/config.rs`, `src/main.rs` | Startup, listeners, shutdown, flags. |
-| `src/data/`, `src/grants.rs`, `src/regions.rs` | The stream and RDMA data-channel modules and their tests; wired to instances in a later change. |
+| `src/data/channel.rs` | The data channel instances without shared memory copy through: the listener, the per-transfer handlers and their fencing, over the stream and RDMA. |
+| `src/data/ibv.rs`, `src/data/rdma.rs` | The RDMA device, queue pairs and the one-sided channel they carry. |
+| `src/data/stream.rs`, `src/grants.rs`, `src/regions.rs` | The earlier region-to-region stream transport and its helpers, kept with their tests. |
 
 ## Tests
 
