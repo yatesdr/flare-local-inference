@@ -68,6 +68,21 @@ struct Network {
     ca: Option<PathBuf>,
 }
 
+/// A loopback address nobody listens on. Taken from below the ephemeral range and handed out
+/// once, so concurrent tests never share one or meet a connection's own port.
+fn free_address() -> std::net::SocketAddr {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    loop {
+        let port = 20_000
+            + (std::process::id() % 2_000) * 4
+            + NEXT.fetch_add(1, Ordering::Relaxed) % 4_000;
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], port as u16));
+        if std::net::TcpListener::bind(address).is_ok() {
+            return address;
+        }
+    }
+}
+
 struct Manager {
     socket: PathBuf,
     base: PathBuf,
@@ -114,10 +129,7 @@ impl Manager {
         let mut manager = Self::start();
         manager.stop();
         let _ = std::fs::remove_file(&manager.socket);
-        let free = || {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap()
-        };
+        let free = free_address;
         let mut net = selene_manager::config::Config::defaults();
         net.name = manager.config.name.clone();
         net.socket = manager.socket.clone();
@@ -249,9 +261,16 @@ fn geo() -> Vec<crate::CacheGeometry> {
 }
 
 fn config(manager: &Manager, name: &str, gpu: u8) -> PoolConfig {
+    config_on(manager, name, gpu, false)
+}
+
+/// As [`config`]; `local` reaches a network manager over its socket, as an instance on the
+/// manager's own host does.
+fn config_on(manager: &Manager, name: &str, gpu: u8, local: bool) -> PoolConfig {
     let geometry = geo();
     let (address, ca) = manager
         .remote()
+        .filter(|_| !local)
         .unwrap_or_else(|| (PoolAddress::Unix(manager.socket.clone()), None));
     PoolConfig {
         address,
@@ -274,9 +293,17 @@ struct Instance {
 }
 
 fn instance(manager: &Manager, name: &str, gpu: u8) -> Instance {
+    instance_on(manager, name, gpu, false)
+}
+
+fn instance_on(manager: &Manager, name: &str, gpu: u8, local: bool) -> Instance {
     let (copier, memory) = SimulatedGpu::shared(&geo()).unwrap();
-    let client =
-        PoolClient::start(config(manager, name, gpu), copier, Arc::new(OkRegistrar)).unwrap();
+    let client = PoolClient::start(
+        config_on(manager, name, gpu, local),
+        copier,
+        Arc::new(OkRegistrar),
+    )
+    .unwrap();
     Instance {
         client,
         gpu: memory,
@@ -1467,4 +1494,301 @@ fn a_lookup_is_answered_in_well_under_a_millisecond_over_a_unix_socket() {
     );
     b.poll();
     assert!(at(0.99) < Duration::from_millis(5), "p99 {:?}", at(0.99));
+}
+
+// ---- copies between instances through the manager ---------------------------------
+
+/// A host pin that holds back every window after the first until the gate opens, and says
+/// when it was dropped.
+struct StallPin {
+    inner: TestPin,
+    gate: Arc<AtomicBool>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl HostPin for StallPin {
+    fn chain(&self) -> &HostChain {
+        self.inner.chain()
+    }
+    fn read(&mut self, window: &HostWindow, dst: &mut [u8]) -> Result<Checksums> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while window.first_page > 0 && !self.gate.load(Ordering::Acquire) {
+            if Instant::now() > deadline {
+                return Err("the gate never opened".into());
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        self.inner.read(window, dst)
+    }
+}
+
+impl Drop for StallPin {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::Release);
+    }
+}
+
+/// `source` saves a host record of `pages` pages; the manager offers it to `requester`.
+fn offer_host_record(
+    source: &Instance,
+    requester: &Instance,
+    history: &TestHistory,
+    pages: usize,
+    generation: u64,
+) -> PrefixKey {
+    let key = history.key_at(pages as u64 * PT).unwrap();
+    source.client.saved(IndexEntry {
+        key,
+        parent: None,
+        bucket: history.bucket_at(key.consumed_tokens).unwrap(),
+        tail_pages: pages as u32,
+        row: true,
+        tier: Tier::Dram,
+        generation,
+        bytes: (pages * PAGE + ROW) as u64,
+    });
+    wait("the manager to offer the record", || {
+        let ticket = requester.client.begin_lookup(history, Vec::new());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while matches!(ticket.state(), LookupState::Pending) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        matches!(ticket.state(), LookupState::Ready(a) if !a.candidates.is_empty())
+    });
+    key
+}
+
+fn finish_restore(requester: &mut Instance) -> std::result::Result<u64, String> {
+    requester.event("the restore", |e| match e {
+        PoolEvent::Fetched { result, .. } => {
+            Some(result.as_ref().map(|b| *b).map_err(|f| f.error.to_string()))
+        }
+        _ => None,
+    })
+}
+
+/// The pages and row a restore of `pages` pages of `expected_page` put on `requester`'s device.
+fn check_restored(requester: &Instance, scratch: &[u32], pages: usize) {
+    let gpu = requester.gpu.pages.lock().unwrap();
+    for page in 0..pages {
+        assert_eq!(gpu[&scratch[page]], expected_page(page), "page {page}");
+    }
+    assert_eq!(
+        requester.gpu.rows.lock().unwrap()[&9],
+        (pages * PAGE..pages * PAGE + ROW)
+            .map(|i| (i * 13 + 5) as u8)
+            .collect::<Vec<u8>>()
+    );
+}
+
+/// A host record of `pages` pages moves from `source` to `requester` through the manager,
+/// whichever of them are on the manager's host.
+fn relay_host_record(manager: &Manager, source_local: bool, requester_local: bool, pages: usize) {
+    let mut source = instance_on(manager, "source", 1, source_local);
+    let mut requester = instance_on(manager, "requester", 2, requester_local);
+    source.ready();
+    requester.ready();
+    let history = history_of(pages as u32 * PT as u32 + 64);
+    let key = offer_host_record(&source, &requester, &history, pages, 11);
+    let scratch: Vec<u32> = (0..pages as u32).map(|p| 5000 + p).collect();
+    let fetch = fetch_for(&mut requester, &history, pages, &scratch);
+    requester.client.fetch(fetch).unwrap();
+    let export = source.event("an export request", |e| match e {
+        PoolEvent::Export(request) => Some(request.export),
+        _ => None,
+    });
+    source.client.host_pinned(export, pin_for(key, 11, pages));
+    assert_eq!(
+        finish_restore(&mut requester),
+        Ok((pages * PAGE + ROW) as u64)
+    );
+    check_restored(&requester, &scratch, pages);
+    source.client.close().unwrap();
+    requester.client.close().unwrap();
+}
+
+#[test]
+fn a_host_record_is_relayed_between_two_instances_on_other_hosts_over_tcp() {
+    let manager = Manager::start_network(false);
+    // Two windows of a 4 MiB manager window each way.
+    relay_host_record(&manager, false, false, 700);
+    let (windows, bytes) = manager.moved("stream");
+    assert!(windows >= 4, "{windows} windows crossed the manager twice");
+    assert!(bytes >= 2 * (700 * PAGE + ROW) as u64, "{bytes} bytes");
+}
+
+#[test]
+fn a_host_record_is_relayed_between_two_instances_on_other_hosts_over_tls() {
+    let manager = Manager::start_network(true);
+    relay_host_record(&manager, false, false, 5);
+}
+
+#[test]
+fn a_remote_instance_serves_an_instance_on_the_managers_host() {
+    let manager = Manager::start_network(false);
+    relay_host_record(&manager, false, true, 700);
+    let (windows, _) = manager.moved("stream");
+    assert!(windows >= 2, "{windows} windows came in from the source");
+}
+
+#[test]
+fn an_instance_on_the_managers_host_serves_a_remote_instance() {
+    let manager = Manager::start_network(false);
+    relay_host_record(&manager, true, false, 700);
+    let (windows, _) = manager.moved("stream");
+    assert!(windows >= 2, "{windows} windows went out to the requester");
+}
+
+#[test]
+fn a_gpu_checkpoint_on_another_host_is_relayed_through_reserved_staging() {
+    let manager = Manager::start_network(false);
+    let mut source = instance(&manager, "source", 1);
+    let mut requester = instance(&manager, "requester", 2);
+    source.ready();
+    requester.ready();
+    let history = history();
+    let pages = 3usize;
+    let key = history.key_at(pages as u64 * PT).unwrap();
+    for page in 0..pages {
+        source
+            .gpu
+            .pages
+            .lock()
+            .unwrap()
+            .insert(20 + page as u32, expected_page(page));
+    }
+    let row: Vec<u8> = (pages * PAGE..pages * PAGE + ROW)
+        .map(|i| (i * 13 + 5) as u8)
+        .collect();
+    source.gpu.rows.lock().unwrap().insert(5, row);
+    source.client.saved(IndexEntry {
+        key,
+        parent: None,
+        bucket: history.bucket_at(key.consumed_tokens).unwrap(),
+        tail_pages: pages as u32,
+        row: true,
+        tier: Tier::Gpu,
+        generation: 5,
+        bytes: (pages * PAGE + ROW) as u64,
+    });
+    wait("the manager to offer it", || {
+        let ticket = requester.client.begin_lookup(&history, Vec::new());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while matches!(ticket.state(), LookupState::Pending) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        matches!(ticket.state(), LookupState::Ready(a) if !a.candidates.is_empty())
+    });
+    let scratch = [300, 301, 302];
+    let fetch = fetch_for(&mut requester, &history, pages, &scratch);
+    requester.client.fetch(fetch).unwrap();
+    let (export, reserved) = source.event("an export request", |e| match e {
+        PoolEvent::Export(request) => Some((request.export, request.reserved_bytes)),
+        _ => None,
+    });
+    assert!(reserved >= (pages * PAGE + ROW) as u64);
+    source.client.export_pinned(
+        export,
+        crate::ExportChain {
+            nodes: vec![crate::ExportNode {
+                key,
+                generation: 5,
+                pages: (20..20 + pages as u32).map(PageId).collect(),
+            }],
+            skip_pages: 0,
+            row: Some(StateSlotId(5)),
+        },
+    );
+    assert_eq!(
+        finish_restore(&mut requester),
+        Ok((pages * PAGE + ROW) as u64)
+    );
+    check_restored(&requester, &scratch, pages);
+    source.event("the pin to be released", |e| match e {
+        PoolEvent::ExportEnded { export: ended } if *ended == export => Some(()),
+        _ => None,
+    });
+}
+
+#[test]
+fn a_stalled_source_fails_the_relay_and_the_same_record_relays_after() {
+    let manager = Manager::start_network(false);
+    let pages = 700usize;
+    let mut source = instance(&manager, "source", 1);
+    let mut requester = instance(&manager, "requester", 2);
+    source.ready();
+    requester.ready();
+    let history = history_of(pages as u32 * PT as u32 + 64);
+    let key = offer_host_record(&source, &requester, &history, pages, 11);
+    let scratch: Vec<u32> = (0..pages as u32).map(|p| 5000 + p).collect();
+    let fetch = fetch_for(&mut requester, &history, pages, &scratch);
+    requester.client.fetch(fetch).unwrap();
+    let export = source.event("an export request", |e| match e {
+        PoolEvent::Export(request) => Some(request.export),
+        _ => None,
+    });
+    let gate = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let TestPinParts(inner) = TestPinParts::new(key, 11, pages);
+    source.client.host_pinned(
+        export,
+        Box::new(StallPin {
+            inner,
+            gate: gate.clone(),
+            dropped: dropped.clone(),
+        }),
+    );
+    // The second window never comes: the claim runs out of progress and fails the restore.
+    let result = finish_restore(&mut requester);
+    assert!(result.is_err(), "{result:?}");
+    // The source lets go once its copy can finish, and releases the pin.
+    gate.store(true, Ordering::Release);
+    wait("the source to release its pin", || {
+        source.poll();
+        dropped.load(Ordering::Acquire)
+    });
+    // Nothing was left behind: the same record relays again.
+    let fetch = fetch_for(&mut requester, &history, pages, &scratch);
+    requester.client.fetch(fetch).unwrap();
+    let export = source.event("a second export request", |e| match e {
+        PoolEvent::Export(request) => Some(request.export),
+        _ => None,
+    });
+    source.client.host_pinned(export, pin_for(key, 11, pages));
+    assert_eq!(
+        finish_restore(&mut requester),
+        Ok((pages * PAGE + ROW) as u64)
+    );
+    check_restored(&requester, &scratch, pages);
+}
+
+/// A `TestPin` built the way `pin_for` builds one.
+struct TestPinParts(TestPin);
+
+impl TestPinParts {
+    fn new(key: PrefixKey, generation: u64, pages: usize) -> Self {
+        let data: Vec<u8> = (0..pages * PAGE + ROW)
+            .map(|i| (i * 13 + 5) as u8)
+            .collect();
+        let sums = (0..pages)
+            .map(|p| checksum(&data[p * PAGE..(p + 1) * PAGE]))
+            .collect();
+        let row = checksum(&data[pages * PAGE..]);
+        Self(TestPin {
+            chain: HostChain {
+                records: vec![HostRecord {
+                    key,
+                    generation,
+                    first_page: 0,
+                    pages: pages as u32,
+                    row: true,
+                }],
+                total_pages: pages as u64,
+                row: true,
+            },
+            data,
+            sums,
+            row,
+        })
+    }
 }
