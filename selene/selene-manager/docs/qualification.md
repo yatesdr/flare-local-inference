@@ -18,6 +18,7 @@ client (`tests/support/pool.rs`) and never model the manager's state machine.
 | `tests/pool_store.rs` | Put into the manager's store and claims on its records: persisted checksums, recovered NVMe records, damage at rest, a requester whose stream drops, put cancel and fence. |
 | `tests/pool_net.rs` | The network listener: sessions without shared memory, level-5 candidates, refusal of shared windows, TLS declared and RDMA withheld, the startup warnings and the refusal of RDMA with TLS. |
 | `tests/pool_channel.rs` | Instances on other hosts: a chain put and restored over TCP and TLS byte for byte (mid-record starts, persisted checksums), an instance that never connects, dies mid-window or mid-fill, a released claim, a lost session, corrupt and cancelled puts, no listener; with the `rdma` feature the same over RDMA on a queue pair per transfer. |
+| `tests/pool_relay.rs` | Copies between instances that share no memory with the manager: a host record and a GPU checkpoint relayed from a remote source to a remote and to a local requester, a source or a requester that dies mid-relay, a stalled source leg, a source that never connects, a source whose session is lost; every case ends with nothing quarantined and the same record relayable again. |
 | `tests/l0.rs` | The store engine through the pool protocol: admission and refusal classification, eviction and compaction, chain durability, crash and recovery, streaming and oversize records, budget and cancel, directory modes, failed-start cleanup, signal handling, kill/restart, and a throughput smoke test. |
 | `tests/proto.rs` | The proto file is the one both ends were built from (digest). |
 
@@ -43,7 +44,7 @@ means the case belongs to the instance-side crate; "Flare" means it needs the GP
 **Hello, versions, encryption.** H1 `h1_a_v1_hello_is_a_version_mismatch`; H2, H3, H9 client;
 H4 `h4_a_tls_manager_declares_tls_and_offers_no_rdma`, `rdma_with_tls_is_refused_at_startup_with_the_reason`;
 H5 `h5_a_stale_incarnation_is_refused_and_a_new_hello_succeeds`;
-H6 `h6_a_unix_peer_of_the_same_user_gets_shared_memory`, `h6_a_tcp_session_has_no_shared_memory_and_serves_no_exports`;
+H6 `h6_a_unix_peer_of_the_same_user_gets_shared_memory`, `h6_a_tcp_session_has_no_shared_memory_and_serves_exports_over_the_data_channel`;
 H7 `h7_malformed_scopes_are_refused`; H8 `h8_scopes_never_see_each_other`;
 H10 `h10_a_reconnect_supersedes_the_old_stream`.
 
