@@ -24,7 +24,9 @@ ibverbs-sys = { version = "0.3.2", optional = true }
 libc = "0.2"
 prost = "0.14"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
 toml = "0.8"
 tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "tls-ring", "router"] }

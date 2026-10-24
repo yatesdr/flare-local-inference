@@ -10,6 +10,9 @@ use std::io;
 #[path = "ibv.rs"]
 pub mod ibv;
 
+#[path = "channel.rs"]
+pub mod channel;
+
 #[path = "rdma.rs"]
 pub mod rdma;
 
