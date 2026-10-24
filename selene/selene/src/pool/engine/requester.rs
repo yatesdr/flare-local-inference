@@ -19,7 +19,8 @@ use crate::{
 
 use super::{
     super::{
-        codec,
+        codec, frame,
+        net::{Channel, Id},
         shared::{FetchFailure, FetchPart, PoolEvent, PoolFetch},
         wire::{self, client_message::M as Out},
     },
@@ -99,6 +100,8 @@ struct Restore {
 struct Window {
     jobs_left: u32,
     released: bool,
+    /// The staging slot holding the window, when it came over the data channel.
+    slot: Option<u32>,
 }
 
 struct Claim {
@@ -118,6 +121,13 @@ struct Claim {
     verdict_sent: bool,
     verdict_ok: bool,
     fence_sent: bool,
+    /// The claim's bytes come over the data channel (this session has no shared memory).
+    via_channel: bool,
+    /// The channel's task, until it has been stopped and has reported that it is gone.
+    channel: Option<Channel>,
+    channel_open: bool,
+    /// The manager said the transfer is complete.
+    ended: bool,
 }
 
 impl Engine {
@@ -146,14 +156,9 @@ impl Engine {
         if !self.ready() || self.closing || self.quarantined() {
             return Err(Error::new("the pool is not ready"));
         }
-        if self
-            .sess
-            .as_ref()
-            .and_then(|s| s.regions.as_ref())
-            .is_none()
-        {
+        if self.memory().is_none() {
             return Err(Error::new(
-                "this session has no shared memory to copy through",
+                "this session has neither shared memory nor a data channel to copy through",
             ));
         }
         if fetch.parts.is_empty() || fetch.parts.len() > 2 {
@@ -213,7 +218,11 @@ impl Engine {
             generation: p.generation,
             begin_tokens: p.begin_tokens,
             want_row: p.row,
-            mode: wire::CopyMode::SharedWindows as i32,
+            mode: if self.dial.is_some() {
+                wire::CopyMode::DataChannel
+            } else {
+                wire::CopyMode::SharedWindows
+            } as i32,
             deadline_ms: CLAIM_DEADLINE_MS,
             plan_id: restore,
             part: match (single, index) {
@@ -243,6 +252,10 @@ impl Engine {
                 verdict_sent: false,
                 verdict_ok: false,
                 fence_sent: false,
+                via_channel: self.dial.is_some(),
+                channel: None,
+                channel_open: false,
+                ended: false,
             },
         );
         self.emit(Out::Claim(claim));
@@ -260,8 +273,13 @@ impl Engine {
         if claim.granted || claim.released || claim.terminal.is_some() || claim.bad.is_some() {
             return;
         }
-        let verdict = if granted.channel.is_some() {
-            Err("the grant names a data channel, which this client does not use")
+        let via_channel = claim.via_channel;
+        let verdict = if granted.channel.is_some() != via_channel {
+            Err(if via_channel {
+                "the grant names no data channel, which this session needs"
+            } else {
+                "the grant names a data channel, which this session does not use"
+            })
         } else if !records_match(&claim.coverage.expected, &granted.records)
             || granted.total_pages != claim.total_pages
             || granted.row != claim.wants_row
@@ -287,6 +305,24 @@ impl Engine {
             Ok(()) => {
                 claim.granted = true;
                 let (restore, part) = (claim.restore, claim.part);
+                if let Some(reference) = &granted.channel {
+                    match self.open_channel(Id::Claim(id), reference) {
+                        Ok(channel) => {
+                            let claim = self.requester.claims.get_mut(&id).expect("present");
+                            claim.channel = Some(channel);
+                            claim.channel_open = true;
+                        }
+                        Err(error) => {
+                            return self.fail_restore(
+                                restore,
+                                Some(id),
+                                Some(part),
+                                error,
+                                wire::CopyOutcome::CopyErrorOutcome,
+                            );
+                        }
+                    }
+                }
                 let next = part + 1;
                 if self
                     .requester
@@ -301,17 +337,57 @@ impl Engine {
     }
 
     pub(crate) fn on_window_ready(&mut self, ready: wire::WindowReady) {
+        self.window_ready(ready, None);
+    }
+
+    /// A window of a claim arrived over the data channel into `slot`: it is a
+    /// shared window that lies in the instance's own staging.
+    pub(crate) fn on_net_window(&mut self, claim: u64, window: frame::Window, slot: u32) {
+        let Some(staging) = self.net.clone() else {
+            return;
+        };
+        let shape = window.shape;
+        let ready = wire::WindowReady {
+            claim_id: claim,
+            window: Some(wire::WindowSpec {
+                index: shape.index,
+                region: wire::Region::Staging as i32,
+                offset: staging.offset(slot),
+                length: shape.length,
+                record: shape.record,
+                first_page: shape.first_page,
+                page_count: shape.page_count,
+                row: shape.row,
+            }),
+            page_xxh3: window.page_xxh3,
+            row_xxh3: window.row_xxh3,
+            has_row: shape.row,
+        };
+        self.window_ready(ready, Some(slot));
+    }
+
+    /// Take up a window. A slot the window did not keep is freed.
+    fn window_ready(&mut self, ready: wire::WindowReady, slot: Option<u32>) {
+        let taken = self.take_window(ready, slot);
+        if let (false, Some(slot)) = (taken, slot) {
+            self.free_slot(slot);
+        }
+    }
+
+    /// `false` when the window was not taken up and its slot, if any, is still the
+    /// caller's. Once a window is recorded its slot belongs to it.
+    fn take_window(&mut self, ready: wire::WindowReady, slot: Option<u32>) -> bool {
         let id = ready.claim_id;
         let Some(spec) = ready.window else {
-            return;
+            return false;
         };
-        let regions = self.sess.as_ref().and_then(|s| s.regions.clone());
+        let memory = self.memory();
         let (page_bytes, row_bytes) = (self.st.page_record_bytes(), self.st.row_record_bytes());
         let Some(claim) = self.requester.claims.get_mut(&id) else {
-            return;
+            return false;
         };
         if !claim.granted || claim.released || claim.terminal.is_some() || claim.bad.is_some() {
-            return;
+            return false;
         }
         let (restore, part) = (claim.restore, claim.part);
         let dest = match claim.coverage.accept(&spec, page_bytes, row_bytes) {
@@ -324,7 +400,7 @@ impl Engine {
                     Error::new(why),
                     wire::CopyOutcome::CopyErrorOutcome,
                 );
-                return;
+                return false;
             }
         };
         claim.windows.insert(
@@ -332,9 +408,10 @@ impl Engine {
             Window {
                 jobs_left: 0,
                 released: false,
+                slot,
             },
         );
-        let Some(region) = regions.as_ref().and_then(|r| r.get(spec.region())) else {
+        let Some(region) = memory.as_ref().and_then(|m| m.region(spec.region())) else {
             self.fail_restore(
                 restore,
                 Some(id),
@@ -342,7 +419,7 @@ impl Engine {
                 Error::new("window in an unknown region"),
                 wire::CopyOutcome::CopyErrorOutcome,
             );
-            return;
+            return true;
         };
         let Some(bytes) = region.bytes(spec.offset, spec.length) else {
             self.fail_restore(
@@ -352,7 +429,7 @@ impl Engine {
                 Error::new("window outside its region"),
                 wire::CopyOutcome::CopyErrorOutcome,
             );
-            return;
+            return true;
         };
         let count = spec.page_count as usize;
         if ready.page_xxh3.len() != count || ready.has_row != spec.row {
@@ -363,7 +440,7 @@ impl Engine {
                 Error::new("window checksums do not match its pages"),
                 wire::CopyOutcome::CopyErrorOutcome,
             );
-            return;
+            return true;
         }
         let page_len = page_bytes as usize;
         let mismatch = (0..count)
@@ -379,7 +456,7 @@ impl Engine {
                 Error::new("a page or row failed its checksum"),
                 wire::CopyOutcome::CopyChecksum,
             );
-            return;
+            return true;
         }
         let base = region
             .address(spec.offset, spec.length)
@@ -424,6 +501,82 @@ impl Engine {
                 },
             );
         }
+        true
+    }
+
+    /// The manager ended a claim's transfer cleanly.
+    pub(crate) fn on_net_end(&mut self, claim: u64) {
+        let Some(open) = self.requester.claims.get_mut(&claim) else {
+            return;
+        };
+        open.ended = true;
+        let (restore, part) = (open.restore, open.part);
+        let stray = open.terminal.is_none() && open.bad.is_none() && !open.coverage.complete();
+        if stray {
+            self.fail_restore(
+                restore,
+                Some(claim),
+                Some(part),
+                Error::new("the data channel ended before every window arrived"),
+                wire::CopyOutcome::CopyErrorOutcome,
+            );
+        }
+        self.drive_claim(claim);
+    }
+
+    /// A claim's transfer failed.
+    fn net_claim_failed(&mut self, claim: u64, error: String) {
+        let Some(open) = self.requester.claims.get(&claim) else {
+            return;
+        };
+        if open.terminal.is_some() || open.bad.is_some() {
+            return;
+        }
+        let (restore, part) = (open.restore, open.part);
+        self.fail_restore(
+            restore,
+            Some(claim),
+            Some(part),
+            Error::new(error),
+            wire::CopyOutcome::CopyErrorOutcome,
+        );
+    }
+
+    /// A claim's task is gone and its connection closed: nothing writes to its slots.
+    fn net_claim_closed(&mut self, claim: u64) {
+        let Some(open) = self.requester.claims.get_mut(&claim) else {
+            return;
+        };
+        open.channel = None;
+        open.channel_open = false;
+        let early = open.terminal.is_none()
+            && open.bad.is_none()
+            && !(open.ended && open.coverage.complete());
+        let (restore, part) = (open.restore, open.part);
+        if early {
+            self.fail_restore(
+                restore,
+                Some(claim),
+                Some(part),
+                Error::new("the data channel closed before the claim was complete"),
+                wire::CopyOutcome::CopyErrorOutcome,
+            );
+        }
+        self.drive_claim(claim);
+    }
+
+    pub(crate) fn on_net_failed(&mut self, id: Id, error: String) {
+        match id {
+            Id::Claim(claim) => self.net_claim_failed(claim, error),
+            Id::Put(put) => self.net_put_failed(put, error),
+        }
+    }
+
+    pub(crate) fn on_net_closed(&mut self, id: Id) {
+        match id {
+            Id::Claim(claim) => self.net_claim_closed(claim),
+            Id::Put(put) => self.net_put_closed(put),
+        }
     }
 
     pub(crate) fn on_claim_job(&mut self, id: u64, window: u32, result: crate::Result<()>) {
@@ -458,18 +611,25 @@ impl Engine {
     }
 
     fn release_window(&mut self, claim: u64, window: u32) {
-        if let Some(w) = self
+        let Some(w) = self
             .requester
             .claims
             .get_mut(&claim)
             .and_then(|c| c.windows.get_mut(&window))
-            && !w.released
-        {
-            w.released = true;
-            self.emit(Out::WindowReleased(wire::WindowReleased {
+        else {
+            return;
+        };
+        if w.released {
+            return;
+        }
+        w.released = true;
+        match w.slot.take() {
+            // A window that came over the data channel is released by freeing its slot.
+            Some(slot) => self.free_slot(slot),
+            None => self.emit(Out::WindowReleased(wire::WindowReleased {
                 claim_id: claim,
                 index: window,
-            }));
+            })),
         }
     }
 
@@ -491,6 +651,9 @@ impl Engine {
         }
         let state = terminal.state;
         claim.terminal = Some(terminal);
+        if let Some(channel) = &claim.channel {
+            channel.stop();
+        }
         let (restore, part, verdict_ok) = (claim.restore, claim.part, claim.verdict_ok);
         if state == wire::ClaimState::Copied as i32 && verdict_ok {
             if let Some(run) = self.requester.restores.get_mut(&restore) {
@@ -532,7 +695,8 @@ impl Engine {
         let Some(claim) = self.requester.claims.get_mut(&id) else {
             return;
         };
-        if claim.jobs_outstanding > 0 {
+        // Nothing is acknowledged while a copy reads a window or a task may still write one.
+        if claim.jobs_outstanding > 0 || claim.channel_open {
             return;
         }
         let mut send = Vec::new();
@@ -548,7 +712,10 @@ impl Engine {
         } else if !claim.verdict_sent && claim.granted && !claim.released {
             let outcome = if let Some(bad) = claim.bad {
                 Some(bad)
-            } else if claim.coverage.complete() && claim.windows.values().all(|w| w.released) {
+            } else if claim.coverage.complete()
+                && claim.windows.values().all(|w| w.released)
+                && (claim.ended || !claim.via_channel)
+            {
                 claim.verdict_ok = true;
                 Some(wire::CopyOutcome::CopyOk)
             } else {
@@ -567,7 +734,14 @@ impl Engine {
             .as_ref()
             .is_some_and(|t| !t.fence_required || claim.fence_sent);
         if gone {
-            self.requester.claims.remove(&id);
+            // Slots of windows that never reached a release go back with the claim.
+            if let Some(mut claim) = self.requester.claims.remove(&id) {
+                for window in claim.windows.values_mut() {
+                    if let Some(slot) = window.slot.take() {
+                        self.free_slot(slot);
+                    }
+                }
+            }
         }
         for message in send {
             self.emit(message);
@@ -583,7 +757,7 @@ impl Engine {
             .requester
             .claims
             .values()
-            .any(|c| c.restore == id && c.jobs_outstanding > 0);
+            .any(|c| c.restore == id && (c.jobs_outstanding > 0 || c.channel_open));
         let result = if restore.failure.is_some() {
             if !drained {
                 return;
@@ -631,6 +805,10 @@ impl Engine {
         for claim_id in claims {
             self.withdraw_queued(claim_id);
             let claim = self.requester.claims.get_mut(&claim_id).expect("listed");
+            // No more windows are wanted; the task goes and reports `Closed`.
+            if let Some(channel) = &claim.channel {
+                channel.stop();
+            }
             if claim.terminal.is_none() {
                 if !claim.granted {
                     if !claim.released {

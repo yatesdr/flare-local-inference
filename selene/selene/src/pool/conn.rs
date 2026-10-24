@@ -20,6 +20,7 @@ use crate::{CLOSE_TIMEOUT, Error, Result};
 use super::{
     client::PoolAddress,
     engine::{Ended, Engine, PROTOCOL},
+    net::{self, Dial},
     shared::PoolStatus,
     shm::Regions,
     wire::{self, client_message::M as Out, server_message::M as In},
@@ -282,6 +283,8 @@ struct Established {
     hello: wire::HelloReply,
     opened: wire::SessionOpened,
     regions: Option<Arc<Regions>>,
+    /// How this session opens data-channel transfers when it has no shared memory.
+    dial: Option<Arc<dyn Dial>>,
     stream: tonic::Streaming<wire::ServerMessage>,
     tx: mpsc::Sender<wire::ClientMessage>,
 }
@@ -309,6 +312,7 @@ async fn attempt(engine: &mut Engine, link: &Link) -> Attempt {
         hello,
         opened,
         regions,
+        dial,
         mut stream,
         tx,
     } = match established {
@@ -324,11 +328,14 @@ async fn attempt(engine: &mut Engine, link: &Link) -> Attempt {
         limits_or_default(hello.limits),
         regions,
     );
+    if let Some(dial) = dial {
+        engine.set_dial(dial);
+    }
     run_session(engine, link, &mut stream, tx).await;
     Attempt::Ended
 }
 
-async fn establish(engine: &Engine, link: &Link) -> std::result::Result<Established, Attempt> {
+async fn establish(engine: &mut Engine, link: &Link) -> std::result::Result<Established, Attempt> {
     let (channel, connected_with) = match connect(link).await {
         Ok(connected) => connected,
         Err(why) => return Err(Attempt::Retry(why)),
@@ -363,6 +370,22 @@ async fn establish(engine: &Engine, link: &Link) -> std::result::Result<Establis
         },
         None => None,
     };
+    // Without shared memory, windows pass through this process's own staging and the
+    // manager's data channel, if it offers one.
+    let dial = match (&regions, &link.address) {
+        (None, PoolAddress::Tcp(address)) if !hello.data_transports.is_empty() => {
+            match net_dial(engine, link, address, limits_or_default(hello.limits)) {
+                Ok(dial) => Some(dial),
+                Err(error) => {
+                    eprintln!(
+                        "warning: cannot use the pool's data channel ({error}); restores and puts are off"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
     let st = engine.st.clone();
     let (tx, rx) = mpsc::channel::<wire::ClientMessage>(OUTBOUND);
     let open = wire::OpenSession {
@@ -376,7 +399,11 @@ async fn establish(engine: &Engine, link: &Link) -> std::result::Result<Establis
         } else {
             0
         },
-        claim_slots: if regions.is_some() { st.claim_slots } else { 0 },
+        claim_slots: if regions.is_some() || dial.is_some() {
+            st.claim_slots
+        } else {
+            0
+        },
     };
     let _ = tx
         .send(wire::ClientMessage {
@@ -423,9 +450,35 @@ async fn establish(engine: &Engine, link: &Link) -> std::result::Result<Establis
         hello,
         opened,
         regions,
+        dial,
         stream,
         tx,
     })
+}
+
+/// The data channel over TCP to the manager at `address`: staging made once for the
+/// process, and TLS exactly when the client was given a CA.
+fn net_dial(
+    engine: &mut Engine,
+    link: &Link,
+    address: &str,
+    limits: wire::Limits,
+) -> Result<Arc<dyn Dial>> {
+    let host = address
+        .rsplit_once(':')
+        .map_or(address, |(host, _)| host)
+        .to_string();
+    let tls = match &link.ca {
+        Some(ca) => Some(net::tls_for(ca, &host)?),
+        None => None,
+    };
+    let staging = engine.net_staging(&limits)?;
+    Ok(Arc::new(net::Tcp {
+        host,
+        tls,
+        staging,
+        events: engine.net_events.clone(),
+    }))
 }
 
 fn map_regions(engine: &Engine, shared: &wire::SharedMemory) -> Result<Regions> {
