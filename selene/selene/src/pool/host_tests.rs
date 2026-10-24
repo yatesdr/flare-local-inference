@@ -383,3 +383,17 @@ fn the_disk_probe_writes_and_restores_a_record_cold_and_leaves_no_file_and_no_an
     drop(store);
     std::fs::remove_dir_all(&directory).unwrap();
 }
+
+#[test]
+fn a_store_dropped_while_its_records_are_being_hashed_frees_no_slab_under_the_hasher() {
+    // The checksum thread reads a record's slabs; the store joins it before
+    // it frees them.
+    for _ in 0..300 {
+        let mut rig = rig(8);
+        let checkpoint = rig.publish(3, 100);
+        assert_eq!(rig.store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
+        rig.poll();
+        rig.poll();
+        drop(rig);
+    }
+}
