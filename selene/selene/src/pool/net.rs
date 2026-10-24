@@ -32,7 +32,7 @@ use tokio_rustls::TlsConnector;
 use crate::{Error, HostRegistrar, Result};
 
 use super::{
-    frame::{Carrier, Shape, TOKEN_BYTES, ToInstance, ToManager, Window},
+    frame::{Carrier, NO_SLOT, Shape, TOKEN_BYTES, ToInstance, ToManager, Window},
     shm::Region,
     wire,
 };
@@ -458,7 +458,7 @@ async fn connect(target: &Target) -> io::Result<Box<dyn Conn>> {
         None => Box::new(stream),
     };
     conn.write_all(&target.token).await?;
-    ToManager::Hello(Carrier::Tcp).write(&mut conn).await?;
+    ToManager::Hello(Carrier::Stream).write(&mut conn).await?;
     conn.flush().await?;
     Ok(conn)
 }
@@ -476,6 +476,9 @@ async fn receive(target: &Target, id: Id) -> io::Result<()> {
         match frame {
             ToInstance::Window(window) => {
                 let length = window.shape.length;
+                if window.slot != NO_SLOT {
+                    return Err(invalid("a window names a slot on the stream carrier"));
+                }
                 if length == 0 || length % ALIGN != 0 || length > target.staging.slot_bytes() {
                     return Err(invalid(format!(
                         "window {} has an unusable length ({length})",
@@ -504,7 +507,7 @@ async fn receive(target: &Target, id: Id) -> io::Result<()> {
                     "the manager ended the transfer: {text}"
                 )));
             }
-            ToInstance::Grant(_) => return Err(invalid("a claim's channel carries no grants")),
+            _ => return Err(invalid("a claim's channel carries only windows")),
         }
     }
 }
@@ -564,6 +567,7 @@ async fn fill(
                 index: window.index,
                 row_xxh3: window.row_xxh3,
                 page_xxh3: window.page_xxh3,
+                slot: NO_SLOT,
             };
             timeout(IDLE_TIMEOUT, async {
                 frame.write(&mut writer).await?;
@@ -692,7 +696,7 @@ mod tests {
             let mut token = [0u8; TOKEN_BYTES];
             stream.read_exact(&mut token).await.unwrap();
             let hello = ToManager::read(&mut stream, MAX_PAGES).await.unwrap();
-            assert_eq!(hello, ToManager::Hello(Carrier::Tcp));
+            assert_eq!(hello, ToManager::Hello(Carrier::Stream));
             (stream, token)
         }
     }
@@ -708,6 +712,7 @@ mod tests {
             } else {
                 0
             },
+            slot: NO_SLOT,
         }
     }
 
@@ -860,6 +865,7 @@ mod tests {
                 shape: odd,
                 page_xxh3: vec![0],
                 row_xxh3: 0,
+                slot: NO_SLOT,
             })
             .write(&mut stream)
             .await
@@ -940,7 +946,8 @@ mod tests {
             ToManager::Filled {
                 index: 0,
                 row_xxh3: Some(11),
-                page_xxh3: vec![1, 2]
+                page_xxh3: vec![1, 2],
+                slot: NO_SLOT
             }
         );
         let mut got = vec![0u8; bytes.len()];
@@ -1051,7 +1058,7 @@ mod tests {
         assert_eq!(token, [4; TOKEN_BYTES]);
         assert_eq!(
             ToManager::read(&mut stream, MAX_PAGES).await.unwrap(),
-            ToManager::Hello(Carrier::Tcp)
+            ToManager::Hello(Carrier::Stream)
         );
         let bytes = vec![6u8; PAGE];
         ToInstance::Window(window_frame(shape(0, 1, false), &bytes))

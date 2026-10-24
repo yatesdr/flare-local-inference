@@ -2021,7 +2021,7 @@ mod tests {
         // The instance is connected and quiet: a handler is attached.
         let mut socket = tokio::net::TcpStream::connect(hub.address()).await.unwrap();
         socket.write_all(&token).await.unwrap();
-        ToManager::Hello(Carrier::Tcp)
+        ToManager::Hello(Carrier::Stream)
             .write(&mut socket)
             .await
             .unwrap();
