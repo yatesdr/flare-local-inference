@@ -776,6 +776,14 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
         PoolPort::evictions_lost(&self.pool);
     }
 
+    fn needs_characterization(&self) -> bool {
+        PooledStore::needs_characterization(self)
+    }
+
+    fn characterize(&mut self, scratch: &Scratch) -> Result<Option<String>> {
+        PooledStore::characterize(self, scratch)
+    }
+
     fn evicted(&mut self, key: PrefixKey, generation: u64, heir: Option<&PublishedCheckpoint>) {
         PoolPort::evicted(
             &self.pool,

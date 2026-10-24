@@ -24,7 +24,7 @@ pub mod transfer;
 pub use flare_selene::{
     CacheGeometry, ExportChain, ExportId, ExportNode, ExportRefusal, HostHit,
     INITIAL_DIRECT_DISK_RATE, INITIAL_MEMORY_RATE, INITIAL_PREFILL_RATE, INITIAL_STAGED_DISK_RATE,
-    InboundTicket, JobId, Layout, Plane, PublishedCheckpoint, StoreOutcome, StoreReason,
+    InboundTicket, JobId, Layout, Plane, PublishedCheckpoint, Scratch, StoreOutcome, StoreReason,
     StoreStats, Tier, Transport, disk, disk_store, geometry, index, input, pool::LookupTicket,
     record, slab, worth_fetching,
 };
@@ -773,7 +773,7 @@ fn attach_pool(
         level_order: None,
         registration_context,
     };
-    let store = PooledStore::connect(adapter::Tiers::new(local), config, copier, registrar, None)?;
+    let store = PooledStore::connect(adapter::Tiers::new(local), config, copier, registrar)?;
     Ok(Box::new(adapter::Host::new(Box::new(store), true)))
 }
 
@@ -874,6 +874,15 @@ pub trait PrefixStore {
     fn evicted(&mut self, _key: PrefixKey, _generation: u64, _heir: Option<&PublishedCheckpoint>) {}
     /// Eviction notices were dropped before delivery; announce holdings again.
     fn evictions_lost(&mut self) {}
+    /// Whether the pool's copy levels should be measured (again).
+    fn needs_characterization(&self) -> bool {
+        false
+    }
+    /// Measure the pool's copy levels with `scratch`, GPU ids idle for the whole
+    /// call with no transfer in flight. Returns the line to log when it measured.
+    fn characterize(&mut self, _scratch: &Scratch) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

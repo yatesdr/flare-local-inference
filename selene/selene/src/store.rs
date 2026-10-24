@@ -238,6 +238,16 @@ pub trait HostStore {
     /// worker delivered them, so the announced holdings may be stale and must be
     /// announced again in full.
     fn evictions_lost(&mut self) {}
+    /// Whether the copy levels should be measured again. Only a pooled store
+    /// ever says yes.
+    fn needs_characterization(&self) -> bool {
+        false
+    }
+    /// Measure the copy levels with idle `scratch` ids; see the pooled store.
+    /// Returns the log line when it measured.
+    fn characterize(&mut self, _scratch: &Scratch) -> Result<Option<String>> {
+        Ok(None)
+    }
     /// Announce what this store's tiers hold, now and as they change, through
     /// `announcer`, and serve them as exports. Nothing is recorded before this.
     fn announce_to(&mut self, _announcer: Announcer) {}

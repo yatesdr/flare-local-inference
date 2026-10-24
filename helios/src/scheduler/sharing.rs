@@ -69,6 +69,37 @@ impl RequestScheduler {
         std::mem::take(&mut self.evictions)
     }
 
+    /// Lends `pages` idle page ids and one idle state slot to `f` and takes them
+    /// back after, or `None` when the scheduler is not idle or lacks them. Nothing
+    /// may be live or submitted. If `f` fails, copies it started may still touch
+    /// the ids, so they are not returned to the free lists.
+    pub fn with_scratch<R>(
+        &mut self,
+        pages: usize,
+        f: impl FnOnce(&[PageId], StateSlotId) -> Result<R>,
+    ) -> Option<Result<R>> {
+        if self.slots.iter().any(|s| s.request.is_some() || s.retiring)
+            || !self.submissions.is_empty()
+            || !self.tickets.is_empty()
+        {
+            return None;
+        }
+        let snapshot = self.reserve_snapshot(pages)?;
+        if self.free_pages.len() < pages {
+            self.release_snapshot(snapshot);
+            return None;
+        }
+        let taken: Vec<_> = (0..pages)
+            .map(|_| self.free_pages.pop_first().unwrap())
+            .collect();
+        let result = f(&taken, self.snapshot_slot(snapshot));
+        if result.is_ok() {
+            self.free_pages.extend(taken);
+            self.release_snapshot(snapshot);
+        }
+        Some(result)
+    }
+
     /// Whether notices were dropped since the previous call.
     pub fn take_evictions_lost(&mut self) -> bool {
         std::mem::take(&mut self.evictions_lost)
@@ -475,6 +506,38 @@ mod tests {
         }
         assert!(s.export_fits(b, Some(next(8))));
         assert!(!s.export_fits(b, Some(next(9))));
+    }
+
+    #[test]
+    fn scratch_is_lent_and_returned_or_withheld_after_a_failure() {
+        let mut s = scheduler(2, 16, 4);
+        let lent = s
+            .with_scratch(8, |pages, slot| {
+                assert_eq!(pages.len(), 8);
+                assert!(pages.windows(2).all(|pair| pair[0] < pair[1]));
+                assert!(slot.0 > 0);
+                Ok(pages.len())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(lent, 8);
+        assert_eq!((s.free_page_count(), s.free_snapshot_count()), (16, 4));
+        // More ids than exist: nothing is taken.
+        assert!(s.with_scratch(17, |_, _| Ok(())).is_none());
+        assert_eq!((s.free_page_count(), s.free_snapshot_count()), (16, 4));
+        // A failure may leave copies running against the ids, so they stay out.
+        let failed = s
+            .with_scratch(8, |_, _| Err::<(), _>("probe failed".into()))
+            .unwrap();
+        assert!(failed.is_err());
+        assert_eq!((s.free_page_count(), s.free_snapshot_count()), (8, 3));
+    }
+
+    #[test]
+    fn scratch_is_not_lent_while_a_request_is_live() {
+        let mut s = scheduler(2, 16, 4);
+        s.admit(spec(64, 1)).unwrap();
+        assert!(s.with_scratch(2, |_, _| Ok(())).is_none());
     }
 
     #[test]
