@@ -845,6 +845,16 @@ copier's streams and events on each device, like each local tier's, and adds no
 host bytes; the device cost of registering the manager's regions, about 2 MiB
 per GiB, depends on sizes the manager announces and is not included.
 
+The store measures what each copy level costs, end to end, before ranking them.
+The worker runs that probe only when nothing is running: once at startup,
+before any request is admitted, and again later if the store reports that the
+topology changed (a manager joined or left) and the worker is idle. It lends the
+probe 64 idle page ids and one state slot from the free lists and takes them back
+afterwards, so it allocates nothing on the GPU. The probe blocks the worker for
+a bounded time; a request that arrives meanwhile waits for it. Too few free ids
+skip the measurement and keep the default order, and a failed probe stops the
+worker, because copies may still be using the ids. The result is logged once.
+
 A pooled instance supports a single host. A multi-host package keeps disk-only
 retention, and startup refuses a pool for it.
 
