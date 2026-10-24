@@ -63,6 +63,9 @@ pub struct PoolOptions {
     /// `unix:PATH` for a manager on this host, or `HOST:PORT`.
     pub address: String,
     pub tenant: String,
+    /// The CA certificate the manager's TLS certificate must chain to. Set, the connection
+    /// must be TLS; unset, it is plaintext. Only a `HOST:PORT` manager can use one.
+    pub ca: Option<std::path::PathBuf>,
 }
 
 /// The tenant of an instance that names none: the protocol requires a nonempty one.
@@ -764,7 +767,7 @@ fn attach_pool(
     let config = PoolConfig {
         address,
         tenant: pool.tenant.clone(),
-        ca: None,
+        ca: pool.ca.clone(),
         scope: pool_scope(&pool.tenant, identity, geometry)?,
         instance_name: format!("flare-{}", std::process::id()),
         gpu_uuids,
@@ -937,6 +940,7 @@ mod tests {
         PoolOptions {
             address: address.into(),
             tenant: DEFAULT_POOL_TENANT.into(),
+            ca: None,
         }
     }
 

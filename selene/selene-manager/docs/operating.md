@@ -71,7 +71,7 @@ own uid (with distinct manager names) or its own host.
 
 At start the manager prints a warning for each option that widens its exposure:
 
-- `selene: warning: network listening enabled on ADDR (TLS|plaintext)` when `--listen` is set;
+- `selene: warning: network listening enabled on ADDR (TLS|plaintext, data on ADDR)` when `--listen` is set;
 - `selene: warning: RDMA enabled (experimental)` when `--rdma` is set in a build that has it.
 
 It refuses to start, and says why, when `--rdma` is combined with TLS (RDMA transfers are not
@@ -174,7 +174,7 @@ Stop the manager, replace the binary and start it with the same `--root`, `--nam
 Durable records are validated and reused; instances reconnect, resync and refill the DRAM tier from
 their traffic. The protocol version must match the instances: a manager that does not speak the
 instance's version answers `Hello` with `VERSION_MISMATCH` and the instance runs on its local tiers
-until restarted. `--name`, `--socket`, `--listen` and the TLS files are restart-only.
+until restarted. `--name`, `--socket`, `--listen`, `--listen-data` and the TLS files are restart-only.
 
 The root holds one opaque 64-hex directory per scope plus `.lock` and `instances`. Remove a scope
 directory to drop that model's durable records, or all of them to clear the pool, only while the

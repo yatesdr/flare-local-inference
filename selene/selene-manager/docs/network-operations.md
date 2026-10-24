@@ -9,11 +9,17 @@ the manager is never put behind a load balancer.
 
 ```sh
 selene --name pool --root /var/lib/selene --memory 16G --nvme 1T --staging 1G \
-  --listen 0.0.0.0:9200 --tls-cert server.pem --tls-key server-key.pem
+  --listen 0.0.0.0:9200 --listen-data 0.0.0.0:9201 --tls-cert server.pem --tls-key server-key.pem
 ```
 
 - `--listen ADDR:PORT` serves the pool protocol on that address in addition to the Unix socket.
-  The manager prints `selene: warning: network listening enabled on ADDR (TLS|plaintext)` at start.
+  The manager prints
+  `selene: warning: network listening enabled on ADDR (TLS|plaintext, data on ADDR)` at start.
+- `--listen-data ADDR:PORT` is where those instances connect to copy bytes (see below). It
+  defaults to the host of `--listen` on the next port (and to any free port when `--listen` names
+  port 0). The address a grant names is the one the listener bound; when it is the unspecified
+  address (`0.0.0.0`), the instance connects to the host it reached the manager by. Publish this
+  port as you publish the first.
 - `--tls-cert` and `--tls-key` give the manager a TLS identity. A client that was given a CA
   verifies the manager against it and refuses a plaintext manager; a client without a CA speaks
   plaintext. `Hello.encryption` tells the client what the manager was started with, and a client
@@ -25,16 +31,33 @@ selene --name pool --root /var/lib/selene --memory 16G --nvme 1T --staging 1G \
 A session on this listener has no shared memory, so it gets no instance-sourced candidates, and the manager's own
 records are offered to it as level 5 (remote NVMe).
 
-## What works today, and what does not
+## The data channel
 
 Hello, sessions, notices, resync, lookup, and the readiness barrier work over the network
-listener exactly as on the Unix socket. **The data channel is not served in this version.**
-Moving record bytes to or from an instance on another host needs it, so a `Claim` or `PutBegin` in
-mode `DATA_CHANNEL` is refused (`INVALID_CLAIM`; `PutRefused{INVALID}` with a detail saying the
-data channel is not served). The stream transport and the RDMA transport that will carry it are
-in `src/data` (`stream.rs`, `rdma.rs`, `ibv.rs`) and keep their unit tests; they move
-bytes between regions the two ends have mapped, and the instance-to-manager framing is wired in a
-later change.
+listener exactly as on the Unix socket. An instance without shared memory moves record bytes on
+the **data channel**: a `Claim` or `PutBegin` in mode `DATA_CHANNEL` is granted a single-use token
+and the data listener's address instead of windows. The instance connects (with TLS when the
+manager has a certificate), presents the token and says which carrier moves the payload.
+
+- **A claim** (the manager's own records, DRAM or NVMe): the store fills its windows as for a
+  local requester, and the manager's handler writes each one to the instance with the checksums
+  stored with the record, then `END`. The instance verifies every page and the row before it sends
+  `COPY_OK`.
+- **A put**: the store's windows are offered to the instance as `GRANT`s and filled from what it
+  writes back; the manager checks each fill against its grant before reading the payload into the
+  window. A commit that reaches the session before the last fill reaches the channel waits for it.
+- **Fencing**: a transfer's windows go back to the store only after its handler has exited and
+  its connection is closed (RDMA: its queue pair moved to the error state and destroyed). A handler
+  that is not seen to exit within five seconds of the stop leaves its windows quarantined and
+  counted in the readiness `quarantined_bytes`; a late exit releases them. A remote instance
+  never touches the manager's windows, so its own exit is not waited for.
+- **Limits**: a transfer that makes no progress for the claim's progress timeout (3 s by
+  default) expires; a socket that stalls for 20 s fails. The metrics carry
+  `cm_pool_channel_windows_total` and `cm_pool_channel_bytes_total` by `carrier`.
+
+Instance-sourced candidates (a neighbour's host or GPU records) are not offered to a session
+without shared memory, so only the manager's own records travel this way. The framing is
+`flare_selene::pool::frame`, documented at the top of that file.
 
 ## Certificates
 
@@ -60,7 +83,15 @@ The default build and image never link libibverbs. Build with `--features rdma` 
 `selene: warning: RDMA enabled (experimental)`. RDMA bytes are not encrypted, so the manager
 **refuses to start** with `--rdma` and TLS together and says why; choose one. RDMA is never listed
 in `Hello.data_transports` when the manager is TLS. The container needs
-`--device /dev/infiniband` and `--ulimit memlock=-1:-1`. For a Soft-RoCE test host:
+`--device /dev/infiniband` and `--ulimit memlock=-1:-1`. The manager opens the first device with
+an active port and registers its regions once; `--rdma` on a host with none refuses to start.
+
+The manager does every RDMA transfer, one-sided, on a queue pair made for the transfer: it writes
+a claim's windows into slots the instance lends (`CREDIT`) and reads a put's windows out of the
+slots the instance fills (`FILLED`, released with `TAKEN`). The instance must be built with the
+`rdma` feature and have a device; otherwise, or after one RDMA transfer fails, it asks for the
+stream carrier on its connection, so a mixed pool works. Both ends use GID index 0 and a path MTU
+of 1024. For a Soft-RoCE test host:
 
 ```sh
 sudo modprobe rdma_rxe
@@ -73,6 +104,8 @@ ibv_devices                                    # rxe0 should appear
 | Symptom | Check |
 |---|---|
 | Remote instances run on local tiers only | The address and firewall; whether the instance has the CA for a TLS manager (or none for a plaintext one); `Hello.encryption`. |
-| `DATA_CHANNEL` claims or puts refused | Expected until the data channel is wired; same-host instances use shared windows. |
+| `DATA_CHANNEL` claims or puts refused | The manager has no network listener (`INVALID_CLAIM`, or `PutRefused{INVALID}` saying so); or the claim is not for the manager's own records. |
+| Claims expire with `NO_PROGRESS` | The instance cannot reach `--listen-data` (firewall, a published port that is not the bound one), or it does not read fast enough. |
+| Windows quarantined (`quarantined_bytes`) | A data handler did not exit after its transfer was stopped; the manager logs the claim. They return if the exit is seen, else at restart. |
 | TLS handshake failures | The certificate's SAN against the name clients dial; that the CA the clients hold signed the server certificate. |
 | `--rdma` refused | TLS options present, or a build without the `rdma` feature. |

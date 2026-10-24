@@ -556,6 +556,24 @@ deregistered after that); the requester closes its end the same way and only the
 sends `FenceAck`. An unresponsive peer means the manager's registered regions for
 that transfer stay quarantined until it exits.
 
+**Framing (this implementation).** One connection per transfer, after TLS when the manager
+has a certificate. The instance sends the 32-byte token, then `HELLO` naming the carrier
+(stream, or RDMA with its queue-pair description). Frames, little-endian, are defined in
+`flare_selene::pool::frame` (the header of `selene/src/pool/frame.rs`): `WINDOW` (index, record,
+first page, page count, row flag, length, row checksum, slot, one checksum per page) followed on the
+stream carrier by `length` payload bytes, then `END`; for a put `GRANT` from the manager and
+`FILLED` (with the instance's checksums) from the instance, payload following on the stream
+carrier. On the RDMA carrier the payload never travels on the connection: the manager writes a
+claim's window into a slot the instance lent (`CREDIT`) and then names the slot in `WINDOW`; it reads a
+put's slot out of the instance's staging and releases it with `TAKEN`. Windows arrive in index
+order and are checked by the receiver's coverage exactly as shared windows are, so a transfer that
+ends short or over is a `COPY_ERROR`; `COPY_OK` waits for `END`.
+
+The manager's windows are read or written only by its own handler, so its exit is the manager's
+fence for them (the requester's `FenceAck` is accepted and idempotent, but no window waits for it).
+A handler that is not seen to exit within five seconds of the stop quarantines its windows, counted
+in `ReadinessInfo.quarantined_bytes`; seeing the exit later releases them.
+
 ### 7.6 Flare's view
 
 Flare sees `Fetched` only after every destination write has drained: selene
@@ -780,12 +798,14 @@ What the manager serves, and where it is narrower than the contract above.
   the manager was started with. RDMA is offered only without TLS and only with `--rdma` in a
   build with the `rdma` feature; a manager started with both refuses to start and says why.
   `shared_memory` is returned only to a Unix-socket peer with the manager's uid and gid.
-- **The data channel is not served in this version.** A session without shared memory can
-  open, resynchronise, look up and (for the manager's own store) see level-5 candidates, but
-  a `Claim` or `PutBegin` in mode `DATA_CHANNEL` is refused (`INVALID_CLAIM`, and
-  `PutRefused{INVALID}` with a detail saying so). `Hello.data_transports` lists the
-  transports the listener will carry once it is; the transfer framing is defined with the
-  instance-side client.
+- **The data channel.** A session without shared memory can open, resynchronise, look up, see
+  level-5 candidates (the manager's own records), claim them and put into the manager's store,
+  with the bytes on the data channel (`--listen-data`; section 7.5). Only the manager's own store
+  is a source on this path; a `DATA_CHANNEL` claim naming an instance is `INVALID_CLAIM`. On a
+  manager with no network listener `DATA_CHANNEL` is refused (`INVALID_CLAIM`;
+  `PutRefused{INVALID}` saying so). A remote instance has no pid, so the store gives it a
+  peer-style connection; it is told apart by its session, not watched, and no window is ever
+  leased to it.
 - **Lookup timing.** Lookups are answered on the manager's 10 ms clock, not inline, so a
   burst beyond `max_concurrent_lookups` is refused `LOOKUP_OVERLOADED` at once. Candidates
   come from the index only; the manager never contacts a source to answer one.
