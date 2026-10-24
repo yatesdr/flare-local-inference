@@ -16,6 +16,7 @@ mod shared;
 mod shm;
 #[cfg(test)]
 mod smoke_tests;
+mod store;
 #[allow(clippy::all, dead_code)]
 pub(crate) mod wire {
     tonic::include_proto!("selene.v2");
@@ -28,4 +29,5 @@ pub use exporter::{Checksums, HostChain, HostExporter, HostPin, HostRecord, Host
 pub use identity::{Geometry, RankPlanes, Scope, instance_id, process_nonce, scope_id};
 pub use lookup::{Answer, LookupState, LookupTicket};
 pub use shared::{ExportRequest, FetchFailure, FetchPart, PoolEvent, PoolFetch, PoolStatus};
+pub use store::{PoolPort, PooledStore};
 pub use types::{HeldRange, PoolCandidate, SourceRef, Tier};

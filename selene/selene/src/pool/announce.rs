@@ -188,6 +188,22 @@ impl Announcer {
         self.wake.notify_one();
     }
 
+    /// Every GPU holding is forgotten and the manager's view is replaced by a
+    /// new snapshot. For when eviction notices were lost: holdings that were
+    /// announced and have since left the GPU cannot be told apart, so none is
+    /// kept; those still resident are announced again when they are published
+    /// again.
+    pub fn forget_gpu(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.entries.retain(|(_, tier), _| *tier != Tier::Gpu);
+        if state.active {
+            state.queue.clear();
+            state.overflowed = true;
+        }
+        drop(state);
+        self.wake.notify_one();
+    }
+
     /// Entries announced beyond `max` are held back: they are hints only.
     pub(crate) fn set_max_entries(&self, max: usize) {
         self.state.lock().unwrap().max_entries = max;
@@ -378,6 +394,21 @@ mod tests {
         let snapshot = a.snapshot();
         assert!(snapshot.entries.iter().all(|e| e.key != key(3)));
         assert_eq!(snapshot.entries.len(), QUEUE_BOUND + 4);
+    }
+
+    #[test]
+    fn forgetting_the_gpu_tier_keeps_host_holdings_and_asks_for_a_snapshot() {
+        let a = announcer();
+        a.begin_session();
+        a.saved(entry(1, Tier::Gpu, 1));
+        a.saved(entry(1, Tier::Dram, 1));
+        a.saved(entry(2, Tier::Gpu, 2));
+        a.forget_gpu();
+        assert!(a.overflowed());
+        let snapshot = a.snapshot();
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].tier, Tier::Dram);
+        assert!(a.take_batch(10).is_none());
     }
 
     #[test]
