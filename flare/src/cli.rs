@@ -899,6 +899,12 @@ pub struct ServingOptions {
     #[arg(long, value_name = "NAME", value_parser = parse_pool_tenant,
         requires = "prefix_cache_pool", help_heading = "Prefix cache options")]
     pub prefix_cache_pool_tenant: Option<String>,
+
+    /// CA certificate that the pool manager's TLS certificate must chain to; set, the connection must
+    /// be TLS [default: plaintext].
+    #[arg(long, value_name = "FILE", requires = "prefix_cache_pool",
+        help_heading = "Prefix cache options")]
+    pub prefix_cache_pool_ca: Option<PathBuf>,
 }
 
 fn served_model_name(value: &str) -> Result<String, String> {
@@ -1053,6 +1059,9 @@ impl ServingOptions {
         if let Some(tenant) = &self.prefix_cache_pool_tenant {
             options.extend(["--prefix-cache-pool-tenant".into(), tenant.clone()]);
         }
+        if let Some(ca) = &self.prefix_cache_pool_ca {
+            options.extend(["--prefix-cache-pool-ca".into(), ca.display().to_string()]);
+        }
         options
     }
 
@@ -1097,6 +1106,7 @@ impl ServingOptions {
                     tenant: self.prefix_cache_pool_tenant
                         .clone()
                         .unwrap_or_else(|| DEFAULT_POOL_TENANT.to_owned()),
+                    ca: self.prefix_cache_pool_ca.clone(),
                 }),
             },
             cluster_rank,
@@ -1808,7 +1818,8 @@ mod tests {
             single.load_options().prefix_cache.pool,
             Some(PoolOptions {
                 address: "unix:/run/selene.sock".into(),
-                tenant: DEFAULT_POOL_TENANT.into()
+                tenant: DEFAULT_POOL_TENANT.into(),
+                ca: None
             })
         );
         assert_eq!(
@@ -1854,7 +1865,8 @@ mod tests {
                 args.load_options().prefix_cache.pool,
                 Some(PoolOptions {
                     address: address.into(),
-                    tenant: "acme".into()
+                    tenant: "acme".into(),
+                    ca: None
                 })
             );
             // Every rank receives the same pool settings.
@@ -1871,6 +1883,48 @@ mod tests {
         let unset = run(&["flare", "run", "model.safetensors"]);
         assert!(unset.load_options().prefix_cache.pool.is_none());
         assert!(!unset.load_options().prefix_cache.enabled());
+    }
+
+    #[test]
+    fn the_pool_ca_needs_a_pool_and_reaches_every_rank() {
+        let rejected = |arguments: &[&str]| {
+            let mut all = vec!["flare", "run", "model.safetensors"];
+            all.extend(arguments);
+            Cli::try_parse_from(all).is_err()
+        };
+        assert!(rejected(&["--prefix-cache-pool-ca", "/etc/selene/ca.pem"]));
+        let args = run(&[
+            "flare",
+            "run",
+            "model.safetensors",
+            "--prefix-cache-pool",
+            "selene.local:7000",
+            "--prefix-cache-pool-ca",
+            "/etc/selene/ca.pem",
+        ]);
+        assert_eq!(
+            args.load_options().prefix_cache.pool,
+            Some(PoolOptions {
+                address: "selene.local:7000".into(),
+                tenant: DEFAULT_POOL_TENANT.into(),
+                ca: Some("/etc/selene/ca.pem".into())
+            })
+        );
+        assert_eq!(
+            args.rank_options(),
+            [
+                "--prefix-cache-pool",
+                "selene.local:7000",
+                "--prefix-cache-pool-ca",
+                "/etc/selene/ca.pem"
+            ]
+        );
+        let mut forwarded = vec!["flare".to_owned(), "run".into(), "model.safetensors".into()];
+        forwarded.extend(args.rank_options());
+        let Command::Run(peer) = Cli::try_parse_from(forwarded).unwrap().command else {
+            panic!()
+        };
+        assert_eq!(peer.load_options().prefix_cache.pool, args.load_options().prefix_cache.pool);
     }
 
     #[test]

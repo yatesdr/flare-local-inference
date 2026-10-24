@@ -16,7 +16,8 @@ client (`tests/support/pool.rs`) and never model the manager's state machine.
 | `tests/pool_l0.rs` | Hello, sessions and supersede, notices, generations, resync (every failure), lookup, readiness and the restart barrier, limits, shutdown drain. |
 | `tests/pool_claims.rs` | Claims between instances: retained and streamed copies byte for byte through the shared staging region, every refusal, timeouts, races, fencing and quarantine, Goodbye, stream blips, process replacement, and a real peer process that is killed or hung. |
 | `tests/pool_store.rs` | Put into the manager's store and claims on its records: persisted checksums, recovered NVMe records, damage at rest, a requester whose stream drops, put cancel and fence. |
-| `tests/pool_net.rs` | The network listener: sessions without shared memory, level-5 candidates, refusal of the data channel, TLS declared and RDMA withheld, the startup warnings and the refusal of RDMA with TLS. |
+| `tests/pool_net.rs` | The network listener: sessions without shared memory, level-5 candidates, refusal of shared windows, TLS declared and RDMA withheld, the startup warnings and the refusal of RDMA with TLS. |
+| `tests/pool_channel.rs` | Instances on other hosts: a chain put and restored over TCP and TLS byte for byte (mid-record starts, persisted checksums), an instance that never connects, dies mid-window or mid-fill, a released claim, a lost session, corrupt and cancelled puts, no listener; with the `rdma` feature the same over RDMA on a queue pair per transfer. |
 | `tests/l0.rs` | The store engine through the pool protocol: admission and refusal classification, eviction and compaction, chain durability, crash and recovery, streaming and oversize records, budget and cancel, directory modes, failed-start cleanup, signal handling, kill/restart, and a throughput smoke test. |
 | `tests/proto.rs` | The proto file is the one both ends were built from (digest). |
 
@@ -78,7 +79,9 @@ E12 manager half `x1_claims_in_flight_and_export_slots_are_limited`.
 **Fencing and quarantine.** F1 `f1_the_window_order_is_enforced`; F2 `f2_a_window_the_source_may_still_write_waits_for_its_end`;
 F3 `f3_a_window_the_requester_may_still_read_waits_for_its_fence`; F4 `f4_a_quarantined_party_keeps_its_windows_out_of_service`;
 F5 `r7_and_r8_a_killed_or_hung_requester_leaves_nothing_behind`, `a5_...`; F12 `s4_and_s7_a_new_process_attests_nothing_for_its_predecessor`;
-F6 is not applicable yet (remote windows exist only with the data channel); F7 to F11, F13 client.
+F9 `d4_...`, `d3_...` and the hub unit tests (the handler has exited and the socket is shut down before the windows return);
+F10 the `over_rdma` hub tests and `r2_...` (the queue pair is destroyed before Closed); F6 the
+quarantine unit test (`windows_of_a_handler_that_cannot_be_seen_to_exit_are_quarantined`); F7, F8, F11, F13 client.
 
 **Restart and death.** R2, R3, R6 `r2_r3_and_s2_ready_when_remembered_sources_return_or_the_wait_ends`;
 R3b unit `a_crash_mid_write_leaves_the_previous_list`; R5 `i18_and_i19_...` (messages from a dead incarnation are dropped);
@@ -111,9 +114,10 @@ S8 `s8_a_changed_instance_id_does_not_satisfy_the_barrier_and_ages_out`; S1 clie
 
 ## Limitations
 
-- The data channel is not served yet: claims and puts in `DATA_CHANNEL` mode are refused, and no
-  test moves bytes between hosts. The stream and RDMA data-channel modules keep their unit tests.
-- Process death is exercised with real `SIGKILL` and `SIGSTOP` of a peer process; a peer on another
-  host (whose exit cannot be observed) has no windows to quarantine until the data channel exists.
+- Data-channel tests run over loopback (and Soft-RoCE for RDMA), so they exercise the framing,
+  the fencing and the faults but not a real network's latency or loss; the two-host runs are a
+  separate qualification.
+- A peer killed mid-transfer is a connection that drops (and a queue pair that is destroyed); a
+  half-open connection is bounded by the 20 s write and read limits and the claim's progress timeout.
 - The tests cover the CPU data path and shared-memory windows. They do not include GPU transfer,
   scheduling or model execution time.
