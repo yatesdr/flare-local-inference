@@ -331,7 +331,11 @@ fn main() {
     };
     let client = PoolClient::start(
         PoolConfig {
-            address: PoolAddress::Tcp(o.address.clone()),
+            address: if o.ca.is_some() {
+                PoolAddress::Tcp(o.address.clone())
+            } else {
+                PoolAddress::TcpPlaintext(o.address.clone())
+            },
             tenant: "remote".into(),
             ca: o.ca.clone(),
             scope: Scope::new("remote", [7; 32], fingerprint(&geo), &geo).unwrap(),

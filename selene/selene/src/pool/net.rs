@@ -422,25 +422,94 @@ impl Dial for Tcp {
     }
 }
 
+/// Where a client without a CA file finds the certificates it trusts.
+#[derive(Clone)]
+pub(crate) enum Roots {
+    /// The host's CA bundle, at the first of [`SYSTEM_CA_BUNDLES`] that is a file.
+    System,
+    /// These certificates, so a test names its trust store without touching the host's.
+    #[cfg(test)]
+    Fixed(Vec<rustls::pki_types::CertificateDer<'static>>),
+}
+
+/// Where a Linux or BSD host keeps its CA bundle, tried in this order; the first that is a
+/// file is the trust store. They are fixed: nothing in the environment moves them. A host
+/// that keeps its bundle elsewhere gives the CA file.
+pub(crate) const SYSTEM_CA_BUNDLES: [&str; 5] = [
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+];
+
+/// The certificates of a PEM file.
+fn read_bundle(
+    path: &Path,
+) -> std::result::Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+    let pem = std::fs::read(path).map_err(|e| format!("cannot be read: {e}"))?;
+    let mut certificates = Vec::new();
+    for certificate in CertificateDer::pem_slice_iter(&pem) {
+        certificates.push(certificate.map_err(|e| format!("is not PEM: {e}"))?);
+    }
+    if certificates.is_empty() {
+        return Err("holds no certificate".into());
+    }
+    Ok(certificates)
+}
+
+/// The certificates of the first of `paths` that is a file.
+fn first_bundle(paths: &[&str]) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let Some(path) = paths.iter().map(Path::new).find(|path| path.is_file()) else {
+        return Err(Error::new(format!(
+            "the host has no CA bundle at any of {}",
+            paths.join(", ")
+        )));
+    };
+    read_bundle(path)
+        .map_err(|e| Error::new(format!("the host's CA bundle {}: {e}", path.display())))
+}
+
+/// The CA certificates to verify the manager against: the CA file's when one is given (a
+/// private CA), otherwise the trust store.
+pub(crate) fn trusted(
+    ca: Option<&Path>,
+    roots: &Roots,
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    if let Some(ca) = ca {
+        return read_bundle(ca)
+            .map_err(|e| Error::new(format!("the CA file {}: {e}", ca.display())));
+    }
+    match roots {
+        Roots::System => first_bundle(&SYSTEM_CA_BUNDLES),
+        #[cfg(test)]
+        Roots::Fixed(certificates) => Ok(certificates.clone()),
+    }
+}
+
 /// A TLS connector trusting the CA file's certificates, and the name to expect.
+#[cfg(test)]
 pub(crate) fn tls_for(
     ca: &Path,
     host: &str,
 ) -> Result<(TlsConnector, rustls::pki_types::ServerName<'static>)> {
-    use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
-    let pem = std::fs::read(ca).map_err(|e| Error::caused_by("cannot read the CA file", e))?;
+    tls_trusting(trusted(Some(ca), &Roots::System)?, host)
+}
+
+/// A TLS connector trusting `certificates`, and the name to expect.
+pub(crate) fn tls_trusting(
+    certificates: Vec<rustls::pki_types::CertificateDer<'static>>,
+    host: &str,
+) -> Result<(TlsConnector, rustls::pki_types::ServerName<'static>)> {
+    use rustls::pki_types::ServerName;
     let mut roots = rustls::RootCertStore::empty();
-    let mut count = 0;
-    for certificate in CertificateDer::pem_slice_iter(&pem) {
-        let certificate =
-            certificate.map_err(|e| Error::new(format!("the CA file is not PEM: {e}")))?;
-        roots
-            .add(certificate)
-            .map_err(|e| Error::new(format!("the CA file holds a bad certificate: {e}")))?;
-        count += 1;
+    for certificate in certificates {
+        // A system store holds the odd certificate rustls will not take; it is skipped.
+        let _ = roots.add(certificate);
     }
-    if count == 0 {
-        return Err(Error::new("the CA file holds no certificate"));
+    if roots.is_empty() {
+        return Err(Error::new("no usable CA certificate"));
     }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ClientConfig::builder_with_provider(provider)
@@ -835,6 +904,49 @@ async fn fill(target: &Target, id: Id, filled: mpsc::UnboundedReceiver<Filled>) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_system_bundle_is_the_first_fixed_path_that_exists_and_no_variable_moves_it() {
+        let dir = std::env::temp_dir().join(format!("selene-bundle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (first, second, missing) = (
+            dir.join("first.pem"),
+            dir.join("second.pem"),
+            dir.join("missing.pem"),
+        );
+        let cert = |name: &str| {
+            let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, name);
+            params
+                .self_signed(&rcgen::KeyPair::generate().unwrap())
+                .unwrap()
+        };
+        let (a, b) = (cert("a"), cert("b"));
+        std::fs::write(&first, format!("{}{}", a.pem(), b.pem())).unwrap();
+        std::fs::write(&second, b.pem()).unwrap();
+        let path = |p: &std::path::PathBuf| p.to_str().unwrap().to_string();
+        let order = [path(&missing), path(&first), path(&second)];
+        let order: Vec<&str> = order.iter().map(String::as_str).collect();
+        let found = first_bundle(&order).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].as_ref(), a.der().as_ref());
+        // None of them exists: the error names where it looked.
+        let none = [path(&missing)];
+        let none: Vec<&str> = none.iter().map(String::as_str).collect();
+        let error = first_bundle(&none).unwrap_err().to_string();
+        assert!(error.contains("missing.pem"), "{error}");
+        // An empty or non-PEM bundle is an error, not an empty trust store.
+        std::fs::write(&second, "not a certificate").unwrap();
+        let only = [path(&second)];
+        let only: Vec<&str> = only.iter().map(String::as_str).collect();
+        assert!(first_bundle(&only).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+        // The fixed list is what documents say.
+        assert_eq!(SYSTEM_CA_BUNDLES[0], "/etc/ssl/certs/ca-certificates.crt");
+    }
+
     use super::*;
     use crate::{Registration, record::checksum};
     use tokio::net::TcpListener;
