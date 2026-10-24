@@ -24,7 +24,7 @@ async fn open(pool: &mut Pool, name: &str) -> Session {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn h6_a_tcp_session_has_no_shared_memory_and_serves_no_exports() {
+async fn h6_a_tcp_session_has_no_shared_memory_and_serves_exports_over_the_data_channel() {
     let net = Net::start(|_| {});
     let unix = net.unix().await;
     assert!(unix.hello.shared_memory.is_some());
@@ -41,14 +41,14 @@ async fn h6_a_tcp_session_has_no_shared_memory_and_serves_no_exports() {
     assert_eq!(tcp.hello.host_id, unix.hello.host_id);
     let session = tcp.open(&Ident::new("remote")).await;
     assert_eq!(
-        session.opened.export_slots, 0,
-        "an instance without shared memory is no source"
+        session.opened.export_slots, 2,
+        "an instance without shared memory is a source whose windows are relayed"
     );
     assert_eq!(session.opened.claim_slots, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l4_and_a22_remote_sessions_see_only_the_managers_records_as_level_five() {
+async fn l4_and_a22_remote_sessions_see_the_managers_records_as_level_five_and_instances_through_the_relay() {
     let net = Net::start(|_| {});
     let mut unix = net.unix().await;
     // A same-host source with shared memory, and a record in the manager's store.
@@ -75,7 +75,8 @@ async fn l4_and_a22_remote_sessions_see_only_the_managers_records_as_level_five(
     let mut near = open(&mut unix, "near").await;
     let local = near.manager_candidate(1, 1024).await;
     assert_eq!(local.level, v2::Level::HostDram as i32);
-    // Another host: every manager record is level 5, and instance sources are not offered.
+    // Another host: every manager record is level 5, and an instance's records are offered
+    // too, relayed through the manager.
     let mut tcp = net.tcp().await;
     let mut far = open(&mut tcp, "far").await;
     let remote = far.manager_candidate(2, 1024).await;
@@ -83,11 +84,11 @@ async fn l4_and_a22_remote_sessions_see_only_the_managers_records_as_level_five(
     assert!(remote.source.as_ref().unwrap().instance_id.is_empty());
     let reply = far.lookup(3, 1024, vec![]).await;
     assert!(
-        reply.candidates.iter().all(|candidate| candidate
+        reply.candidates.iter().any(|candidate| candidate
             .source
             .as_ref()
-            .is_some_and(|source| source.instance_id.is_empty())),
-        "an instance-sourced candidate needs shared memory on both sides"
+            .is_some_and(|source| !source.instance_id.is_empty())),
+        "the same-host instance's record is offered to the remote session"
     );
 }
 

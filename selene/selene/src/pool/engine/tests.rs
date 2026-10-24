@@ -1278,7 +1278,7 @@ fn a_fetch_is_refused_with_one_failed_event_when_the_pool_is_not_ready() {
 
 // ---- exports ----------------------------------------------------------------
 
-fn export_request(id: u64, reserved: u64) -> In {
+pub(super) fn export_request(id: u64, reserved: u64) -> In {
     In::ExportRequest(wire::ExportRequest {
         export_id: id,
         claim_id: 1,
@@ -1291,10 +1291,11 @@ fn export_request(id: u64, reserved: u64) -> In {
         pin_deadline_ms: 250,
         session_incarnation: SESSION,
         reserved_bytes: reserved,
+        channel: None,
     })
 }
 
-fn chain() -> ExportChain {
+pub(super) fn chain() -> ExportChain {
     ExportChain {
         nodes: vec![
             ExportNode {
