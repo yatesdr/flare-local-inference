@@ -315,8 +315,13 @@ impl Shared {
         *self.ranking.lock().unwrap() = ranking;
     }
 
-    /// Identifies the manager and link the session runs over; 0 until one opened.
+    /// Identifies the manager and link the session runs over; 0 while no session
+    /// is ready, because the pool levels cannot be timed before then and a change
+    /// of topology is what asks for a new measurement.
     pub(crate) fn topology(&self) -> u64 {
+        if self.status() != PoolStatus::Ready {
+            return 0;
+        }
         self.topology.load(Ordering::Relaxed)
     }
 
@@ -506,6 +511,17 @@ mod tests {
         shared.set_status(PoolStatus::Ready);
         shared.set_max_lookups(8);
         shared
+    }
+
+    #[test]
+    fn the_topology_is_zero_until_the_session_is_ready() {
+        let shared = Shared::new(Arc::new(Notify::new()));
+        shared.set_topology(7);
+        assert_eq!(shared.topology(), 0);
+        shared.set_status(PoolStatus::Ready);
+        assert_eq!(shared.topology(), 7);
+        shared.set_status(PoolStatus::Connecting);
+        assert_eq!(shared.topology(), 0);
     }
 
     fn lookup(shared: &Arc<Shared>, n: u64) -> LookupTicket {
