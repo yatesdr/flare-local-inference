@@ -70,6 +70,7 @@ impl Net {
         net.socket = socket.clone();
         net.socket_explicit = true;
         net.memory = 8 * 1024 * 1024;
+        net.staging = 8 << 20;
         net.listen = Some(address);
         net.listen_data = Some(data);
         tweak(&mut net);
