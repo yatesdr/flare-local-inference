@@ -33,7 +33,7 @@ use std::{
 };
 
 use crate::{
-    CheckpointId, Error, ExportRefusal, History, PrefixKey, Result,
+    CheckpointId, Error, ExportRefusal, History, PrefixKey, Result, Scratch,
     pool::{Announcer, HostPin, Tier as PoolTier},
 };
 
@@ -1056,6 +1056,19 @@ impl HostStore for CompositeStore {
             .flush_announcements(&|key, _| disk.index().node(key).and_then(|node| node.parent));
         self.disk.flush_announcements();
         polled
+    }
+
+    fn probe(
+        &mut self,
+        tier: Tier,
+        scratch: &Scratch,
+        pages: usize,
+        cold: bool,
+    ) -> Result<Option<Duration>> {
+        match tier {
+            Tier::Memory => self.memory.probe(tier, scratch, pages, cold),
+            Tier::Disk => self.disk.probe(tier, scratch, pages, cold),
+        }
     }
 
     fn announce_to(&mut self, announcer: Announcer) {

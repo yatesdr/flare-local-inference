@@ -286,6 +286,18 @@ struct Established {
     tx: mpsc::Sender<wire::ClientMessage>,
 }
 
+/// A value that changes when the manager, its host or the way copies reach it do.
+fn topology_of(hello: &wire::HelloReply, shared_memory: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hello.manager_incarnation.hash(&mut hasher);
+    hello.host_id.hash(&mut hasher);
+    hello.data_transports.hash(&mut hasher);
+    shared_memory.hash(&mut hasher);
+    // Zero is reserved for "no session yet".
+    hasher.finish() | 1
+}
+
 async fn attempt(engine: &mut Engine, link: &Link) -> Attempt {
     engine.shared.set_status(PoolStatus::Connecting);
     // Stopping interrupts connecting; once a session is open the engine owns it.
@@ -303,6 +315,9 @@ async fn attempt(engine: &mut Engine, link: &Link) -> Attempt {
         Ok(established) => established,
         Err(attempt) => return attempt,
     };
+    engine
+        .shared
+        .set_topology(topology_of(&hello, regions.is_some()));
     engine.session_opened(
         hello.manager_incarnation,
         &opened,

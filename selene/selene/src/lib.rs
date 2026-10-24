@@ -38,7 +38,7 @@ pub use registrar::{HostRegistrar, Registration, SplitMapping};
 pub use store::{
     ExportChain, ExportId, ExportNode, ExportRefusal, HostHit, HostStore, INITIAL_DIRECT_DISK_RATE,
     INITIAL_MEMORY_RATE, INITIAL_PREFILL_RATE, INITIAL_STAGED_DISK_RATE, InboundTicket, JobId,
-    PublishedCheckpoint, StoreEvent, StoreOutcome, StoreReason, StoreStats, Tier, Transport,
-    worth_fetching, worth_transfer,
+    PublishedCheckpoint, Scratch, StoreEvent, StoreOutcome, StoreReason, StoreStats, Tier,
+    Transport, worth_fetching, worth_transfer,
 };
 pub use vocab::{CheckpointId, HASH_BLOCK_TOKENS, History, PageId, PrefixKey, StateSlotId};
