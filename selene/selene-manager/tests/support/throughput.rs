@@ -76,7 +76,7 @@ async fn benchmark(enforce: bool, profile: &Profile) {
     ] {
         let base = base("bench");
         let mut config = Config::new(
-            root.join(format!("cm-bench-{}-{mode}", std::process::id())),
+            root.join(format!("selene-bench-{}-{mode}", std::process::id())),
             base.join("run/m.sock"),
             memory,
             profile.nvme,

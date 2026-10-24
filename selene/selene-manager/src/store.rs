@@ -7674,7 +7674,7 @@ mod tests {
 
     fn dram_store(label: &str, memory: usize) -> (Store, PathBuf) {
         let name = format!(
-            "cm-unit-{}-{label}-{}",
+            "selene-unit-{}-{label}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
@@ -7688,7 +7688,7 @@ mod tests {
 
     fn store_with_root(label: &str, memory: usize) -> (Store, PathBuf, PathBuf) {
         let name = format!(
-            "cm-unit-{}-{label}-{}",
+            "selene-unit-{}-{label}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
@@ -8235,7 +8235,7 @@ mod tests {
     #[test]
     fn streaming_admission_uses_the_hold() {
         let name = format!(
-            "cm-unit-{}-budget-staging-{}",
+            "selene-unit-{}-budget-staging-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
@@ -9294,7 +9294,7 @@ mod tests {
 
     fn store_with_delayed_disk(label: &str) -> (Store, PathBuf, PathBuf) {
         let name = format!(
-            "cm-unit-{}-{label}-{}",
+            "selene-unit-{}-{label}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         );

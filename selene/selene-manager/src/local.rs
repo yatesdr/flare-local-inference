@@ -1072,7 +1072,7 @@ mod tests {
 
     fn instance(tag: &str) -> String {
         format!(
-            "m2a-{}-{tag}-{}",
+            "selene-local-{}-{tag}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         )
