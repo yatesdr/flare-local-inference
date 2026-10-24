@@ -7,6 +7,9 @@
 
 mod coverage;
 mod hostfill;
+#[cfg(test)]
+mod net_tests;
+mod netio;
 mod requester;
 mod source;
 #[cfg(test)]
@@ -25,6 +28,7 @@ use super::{
     announce::Announcer,
     codec::{self, Sources},
     identity::Scope,
+    net::{self, Dial, Staging},
     shared::{Command, PoolEvent, PoolStatus, Shared},
     shm::Regions,
     wire::{self, client_message::M as Out, server_message::M as In},
@@ -123,6 +127,11 @@ pub(crate) struct Engine {
     drain_started: Option<Instant>,
     pub(crate) closing: bool,
     filler: Option<hostfill::HostFiller>,
+    /// The registered slots windows of a session without shared memory pass through.
+    pub(crate) net: Option<Arc<Staging>>,
+    pub(crate) net_events: Arc<net::Events>,
+    /// How the open session opens data-channel transfers, when it has no shared memory.
+    pub(crate) dial: Option<Arc<dyn Dial>>,
 }
 
 impl Engine {
@@ -133,6 +142,7 @@ impl Engine {
         copier: SharedCopier,
         registrar: Arc<dyn HostRegistrar + Send + Sync>,
     ) -> Self {
+        let net_events = net::Events::new(shared.wake.clone());
         Self {
             st,
             shared,
@@ -155,6 +165,9 @@ impl Engine {
             drain_started: None,
             closing: false,
             filler: None,
+            net: None,
+            net_events,
+            dial: None,
         }
     }
 
@@ -274,6 +287,7 @@ impl Engine {
         let Some(sess) = self.sess.take() else {
             return;
         };
+        self.dial = None;
         self.announce.end_session();
         self.out.clear();
         if let Some(regions) = sess.regions {
@@ -510,6 +524,9 @@ impl Engine {
         for regions in self.draining.drain(..) {
             std::mem::forget(regions);
         }
+        if let Some(staging) = self.net.take() {
+            std::mem::forget(staging);
+        }
         self.source_quarantine();
         self.requester_quarantine();
         self.writer_quarantine();
@@ -521,6 +538,7 @@ impl Engine {
     /// Poll the copier, submit queued jobs, and send resync chunks and notices.
     /// Returns whether another call has more to do right away.
     pub(crate) fn pump(&mut self, now: Instant) -> bool {
+        self.collect_net();
         let mut replies = Vec::new();
         self.copier.lock().unwrap().poll(&mut replies);
         for reply in replies {

@@ -25,6 +25,8 @@ use super::{
     super::{
         codec,
         exporter::{Checksums, PutBytes},
+        frame,
+        net::{Channel, Filled, Id},
         shared::{PoolEvent, PutOutcome, PutRefusal, PutRequest, PutSource},
         wire::{self, client_message::M as Out},
     },
@@ -76,6 +78,15 @@ struct Put {
     stored: Option<u64>,
     fence_sent: bool,
     deadline: Instant,
+    /// Windows go to the manager over the data channel (no shared memory).
+    via_channel: bool,
+    /// The channel's task, until it has reported that it is gone.
+    channel: Option<Channel>,
+    channel_open: bool,
+    /// The staging slot of each granted window until the window has been written.
+    slots: HashMap<u32, u32>,
+    /// Filled windows the channel has not yet written out.
+    sends_outstanding: u32,
 }
 
 #[derive(Default)]
@@ -120,13 +131,11 @@ impl Engine {
         if !self.ready() || self.closing || self.quarantined() {
             return fail(self, "the pool is not ready");
         }
-        if self
-            .sess
-            .as_ref()
-            .and_then(|s| s.regions.as_ref())
-            .is_none()
-        {
-            return fail(self, "this session has no shared memory to write through");
+        if self.memory().is_none() {
+            return fail(
+                self,
+                "this session has neither shared memory nor a data channel to write through",
+            );
         }
         let gpu_matches = match &request.source {
             PutSource::Gpu { pages, .. } => pages.len() as u64 == request.chain_pages,
@@ -144,7 +153,11 @@ impl Engine {
             published_parent: request.parent.map(codec::key_to),
             bucket: request.bucket.to_vec(),
             published_tail_pages: request.tail_pages,
-            mode: wire::CopyMode::SharedWindows as i32,
+            mode: if self.dial.is_some() {
+                wire::CopyMode::DataChannel
+            } else {
+                wire::CopyMode::SharedWindows
+            } as i32,
             generation: request.generation,
         }));
         self.writer.puts.insert(
@@ -173,6 +186,11 @@ impl Engine {
                 stored: None,
                 fence_sent: false,
                 deadline: now + PUT_DEADLINE,
+                via_channel: self.dial.is_some(),
+                channel: None,
+                channel_open: false,
+                slots: HashMap::new(),
+                sends_outstanding: 0,
             },
         );
     }
@@ -236,7 +254,8 @@ impl Engine {
             .as_ref()
             .and_then(codec::key_from)
             .filter(|_| accept.has_parent);
-        let Some(pages) = pages.filter(|_| accept.channel.is_none()) else {
+        let via_channel = put.via_channel;
+        let Some(pages) = pages.filter(|_| accept.channel.is_some() == via_channel) else {
             return self.fail_put(
                 id,
                 Error::new("the manager accepted a put this client cannot carry out"),
@@ -279,17 +298,55 @@ impl Engine {
         }]));
         put.sums = vec![0; pages as usize];
         put.phase = Phase::Accepted;
+        if let Some(reference) = &accept.channel {
+            match self.open_channel(Id::Put(id), reference) {
+                Ok(channel) => {
+                    let put = self.writer.puts.get_mut(&id).expect("present");
+                    put.channel = Some(channel);
+                    put.channel_open = true;
+                }
+                Err(error) => self.fail_put(id, error),
+            }
+        }
     }
 
     pub(crate) fn on_put_grant(&mut self, grant: wire::PutGrant) {
-        let id = grant.put_id;
-        let (page_bytes, row_bytes) = (self.st.page_record_bytes(), self.st.row_record_bytes());
-        let regions = self.sess.as_ref().and_then(|s| s.regions.clone());
-        let (Some(spec), Some(put)) = (grant.window, self.writer.puts.get_mut(&id)) else {
+        let Some(spec) = grant.window else {
             return;
         };
-        if put.phase != Phase::Accepted || put.cancelled || put.failed.is_some() {
+        self.put_window(grant.put_id, spec, None);
+    }
+
+    /// The manager granted a window over the data channel; its bytes go in `slot`.
+    pub(crate) fn on_net_grant(&mut self, put: u64, shape: frame::Shape, slot: u32) {
+        let Some(staging) = self.net.clone() else {
             return;
+        };
+        let spec = wire::WindowSpec {
+            index: shape.index,
+            region: wire::Region::Staging as i32,
+            offset: staging.offset(slot),
+            length: shape.length,
+            record: shape.record,
+            first_page: shape.first_page,
+            page_count: shape.page_count,
+            row: shape.row,
+        };
+        if !self.put_window(put, spec, Some(slot)) {
+            self.free_slot(slot);
+        }
+    }
+
+    /// A window of a put to fill. `false` when it was not taken up and its slot,
+    /// if any, is still the caller's.
+    fn put_window(&mut self, id: u64, spec: wire::WindowSpec, slot: Option<u32>) -> bool {
+        let (page_bytes, row_bytes) = (self.st.page_record_bytes(), self.st.row_record_bytes());
+        let memory = self.memory();
+        let Some(put) = self.writer.puts.get_mut(&id) else {
+            return false;
+        };
+        if put.phase != Phase::Accepted || put.cancelled || put.failed.is_some() {
+            return false;
         }
         let dest = match put
             .coverage
@@ -298,16 +355,23 @@ impl Engine {
             .accept(&spec, page_bytes, row_bytes)
         {
             Ok(dest) => dest,
-            Err(why) => return self.fail_put(id, Error::new(why)),
+            Err(why) => {
+                self.fail_put(id, Error::new(why));
+                return false;
+            }
         };
-        let address = regions
+        let address = memory
             .as_ref()
-            .and_then(|r| r.get(spec.region()))
+            .and_then(|m| m.region(spec.region()))
             .and_then(|region| region.address(spec.offset, spec.length));
-        let Some(address) = address else {
-            return self.fail_put(id, Error::new("the granted window lies outside its region"));
-        };
         let put = self.writer.puts.get_mut(&id).expect("present");
+        if let Some(slot) = slot {
+            put.slots.insert(spec.index, slot);
+        }
+        let Some(address) = address else {
+            self.fail_put(id, Error::new("the granted window lies outside its region"));
+            return true;
+        };
         let first = put.first_page + dest;
         let count = spec.page_count as usize;
         put.windows.insert(spec.index, (spec, dest));
@@ -363,6 +427,7 @@ impl Engine {
                 }
             }
         }
+        true
     }
 
     /// A D2H job of a put drained.
@@ -413,7 +478,7 @@ impl Engine {
     /// (the source's own when it persists them, otherwise of what was written).
     fn window_filled(&mut self, id: u64, window: u32, supplied: Option<Checksums>) {
         let page_bytes = self.st.page_record_bytes() as usize;
-        let regions = self.sess.as_ref().and_then(|s| s.regions.clone());
+        let memory = self.memory();
         let Some(put) = self.writer.puts.get_mut(&id) else {
             return;
         };
@@ -424,7 +489,7 @@ impl Engine {
             return;
         };
         let sums = supplied.or_else(|| {
-            let region = regions.as_ref()?.get(spec.region())?;
+            let region = memory.as_ref()?.region(spec.region())?;
             let bytes = region.bytes(spec.offset, spec.length)?;
             let count = spec.page_count as usize;
             Some(Checksums {
@@ -443,6 +508,27 @@ impl Engine {
         if spec.row {
             put.row_sum = sums.row;
         }
+        if put.via_channel {
+            // The window is written to the manager on the channel, from its slot.
+            let Some(slot) = put.slots.get(&window).copied() else {
+                return self.fail_put(id, Error::new("a filled window has no staging slot"));
+            };
+            let sent = put.channel.as_ref().is_some_and(|channel| {
+                channel.send(Filled {
+                    index: window,
+                    row_xxh3: sums.row,
+                    page_xxh3: sums.pages,
+                    slot,
+                    length: spec.length,
+                })
+            });
+            if sent {
+                put.sends_outstanding += 1;
+            } else {
+                self.fail_put(id, Error::new("the data channel is gone"));
+            }
+            return;
+        }
         self.emit(Out::PutFilled(wire::PutFilled {
             put_id: id,
             index: window,
@@ -450,6 +536,51 @@ impl Engine {
             row_xxh3: sums.row.unwrap_or(0),
             has_row: sums.row.is_some(),
         }));
+    }
+
+    /// A filled window has left its slot.
+    pub(crate) fn on_net_sent(&mut self, put: u64, index: u32, slot: u32) {
+        // The slot is free whatever became of the put: the task is done with it.
+        if let Some(open) = self.writer.puts.get_mut(&put) {
+            open.sends_outstanding = open.sends_outstanding.saturating_sub(1);
+            open.slots.remove(&index);
+        }
+        self.free_slot(slot);
+        self.drive_put(put);
+    }
+
+    /// A put's transfer failed.
+    pub(crate) fn net_put_failed(&mut self, put: u64, error: String) {
+        if self.writer.puts.contains_key(&put) {
+            self.fail_put(put, Error::new(error));
+        }
+    }
+
+    /// A put's task is gone and its connection closed.
+    pub(crate) fn net_put_closed(&mut self, put: u64) {
+        let Some(open) = self.writer.puts.get_mut(&put) else {
+            return;
+        };
+        open.channel = None;
+        open.channel_open = false;
+        // Nothing sends from a slot any more.
+        open.sends_outstanding = 0;
+        let slots: Vec<u32> = open.slots.drain().map(|(_, slot)| slot).collect();
+        let early = open.stored.is_none()
+            && open.refused.is_none()
+            && open.failed.is_none()
+            && !open.cancelled
+            && open.phase != Phase::Committed;
+        for slot in slots {
+            self.free_slot(slot);
+        }
+        if early {
+            self.fail_put(
+                put,
+                Error::new("the data channel closed before the put was committed"),
+            );
+        }
+        self.drive_put(put);
     }
 
     pub(crate) fn on_stored(&mut self, stored: wire::Stored) {
@@ -478,13 +609,19 @@ impl Engine {
             let ready = put.phase == Phase::Accepted
                 && put.coverage.as_ref().is_some_and(|c| c.complete())
                 && put.windows.is_empty()
-                && put.jobs_outstanding == 0;
+                && put.jobs_outstanding == 0
+                && put.sends_outstanding == 0;
             if ready {
                 return self.commit_put(id);
             }
             return;
         }
-        if put.jobs_outstanding > 0 {
+        // The put is over: the task stops, and nothing is acknowledged or freed
+        // while a copy reads a window or the task may still use a slot.
+        if let Some(channel) = &put.channel {
+            channel.stop();
+        }
+        if put.jobs_outstanding > 0 || put.channel_open {
             return;
         }
         let fenced = put.stored.is_some() || put.phase == Phase::Begun || put.fence_sent;

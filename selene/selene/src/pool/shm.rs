@@ -6,7 +6,6 @@
 
 use std::io;
 
-#[cfg(test)]
 use flare_eos as os;
 use crate::{Error, Registration, Result};
 
@@ -15,6 +14,9 @@ use super::wire;
 enum Owner {
     #[cfg(unix)]
     Mapped,
+    /// Private anonymous memory this process owns: the staging of a session
+    /// without shared memory.
+    Anonymous,
     #[cfg(test)]
     Heap,
 }
@@ -79,6 +81,21 @@ impl Region {
         Err(Error::new("shared memory needs a Unix host"))
     }
 
+    /// `bytes` of zeroed private memory.
+    pub(crate) fn anonymous(bytes: usize) -> Result<Self> {
+        if bytes == 0 {
+            return Err(Error::new("a staging region needs some bytes"));
+        }
+        let base = os::map_host(bytes)
+            .map_err(|e| Error::caused_by("cannot map the data channel's staging memory", e))?;
+        Ok(Self {
+            registration: None,
+            base,
+            len: bytes,
+            owner: Owner::Anonymous,
+        })
+    }
+
     /// A zeroed private region, for tests.
     #[cfg(test)]
     pub(crate) fn heap(bytes: usize) -> Self {
@@ -130,6 +147,8 @@ impl Drop for Region {
             Owner::Mapped => unsafe {
                 libc::munmap(self.base as *mut _, self.len);
             },
+            // SAFETY: made by `map_host`, unregistered just above, referenced by nothing else.
+            Owner::Anonymous => unsafe { os::unmap_host(self.base, self.len) },
             #[cfg(test)]
             Owner::Heap => unsafe { os::free_aligned(self.base, self.len) },
         }

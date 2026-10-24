@@ -18,6 +18,7 @@ mod identity;
 mod lookup;
 #[cfg(test)]
 mod manager_tests;
+pub(crate) mod net;
 pub(crate) mod pins;
 mod probe;
 mod shared;

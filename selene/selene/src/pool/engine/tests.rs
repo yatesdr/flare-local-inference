@@ -416,7 +416,7 @@ pub(super) fn records(fetch: &PoolFetch) -> Vec<wire::Record> {
         .collect()
 }
 
-fn window(
+pub(super) fn window(
     index: u32,
     record: u32,
     first_page: u32,
@@ -467,7 +467,12 @@ fn granted(claim: u64, fetch: &PoolFetch) -> In {
     })
 }
 
-fn terminal(claim: u64, state: wire::ClaimState, reason: wire::ClaimReason, fence: bool) -> In {
+pub(super) fn terminal(
+    claim: u64,
+    state: wire::ClaimState,
+    reason: wire::ClaimReason,
+    fence: bool,
+) -> In {
     In::ClaimTerminal(wire::ClaimTerminal {
         claim_id: claim,
         state: state as i32,
@@ -476,7 +481,7 @@ fn terminal(claim: u64, state: wire::ClaimState, reason: wire::ClaimReason, fenc
     })
 }
 
-fn fetched(events: &[PoolEvent]) -> Vec<(u64, std::result::Result<u64, String>)> {
+pub(super) fn fetched(events: &[PoolEvent]) -> Vec<(u64, std::result::Result<u64, String>)> {
     events
         .iter()
         .filter_map(|e| match e {
@@ -1286,7 +1291,7 @@ fn chain() -> ExportChain {
     }
 }
 
-fn gpu_with_chain(rig: &Rig) {
+pub(super) fn gpu_with_chain(rig: &Rig) {
     let mut copier = rig.copier.lock().unwrap();
     for p in 20..23u32 {
         copier.gpu_pages.insert(p, pattern(p as u8, PAGE as usize));
@@ -1710,7 +1715,7 @@ fn a_host_pin_the_export_cannot_use_is_dropped() {
 // ---- puts ---------------------------------------------------------------------
 
 /// Bytes for a host-sourced put whose persisted checksums are given, not computed.
-struct Bytes {
+pub(super) struct Bytes {
     data: Vec<u8>,
     sums: Vec<u64>,
     row: u64,
@@ -1737,7 +1742,7 @@ impl crate::pool::PutBytes for Bytes {
     }
 }
 
-fn gpu_put(parent: Option<PrefixKey>) -> crate::pool::PutRequest {
+pub(super) fn gpu_put(parent: Option<PrefixKey>) -> crate::pool::PutRequest {
     crate::pool::PutRequest {
         key: key(192, 2),
         parent,
@@ -1754,7 +1759,7 @@ fn gpu_put(parent: Option<PrefixKey>) -> crate::pool::PutRequest {
 }
 
 /// The record length the manager expects for `pages` pages and a row.
-fn record_len(pages: u64) -> u64 {
+pub(super) fn record_len(pages: u64) -> u64 {
     4096 + 4096 + pages * PAGE + ROW
 }
 
@@ -1776,7 +1781,7 @@ fn grant_put(put: u64, spec: wire::WindowSpec) -> In {
     })
 }
 
-fn puts(events: &[PoolEvent]) -> Vec<(u64, String)> {
+pub(super) fn puts(events: &[PoolEvent]) -> Vec<(u64, String)> {
     events
         .iter()
         .filter_map(|e| match e {
