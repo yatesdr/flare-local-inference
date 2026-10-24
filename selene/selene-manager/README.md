@@ -96,7 +96,7 @@ experimental RDMA variant.
 | `src/control.rs`, `src/config.rs`, `src/main.rs` | Startup, listeners, shutdown, flags. |
 | `src/data/channel.rs` | The data channel instances without shared memory copy through: the listener, the per-transfer handlers and their fencing, over the stream and RDMA. |
 | `src/data/ibv.rs`, `src/data/rdma.rs` | The RDMA device, queue pairs and the one-sided channel they carry. |
-| `src/data/stream.rs`, `src/grants.rs`, `src/regions.rs` | The earlier region-to-region stream transport and its helpers, kept with their tests. |
+| `src/regions.rs` | The store's two regions as the data channel reads and writes them. |
 
 ## Tests
 

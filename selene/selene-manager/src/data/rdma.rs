@@ -1,9 +1,9 @@
 //! RDMA data channel (experimental).
 //!
-//! This module implements the setup payload exchanged in `PeerHello` and the transport-selection
-//! rules. The ibverbs queue-pair layer lands in M6a and needs a RoCE or soft-RoCE host; it must
-//! register each region file and use one-sided `IBV_WR_RDMA_WRITE` / `IBV_WR_RDMA_READ` with the
-//! keys below. No part of this module is used by Flare.
+//! The queue-pair description exchanged in the data channel's hello, and the piece-wise channel
+//! over a mockable verbs layer. The ibverbs implementation (feature `rdma`, `ibv.rs`) registers
+//! each region file and uses one-sided `IBV_WR_RDMA_WRITE` / `IBV_WR_RDMA_READ` with the keys
+//! below.
 
 use super::{
     DataChannel, GrantKey, PIECE_BYTES, Region, checked_range, invalid, piece_len, pieces,
@@ -15,7 +15,7 @@ use std::io;
 pub const HANDSHAKE_BYTES: usize = 4 + 4 + 4 + 16 + 2 + 4 + 4 + 8 + 8;
 pub const HANDSHAKE_VERSION: u32 = 1;
 
-/// What a peer advertised during `PeerHello`.
+/// What a peer advertised in its hello.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Handshake {
     pub qpn: u32,
@@ -88,38 +88,6 @@ impl Handshake {
             Region::Arena => self.arena_base,
             Region::Staging => self.staging_base,
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Transport {
-    Stream,
-    Rdma,
-}
-
-/// Pick the peer transport. `--peer-transport rdma` without the feature is an error; an RDMA
-/// handshake that fails after selection falls back to stream with one log line.
-pub fn select(configured: &str, built: bool, handshake_ok: bool) -> io::Result<Transport> {
-    match configured {
-        "stream" => Ok(Transport::Stream),
-        "rdma" => {
-            if !built {
-                return Err(invalid(
-                    "--peer-transport rdma requires a build with the `rdma` feature",
-                ));
-            }
-            Ok(if handshake_ok {
-                Transport::Rdma
-            } else {
-                Transport::Stream
-            })
-        }
-        "auto" => Ok(if built && handshake_ok {
-            Transport::Rdma
-        } else {
-            Transport::Stream
-        }),
-        other => Err(invalid(format!("invalid --peer-transport {other:?}"))),
     }
 }
 
@@ -985,18 +953,5 @@ mod tests {
                 .write(1, 0, Region::Arena, 0, 4096, Region::Staging, 8 << 20)
                 .is_err()
         );
-    }
-
-    #[test]
-    fn transport_selection_follows_the_spec() {
-        assert_eq!(select("stream", true, true).unwrap(), Transport::Stream);
-        assert_eq!(select("rdma", true, true).unwrap(), Transport::Rdma);
-        assert_eq!(select("rdma", true, false).unwrap(), Transport::Stream);
-        assert!(select("rdma", false, true).is_err());
-        assert_eq!(select("auto", true, true).unwrap(), Transport::Rdma);
-        assert_eq!(select("auto", true, false).unwrap(), Transport::Stream);
-        assert_eq!(select("auto", false, true).unwrap(), Transport::Stream);
-        assert_eq!(select("auto", false, false).unwrap(), Transport::Stream);
-        assert!(select("carrier-pigeon", true, true).is_err());
     }
 }
