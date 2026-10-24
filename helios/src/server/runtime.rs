@@ -134,6 +134,9 @@ impl Drop for Generation {
     }
 }
 
+/// Idle page ids the pool's characterization probes copy into.
+const CHARACTERIZATION_PAGES: usize = 64;
+
 struct Incoming {
     _capacity: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     arrival_ns: u64,
@@ -516,6 +519,13 @@ impl ModelRuntime {
                     queue_capacity,
                 );
                 worker.attach_store(store);
+                if let Err(error) = worker.characterize_pool() {
+                    let _ = ready_tx.send(Err(error.clone()));
+                    let mut shutdown = executor.close();
+                    worker.close_store(&mut shutdown);
+                    shutdown.error.get_or_insert(error);
+                    return shutdown;
+                }
                 if worker.config.contract.vision.enabled() {
                     worker.image_preparation = Some(ImagePreparation::new(worker_input_store));
                 }
@@ -847,6 +857,8 @@ struct Worker<'a> {
     /// place an export's pin is released.
     exports: HashMap<crate::offload::ExportId, crate::cache::CheckpointId>,
     store_progress: u64,
+    /// The pool's copy levels could not be measured for lack of idle ids; not retried.
+    scratch_unavailable: bool,
     /// Prefill tokens per second measured from completed prefill frames, which
     /// the host-store fetch policy compares with transfer time.
     prefill_rate: f64,
@@ -878,6 +890,7 @@ impl<'a> Worker<'a> {
             deferred_stores: Vec::new(),
             exports: HashMap::new(),
             store_progress: 0,
+            scratch_unavailable: false,
             pending: VecDeque::with_capacity(queue_capacity),
             parked: VecDeque::new(),
             active: (0..config.limits.max_active).map(|_| None).collect(),
@@ -943,6 +956,7 @@ impl<'a> Worker<'a> {
                     std::hint::spin_loop();
                     thread::yield_now();
                 } else {
+                    self.characterize_pool()?;
                     self.scheduler.idle()?;
                     match self
                         .receiver
@@ -966,6 +980,49 @@ impl<'a> Worker<'a> {
             self.scheduler.enable_evictions();
         }
         self.store = store;
+    }
+
+    /// Measure the pool's copy levels when the store asks (at startup, and again
+    /// when the topology changed) and only while nothing runs, so the idle page
+    /// ids and state slot it needs are free and no transfer is in flight. The
+    /// ids come from the free lists and return to them before this returns.
+    fn characterize_pool(&mut self) -> Result<()> {
+        let Some(store) = self
+            .store
+            .as_mut()
+            .filter(|store| store.pooled() && store.needs_characterization())
+        else {
+            return Ok(());
+        };
+        let stats = store.stats();
+        if self.scratch_unavailable
+            || self.active.iter().any(Option::is_some)
+            || !self.pending.is_empty()
+            || !self.parked.is_empty()
+            || !self.exports.is_empty()
+            || !self.deferred_stores.is_empty()
+            || stats.outbound_in_flight != 0
+            || stats.inbound_in_flight != 0
+        {
+            return Ok(());
+        }
+        let measured = self
+            .scheduler
+            .with_scratch(CHARACTERIZATION_PAGES, |pages, slot| {
+                store.characterize(&crate::offload::Scratch {
+                    pages: pages.to_vec(),
+                    slot,
+                })
+            });
+        match measured {
+            Some(result) => {
+                if let Some(line) = result? {
+                    eprintln!("prefix cache pool: {line}");
+                }
+            }
+            None => self.scratch_unavailable = true,
+        }
+        Ok(())
     }
 
     /// Queue arriving requests, starting each one's pool lookup so its answer is

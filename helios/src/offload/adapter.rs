@@ -2,7 +2,7 @@
 
 use flare_selene::{
     ExportChain, ExportId, ExportRefusal, HostHit, HostStore, InboundTicket, PublishedCheckpoint,
-    StoreOutcome, StoreStats, pool::LookupTicket,
+    Scratch, StoreOutcome, StoreStats, pool::LookupTicket,
 };
 
 use super::{PrefixStore, StoreEvent};
@@ -113,6 +113,14 @@ impl PrefixStore for Host {
 
     fn evictions_lost(&mut self) {
         self.store.evictions_lost();
+    }
+
+    fn needs_characterization(&self) -> bool {
+        self.store.needs_characterization()
+    }
+
+    fn characterize(&mut self, scratch: &Scratch) -> Result<Option<String>> {
+        Ok(self.store.characterize(scratch)?)
     }
 
     fn stats(&self) -> StoreStats {

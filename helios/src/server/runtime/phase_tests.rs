@@ -1247,8 +1247,16 @@ struct FakeStore {
     refused: Vec<(crate::offload::ExportId, crate::offload::ExportRefusal)>,
     reject_export: bool,
     evictions_lost: usize,
+    needs_characterization: bool,
+    characterize_fails: bool,
+    characterized: Vec<crate::offload::Scratch>,
     /// Each eviction notice with the number of `store` calls made before it.
-    evicted: Vec<(crate::cache::PrefixKey, u64, Option<crate::offload::PublishedCheckpoint>, usize)>,
+    evicted: Vec<(
+        crate::cache::PrefixKey,
+        u64,
+        Option<crate::offload::PublishedCheckpoint>,
+        usize,
+    )>,
 }
 
 impl FakeStore {
@@ -1274,6 +1282,9 @@ impl FakeStore {
             refused: Vec::new(),
             reject_export: false,
             evictions_lost: 0,
+            needs_characterization: false,
+            characterize_fails: false,
+            characterized: Vec::new(),
             evicted: Vec::new(),
         }
     }
@@ -1335,6 +1346,17 @@ impl crate::offload::PrefixStore for FakeStore {
     }
     fn evictions_lost(&mut self) {
         self.evictions_lost += 1;
+    }
+    fn needs_characterization(&self) -> bool {
+        self.needs_characterization
+    }
+    fn characterize(&mut self, scratch: &crate::offload::Scratch) -> Result<Option<String>> {
+        self.characterized.push(scratch.clone());
+        if self.characterize_fails {
+            return Err("probe failed".into());
+        }
+        self.needs_characterization = false;
+        Ok(Some("copy order: gpu, dram".into()))
     }
     fn lookup(
         &mut self,
@@ -2038,6 +2060,95 @@ fn a_local_store_builds_no_lookup_and_a_failed_restore_starts_none() {
     assert_eq!(worker.parked.len(), 1);
     assert!(worker.parked[0].0.pool_lookup.is_none());
     assert_eq!(fake_store(&mut worker).begun, [70]);
+}
+
+#[test]
+fn the_pool_is_characterized_once_with_idle_ids_that_come_back() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 96;
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.pooled = true;
+    store.needs_characterization = true;
+    worker.attach_store(Some(Box::new(store)));
+    let free = (
+        worker.scheduler.free_page_count(),
+        worker.scheduler.free_snapshot_count(),
+    );
+    worker.characterize_pool().unwrap();
+    let seen = &fake_store(&mut worker).characterized;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].pages.len(), CHARACTERIZATION_PAGES);
+    assert_eq!(
+        (
+            worker.scheduler.free_page_count(),
+            worker.scheduler.free_snapshot_count()
+        ),
+        free
+    );
+    // Once measured, and nothing changed, it is not measured again.
+    worker.characterize_pool().unwrap();
+    assert_eq!(fake_store(&mut worker).characterized.len(), 1);
+    // A topology change asks again.
+    fake_store(&mut worker).needs_characterization = true;
+    worker.characterize_pool().unwrap();
+    assert_eq!(fake_store(&mut worker).characterized.len(), 2);
+}
+
+#[test]
+fn characterization_waits_for_an_idle_worker_and_a_pooled_store() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 96;
+    let (sender, receiver) = mpsc::channel();
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    sender.send(vec![incoming]).unwrap();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.pooled = true;
+    store.needs_characterization = true;
+    worker.attach_store(Some(Box::new(store)));
+    worker.admit().unwrap();
+    assert!(worker.active[0].is_some());
+    worker.characterize_pool().unwrap();
+    assert!(fake_store(&mut worker).characterized.is_empty());
+
+    let (_sender, receiver) = mpsc::channel();
+    let mut local = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.needs_characterization = true;
+    local.attach_store(Some(Box::new(store)));
+    local.characterize_pool().unwrap();
+    assert!(fake_store(&mut local).characterized.is_empty());
+}
+
+#[test]
+fn too_few_idle_ids_skip_characterization_without_retrying_and_failure_withholds_them() {
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.pooled = true;
+    store.needs_characterization = true;
+    worker.attach_store(Some(Box::new(store)));
+    worker.characterize_pool().unwrap();
+    assert!(fake_store(&mut worker).characterized.is_empty());
+    assert!(worker.scratch_unavailable);
+
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 96;
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.pooled = true;
+    store.needs_characterization = true;
+    store.characterize_fails = true;
+    worker.attach_store(Some(Box::new(store)));
+    assert!(worker.characterize_pool().is_err());
+    assert_eq!(
+        worker.scheduler.free_page_count(),
+        96 - CHARACTERIZATION_PAGES
+    );
 }
 
 fn group_runtime(
