@@ -28,17 +28,13 @@ pub struct PassJob {
     pub stated_slices: Option<Vec<SliceSums>>,
     /// The whole-page and row checksums a single-process source or the store stated; checked.
     pub stated_whole: Option<SliceSums>,
-    /// Produce whole-page and row checksums (a single-process requester, or a put's commit).
-    pub want_whole: bool,
-    /// Produce every rank's slice transfer checksums (a multi-process requester).
-    pub want_slices: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PassOut {
-    pub whole: Option<SliceSums>,
+    pub whole: SliceSums,
     /// By rank.
-    pub slices: Option<Vec<SliceSums>>,
+    pub slices: Vec<SliceSums>,
 }
 
 /// Why a pass failed. A mismatch is the sender's bytes disagreeing with its checksums.
@@ -52,8 +48,6 @@ fn compute(job: &PassJob, window: &[u8]) -> Result<PassOut, PassError> {
     let layout = &*job.layout;
     let pages = job.pages as usize;
     let world = layout.world();
-    let need_slices = job.stated_slices.is_some() || job.want_slices;
-    let need_whole = job.want_whole || job.stated_whole.is_some();
     if let Some(stated) = &job.stated_slices {
         let ok = stated.len() == world
             && stated
@@ -81,28 +75,24 @@ fn compute(job: &PassJob, window: &[u8]) -> Result<PassOut, PassError> {
             .min(pages)
     };
     // Per page: (whole, per-rank slice sums).
-    let per_page = |page: u32| -> (Option<u64>, Vec<u64>) {
-        let whole = need_whole.then(|| {
+    let per_page = |page: u32| -> (u64, Vec<u64>) {
+        let whole = {
             let record = layout.page_record_bytes() as usize;
             flare_selene::record::checksum(
                 &window[page as usize * record..(page as usize + 1) * record],
             )
-        });
-        let slices = if need_slices {
-            (0..world)
-                .map(|r| layout.page_sum(r, window, page))
-                .collect()
-        } else {
-            Vec::new()
         };
+        let slices = (0..world)
+            .map(|r| layout.page_sum(r, window, page))
+            .collect();
         (whole, slices)
     };
-    let mut results: Vec<(Option<u64>, Vec<u64>)> = Vec::with_capacity(pages);
+    let mut results: Vec<(u64, Vec<u64>)> = Vec::with_capacity(pages);
     if threads <= 1 {
         results.extend((0..job.pages).map(per_page));
     } else {
         let chunk = pages.div_ceil(threads);
-        let mut parts: Vec<Vec<(Option<u64>, Vec<u64>)>> = Vec::new();
+        let mut parts: Vec<Vec<(u64, Vec<u64>)>> = Vec::new();
         thread::scope(|scope| {
             let handles: Vec<_> = (0..threads)
                 .map(|t| {
@@ -117,10 +107,10 @@ fn compute(job: &PassJob, window: &[u8]) -> Result<PassOut, PassError> {
         });
         results.extend(parts.into_iter().flatten());
     }
-    let row_whole = (need_whole && job.row).then(|| {
+    let row_whole = job.row.then(|| {
         flare_selene::record::checksum(&window[pages * layout.page_record_bytes() as usize..])
     });
-    let row_slices: Vec<u64> = if need_slices && job.row {
+    let row_slices: Vec<u64> = if job.row {
         (0..world)
             .map(|r| layout.row_sum(r, window, job.pages))
             .collect()
@@ -146,7 +136,7 @@ fn compute(job: &PassJob, window: &[u8]) -> Result<PassOut, PassError> {
     }
     if let Some(stated) = &job.stated_whole {
         for (page, sum) in stated.pages.iter().enumerate() {
-            if results[page].0 != Some(*sum) {
+            if results[page].0 != *sum {
                 return Err(PassError::Mismatch(format!(
                     "page {page} failed its checksum"
                 )));
@@ -156,18 +146,16 @@ fn compute(job: &PassJob, window: &[u8]) -> Result<PassOut, PassError> {
             return Err(PassError::Mismatch("the row failed its checksum".into()));
         }
     }
-    let whole = (job.want_whole).then(|| SliceSums {
-        pages: results.iter().map(|r| r.0.expect("computed")).collect(),
+    let whole = SliceSums {
+        pages: results.iter().map(|r| r.0).collect(),
         row: row_whole,
-    });
-    let slices = job.want_slices.then(|| {
-        (0..world)
-            .map(|rank| SliceSums {
-                pages: results.iter().map(|r| r.1[rank]).collect(),
-                row: job.row.then(|| row_slices[rank]),
-            })
-            .collect()
-    });
+    };
+    let slices = (0..world)
+        .map(|rank| SliceSums {
+            pages: results.iter().map(|r| r.1[rank]).collect(),
+            row: job.row.then(|| row_slices[rank]),
+        })
+        .collect();
     Ok(PassOut { whole, slices })
 }
 
@@ -248,8 +236,6 @@ mod tests {
                 layout: self.layout.clone(),
                 stated_slices: None,
                 stated_whole: None,
-                want_whole: false,
-                want_slices: false,
             }
         }
 
@@ -287,10 +273,9 @@ mod tests {
             let whole = f.layout.whole_sums(&window, pages, row).unwrap();
             let mut job = f.job();
             job.stated_whole = Some(whole);
-            job.want_slices = true;
             let out = run(job).unwrap();
-            let slices = out.slices.unwrap();
-            assert!(out.whole.is_none());
+            let slices = out.slices;
+            assert_eq!(out.whole, f.layout.whole_sums(&window, pages, row).unwrap());
             for (rank, got) in slices.iter().enumerate() {
                 assert_eq!(
                     *got,
@@ -310,17 +295,13 @@ mod tests {
             .collect();
         let mut job = f.job();
         job.stated_slices = Some(stated);
-        job.want_whole = true;
         let out = run(job).unwrap();
-        assert_eq!(
-            out.whole.unwrap(),
-            f.layout.whole_sums(&window, 70, true).unwrap()
-        );
-        assert!(out.slices.is_none());
+        assert_eq!(out.whole, f.layout.whole_sums(&window, 70, true).unwrap());
+        assert_eq!(out.slices.len(), 3);
     }
 
     #[test]
-    fn multi_to_multi_verifies_and_reuses_the_slices_without_whole_sums() {
+    fn multi_to_multi_verifies_slices_and_produces_both_checksum_forms() {
         let f = Fixture::new(2, 5, false);
         let window = f.window();
         let stated: Vec<_> = (0..2)
@@ -328,10 +309,9 @@ mod tests {
             .collect();
         let mut job = f.job();
         job.stated_slices = Some(stated.clone());
-        job.want_slices = true;
         let out = run(job).unwrap();
-        assert_eq!(out.slices.unwrap(), stated);
-        assert!(out.whole.is_none());
+        assert_eq!(out.slices, stated);
+        assert_eq!(out.whole, f.layout.whole_sums(&window, 5, false).unwrap());
     }
 
     #[test]
@@ -390,16 +370,11 @@ mod tests {
     fn the_parallel_result_equals_the_serial_one() {
         // Large enough to be split across threads.
         let f = Fixture::new(2, 64, true);
-        let mut job = f.job();
-        job.want_whole = true;
-        job.want_slices = true;
+        let job = f.job();
         let out = run(job).unwrap();
         let window = f.window();
-        assert_eq!(
-            out.whole.unwrap(),
-            f.layout.whole_sums(&window, 64, true).unwrap()
-        );
-        let slices = out.slices.unwrap();
+        assert_eq!(out.whole, f.layout.whole_sums(&window, 64, true).unwrap());
+        let slices = out.slices;
         for (rank, got) in slices.iter().enumerate() {
             assert_eq!(*got, f.layout.slice_sums(rank, &window, 64, true).unwrap());
         }

@@ -896,8 +896,6 @@ impl Core {
             layout: mp.layout.clone(),
             stated_slices: Some(stated),
             stated_whole: None,
-            want_whole: true,
-            want_slices: false,
         };
         mp.passes += 1;
         let events = self.self_tx.clone();
@@ -925,7 +923,7 @@ impl Core {
         }
         match result {
             Ok(out) => {
-                let whole = out.whole.unwrap_or_default();
+                let whole = out.whole;
                 if let Some(mp) = self.puts.get_mut(&key).and_then(|rec| rec.mp.as_mut()) {
                     let first = mp.windows.get(&index).map_or(0, |w| w.first_page as usize);
                     if mp.whole.len() < first + whole.pages.len() {
