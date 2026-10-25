@@ -32,8 +32,7 @@ upgrades for `selene`. The wire contract is [PROTOCOL.md](../PROTOCOL.md) and
 
 The service is CPU-only and never touches GPU memory. Three budgets are configured
 separately and shared by every scope: `--memory` (the DRAM arena), `--staging` (windows) and
-`--nvme` (durable records). A fourth, `--write-budget`, limits how fast one process may admit
-puts.
+`--nvme` (durable records).
 
 `--memory` is the arena for the manager's own records served without touching NVMe. Size it for
 the hot working set, not for everything. Allocation uses power-of-two size classes, so a record
@@ -61,9 +60,6 @@ Size `--staging` from that line and from your longest contexts.
 `--nvme` is the durable budget and includes the 4096-byte envelope per record. It must exceed the
 largest record an instance can put, or the put is refused `OVERSIZE`. Keep it above `--memory`:
 DRAM eviction needs durability, so a full NVMe budget stops DRAM from making room.
-
-`--write-budget` is a token bucket in bytes per second per process, with a burst of
-`max(rate, 1 MiB)`; `0` (the default) is unlimited. It gates admission of puts, not the device.
 
 The arena and staging are preallocated files in `/dev/shm/selene/<name>`, so the shared-memory mount
 must provide at least `--memory + --staging` for each manager. A container's default 64 MiB

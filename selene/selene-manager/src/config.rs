@@ -1,8 +1,7 @@
-//! Manager configuration: command line, optional TOML, and validation.
+//! Manager configuration: command line and validation.
 //!
 //! This module is self-contained so it can be unit-tested without starting a manager.
 
-use serde::Deserialize;
 use std::{io, net::SocketAddr, path::PathBuf, time::Duration};
 
 pub const DEFAULT_NAME: &str = "default";
@@ -38,7 +37,6 @@ pub struct Config {
     /// cannot be combined with TLS.
     pub rdma: bool,
     pub metrics: Option<SocketAddr>,
-    pub write_budget: u64,
     /// How long, after start, the manager waits for instances it served before to
     /// resynchronise before it serves lookups, claims and puts.
     pub source_wait: Duration,
@@ -68,7 +66,6 @@ impl Config {
             tls_key: None,
             rdma: false,
             metrics: None,
-            write_budget: 0,
             source_wait: DEFAULT_SOURCE_WAIT,
             instance_retention: DEFAULT_INSTANCE_RETENTION,
         }
@@ -198,7 +195,6 @@ pub fn help_text() -> String {
      --memory BYTES                  shared arena, default 1G\n\
      --nvme BYTES                    NVMe budget; required with --root\n\
      --staging BYTES                 shared staging, default 4G\n\
-     --write-budget BYTES/s          per-process write rate; 0 = unlimited\n\
      --listen ADDR:PORT              serve instances on other hosts\n\
      --listen-data ADDR:PORT         where they copy bytes, default --listen's next port\n\
      --tls-cert PATH --tls-key PATH  TLS for --listen (clients verify against their CA)\n\
@@ -206,7 +202,6 @@ pub fn help_text() -> String {
      --source-wait DURATION          wait for remembered instances, default 10s\n\
      --instance-retention DURATION   forget instances unseen this long, default 7d\n\
      --metrics ADDR:PORT\n\
-     --config PATH                   TOML defaults; flags override\n\
      \n\
      Sizes accept binary K, M, G and T suffixes; durations accept ms, s, m, h and d."
         .to_string()
@@ -224,18 +219,7 @@ where
         }
     }
 
-    let mut config_path: Option<PathBuf> = None;
-    for pair in args.windows(2) {
-        if pair[0] == "--config" {
-            config_path = Some(pair[1].clone().into());
-        }
-    }
-    let mut config = match &config_path {
-        Some(path) => Config::from_toml(&std::fs::read_to_string(path).map_err(|error| {
-            io::Error::new(error.kind(), format!("read {}: {error}", path.display()))
-        })?)?,
-        None => Config::defaults(),
-    };
+    let mut config = Config::defaults();
     let mut explicit_socket = false;
 
     let mut index = 0;
@@ -273,10 +257,6 @@ where
                 config.staging = parse_size(value(index)?)?;
                 index += 2;
             }
-            "--write-budget" => {
-                config.write_budget = parse_size(value(index)?)?;
-                index += 2;
-            }
             "--listen" => {
                 config.listen = Some(parse_address(value(index)?)?);
                 index += 2;
@@ -309,10 +289,6 @@ where
                 config.metrics = Some(parse_address(value(index)?)?);
                 index += 2;
             }
-            "--config" => {
-                value(index)?;
-                index += 2;
-            }
             other => {
                 return Err(invalid(format!("unknown option {other}")));
             }
@@ -323,108 +299,6 @@ where
     }
     config.validate()?;
     Ok(Parsed::Run(config))
-}
-
-impl Config {
-    /// Parse a TOML document into a configuration with defaults applied.
-    pub fn from_toml(text: &str) -> io::Result<Self> {
-        let raw: RawConfig = toml::from_str(text)
-            .map_err(|error| invalid(format!("invalid TOML configuration: {error}")))?;
-        let mut config = Config::defaults();
-        if let Some(name) = raw.name {
-            config.name = name;
-        }
-        if let Some(path) = raw.socket {
-            config.socket = path.into();
-            config.socket_explicit = true;
-        } else {
-            config.socket = Config::default_socket(&config.name);
-        }
-        if let Some(path) = raw.root {
-            config.root = Some(path.into());
-        }
-        if let Some(size) = raw.memory {
-            config.memory = size;
-        }
-        if let Some(size) = raw.nvme {
-            config.nvme = size;
-        }
-        if let Some(size) = raw.staging {
-            config.staging = size;
-        }
-        if let Some(address) = raw.listen {
-            config.listen = Some(parse_address(&address)?);
-        }
-        if let Some(address) = raw.listen_data {
-            config.listen_data = Some(parse_address(&address)?);
-        }
-        if let Some(path) = raw.tls_cert {
-            config.tls_cert = Some(path.into());
-        }
-        if let Some(path) = raw.tls_key {
-            config.tls_key = Some(path.into());
-        }
-        if let Some(rdma) = raw.rdma {
-            config.rdma = rdma;
-        }
-        if let Some(address) = raw.metrics {
-            config.metrics = Some(parse_address(&address)?);
-        }
-        if let Some(size) = raw.write_budget {
-            config.write_budget = size;
-        }
-        if let Some(text) = raw.source_wait {
-            config.source_wait = parse_duration(&text)?;
-        }
-        if let Some(text) = raw.instance_retention {
-            config.instance_retention = parse_duration(&text)?;
-        }
-        Ok(config)
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-struct RawConfig {
-    name: Option<String>,
-    socket: Option<String>,
-    root: Option<String>,
-    #[serde(default, deserialize_with = "de_size")]
-    memory: Option<u64>,
-    #[serde(default, deserialize_with = "de_size")]
-    nvme: Option<u64>,
-    #[serde(default, deserialize_with = "de_size")]
-    staging: Option<u64>,
-    listen: Option<String>,
-    listen_data: Option<String>,
-    tls_cert: Option<String>,
-    tls_key: Option<String>,
-    rdma: Option<bool>,
-    metrics: Option<String>,
-    #[serde(default, deserialize_with = "de_size")]
-    write_budget: Option<u64>,
-    source_wait: Option<String>,
-    instance_retention: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum SizeValue {
-    Integer(u64),
-    Text(String),
-}
-
-fn de_size<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    match Option::<SizeValue>::deserialize(deserializer)? {
-        None => Ok(None),
-        Some(SizeValue::Integer(value)) => Ok(Some(value)),
-        Some(SizeValue::Text(text)) => parse_size(&text)
-            .map(Some)
-            .map_err(serde::de::Error::custom),
-    }
 }
 
 /// Parse a byte size with an optional binary K, M, G or T suffix.
@@ -561,8 +435,6 @@ mod tests {
             "2G",
             "--staging",
             "16M",
-            "--write-budget",
-            "8M",
             "--source-wait",
             "30s",
             "--instance-retention",
@@ -571,7 +443,6 @@ mod tests {
         assert_eq!(config.nvme, 1 << 30);
         assert_eq!(config.memory, 2 << 30);
         assert_eq!(config.staging, 16 << 20);
-        assert_eq!(config.write_budget, 8 << 20);
         assert_eq!(config.source_wait, Duration::from_secs(30));
         assert_eq!(config.instance_retention, Duration::from_secs(86_400));
     }
@@ -608,18 +479,6 @@ mod tests {
             "/k",
         ]);
         assert!(config.listen.is_some() && config.tls_cert.is_some());
-    }
-
-    #[test]
-    fn toml_defaults_are_overridden_by_flags() {
-        let config = Config::from_toml(
-            "name = \"a\"\nmemory = \"2G\"\nroot = \"/r\"\nnvme = \"1G\"\nsource-wait = \"5s\"\n",
-        )
-        .unwrap();
-        assert_eq!(config.name, "a");
-        assert_eq!(config.memory, 2 << 30);
-        assert_eq!(config.source_wait, Duration::from_secs(5));
-        assert!(Config::from_toml("bogus = 1").is_err());
     }
 
     #[test]
