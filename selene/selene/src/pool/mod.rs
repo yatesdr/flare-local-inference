@@ -42,7 +42,7 @@ mod startup;
 mod store;
 pub(crate) mod tiers;
 #[allow(clippy::all, dead_code)]
-pub(crate) mod wire {
+pub mod wire {
     tonic::include_proto!("selene.v2");
 }
 mod types;
