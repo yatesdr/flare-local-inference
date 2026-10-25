@@ -614,6 +614,8 @@ pub struct Store {
     counter: u64,
     metrics: Metrics,
     charged: u64,
+    /// The highest `charge_total` seen at an admission or a tick.
+    reserved_peak: u64,
     deferred_disk: Vec<Arc<DiskExtent>>,
     retired_puts: Vec<PutDrain>,
     retired_gets: Vec<GetDrain>,
@@ -697,6 +699,7 @@ impl Store {
             counter: 0,
             metrics: Metrics::default(),
             charged: 0,
+            reserved_peak: 0,
             deferred_disk: Vec::new(),
             retired_puts: Vec::new(),
             retired_gets: Vec::new(),
@@ -1022,8 +1025,42 @@ impl Store {
         }
     }
 
+    /// What the NVMe limit (`--nvme`) bounds: the durable reservations (every record's
+    /// envelope and file, or its arena extent and envelope, and what an unfinished Put will
+    /// leave on disk) plus the staging hold of each unfinished streamed Put, which stands for
+    /// the disk record in flight. Windows the pool leases from the staging region for claims
+    /// and exports are not in it: they are bounded by `--staging`, and never become records.
     fn charge_total(&self) -> u64 {
-        self.charged + self.local.staging_used() as u64
+        self.charged.saturating_add(self.put_staging_held())
+    }
+
+    /// Staging held by unfinished streamed Puts, those still on a connection, detached from
+    /// it, or draining their last chunk writes.
+    fn put_staging_held(&self) -> u64 {
+        fn held(hold: &Option<Arc<Extent>>) -> u64 {
+            hold.as_ref().map_or(0, |hold| hold.capacity() as u64)
+        }
+        let mut total = 0u64;
+        for session in self.sessions.values() {
+            for open in session.ops.values() {
+                if let Operation::Put(put) = &open.operation {
+                    total = total.saturating_add(held(&put.staging_hold));
+                }
+            }
+        }
+        for put in self.detached_puts.values() {
+            total = total.saturating_add(held(&put.staging_hold));
+        }
+        for drain in &self.retired_puts {
+            total = total.saturating_add(held(&drain._staging_hold));
+        }
+        total
+    }
+
+    /// Remember the most the limit's measure has been.
+    fn note_reserved(&mut self) {
+        let now = self.charge_total();
+        self.reserved_peak = self.reserved_peak.max(now);
     }
 
     pub fn submit_put(
@@ -1534,6 +1571,13 @@ impl Store {
             None
         };
         self.charged += requirement.reservation;
+        // The hold is allocated, and counts from here.
+        let held_now = staging_hold
+            .as_ref()
+            .map_or(0, |hold| hold.capacity() as u64);
+        self.reserved_peak = self
+            .reserved_peak
+            .max(self.charge_total().saturating_add(held_now));
         let first =
             parent.map_or(0, |parent| parent.consumed_tokens / descriptor.page_tokens) as u32;
         let grants = plan_put_grants(&header, first, self.config.max_window_bytes);
@@ -4839,6 +4883,7 @@ impl Store {
     }
 
     fn tick(&mut self) {
+        self.note_reserved();
         let now = Instant::now();
         for session in self.sessions.values_mut() {
             session.budget.refill(now);
@@ -5309,6 +5354,10 @@ impl Store {
             ("memory_allocated_bytes", self.local.arena_used() as u64),
             ("staging_allocated_bytes", self.local.staging_used() as u64),
             ("nvme_reserved_bytes", self.charge_total()),
+            (
+                "nvme_reserved_peak_bytes",
+                self.reserved_peak.max(self.charge_total()),
+            ),
             (
                 "cleanup_records",
                 self.retired_gets
@@ -7425,6 +7474,30 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, StoreEvent::Room { .. }))
         );
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn the_nvme_measure_counts_put_holds_and_reservations_not_windows_leased_for_claims() {
+        let (mut store, base, directory) = store_with_root("nvme-measure", 4096);
+        assert_eq!(store.charge_total(), 0);
+        // Windows the pool leases from the staging region for claims and exports are not
+        // records and never reach the disk: they do not use the limit.
+        let leased = store
+            .local
+            .staging()
+            .allocate(1 << 20)
+            .expect("a window of staging");
+        assert_eq!(store.local.staging_used(), 1 << 20);
+        assert_eq!(store.charge_total(), 0);
+        assert!(
+            store
+                .metrics_text()
+                .contains("selene_nvme_reserved_bytes 0\n")
+        );
+        drop(leased);
         drop(store);
         let _ = fs::remove_dir_all(base);
         let _ = fs::remove_dir_all(directory);
