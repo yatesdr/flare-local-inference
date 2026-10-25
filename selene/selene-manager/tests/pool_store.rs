@@ -110,7 +110,7 @@ async fn u1_and_c3_a_put_is_stored_indexed_and_served_to_a_claim() {
     }
     let expect = expected(&tokens, 1, 0, true);
     assert_eq!(got, expect);
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    reader.barrier().await;
     reader.copy_result(1, v2::CopyOutcome::CopyOk).await;
     let terminal = reader.claim_terminal(1).await;
     assert_eq!(
@@ -154,7 +154,7 @@ async fn u2_u8_and_a9_present_queue_and_invalid_metadata() {
         other => panic!("{other:?}"),
     }
     let mut reader = open(&mut pool, "reader").await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    reader.manager_candidate(900, 1024).await;
     let reply = reader
         .lookup_request(v2::LookupRequest {
             lookup_id: 1,
@@ -319,7 +319,7 @@ async fn c4_a_recovered_record_is_served_from_nvme_with_its_persisted_checksums(
         got[window.record as usize].extend_from_slice(bytes);
     }
     assert_eq!(got, expected(&tokens, 1, 0, true));
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    reader.barrier().await;
     reader.copy_result(1, v2::CopyOutcome::CopyOk).await;
     assert_eq!(
         reader.claim_terminal(1).await.state,
@@ -365,7 +365,7 @@ async fn a_requesters_stream_that_blips_keeps_the_manager_windows_until_it_repor
         quarantined, length,
         "leased to a process that is still alive"
     );
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    watcher.barrier().await;
     assert_eq!(watcher.readiness().await.quarantined_bytes, length);
     let mut again = pool.open(&ident).await;
     again.snapshot(vec![]).await;
@@ -489,7 +489,7 @@ async fn u4_a_cancelled_put_keeps_its_unfilled_windows_until_the_writers_fence()
         })
         .await;
     assert!(grant.window.unwrap().length > 0);
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    host.wait(|host| host.gauge("memory_allocated_bytes") + host.gauge("staging_allocated_bytes") > 0);
     let held = host.gauge("memory_allocated_bytes") + host.gauge("staging_allocated_bytes");
     assert!(held > 0, "a granted window is memory in use");
     writer
@@ -497,7 +497,7 @@ async fn u4_a_cancelled_put_keeps_its_unfilled_windows_until_the_writers_fence()
             put_id: 1,
         }))
         .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    writer.barrier().await;
     assert_eq!(
         host.gauge("memory_allocated_bytes") + host.gauge("staging_allocated_bytes"),
         held,
@@ -545,8 +545,7 @@ async fn the_nvme_limit_bounds_the_reservations_it_reports_however_many_puts_pas
         );
     }
     assert!(stored >= 10, "{stored} stored, {refused} refused");
-    // Let the store settle, then read the high-water mark of the same measure.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    host.wait(|host| host.gauge("open_ops") == 0);
     let peak = host.gauge("nvme_reserved_peak_bytes");
     assert!(
         peak > limit / 2 && peak <= limit,
