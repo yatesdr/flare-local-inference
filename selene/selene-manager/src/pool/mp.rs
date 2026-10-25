@@ -87,8 +87,8 @@ pub fn accept_parts(
         .ok_or(())
 }
 
-/// A peer rank's data-channel leg.
-pub struct RankLeg {
+/// One root or peer data-channel leg, on the source or requester side.
+pub struct Leg {
     pub rank: u32,
     /// The leg of the claim's source (a put-kind transfer) rather than its requester.
     pub source: bool,
@@ -115,7 +115,6 @@ pub enum Stated {
 pub struct MpState {
     pub req: Option<MpSide>,
     pub src: Option<MpSide>,
-    pub legs: Vec<RankLeg>,
     pub deliver: Delivery,
     /// Passes running on the claim's windows: they read manager memory, so the windows are
     /// not reclaimed until they are over.
@@ -123,23 +122,14 @@ pub struct MpState {
 }
 
 impl MpState {
-    pub fn quiet(&self, source: bool, exited: impl Fn(&ProcKey) -> bool) -> bool {
+    pub fn quiet(&self, legs: &[Leg], source: bool, exited: impl Fn(&ProcKey) -> bool) -> bool {
         let side = if source { &self.src } else { &self.req };
         side.as_ref()
             .is_none_or(|side| peers_quiet(&side.peers, exited))
-            && self
-                .legs
+            && legs
                 .iter()
                 .filter(|leg| leg.source == source)
                 .all(|leg| leg.ch.exited)
-    }
-
-    /// Bit `rank` of a window's reader mask: the legs that must read it before it is free.
-    pub fn leg_readers(&self) -> u64 {
-        self.legs
-            .iter()
-            .filter(|leg| !leg.source)
-            .fold(0, |mask, leg| mask | 1 << leg.rank)
     }
 
     pub fn peer_procs(&self) -> impl Iterator<Item = ProcKey> + '_ {
@@ -159,7 +149,7 @@ impl Core {
         sid: u64,
         owner: &dyn Fn(usize) -> ChanOwner,
         kind: channel::Kind,
-        legs: &mut Vec<RankLeg>,
+        legs: &mut Vec<Leg>,
     ) -> Result<Option<MpSide>, v2::ClaimReason> {
         let Some(session) = self.sessions.get(&sid) else {
             return Ok(None);
@@ -188,7 +178,7 @@ impl Core {
                 match opened {
                     Some(Ok((transfer, token))) => {
                         self.channels.insert(transfer, owner(legs.len()));
-                        legs.push(RankLeg {
+                        legs.push(Leg {
                             rank,
                             source: kind == channel::Kind::Put,
                             ch: Channel {
@@ -215,7 +205,7 @@ impl Core {
     }
 
     /// Drop legs that no one has connected to.
-    pub(super) fn discard_legs(&mut self, legs: &mut Vec<RankLeg>) {
+    pub(super) fn discard_legs(&mut self, legs: &mut Vec<Leg>) {
         for leg in legs.drain(..) {
             self.channels.remove(&leg.ch.transfer);
             if let Some(hub) = &self.cfg.channel {
@@ -236,9 +226,9 @@ impl Core {
             return Vec::new();
         };
         claim
-            .mp
             .legs
             .iter()
+            .filter(|leg| leg.rank != 0)
             .filter(|leg| leg.source == source)
             .map(|leg| v2::RankChannel {
                 rank: leg.rank,
@@ -403,15 +393,15 @@ impl Core {
         };
         let window = &mut claim.windows[index];
         window.phase = Phase::RequesterRead;
-        window.readers = 1 | claim.mp.leg_readers();
+        window.readers = 1 | leg_readers(&claim.legs);
         claim.state = v2::ClaimState::Granted;
         claim.last_progress = Instant::now();
         let requester_sid = claim.requester_sid;
-        let rank0_leg = claim.channel.as_ref().map(|leg| leg.transfer);
+        let rank0_leg = claim.channel().map(|leg| leg.transfer);
         let legs: Vec<(u64, u32)> = claim
-            .mp
             .legs
             .iter()
+            .filter(|leg| leg.rank != 0)
             .filter(|leg| !leg.source)
             .map(|leg| (leg.ch.transfer, leg.rank))
             .collect();
@@ -474,11 +464,8 @@ impl Core {
             return;
         }
         if let Some(hub) = &self.cfg.channel {
-            for leg in claim.mp.legs.iter().filter(|leg| !leg.source) {
+            for leg in claim.legs.iter().filter(|leg| !leg.source) {
                 hub.finish(leg.ch.transfer);
-            }
-            if let Some(open) = &claim.channel {
-                hub.finish(open.transfer);
             }
         }
     }
@@ -528,7 +515,6 @@ pub struct PutWin {
 pub struct PutMp {
     pub layout: Arc<SliceLayout>,
     pub peers: Vec<MpPeer>,
-    pub legs: Vec<RankLeg>,
     pub windows: BTreeMap<u32, PutWin>,
     /// Passes running on the put's windows.
     pub passes: u32,
@@ -562,5 +548,49 @@ mod tests {
             .is_err()
         );
         assert_eq!(writers, 1, "a rejected batch must not discharge its writer");
+    }
+}
+
+/// Rank zero's channels precede the peer legs; peer indices are bound after assembly.
+pub fn join_legs(requester: Option<Channel>, source: Option<Channel>, peers: Vec<Leg>) -> Vec<Leg> {
+    [
+        requester.map(|ch| Leg {
+            rank: 0,
+            source: false,
+            ch,
+        }),
+        source.map(|ch| Leg {
+            rank: 0,
+            source: true,
+            ch,
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(peers)
+    .collect()
+}
+pub fn root(legs: &[Leg], source: bool) -> Option<&Channel> {
+    legs.iter()
+        .take(2)
+        .find(|leg| leg.rank == 0 && leg.source == source)
+        .map(|leg| &leg.ch)
+}
+pub fn leg_readers(legs: &[Leg]) -> u64 {
+    legs.iter()
+        .filter(|leg| !leg.source)
+        .fold(0, |mask, leg| mask | 1 << leg.rank)
+}
+/// Stop every channel through the same handler-exit fence.
+pub fn stop_legs(
+    legs: &mut [Leg],
+    hub: Option<&channel::Hub>,
+    owners: &mut std::collections::HashMap<u64, ChanOwner>,
+) {
+    for leg in legs {
+        if !leg.ch.exited && hub.is_none_or(|hub| hub.stop(leg.ch.transfer)) {
+            leg.ch.exited = true;
+            owners.remove(&leg.ch.transfer);
+        }
     }
 }

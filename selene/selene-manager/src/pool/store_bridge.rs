@@ -61,7 +61,7 @@ pub(super) struct PutRec {
     /// What the store accepted: the parent it will link to and the first page it needs.
     pub accepted: Option<(Option<Key>, u32)>,
     /// Set when the writer's bytes arrive on the data channel.
-    pub channel: Option<Channel>,
+    pub legs: Vec<super::mp::Leg>,
     /// A commit that arrived before the data channel delivered every window: the
     /// channel and the session are separate streams, so it waits for the last fill.
     pub deferred_commit: Option<(u64, v2::PutCommit)>,
@@ -69,6 +69,12 @@ pub(super) struct PutRec {
     pub mp: Option<PutMp>,
     /// The writer's fence arrived; the put waits for its peers before releasing its windows.
     pub fenced: bool,
+}
+
+impl PutRec {
+    pub(super) fn channel(&self) -> Option<&Channel> {
+        super::mp::root(&self.legs, true)
+    }
 }
 
 /// Per-scope catalog feed from the store.
@@ -452,7 +458,6 @@ impl Core {
             Ok(side) => side.map(|side| PutMp {
                 layout: side.layout,
                 peers: side.peers,
-                legs,
                 windows: Default::default(),
                 passes: 0,
                 whole: Vec::new(),
@@ -477,8 +482,16 @@ impl Core {
                 return Ok(());
             }
         };
-        if let Some(open) = &channel {
-            self.channels.insert(open.transfer, ChanOwner::Put(key));
+        let legs = super::mp::join_legs(None, channel, legs);
+        for (index, leg) in legs.iter().enumerate() {
+            self.channels.insert(
+                leg.ch.transfer,
+                if leg.rank == 0 {
+                    ChanOwner::Put(key)
+                } else {
+                    ChanOwner::PutRank(key, index)
+                },
+            );
         }
         self.puts.insert(
             key,
@@ -492,7 +505,7 @@ impl Core {
                 chain_pages: m.chain_pages,
                 row: m.row,
                 accepted: None,
-                channel,
+                legs,
                 deferred_commit: None,
                 mp,
                 fenced: false,
@@ -538,14 +551,14 @@ impl Core {
             Ok(PutAnswer::Accept(accept)) => {
                 rec.accepted = Some((accept.parent, accept.first_page));
                 let channel = rec
-                    .channel
-                    .as_ref()
+                    .channel()
                     .zip(self.cfg.channel.as_ref())
                     .map(|(open, hub)| super::channel_ref(hub, &open.token));
                 let rank_channels = match (rec.mp.as_ref(), self.cfg.channel.as_ref()) {
-                    (Some(mp), Some(hub)) => mp
+                    (Some(_), Some(hub)) => rec
                         .legs
                         .iter()
+                        .filter(|leg| leg.rank != 0)
                         .map(|leg| v2::RankChannel {
                             rank: leg.rank,
                             channel: Some(super::channel_ref(hub, &leg.ch.token)),
@@ -591,7 +604,11 @@ impl Core {
                         self.put_fail_by_key(key, v2::Reason::Io, "a window in an unknown region");
                         return;
                     };
-                    let writers = mp.legs.iter().fold(1u64, |mask, leg| mask | 1 << leg.rank);
+                    let writers = rec
+                        .legs
+                        .iter()
+                        .filter(|leg| leg.rank != 0)
+                        .fold(1u64, |mask, leg| mask | 1 << leg.rank);
                     mp.windows.insert(
                         grant.index,
                         PutWin {
@@ -610,13 +627,14 @@ impl Core {
                             peer.fence = Party::Pending;
                         }
                     }
-                    peer_grants = mp
+                    peer_grants = rec
                         .legs
                         .iter()
+                        .filter(|leg| leg.rank != 0)
                         .map(|leg| (leg.ch.transfer, leg.rank))
                         .collect();
                 }
-                if let Some((open, hub)) = rec.channel.as_ref().zip(self.cfg.channel.as_ref()) {
+                if let Some((open, hub)) = rec.channel().zip(self.cfg.channel.as_ref()) {
                     // The window is filled by the manager's handler from what the
                     // instance writes; no one else holds it.
                     let Some(region) = region else {
@@ -694,20 +712,18 @@ impl Core {
 
     /// A finished put with no window the writer may still hold needs no record.
     /// One on the data channel is held until its handler has exited.
-    fn puts_settle(&mut self, key: PutKey) {
+    pub(super) fn puts_settle(&mut self, key: PutKey) {
         let Some(rec) = self.puts.get(&key) else {
             return;
         };
         if rec.phase != PutPhase::Finished {
             return;
         }
-        if rec.mp.is_some() {
-            self.put_stop_legs(key);
-        }
+        self.put_stop_legs(key);
         let Some(rec) = self.puts.get(&key) else {
             return;
         };
-        if rec.channel.is_some() {
+        if rec.channel().is_some() {
             return self.put_channel_end(key);
         }
         if rec.unfilled == 0 && self.put_peers_quiet(rec) {
@@ -718,48 +734,19 @@ impl Core {
     /// The put is over: stop its transfer, and once the handler is gone return
     /// the windows to the store and drop the record.
     fn put_channel_end(&mut self, key: PutKey) {
-        let Some(rec) = self.puts.get_mut(&key) else {
+        let Some(rec) = self.puts.get(&key) else {
             return;
         };
-        let Some(open) = rec.channel.as_mut() else {
+        if !rec.channel().is_some_and(|open| open.exited) || !self.put_peers_quiet(rec) {
             return;
-        };
-        if !open.exited {
-            let quiet = self
-                .cfg
-                .channel
-                .as_ref()
-                .is_none_or(|hub| hub.stop(open.transfer));
-            if !quiet {
-                // `Closed` follows when the handler has dropped its connection.
-                return;
-            }
-            open.exited = true;
-            self.channels.remove(&open.transfer);
         }
         let link = rec.link;
-        if self
-            .puts
-            .get(&key)
-            .is_some_and(|rec| !self.put_peers_quiet(rec))
-        {
-            return;
-        }
         self.puts.remove(&key);
         self.store_send(StoreCommand::ReleaseTransfer {
             connection: link.connection,
             generation: link.generation,
             transfer: key.2,
         });
-    }
-
-    /// A put's handler has exited.
-    pub(super) fn put_channel_closed(&mut self, key: PutKey) {
-        let Some(open) = self.puts.get_mut(&key).and_then(|rec| rec.channel.as_mut()) else {
-            return;
-        };
-        open.exited = true;
-        self.puts_settle(key);
     }
 
     /// The put's windows that have been filled and written are accounted for; a
@@ -802,7 +789,11 @@ impl Core {
         };
         let key = (session.instance, session.nonce, m.put_id);
         // Windows of a put on the data channel are filled there, never reported here.
-        if self.puts.get(&key).is_some_and(|rec| rec.channel.is_some()) {
+        if self
+            .puts
+            .get(&key)
+            .is_some_and(|rec| rec.channel().is_some())
+        {
             return Err(Violation::new("PutFilled for a put on the data channel"));
         }
         if self.puts.get(&key).is_some_and(|rec| rec.mp.is_some()) {
@@ -931,37 +922,20 @@ impl Core {
             return true;
         };
         mp.passes == 0
-            && mp.legs.iter().all(|leg| leg.ch.exited)
+            && rec
+                .legs
+                .iter()
+                .filter(|leg| leg.rank != 0)
+                .all(|leg| leg.ch.exited)
             && super::mp::peers_quiet(&mp.peers, |proc| {
                 self.procs.get(proc).is_none_or(|p| p.exited)
             })
     }
 
-    /// Stop the peers' legs of a put that is over.
+    /// Stop every leg of a put that is over.
     fn put_stop_legs(&mut self, key: PutKey) {
-        let Some(hub) = self.cfg.channel.clone() else {
-            if let Some(mp) = self.puts.get_mut(&key).and_then(|rec| rec.mp.as_mut()) {
-                for leg in &mut mp.legs {
-                    leg.ch.exited = true;
-                }
-            }
-            return;
-        };
-        let Some(mp) = self.puts.get_mut(&key).and_then(|rec| rec.mp.as_mut()) else {
-            return;
-        };
-        let mut quiet = Vec::new();
-        for leg in &mut mp.legs {
-            if leg.ch.exited {
-                continue;
-            }
-            if hub.stop(leg.ch.transfer) {
-                leg.ch.exited = true;
-                quiet.push(leg.ch.transfer);
-            }
-        }
-        for transfer in quiet {
-            self.channels.remove(&transfer);
+        if let Some(rec) = self.puts.get_mut(&key) {
+            super::mp::stop_legs(&mut rec.legs, self.cfg.channel.as_ref(), &mut self.channels);
         }
     }
 
@@ -1025,7 +999,7 @@ impl Core {
         let Some(rec) = self.puts.get(&key) else {
             return;
         };
-        if rec.fenced && self.put_peers_quiet(rec) && rec.channel.is_none() {
+        if rec.fenced && self.put_peers_quiet(rec) && rec.channel().is_none() {
             let link = rec.link;
             self.puts.remove(&key);
             self.store_send(StoreCommand::ReleaseTransfer {
@@ -1117,7 +1091,7 @@ impl Core {
         if rec.phase != PutPhase::Open {
             return Ok(());
         }
-        if (rec.channel.is_some() || rec.mp.is_some()) && rec.unfilled > 0 {
+        if (rec.channel().is_some() || rec.mp.is_some()) && rec.unfilled > 0 {
             rec.deferred_commit = Some((sid, m));
             return Ok(());
         }
@@ -1219,7 +1193,7 @@ impl Core {
         let Some(rec) = self.puts.get_mut(&key) else {
             return;
         };
-        if rec.channel.is_some() {
+        if rec.channel().is_some() {
             // The writer touches none of the manager's windows; its handler's exit
             // is what returns them.
             return;
@@ -1266,7 +1240,10 @@ impl Core {
             .collect();
         let mut waiting = false;
         for key in keys {
-            let on_channel = self.puts.get(&key).is_some_and(|rec| rec.channel.is_some());
+            let on_channel = self
+                .puts
+                .get(&key)
+                .is_some_and(|rec| rec.channel().is_some());
             if !on_channel {
                 self.puts.remove(&key);
                 continue;
@@ -1302,7 +1279,7 @@ impl Core {
             let Some(rec) = self.puts.get(&key) else {
                 continue;
             };
-            if rec.channel.is_some() {
+            if rec.channel().is_some() {
                 // Its handler's exit, not the writer's word, returns the windows.
                 continue;
             }
@@ -1500,7 +1477,7 @@ mod tests {
                 chain_pages: 0,
                 row: true,
                 accepted: None,
-                channel: None,
+                legs: Vec::new(),
                 deferred_commit: None,
                 fenced: true,
                 mp: Some(PutMp {
@@ -1511,7 +1488,6 @@ mod tests {
                         shared: true,
                         fence: Party::Quarantined,
                     }],
-                    legs: Vec::new(),
                     windows: BTreeMap::new(),
                     passes: 0,
                     whole: Vec::new(),
