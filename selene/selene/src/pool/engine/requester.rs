@@ -168,13 +168,21 @@ impl Engine {
     /// session. Every part of a restore keeps its slot until the restore ends. A restore
     /// larger than all the slots runs alone.
     fn claim_room(&self, parts: usize) -> bool {
-        let granted = self.sess.as_ref().map_or(0, |s| s.limits.max_claims_in_flight);
+        let granted = self
+            .sess
+            .as_ref()
+            .map_or(0, |s| s.limits.max_claims_in_flight);
         let slots = match (self.st.claim_slots, granted) {
             (0, _) => return true,
             (own, 0) => own,
             (own, granted) => own.min(granted),
         } as usize;
-        let used: usize = self.requester.restores.values().map(|r| r.parts.len()).sum();
+        let used: usize = self
+            .requester
+            .restores
+            .values()
+            .map(|r| r.parts.len())
+            .sum();
         used == 0 || used + parts <= slots
     }
 

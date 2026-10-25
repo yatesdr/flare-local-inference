@@ -224,6 +224,8 @@ pub struct PooledStore<S: HostStore, P: PoolPort = PoolClient> {
     pool_fetch_failed: u64,
     /// Bytes the pool parts copied into the device.
     pool_bytes_in: u64,
+    /// Write-backs declined because restoring the record would not beat recompute.
+    declined: u64,
 }
 
 impl<S: HostStore> PooledStore<S, PoolClient> {
@@ -304,6 +306,7 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             pool_fetched: 0,
             pool_fetch_failed: 0,
             pool_bytes_in: 0,
+            declined: 0,
         }
     }
 
@@ -413,8 +416,11 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
         seen.elapsed() < HELD_FOR && (*level == Level::HostDram || closest == Level::HostNvme)
     }
 
-    /// Whether restoring a checkpoint from the first host tier would beat
-    /// recomputing it, at the measured rate of that tier or its first estimate.
+    /// Whether restoring `checkpoint` from the first host tier would beat
+    /// recomputing what it adds, at the measured rate of that tier or its first
+    /// estimate. What it adds is the tokens past its parent's endpoint, so a
+    /// checkpoint a few tokens beyond a stored parent (a row and no page) is
+    /// not worth a row's worth of transfer, while a long record always is.
     fn worth_keeping(&self, checkpoint: &PublishedCheckpoint) -> bool {
         let bytes = checkpoint.tail_pages as u64 * self.page_record_bytes + self.row_record_bytes;
         let initial = match self.inner.closest_tier() {
@@ -423,20 +429,22 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
         };
         let measured = self.inner.stats().inbound_rate;
         let rate = if measured > 0.0 { measured } else { initial };
-        worth_transfer(
-            checkpoint.tail_pages as u64 * self.page_tokens,
-            bytes as f64 / rate,
-            self.prefill_rate,
-        )
+        let gained = checkpoint.key.consumed_tokens
+            - checkpoint
+                .parent
+                .map_or(0, |parent| parent.consumed_tokens)
+                .min(checkpoint.key.consumed_tokens);
+        worth_transfer(gained, bytes as f64 / rate, self.prefill_rate)
     }
 
     /// Copy `checkpoint` to the first host tier now, if that is worth it:
-    /// `Oversize` (never stored; the worker does not ask again) when restoring
-    /// it would not beat recomputing it, `Present` when the pool already holds
+    /// `Oversize` (never stored) when restoring what it adds would not beat
+    /// recomputing it, counted in the skipped stores, `Present` when the pool already holds
     /// it in a tier at least as close, `Retry(Queue)` when too many copies are
     /// in flight, and otherwise what the tier answers.
     fn copy_out(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
         if !self.worth_keeping(checkpoint) {
+            self.declined += 1;
             return Ok(StoreOutcome::Oversize);
         }
         if self.held_as_close(&checkpoint.key) {
@@ -700,12 +708,17 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
         // into the same pages, and only a restore with no source left is a recompute.
         let own = self.restores.get(&key).and_then(|restore| {
             let pool_only = restore.planned.plan.a.source != LOCAL;
-            restore.planned.local.clone().filter(|hit| pool_only && hit.key == key)
+            restore
+                .planned
+                .local
+                .clone()
+                .filter(|hit| pool_only && hit.key == key)
         });
         if let Some(hit) = own {
             let ticket = self.restores[&key].ticket.clone();
             if self.inner.fetch(hit, ticket).is_ok() {
-                self.restores.get_mut(&key).expect("found").stage = Stage::Fallback { local_key: key };
+                self.restores.get_mut(&key).expect("found").stage =
+                    Stage::Fallback { local_key: key };
                 self.pool_fetch_failed += 1;
                 return;
             }
@@ -749,8 +762,11 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
         // fetches its own part first and the pool serves the rest. Plan again from the pool's
         // candidates alone, and fall back to the local hit when they cannot cover the restore.
         if plan.b.as_ref().is_some_and(|b| b.source == LOCAL) {
-            let pool_only: Vec<plan::Candidate> =
-                candidates.iter().filter(|c| c.source != LOCAL).cloned().collect();
+            let pool_only: Vec<plan::Candidate> = candidates
+                .iter()
+                .filter(|c| c.source != LOCAL)
+                .cloned()
+                .collect();
             match plan::plan(&request, &pool_only) {
                 Some(replanned) => plan = replanned,
                 None => return local,
@@ -966,6 +982,8 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
 
     fn stats(&self) -> StoreStats {
         let mut stats = self.inner.stats();
+        // A declined write-back is a store that was skipped.
+        stats.store_skipped += self.declined;
         stats.fetched += self.pool_fetched;
         stats.fetch_failed += self.pool_fetch_failed;
         stats.bytes_in += self.pool_bytes_in;
@@ -1631,12 +1649,24 @@ mod tests {
             id: 1,
             result: Err(failure(0, refused, false)),
         });
-        assert!(fetched(&rig.poll()).is_empty(), "the failure is not reported");
-        assert_eq!(rig.local.0.lock().unwrap().fetches.len(), 1, "the local copy is fetched");
-        rig.local.0.lock().unwrap().events.push(StoreEvent::Fetched {
-            key: rig.key(1600),
-            result: Ok(1),
-        });
+        assert!(
+            fetched(&rig.poll()).is_empty(),
+            "the failure is not reported"
+        );
+        assert_eq!(
+            rig.local.0.lock().unwrap().fetches.len(),
+            1,
+            "the local copy is fetched"
+        );
+        rig.local
+            .0
+            .lock()
+            .unwrap()
+            .events
+            .push(StoreEvent::Fetched {
+                key: rig.key(1600),
+                result: Ok(1),
+            });
         assert_eq!(fetched(&rig.poll()), [(rig.key(1600), true)]);
     }
 
@@ -1723,7 +1753,10 @@ mod tests {
         let fetch = rig.pool.lock().unwrap().fetches[0].clone();
         assert_eq!(fetch.parts.len(), 1);
         assert!(fetch.parts[0].part.row, "the pool part carries the row");
-        assert!(rig.local.0.lock().unwrap().fetches.is_empty(), "nothing is fetched locally");
+        assert!(
+            rig.local.0.lock().unwrap().fetches.is_empty(),
+            "nothing is fetched locally"
+        );
     }
 
     #[test]
@@ -2443,6 +2476,33 @@ mod tests {
         );
         assert_eq!(rig.copies(), [checkpoint.key]);
         assert_eq!(rig.announced_on_gpu(), 1, "announced once");
+    }
+
+    #[test]
+    fn a_row_a_few_tokens_past_a_parent_is_declined_and_counted_while_a_long_record_is_kept() {
+        let mut rig = rig();
+        // Prefill fast enough that a row alone is not worth restoring for seven
+        // tokens, while a record of fifty pages still is.
+        rig.store.set_prefill_rate(2.5e7);
+        let parent = rig.publication(800);
+        // The terminal checkpoint of a prompt: seven tokens on, no page of its own.
+        let mut child = rig.publication(800);
+        child.key = rig.key(807);
+        child.parent = Some(parent.key);
+        child.tail_pages = 0;
+        assert_eq!(
+            rig.store.write_back(&child).unwrap(),
+            StoreOutcome::Oversize
+        );
+        assert!(rig.copies().is_empty());
+        assert_eq!(rig.store.stats().store_skipped, 1);
+        // The same long record with no parent, or with a parent far behind it, is kept.
+        assert_eq!(rig.store.write_back(&parent).unwrap(), StoreOutcome::Queued);
+        let mut later = rig.publication(1600);
+        later.parent = Some(parent.key);
+        later.tail_pages = 50;
+        assert_eq!(rig.store.write_back(&later).unwrap(), StoreOutcome::Queued);
+        assert_eq!(rig.store.stats().store_skipped, 1);
     }
 
     #[test]

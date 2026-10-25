@@ -1299,7 +1299,10 @@ fn restores_beyond_the_claim_slots_wait_for_a_slot_instead_of_being_refused() {
     }
     assert_eq!(started[0].1.len(), 1);
     assert_eq!(started[1].1.len(), 1);
-    assert!(started[2].1.is_empty(), "two slots are taken: the third waits");
+    assert!(
+        started[2].1.is_empty(),
+        "two slots are taken: the third waits"
+    );
     assert!(fetched(&rig.events()).is_empty(), "waiting is not failing");
     // The first restore ends and the third takes its slot.
     let claim = started[0].1[0].claim_id;
@@ -1312,7 +1315,11 @@ fn restores_beyond_the_claim_slots_wait_for_a_slot_instead_of_being_refused() {
         wire::ClaimReason::ReasonNone,
         true,
     ));
-    assert_eq!(pick!(out, Claim).len(), 1, "the waiting restore claims the freed slot");
+    assert_eq!(
+        pick!(out, Claim).len(),
+        1,
+        "the waiting restore claims the freed slot"
+    );
 }
 
 // ---- exports ----------------------------------------------------------------
