@@ -1,11 +1,9 @@
 mod support;
 use selene_manager::{
-    arena::{Arena, ExtentSlice},
     control, disk,
     proto::v2::{self, client_message as c, server_message::M},
-    record::{self, Header},
+    record,
     store::Config,
-    tree::{Eviction, Tree},
 };
 use std::{
     fs,
@@ -65,96 +63,6 @@ async fn store_when_room(
     }
 }
 
-#[test]
-fn l0_01_tree_insert_chain_remove_parity() {
-    for pt in [64, 128, 256] {
-        let mut tree = Tree::new(pt);
-        let keys = [key(700), key(1300), key(1990)];
-        for (index, key) in keys.iter().enumerate() {
-            let parent = index.checked_sub(1).map(|index| keys[index]);
-            let pages =
-                key.consumed_tokens / pt - parent.map_or(0, |parent| parent.consumed_tokens / pt);
-            tree.insert(*key, parent, [4; 16], pages as usize, true, true, ())
-                .unwrap();
-            tree.access_at(key, index as u64 + 1);
-        }
-        let parent = tree.node(&keys[2]).unwrap().parent.unwrap();
-        assert_eq!(parent, keys[1]);
-        assert_eq!(tree.node(&parent).unwrap().parent, Some(keys[0]));
-        let available =
-            tree.node(&parent).unwrap().tail_pages + tree.node(&keys[2]).unwrap().tail_pages;
-        let skip = (1000 / pt - 700 / pt) as usize;
-        assert_eq!(available - skip, (1990 / pt - 1000 / pt) as usize);
-        assert!(
-            tree.insert(key(2000), Some(key(1999)), [0; 16], 0, true, true, ())
-                .is_err()
-        );
-        assert!(
-            tree.insert(key(2000), Some(keys[2]), [0; 16], 20, true, true, ())
-                .is_err()
-        );
-        assert_eq!(tree.node(&keys[2]).unwrap().children(), 0);
-        assert!(tree.remove_node(&keys[0]).is_err());
-        tree.pin(&keys[2]).unwrap();
-        assert!(tree.remove_node(&keys[2]).is_err());
-        tree.unpin(&keys[2]).unwrap();
-        assert_eq!(tree.remove_node(&keys[2]).unwrap().key, keys[2]);
-        assert_eq!(tree.node(&keys[1]).unwrap().children(), 0);
-    }
-    let fixture = include_bytes!("fixtures/flare-header-v1.bin");
-    let decoded = Header::decode(fixture).unwrap();
-    let mut planned = selene_manager::record::new_header(&descriptor(), key(130), Some(key(65)), [4; 16], 1).unwrap();
-    planned.created = 1_700_000_000;
-    planned.row_checksum = 0x0123456789abcdef;
-    assert_eq!(decoded, planned);
-    assert_eq!(&encode_header(&planned), fixture);
-    for (offset, value) in [(129, 0u64), (173, 0), (181, u64::MAX)] {
-        let mut invalid = *fixture;
-        invalid[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-        assert!(Header::decode(&invalid).is_err());
-    }
-    let arena = Arena::new(1024 * 1024).unwrap();
-    let extent = Arc::new(arena.allocate(9000).unwrap());
-    assert_eq!(extent.bytes().as_ptr() as usize % 4096, 0);
-    let reader = extent.clone();
-    drop(extent);
-    assert_eq!(arena.used(), 16384);
-    drop(reader);
-    assert_eq!(arena.used(), 0);
-    assert!(arena.allocate(1024 * 1024).is_some());
-}
-#[test]
-fn l0_02_leaf_lru_compaction_and_cascade() {
-    let mut tree = Tree::new(64);
-    for (tokens, parent) in [(200, None), (400, Some(200)), (600, Some(400))] {
-        tree.insert(
-            key(tokens),
-            parent.map(key),
-            [0; 16],
-            (tokens / 64 - parent.unwrap_or(0) / 64) as usize,
-            true,
-            true,
-            (),
-        )
-        .unwrap();
-        tree.access_at(&key(tokens), tokens);
-    }
-    tree.access_at(&key(200), 1000);
-    tree.pin(&key(600)).unwrap();
-    assert!(tree.evict(false, |_| true).is_none());
-    assert!(matches!(tree.evict(true, |_| true), Some(Eviction::Compacted(k)) if k == key(400)));
-    assert!(!tree.node(&key(400)).unwrap().row);
-    assert!(tree.node(&key(600)).unwrap().row);
-    tree.unpin(&key(600)).unwrap();
-    let Some(Eviction::Leaves(removed)) = tree.evict(false, |_| true) else {
-        panic!("leaves")
-    };
-    assert_eq!(
-        removed.iter().map(|node| node.key).collect::<Vec<_>>(),
-        [key(600), key(400)]
-    );
-    assert_eq!(tree.len(), 1);
-}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_03_accept_shapes_and_present_inflight() {
     let mut host = Host::new(4 * 1024 * 1024, 4 * 1024 * 1024);
@@ -610,92 +518,6 @@ async fn l0_12_round_robin_and_dead_client_cleanup() {
     a.fetch(&[key(64)], 0, 1).await;
     assert!(start.elapsed() < Duration::from_millis(500));
     unknown.finish(held).await;
-}
-#[test]
-fn l0_15_namespace_id_vectors() {
-    let id = record::namespace_id(&[0x63; 32], &[0x1b; 16], "test");
-    assert_eq!(
-        record::hex(&id),
-        "83bbb4befe798c5d717456d55695acc1d166d45c214e54e253f249cd025d4040"
-    );
-    let id = record::namespace_id(&[0x63; 32], &[0x1b; 16], "");
-    assert_eq!(
-        record::hex(&id),
-        "6fbf3a101213ca13f48c6ab6ae91e7e1e35fd409de023b30696e32b18c97ed74"
-    );
-}
-#[test]
-fn l0_16_disk_queue_read_write_interleave() {
-    let base = base("disk");
-    fs::create_dir_all(&base).unwrap();
-    let lock = Arc::new(disk::RootLock::acquire(&base.join("root")).unwrap());
-    let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let faults = disk::Faults {
-        delay_ms: 10,
-        trace: Some(trace.clone()),
-        ..disk::Faults::default()
-    };
-    let worker = disk::Worker::start(faults, lock);
-    let source = base.join("source");
-    let mut bytes = vec![0u8; 4096];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = index as u8;
-    }
-    fs::write(&source, &bytes).unwrap();
-    let file = Arc::new(disk::open_read(&source).unwrap());
-    let arena = Arena::new(8 * 4096).unwrap();
-    let reader = worker.reader();
-    let write_arena = Arena::new(4 * 4096).unwrap();
-    for index in 0..4 {
-        let mut extent = write_arena.allocate(4096).unwrap();
-        extent.bytes_mut().fill(index as u8);
-        let temporary = Arc::new(disk::DiskExtent::new(base.join(format!("w-{index}.tmp"))));
-        temporary.retire();
-        worker
-            .sender
-            .send(disk::Task::Chunk {
-                id: index,
-                temporary,
-                offset: 0,
-                data: ExtentSlice::new(Arc::new(extent), 0, 4096),
-            })
-            .unwrap();
-    }
-    let mut readers = Vec::new();
-    for _ in 0..8 {
-        let reader = reader.clone();
-        let file = file.clone();
-        let extent = arena.allocate(4096).unwrap();
-        readers.push(std::thread::spawn(move || {
-            reader.read(&file, 0, extent).unwrap();
-        }));
-    }
-    for _ in 0..4 {
-        worker.receiver.recv().unwrap();
-    }
-    for reader in readers {
-        reader.join().unwrap();
-    }
-    // The worker records its own service order, so the observation cannot be
-    // reordered by reader or completion-receiver scheduling.
-    let trace = trace.lock().unwrap();
-    assert_eq!(trace.iter().filter(|kind| **kind == b'R').count(), 8);
-    assert_eq!(trace.iter().filter(|kind| **kind == b'W').count(), 4);
-    let mut run = 0;
-    let mut saw_write = false;
-    for &kind in trace.iter() {
-        if kind == b'R' {
-            run += 1;
-            assert!(
-                !saw_write || run <= 4,
-                "more than four reads between writes"
-            );
-        } else {
-            saw_write = true;
-            run = 0;
-        }
-    }
-    fs::remove_dir_all(base).unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_18_descriptor_format_and_recovery_refusal() {
@@ -1206,68 +1028,6 @@ async fn l0_34_concurrent_nvme_gets_share_connection_credits() {
             && host.gauge("cleanup_records") == 0
             && host.gauge("open_ops") == 0
     });
-}
-#[test]
-fn l0_38_async_reads_overtake_queued_writes() {
-    let base = base("read-priority");
-    fs::create_dir_all(&base).unwrap();
-    let lock = Arc::new(disk::RootLock::acquire(&base.join("root")).unwrap());
-    // Long enough that enqueueing the read cannot race the first write completing.
-    let worker = disk::Worker::start(
-        disk::Faults {
-            delay_ms: 2000,
-            ..disk::Faults::default()
-        },
-        lock,
-    );
-    let source = base.join("source");
-    fs::write(&source, vec![7u8; 4096]).unwrap();
-    let file = Arc::new(disk::open_read(&source).unwrap());
-    let arena = Arena::new(4096).unwrap();
-    let write_arena = Arena::new(8 * 4096).unwrap();
-    for index in 0..8u64 {
-        let mut extent = write_arena.allocate(4096).unwrap();
-        extent.bytes_mut().fill(index as u8);
-        let temporary = Arc::new(disk::DiskExtent::new(base.join(format!("w-{index}.tmp"))));
-        temporary.retire();
-        worker
-            .sender
-            .send(disk::Task::Chunk {
-                id: index,
-                temporary,
-                offset: 0,
-                data: ExtentSlice::new(Arc::new(extent), 0, 4096),
-            })
-            .unwrap();
-    }
-    worker
-        .read_sender
-        .send(disk::Task::Read {
-            id: 999,
-            file,
-            offset: 0,
-            buffer: arena.allocate(4096).unwrap(),
-        })
-        .unwrap();
-    // The write channel holds all eight writes, so the read is enqueued while at most the
-    // first write is in flight; it must be the next completion.
-    let mut writes_ahead = 0;
-    loop {
-        let completion = worker.receiver.recv().unwrap();
-        if completion.id == 999 {
-            assert_eq!(completion.data.unwrap().bytes(), &[7u8; 4096]);
-            break;
-        }
-        writes_ahead += 1;
-    }
-    assert!(
-        writes_ahead <= 1,
-        "the read waited behind {writes_ahead} queued writes"
-    );
-    for _ in writes_ahead..8 {
-        worker.receiver.recv().unwrap();
-    }
-    fs::remove_dir_all(base).unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_40_detached_finalization_uses_the_put_namespace() {

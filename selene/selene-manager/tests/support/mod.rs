@@ -19,13 +19,13 @@ use std::{
 };
 
 pub mod channel;
-pub mod compat;
+pub mod store_client;
 pub mod net;
 pub mod pool;
 #[cfg(feature = "rdma")]
 pub mod rdma;
 
-pub use compat::*;
+pub use store_client::*;
 
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 static HOST_BUSY: AtomicBool = AtomicBool::new(false);

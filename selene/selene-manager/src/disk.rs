@@ -833,3 +833,147 @@ pub fn crc32(bytes: &[u8]) -> u32 {
     crc_update(&mut crc, bytes);
     !crc
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn base(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("selene-disk-{}-{label}", std::process::id()))
+    }
+    #[test]
+    fn disk_queue_read_write_interleave() {
+        let base = base("disk");
+        fs::create_dir_all(&base).unwrap();
+        let lock = Arc::new(RootLock::acquire(&base.join("root")).unwrap());
+        let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let faults = Faults {
+            delay_ms: 10,
+            trace: Some(trace.clone()),
+            ..Faults::default()
+        };
+        let worker = Worker::start(faults, lock);
+        let source = base.join("source");
+        let mut bytes = vec![0u8; 4096];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        fs::write(&source, &bytes).unwrap();
+        let file = Arc::new(open_read(&source).unwrap());
+        let arena = Arena::new(8 * 4096).unwrap();
+        let reader = worker.reader();
+        let write_arena = Arena::new(4 * 4096).unwrap();
+        for index in 0..4 {
+            let mut extent = write_arena.allocate(4096).unwrap();
+            extent.bytes_mut().fill(index as u8);
+            let temporary = Arc::new(DiskExtent::new(base.join(format!("w-{index}.tmp"))));
+            temporary.retire();
+            worker
+                .sender
+                .send(Task::Chunk {
+                    id: index,
+                    temporary,
+                    offset: 0,
+                    data: ExtentSlice::new(Arc::new(extent), 0, 4096),
+                })
+                .unwrap();
+        }
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let reader = reader.clone();
+            let file = file.clone();
+            let extent = arena.allocate(4096).unwrap();
+            readers.push(std::thread::spawn(move || {
+                reader.read(&file, 0, extent).unwrap();
+            }));
+        }
+        for _ in 0..4 {
+            worker.receiver.recv().unwrap();
+        }
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        // The worker records its own service order, so the observation cannot be
+        // reordered by reader or completion-receiver scheduling.
+        let trace = trace.lock().unwrap();
+        assert_eq!(trace.iter().filter(|kind| **kind == b'R').count(), 8);
+        assert_eq!(trace.iter().filter(|kind| **kind == b'W').count(), 4);
+        let mut run = 0;
+        let mut saw_write = false;
+        for &kind in trace.iter() {
+            if kind == b'R' {
+                run += 1;
+                assert!(
+                    !saw_write || run <= 4,
+                    "more than four reads between writes"
+                );
+            } else {
+                saw_write = true;
+                run = 0;
+            }
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn async_reads_overtake_queued_writes() {
+        let base = base("read-priority");
+        fs::create_dir_all(&base).unwrap();
+        let lock = Arc::new(RootLock::acquire(&base.join("root")).unwrap());
+        // Long enough that enqueueing the read cannot race the first write completing.
+        let worker = Worker::start(
+            Faults {
+                delay_ms: 2000,
+                ..Faults::default()
+            },
+            lock,
+        );
+        let source = base.join("source");
+        fs::write(&source, vec![7u8; 4096]).unwrap();
+        let file = Arc::new(open_read(&source).unwrap());
+        let arena = Arena::new(4096).unwrap();
+        let write_arena = Arena::new(8 * 4096).unwrap();
+        for index in 0..8u64 {
+            let mut extent = write_arena.allocate(4096).unwrap();
+            extent.bytes_mut().fill(index as u8);
+            let temporary = Arc::new(DiskExtent::new(base.join(format!("w-{index}.tmp"))));
+            temporary.retire();
+            worker
+                .sender
+                .send(Task::Chunk {
+                    id: index,
+                    temporary,
+                    offset: 0,
+                    data: ExtentSlice::new(Arc::new(extent), 0, 4096),
+                })
+                .unwrap();
+        }
+        worker
+            .read_sender
+            .send(Task::Read {
+                id: 999,
+                file,
+                offset: 0,
+                buffer: arena.allocate(4096).unwrap(),
+            })
+            .unwrap();
+        // The write channel holds all eight writes, so the read is enqueued while at most the
+        // first write is in flight; it must be the next completion.
+        let mut writes_ahead = 0;
+        loop {
+            let completion = worker.receiver.recv().unwrap();
+            if completion.id == 999 {
+                assert_eq!(completion.data.unwrap().bytes(), &[7u8; 4096]);
+                break;
+            }
+            writes_ahead += 1;
+        }
+        assert!(
+            writes_ahead <= 1,
+            "the read waited behind {writes_ahead} queued writes"
+        );
+        for _ in writes_ahead..8 {
+            worker.receiver.recv().unwrap();
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+}

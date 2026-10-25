@@ -862,4 +862,91 @@ mod tests {
         insert(&mut index, &full, 700, None);
         assert_eq!(index.ready_notices().len(), 1);
     }
+    fn test_key(tokens: u64) -> PrefixKey {
+        PrefixKey {
+            consumed_tokens: tokens,
+            digest: (tokens as u128 * 7919).to_le_bytes(),
+        }
+    }
+
+    #[test]
+    fn parent_links_pages_and_removal_remain_consistent() {
+        for pt in [64, 128, 256] {
+            let mut tree = Index::new(pt);
+            let keys = [test_key(700), test_key(1300), test_key(1990)];
+            for (index, key) in keys.iter().enumerate() {
+                let parent = index.checked_sub(1).map(|index| keys[index]);
+                let pages = key.consumed_tokens / pt
+                    - parent.map_or(0, |parent| parent.consumed_tokens / pt);
+                tree.insert(*key, parent, [4; 16], pages as usize, true, true, ())
+                    .unwrap();
+                tree.access_at(key, index as u64 + 1);
+            }
+            let parent = tree.node(&keys[2]).unwrap().parent.unwrap();
+            assert_eq!(parent, keys[1]);
+            assert_eq!(tree.node(&parent).unwrap().parent, Some(keys[0]));
+            let available =
+                tree.node(&parent).unwrap().tail_pages + tree.node(&keys[2]).unwrap().tail_pages;
+            let skip = (1000 / pt - 700 / pt) as usize;
+            assert_eq!(available - skip, (1990 / pt - 1000 / pt) as usize);
+            assert!(
+                tree.insert(
+                    test_key(2000),
+                    Some(test_key(1999)),
+                    [0; 16],
+                    0,
+                    true,
+                    true,
+                    ()
+                )
+                .is_err()
+            );
+            assert!(
+                tree.insert(test_key(2000), Some(keys[2]), [0; 16], 20, true, true, ())
+                    .is_err()
+            );
+            assert_eq!(tree.node(&keys[2]).unwrap().children(), 0);
+            assert!(tree.remove_node(&keys[0]).is_err());
+            tree.pin(&keys[2]).unwrap();
+            assert!(tree.remove_node(&keys[2]).is_err());
+            tree.unpin(&keys[2]).unwrap();
+            assert_eq!(tree.remove_node(&keys[2]).unwrap().key, keys[2]);
+            assert_eq!(tree.node(&keys[1]).unwrap().children(), 0);
+        }
+    }
+
+    #[test]
+    fn leaf_lru_compaction_and_cascade() {
+        let mut tree = Index::new(64);
+        for (tokens, parent) in [(200, None), (400, Some(200)), (600, Some(400))] {
+            tree.insert(
+                test_key(tokens),
+                parent.map(test_key),
+                [0; 16],
+                (tokens / 64 - parent.unwrap_or(0) / 64) as usize,
+                true,
+                true,
+                (),
+            )
+            .unwrap();
+            tree.access_at(&test_key(tokens), tokens);
+        }
+        tree.access_at(&test_key(200), 1000);
+        tree.pin(&test_key(600)).unwrap();
+        assert!(tree.evict(false, |_| true).is_none());
+        assert!(
+            matches!(tree.evict(true, |_| true), Some(Eviction::Compacted(k)) if k == test_key(400))
+        );
+        assert!(!tree.node(&test_key(400)).unwrap().row);
+        assert!(tree.node(&test_key(600)).unwrap().row);
+        tree.unpin(&test_key(600)).unwrap();
+        let Some(Eviction::Leaves(removed)) = tree.evict(false, |_| true) else {
+            panic!("leaves")
+        };
+        assert_eq!(
+            removed.iter().map(|node| node.key).collect::<Vec<_>>(),
+            [test_key(600), test_key(400)]
+        );
+        assert_eq!(tree.len(), 1);
+    }
 }
