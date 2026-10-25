@@ -380,7 +380,6 @@ mod tests {
                 v2::OpenSession {
                     manager_incarnation: core.incarnation,
                     instance_id: INSTANCE.to_vec(),
-                    instance_name: "r0".into(),
                     scope: Some(scope(world)),
                     process_nonce: nonce.to_vec(),
                     export_slots: 2,
@@ -401,7 +400,6 @@ mod tests {
             rank,
             agent_nonce: vec![nonce; 16],
             rank_secret: SECRET.to_vec(),
-            name: "agent".into(),
         }
     }
 
@@ -601,7 +599,6 @@ mod tests {
             v2::OpenSession {
                 manager_incarnation: core.incarnation,
                 instance_id: [5; 16].to_vec(),
-                instance_name: "x".into(),
                 scope: Some(scope(1)),
                 process_nonce: [3; 16].to_vec(),
                 rank_secret: SECRET.to_vec(),

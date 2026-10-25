@@ -180,7 +180,6 @@ pub struct AgentConfig {
     pub scope: Scope,
     pub rank: usize,
     pub world: usize,
-    pub instance_name: String,
     /// The link to rank 0.
     pub link: RankLink,
     /// This rank's page copier, built for its own one-rank geometry.
@@ -243,7 +242,6 @@ impl RankAgent {
             layout,
             rank: config.rank,
             world: config.world,
-            name: config.instance_name,
             gpu_uuid: config.gpu_uuid,
             context: config.registration_context,
             copier: config.copier,
@@ -389,7 +387,6 @@ struct Agent {
     layout: Arc<SliceLayout>,
     rank: usize,
     world: usize,
-    name: String,
     gpu_uuid: [u8; 16],
     context: usize,
     copier: SharedCopier,
@@ -786,7 +783,6 @@ impl Agent {
             rank: self.rank as u32,
             agent_nonce: self.agent_nonce.to_vec(),
             rank_secret: bound.secret.clone(),
-            name: self.name.clone(),
         };
         let _ = tx
             .send(wire::RankClientMessage {

@@ -952,17 +952,6 @@ impl MemoryStore {
         })
     }
 
-    /// Switch an empty store to flat parent links.
-    pub fn into_flat(mut self) -> Result<Self> {
-        if !self.core.index.is_empty() || !self.core.deferred.is_empty() {
-            return Err(invalid(
-                "a memory store with records cannot switch to flat parent links",
-            ));
-        }
-        self.core.flat = true;
-        Ok(self)
-    }
-
     pub fn flat(&self) -> bool {
         self.core.flat
     }

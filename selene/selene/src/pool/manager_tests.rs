@@ -283,7 +283,6 @@ fn config_on(manager: &Manager, name: &str, gpu: u8, local: bool) -> PoolConfig 
         tenant: "t".into(),
         ca,
         scope: Scope::new("t", [7; 32], fingerprint(&geometry), &geometry).unwrap(),
-        instance_name: name.into(),
         gpu_uuids: vec![[gpu; 16]],
         export_slots: 2,
         claim_slots: 2,

@@ -638,7 +638,6 @@ impl Core {
                 session_incarnation: sid,
                 scope_id,
                 export_slots,
-                claim_slots,
                 readiness: Some(readiness),
                 resync_required: true,
             }),

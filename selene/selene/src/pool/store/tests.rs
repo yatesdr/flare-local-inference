@@ -817,7 +817,6 @@ fn a_refusal_for_room_or_readiness_drops_the_record_at_once_and_is_not_retried()
         PutRefusal::Budget,
         PutRefusal::Queue,
         PutRefusal::NotReady,
-        PutRefusal::Quota,
         PutRefusal::Oversize,
     ] {
         let mut rig = rig();

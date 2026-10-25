@@ -88,7 +88,6 @@ async fn h6_a_unix_peer_of_the_same_user_gets_shared_memory() {
     let mut pool = pool;
     let session = pool.open(&Ident::new("a")).await;
     assert_eq!(session.opened.export_slots, 2);
-    assert_eq!(session.opened.claim_slots, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

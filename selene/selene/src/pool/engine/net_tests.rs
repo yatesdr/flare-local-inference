@@ -159,7 +159,6 @@ fn channel_ref(token: u8) -> wire::DataChannelRef {
         transport: wire::DataTransport::Tcp as i32,
         address: "manager:9201".into(),
         token: vec![token; 32],
-        rdma: vec![],
     }
 }
 

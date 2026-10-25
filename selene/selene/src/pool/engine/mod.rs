@@ -50,7 +50,6 @@ pub const RESTORE_DEADLINE: Duration = Duration::from_secs(12);
 pub(crate) struct Settings {
     pub instance_id: [u8; 16],
     pub nonce: [u8; 16],
-    pub name: String,
     pub scope: Scope,
     pub scope_id: [u8; 32],
     pub export_slots: u32,

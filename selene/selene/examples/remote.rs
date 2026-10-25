@@ -357,7 +357,6 @@ fn main() {
             tenant: "remote".into(),
             ca: o.ca.clone(),
             scope: Scope::new("remote", [7; 32], fingerprint(&geo), &geo).unwrap(),
-            instance_name: o.name.clone(),
             gpu_uuids: vec![[o.gpu; 16]],
             export_slots: 2,
             claim_slots: 2,

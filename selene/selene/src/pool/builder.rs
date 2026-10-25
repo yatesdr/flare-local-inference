@@ -64,7 +64,6 @@ impl PoolBuilder<'_> {
             tenant: options.tenant.clone(),
             ca: options.ca.clone(),
             scope,
-            instance_name: format!("flare-{}", std::process::id()),
             gpu_uuids: peers
                 .as_ref()
                 .map_or(gpu_uuids, |peers| peers.gpu_uuids.clone()),
@@ -83,7 +82,6 @@ impl PoolBuilder<'_> {
                     scope: config.scope,
                     rank: peers.rank,
                     world: all_ranks.len(),
-                    instance_name: config.instance_name,
                     link: peers.links.remove(0).into_rank_link()?,
                     copier: copier.clone(),
                     registrar,
