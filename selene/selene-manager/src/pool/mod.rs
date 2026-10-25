@@ -12,6 +12,7 @@ pub mod index;
 pub mod limits;
 mod lookup;
 mod notices;
+pub mod pass;
 mod ranks;
 pub mod service;
 mod store_bridge;
