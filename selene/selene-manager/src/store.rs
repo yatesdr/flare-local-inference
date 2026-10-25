@@ -73,7 +73,6 @@ pub struct Config {
     pub staging: usize,
     pub metrics: Option<String>,
     pub faults: disk::Faults,
-    pub write_budget: u64,
     pub max_window_bytes: u64,
     pub pool: crate::pool::limits::PoolSettings,
 }
@@ -89,7 +88,6 @@ impl Config {
             staging: EMBEDDED_STAGING,
             metrics: None,
             faults: disk::Faults::default(),
-            write_budget: 0,
             max_window_bytes: DEFAULT_MAX_WINDOW,
             pool: Default::default(),
         }
@@ -105,7 +103,6 @@ impl Config {
             staging: EMBEDDED_STAGING,
             metrics: None,
             faults: disk::Faults::default(),
-            write_budget: 0,
             max_window_bytes: DEFAULT_MAX_WINDOW,
             pool: Default::default(),
         }
@@ -278,7 +275,7 @@ fn release_slot_job(put: &mut Put, job: u64) {
 
 enum RootChoice {
     Store(Extent),
-    Wait(PutRequirement, Vec<Key>),
+    Wait,
 }
 
 pub struct Put {
@@ -371,56 +368,10 @@ pub struct Open {
     pub progress: Instant,
 }
 
-pub struct TokenBucket {
-    rate: u64,
-    burst: u64,
-    balance: f64,
-    last: Instant,
-}
-
-impl TokenBucket {
-    fn new(rate: u64, now: Instant) -> Self {
-        let burst = rate.max(1024 * 1024);
-        Self {
-            rate,
-            burst,
-            balance: burst as f64,
-            last: now,
-        }
-    }
-
-    fn refill(&mut self, now: Instant) {
-        if self.rate == 0 {
-            self.balance = self.burst as f64;
-            return;
-        }
-        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
-        self.last = now;
-        self.balance = (self.balance + elapsed * self.rate as f64).min(self.burst as f64);
-    }
-
-    fn admit(&mut self, charge: u64, now: Instant) -> bool {
-        if self.rate == 0 {
-            return true;
-        }
-        self.refill(now);
-        if self.balance < 0.0 {
-            return false;
-        }
-        self.balance -= charge as f64;
-        true
-    }
-
-    pub fn balance(&self) -> i64 {
-        self.balance as i64
-    }
-}
-
 pub struct Session {
     pub generation: u64,
     pub namespace: Option<NamespaceId>,
     pub ops: HashMap<u64, Open>,
-    pub budget: TokenBucket,
     /// A manager-to-manager session. It has no local pidfd and may bind its namespace on first
     /// use (Subscribe, PutBegin or GetBegin) instead of at Hello.
     pub remote: bool,
@@ -829,12 +780,6 @@ impl Store {
     pub fn session(&self, connection: u64) -> Option<&Session> {
         self.sessions.get(&connection)
     }
-    pub fn budget_balance(&self, connection: u64) -> Option<i64> {
-        self.sessions
-            .get(&connection)
-            .map(|session| session.budget.balance())
-    }
-
     pub fn hello(
         &mut self,
         connection: u64,
@@ -867,7 +812,6 @@ impl Store {
                 generation,
                 namespace: Some(id),
                 ops: HashMap::new(),
-                budget: TokenBucket::new(self.config.write_budget, Instant::now()),
                 remote: false,
             },
         );
@@ -898,7 +842,6 @@ impl Store {
                 generation,
                 namespace: None,
                 ops: HashMap::new(),
-                budget: TokenBucket::new(self.config.write_budget, Instant::now()),
                 remote: true,
             },
         );
@@ -1435,8 +1378,6 @@ impl Store {
                         let root_pins: Vec<Key> =
                             replacement.then_some(request.key).into_iter().collect();
                         match self.rootless_fallback(
-                            &child_header,
-                            &selected_pins,
                             &root_header,
                             root_pins,
                             arena_bytes,
@@ -1448,7 +1389,7 @@ impl Store {
                                     replacement.then_some(request.key).into_iter().collect();
                                 (root_header, None, root_pins, requirement)
                             }
-                            RootChoice::Wait(_, _) => {
+                            RootChoice::Wait => {
                                 self.metrics.retry_budget += 1;
                                 self.reject_put(&events, proto::Reason::Budget as u8);
                                 return;
@@ -1513,16 +1454,6 @@ impl Store {
         } else {
             None
         };
-        if !self.admit(connection, requirement.charge) {
-            drop(memory);
-            drop(staging_hold);
-            for key in &pins {
-                let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
-            }
-            self.metrics.retry_budget += 1;
-            self.reject_put(&events, proto::Reason::Budget as u8);
-            return;
-        }
         let temporary = if requirement.streaming {
             self.job_counter += 1;
             let job = self.job_counter;
@@ -1606,15 +1537,6 @@ impl Store {
         );
     }
 
-    fn admit(&mut self, connection: u64, bytes: u64) -> bool {
-        let now = Instant::now();
-        self.sessions
-            .get_mut(&connection)
-            .unwrap()
-            .budget
-            .admit(bytes, now)
-    }
-
     fn oldest(
         &self,
         eligible: impl Fn(&crate::tree::Node<Location>) -> bool,
@@ -1677,29 +1599,20 @@ impl Store {
             })
     }
 
-    /// Rootless fallback when the arena cannot hold the child beside its
-    /// parent: try to store the whole chain as one record, otherwise report
-    /// what the retry has to wait for. The caller has already refused a child
-    /// whose own extent exceeds the arena, so the child's shape is
-    /// structurally possible; a wait can succeed once unrelated records leave,
-    /// and only the child's own requirement and its protected parent are
-    /// waited on.
+    /// Try the whole chain when the arena cannot hold the child beside its parent.
     fn rootless_fallback(
         &mut self,
-        child: &Header,
-        child_pins: &[Key],
         root: &Header,
         root_pins: Vec<Key>,
         arena_bytes: u64,
     ) -> RootChoice {
         let requirement = self.put_requirement(root, arena_bytes);
         if requirement.streaming {
-            let waiting = self.put_requirement(child, arena_bytes);
-            return RootChoice::Wait(waiting, child_pins.to_vec());
+            return RootChoice::Wait;
         }
         match self.memory_room_excluding(root.length_with_row() as usize, false, &root_pins) {
             Some(extent) => RootChoice::Store(extent),
-            None => RootChoice::Wait(requirement, root_pins),
+            None => RootChoice::Wait,
         }
     }
 
@@ -4827,9 +4740,6 @@ impl Store {
     fn tick(&mut self) {
         self.note_reserved();
         let now = Instant::now();
-        for session in self.sessions.values_mut() {
-            session.budget.refill(now);
-        }
         if self.jobs.is_empty() {
             self.disk_progress = now;
         }
@@ -7276,7 +7186,6 @@ mod tests {
         );
         config.name = name.clone();
         config.staging = 8 * 1024 * 1024;
-        config.write_budget = 1024 * 1024;
         let mut store = Store::open(config).unwrap();
         let value = descriptor();
         store
@@ -7304,7 +7213,7 @@ mod tests {
         store.dispatch_trace();
         // The hold is two 16 KiB windows (32 KiB), not two negotiated 4 MiB
         // maxima, so both Puts stay in budget.
-        assert!(store.budget_balance(1).unwrap() >= 0);
+        assert!(store.sessions[&1].ops.contains_key(&1));
         store.submit_put(
             1,
             2,
@@ -7323,7 +7232,7 @@ mod tests {
             events,
         );
         store.dispatch_trace();
-        assert!(store.budget_balance(1).unwrap() >= 0);
+        assert!(store.sessions[&1].ops.contains_key(&2));
         drop(store);
         let _ = fs::remove_dir_all(base);
         let _ = fs::remove_dir_all(PathBuf::from("/dev/shm/selene").join(name));

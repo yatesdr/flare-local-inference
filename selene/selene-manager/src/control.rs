@@ -102,7 +102,6 @@ pub fn store_config(config: &crate::config::Config) -> Result<Config> {
     store.staging = usize::try_from(config.staging)
         .map_err(|_| invalid("--staging is too large for this host"))?;
     store.metrics = config.metrics.map(|address| address.to_string());
-    store.write_budget = config.write_budget;
     store.pool.source_wait = config.source_wait;
     store.pool.instance_retention = config.instance_retention;
     Ok(store)
@@ -118,7 +117,6 @@ fn local_config(config: &Config) -> crate::config::Config {
     local.nvme = config.nvme;
     local.staging = config.staging as u64;
     local.metrics = config.metrics.as_deref().and_then(|text| text.parse().ok());
-    local.write_budget = config.write_budget;
     local
 }
 

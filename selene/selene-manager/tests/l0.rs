@@ -699,40 +699,6 @@ fn l0_16_disk_queue_read_write_interleave() {
     fs::remove_dir_all(base).unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_17_write_budget_and_room() {
-    let base = base("budget");
-    let mut config = Config::new(
-        base.join("records"),
-        base.join("run/m.sock"),
-        64 * 1024 * 1024,
-        64 * 1024 * 1024,
-    );
-    config.name = instance_name("budget");
-    config.write_budget = 1024 * 1024;
-    let mut host = Host::open_config(config);
-    host.start();
-    let mut a = host.client().await;
-    a.store(key(128), None).await;
-    a.store(key(2048 * 64), None).await;
-    // Restores are never throttled by the write budget.
-    a.fetch(&[key(128)], 0, 2).await;
-    assert_eq!(
-        a.put(key(256), None, PutOptions::default()).await,
-        PutOutcome::Refused(v2::Reason::Budget as u8)
-    );
-    // selene.v2 does not push Room: the budget refills and the same put is admitted.
-    let _ = store_when_room(&mut a, key(256), None).await;
-    // Buckets are independent per writer.
-    let mut b = host.client().await;
-    b.store(key(384), None).await;
-    // 0 means unlimited.
-    let mut unlimited = Host::new(64 * 1024 * 1024, 64 * 1024 * 1024);
-    unlimited.start();
-    let mut c = unlimited.client().await;
-    c.store(key(2048 * 64), None).await;
-    c.store(key(2048 * 64 + 64), Some(key(2048 * 64))).await;
-}
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_18_descriptor_format_and_recovery_refusal() {
     let mut host = Host::new(1024 * 1024, 1024 * 1024);
     host.start();
@@ -1219,28 +1185,6 @@ async fn l0_32_streaming_reservation_includes_the_disk_record() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-}
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l0_33_write_budget_uses_the_streaming_charge() {
-    let base = base("stream-budget");
-    let mut config = Config::new(
-        base.join("records"),
-        base.join("run/m.sock"),
-        4096,
-        64 * 1024 * 1024,
-    );
-    config.name = instance_name("stream-budget");
-    config.write_budget = 1024 * 1024;
-    let mut host = Host::open_config(config);
-    host.start();
-    let mut client = host.client().await;
-    // 8 MiB streamed record: admitted with a negative balance.
-    client.store(key(2048 * 64), None).await;
-    assert_eq!(
-        client.put(key(256), None, PutOptions::default()).await,
-        PutOutcome::Refused(v2::Reason::Budget as u8)
-    );
-    let _ = store_when_room(&mut client, key(256), None).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_34_concurrent_nvme_gets_share_connection_credits() {
