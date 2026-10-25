@@ -315,9 +315,12 @@ impl Shared {
         *self.ranking.lock().unwrap() = ranking;
     }
 
+    pub(crate) fn observe_restore(&self, level: Level, pages: usize, elapsed: std::time::Duration) {
+        self.ranking.lock().unwrap().observe(level, pages, elapsed);
+    }
+
     /// Identifies the manager and link the session runs over; 0 while no session
-    /// is ready, because the pool levels cannot be timed before then and a change
-    /// of topology is what asks for a new measurement.
+    /// is ready. This identifies the topology timed by the startup probe.
     pub(crate) fn topology(&self) -> u64 {
         if self.status() != PoolStatus::Ready {
             return 0;

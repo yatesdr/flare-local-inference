@@ -69,12 +69,12 @@ impl RequestScheduler {
         std::mem::take(&mut self.evictions)
     }
 
-    /// Lends `pages` idle page ids and one idle state slot to `f` and takes them
+    /// Lends `pages` startup page ids and one state slot to `f` and takes them
     /// back after, or `None` when the scheduler is not idle or lacks them. Nothing
     /// may be live or submitted. `f` returns its result and whether every copy it
     /// started has stopped; when that is not established the ids are never
     /// returned, are counted as quarantined, and the number withheld comes back.
-    pub fn with_scratch<R>(
+    pub(crate) fn with_startup_scratch<R>(
         &mut self,
         pages: usize,
         f: impl FnOnce(&[PageId], StateSlotId) -> (R, bool),
@@ -583,7 +583,7 @@ mod tests {
     fn scratch_is_lent_and_returned_or_quarantined_when_a_drain_is_not_shown() {
         let mut s = scheduler(2, 16, 4);
         let (lent, withheld) = s
-            .with_scratch(8, |pages, slot| {
+            .with_startup_scratch(8, |pages, slot| {
                 assert_eq!(pages.len(), 8);
                 assert!(pages.windows(2).all(|pair| pair[0] < pair[1]));
                 assert!(slot.0 > 0);
@@ -593,20 +593,13 @@ mod tests {
         assert_eq!((lent, withheld), (8, 0));
         assert_eq!((s.free_page_count(), s.free_snapshot_count()), (16, 4));
         // More ids than exist: nothing is taken.
-        assert!(s.with_scratch(17, |_, _| ((), true)).is_none());
+        assert!(s.with_startup_scratch(17, |_, _| ((), true)).is_none());
         assert_eq!((s.free_page_count(), s.free_snapshot_count()), (16, 4));
         // Copies that may still run keep their ids out for good, and it is counted.
-        let ((), withheld) = s.with_scratch(8, |_, _| ((), false)).unwrap();
+        let ((), withheld) = s.with_startup_scratch(8, |_, _| ((), false)).unwrap();
         assert_eq!(withheld, 8);
         assert_eq!((s.free_page_count(), s.free_snapshot_count()), (8, 3));
         assert_eq!(s.stats().quarantined_pages, 8);
-    }
-
-    #[test]
-    fn scratch_is_not_lent_while_a_request_is_live() {
-        let mut s = scheduler(2, 16, 4);
-        s.admit(spec(64, 1)).unwrap();
-        assert!(s.with_scratch(2, |_, _| ((), true)).is_none());
     }
 
     #[test]

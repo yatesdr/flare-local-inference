@@ -141,7 +141,7 @@ impl Drop for Generation {
 /// set just above that p99, with room for a loaded host.
 const POOL_LOOKUP_GRACE_NS: u64 = 2_000_000;
 
-/// Idle page ids the pool's characterization probes copy into.
+/// Startup page ids the pool's characterization probe copies into.
 const CHARACTERIZATION_PAGES: usize = 64;
 /// Longest wait for a probe's copies to be reaped before they count as undrained.
 const DRAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -543,7 +543,6 @@ impl ModelRuntime {
                     queue_capacity,
                 );
                 worker.attach_store(store);
-                worker.characterize_pool();
                 if worker.config.contract.vision.enabled() {
                     worker.image_preparation = Some(ImagePreparation::new(worker_input_store));
                 }
@@ -876,8 +875,7 @@ struct Worker<'a> {
     /// place an export's pin is released.
     exports: HashMap<crate::offload::ExportId, crate::cache::CheckpointId>,
     store_progress: u64,
-    /// The pool's copy levels are not measured again: no idle ids, or a probe failed.
-    characterization_off: bool,
+    pool_characterized: bool,
     /// Prefill tokens per second measured from completed prefill frames, which
     /// the host-store fetch policy compares with transfer time.
     prefill_rate: f64,
@@ -909,7 +907,7 @@ impl<'a> Worker<'a> {
             deferred_stores: Vec::new(),
             exports: HashMap::new(),
             store_progress: 0,
-            characterization_off: false,
+            pool_characterized: false,
             pending: VecDeque::with_capacity(queue_capacity),
             parked: VecDeque::new(),
             active: (0..config.limits.max_active).map(|_| None).collect(),
@@ -975,7 +973,6 @@ impl<'a> Worker<'a> {
                     std::hint::spin_loop();
                     thread::yield_now();
                 } else {
-                    self.characterize_pool();
                     self.scheduler.idle()?;
                     // A request holding for its pool lookup is retried well within the hold.
                     let now_ns = super::observation::monotonic_ns();
@@ -1001,16 +998,16 @@ impl<'a> Worker<'a> {
             self.scheduler.enable_evictions();
         }
         self.store = store;
+        self.characterize_pool();
     }
 
-    /// Measure the pool's copy levels when the store asks (at startup, and again
-    /// when the topology changed) and only while nothing runs, so the idle page
-    /// ids and state slot it needs are free and no transfer is in flight. The
-    /// ids come from the free lists and return to them before this returns,
-    /// unless a copy into them cannot be shown to have stopped: then they are
-    /// withheld for good and counted. A probe never stops serving; a failed one
-    /// leaves the default copy order and is not retried.
+    /// Measure once when the store opens, before admission. Undrained scratch
+    /// remains quarantined; failure leaves the default order and serving proceeds.
     fn characterize_pool(&mut self) {
+        if self.pool_characterized {
+            return;
+        }
+        self.pool_characterized = true;
         let Some(store) = self
             .store
             .as_mut()
@@ -1018,49 +1015,34 @@ impl<'a> Worker<'a> {
         else {
             return;
         };
-        let stats = store.stats();
-        if self.characterization_off
-            || self.active.iter().any(Option::is_some)
-            || !self.pending.is_empty()
-            || !self.parked.is_empty()
-            || !self.exports.is_empty()
-            || !self.deferred_stores.is_empty()
-            || stats.outbound_in_flight != 0
-            || stats.inbound_in_flight != 0
-        {
-            return;
-        }
         let started = std::time::Instant::now();
-        let measured = self
-            .scheduler
-            .with_scratch(CHARACTERIZATION_PAGES, |pages, slot| {
-                let result = store.characterize(&crate::offload::Scratch {
-                    pages: pages.to_vec(),
-                    slot,
+        let measured =
+            self.scheduler
+                .with_startup_scratch(CHARACTERIZATION_PAGES, |pages, slot| {
+                    let result = store.characterize(&crate::offload::Scratch {
+                        pages: pages.to_vec(),
+                        slot,
+                    });
+                    // The probe's own copies may still be draining after a timeout or error.
+                    let deadline = std::time::Instant::now() + DRAIN_WAIT;
+                    while !store.copies_drained() && std::time::Instant::now() < deadline {
+                        thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    (result, store.copies_drained())
                 });
-                // The probe's own copies may still be draining after a timeout or error.
-                let deadline = std::time::Instant::now() + DRAIN_WAIT;
-                while !store.copies_drained() && std::time::Instant::now() < deadline {
-                    thread::sleep(std::time::Duration::from_millis(1));
-                }
-                (result, store.copies_drained())
-            });
         let Some((result, withheld)) = measured else {
-            self.characterization_off = true;
             return;
         };
         match result {
             Ok(Some(line)) => eprintln!("prefix cache pool: {line} ({:?})", started.elapsed()),
             Ok(None) => {}
             Err(error) => {
-                self.characterization_off = true;
                 eprintln!(
                     "prefix cache pool: characterization failed, keeping the default copy order: {error}"
                 );
             }
         }
         if withheld != 0 {
-            self.characterization_off = true;
             eprintln!(
                 "prefix cache pool: {withheld} page ids and one state slot are withheld for good, \
                  because copies into them could not be shown to have stopped"

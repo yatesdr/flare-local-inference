@@ -778,6 +778,7 @@ fn windows_for(rig: &mut Rig, claim: u64) -> Vec<wire::ClientMessage> {
 fn a_restore_copies_every_window_releases_after_the_drain_and_reports_after_the_terminal() {
     let mut rig = Rig::new();
     rig.open();
+    let ranking = rig.shared.ranking();
     let (_, claim) = granted_single(&mut rig);
     let out = windows_for(&mut rig, claim);
     assert!(
@@ -807,6 +808,7 @@ fn a_restore_copies_every_window_releases_after_the_drain_and_reports_after_the_
         fetched(&rig.events()).is_empty(),
         "COPIED is the manager's word"
     );
+    assert_eq!(rig.shared.ranking(), ranking);
     {
         let copier = rig.copier.lock().unwrap();
         let sent = pattern(1, 2 * PAGE as usize);
@@ -829,6 +831,7 @@ fn a_restore_copies_every_window_releases_after_the_drain_and_reports_after_the_
     ));
     let events = rig.events();
     assert_eq!(fetched(&events), [(1, Ok(3 * PAGE + ROW))]);
+    assert_ne!(rig.shared.ranking(), ranking);
 }
 
 #[test]
@@ -861,6 +864,7 @@ fn records_that_do_not_match_the_plan_are_abandoned_after_nothing_was_copied() {
 fn a_corrupt_window_is_never_copied_and_the_restore_fails_with_a_checksum_verdict() {
     let mut rig = Rig::new();
     rig.open();
+    let ranking = rig.shared.ranking();
     let (_, claim) = granted_single(&mut rig);
     let mut w0 = ready(&rig, claim, window(0, 0, 0, 2, false, 0), 1);
     // Corrupt the persisted bytes after the source computed its checksums.
@@ -887,6 +891,7 @@ fn a_corrupt_window_is_never_copied_and_the_restore_fails_with_a_checksum_verdic
         pick!(out, FenceAck)[0].outcome,
         wire::FenceOutcome::Drained as i32
     );
+    assert_eq!(rig.shared.ranking(), ranking);
 }
 
 #[test]
