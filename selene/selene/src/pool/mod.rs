@@ -24,6 +24,7 @@ mod manager_tests;
 pub(crate) mod net;
 pub(crate) mod pins;
 mod probe;
+mod peers;
 mod options;
 mod records;
 pub mod rank;
@@ -54,6 +55,7 @@ pub use exporter::{Checksums, HostChain, HostPin, HostRecord, HostWindow, PutByt
 pub use identity::{Geometry, RankPlanes, Scope, instance_id, process_nonce, scope_id};
 pub use local::Tiers;
 pub use lookup::{Answer, LookupState, LookupTicket};
+pub use peers::{PoolOffer, PoolPeers, pool_rank_zero, pool_peer};
 pub use pins::{FilePin, MemoryPin};
 pub use rank::{FrameReceiver, FrameSender, RankLink, RankSet};
 pub use shared::{
