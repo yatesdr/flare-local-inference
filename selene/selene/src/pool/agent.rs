@@ -588,7 +588,9 @@ impl Agent {
             tls,
             staging: self.staging.clone().expect("made above"),
             events: self.net_events.clone(),
-            rdma_offered: false,
+            rdma_offered: hello
+                .data_transports
+                .contains(&(wire::DataTransport::Rdma as i32)),
             rdma_broken: Arc::default(),
         }));
         Ok(())

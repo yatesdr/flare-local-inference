@@ -251,6 +251,9 @@ pub fn serve(
         channel,
         regions: Some(regions.clone()),
     };
+    if let Some(hub) = &pool_config.channel {
+        hub.set_packed(staging_arena.clone());
+    }
     let (pool_core, pool_handle, pool_events) = crate::pool::Core::new(
         pool_config,
         shm,
