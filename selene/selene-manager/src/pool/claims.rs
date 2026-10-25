@@ -100,6 +100,8 @@ pub struct Claim {
     pub block: Option<Extent>,
     pub windows: Vec<Win>,
     pub requester_fence: Party,
+    /// The requester reported exact coverage; completion still waits for every drain.
+    pub verdict_latched: bool,
     pub granted_at: Option<Instant>,
     pub page_bytes: u64,
     pub row_bytes: u64,
@@ -134,9 +136,6 @@ pub struct ManagerGet {
     pub starts: Vec<u64>,
     /// The store has finished its reads into the windows (its drain).
     pub done: bool,
-    /// The requester's exact COPY_OK arrived before the store's drain; the claim
-    /// completes when `done` does.
-    pub copied: bool,
     pub transfer_released: bool,
 }
 
@@ -590,6 +589,7 @@ impl Core {
             block,
             windows: Vec::new(),
             requester_fence: Party::Drained,
+            verdict_latched: false,
             granted_at: None,
             page_bytes: geometry.page_bytes,
             row_bytes: geometry.row_bytes,
@@ -773,6 +773,7 @@ impl Core {
             block: None,
             windows: Vec::new(),
             requester_fence: Party::Drained,
+            verdict_latched: false,
             granted_at: None,
             page_bytes: geometry.page_bytes,
             row_bytes: geometry.row_bytes,
@@ -788,7 +789,6 @@ impl Core {
                     })
                     .collect(),
                 done: false,
-                copied: false,
                 transfer_released: false,
             }),
             channel: channel.map(|(transfer, token)| Channel {
@@ -1005,10 +1005,8 @@ impl Core {
                 );
             }
             Ok(GetAnswer::Done) => {
-                let mut copied = false;
                 if let Some(manager) = claim.manager.as_mut() {
                     manager.done = true;
-                    copied = manager.copied;
                 }
                 // Every window is queued: the handler ends the transfer after them.
                 if let Some((open, hub)) = claim.channel.as_ref().zip(self.cfg.channel.as_ref()) {
@@ -1019,13 +1017,7 @@ impl Core {
                         hub.finish(leg.ch.transfer);
                     }
                 }
-                if copied && !terminal {
-                    if claim.legs_pending() {
-                        claim.mp.copy_ok = true;
-                    } else {
-                        self.finish(key, v2::ClaimState::Copied, v2::ClaimReason::ReasonNone);
-                    }
-                }
+                self.complete_if_latched(key);
             }
             Ok(GetAnswer::Refused(refused)) => {
                 let reason = match refused.reason {
@@ -1072,6 +1064,7 @@ impl Core {
             block: None,
             windows: Vec::new(),
             requester_fence: Party::Drained,
+            verdict_latched: false,
             granted_at: None,
             page_bytes: 0,
             row_bytes: 0,
@@ -1636,26 +1629,9 @@ impl Core {
                     claim.all_windows_done()
                 };
                 let complete = covered && exact && windows_done && !claim.windows.is_empty();
-                let store_done = claim.manager.as_ref().is_none_or(|manager| manager.done);
-                let legs_pending = claim.legs_pending();
-                if complete && store_done && legs_pending {
-                    // Every peer rank's leg must have delivered its slices too: the claim
-                    // completes when the last of them reports.
-                    if let Some(claim) = self.claims.get_mut(&key) {
-                        claim.mp.copy_ok = true;
-                    }
-                } else if complete && store_done {
-                    self.finish(key, v2::ClaimState::Copied, v2::ClaimReason::ReasonNone);
-                } else if complete {
-                    // The copy is exact; the store has not yet reported that its own reads
-                    // into the windows have drained. Completing waits for that.
-                    if let Some(manager) = self
-                        .claims
-                        .get_mut(&key)
-                        .and_then(|claim| claim.manager.as_mut())
-                    {
-                        manager.copied = true;
-                    }
+                if complete {
+                    self.claims.get_mut(&key).unwrap().verdict_latched = true;
+                    self.complete_if_latched(key);
                 } else {
                     self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
                 }
@@ -2100,7 +2076,7 @@ impl Core {
         let Some(claim) = self.claims.get(&key) else {
             return;
         };
-        if claim.is_terminal() || !claim.mp.copy_ok || claim.legs_pending() {
+        if claim.is_terminal() || !claim.verdict_latched || claim.legs_pending() {
             return;
         }
         if claim.manager.as_ref().is_some_and(|manager| !manager.done) {
@@ -2632,6 +2608,7 @@ mod tests {
                     arrived: false,
                 }],
                 requester_fence: Party::Pending,
+                verdict_latched: false,
                 granted_at: Some(now),
                 page_bytes: 4096,
                 row_bytes: 4096,
@@ -2640,7 +2617,6 @@ mod tests {
                     meta: Default::default(),
                     starts: vec![0],
                     done: false,
-                    copied: false,
                     transfer_released: false,
                 }),
                 channel: None,
@@ -2934,7 +2910,7 @@ mod tests {
             !core.claims[&key].is_terminal(),
             "rank 2's leg has not finished reading"
         );
-        assert!(core.claims[&key].mp.copy_ok);
+        assert!(core.claims[&key].verdict_latched);
         core.reader_done(key, 0, 2);
         assert_eq!(core.claims[&key].state, v2::ClaimState::Copied);
     }
