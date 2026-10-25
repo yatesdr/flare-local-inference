@@ -150,6 +150,9 @@ impl Drop for MemoryPin {
     }
 }
 
+/// Records of fewer bytes than this are read through the page cache.
+const MIN_AHEAD_BYTES: u64 = 2 * 4 << 20;
+
 /// One pinned record file.
 pub(crate) struct FileSpan {
     pub path: PathBuf,
@@ -222,14 +225,16 @@ impl HostPin for FilePin {
         let header = span.header.clone();
         let open = span.open.as_mut().expect("opened");
         if count > 0 {
-            let ahead_ok = (page_bytes.is_multiple_of(BLOCK_BYTES)
-                && pages_at.is_multiple_of(BLOCK_BYTES))
-            .then_some(());
-            // Reading ahead starts at the first window read of the record and runs to the end
-            // of the pages this export takes. A window that does not follow the last (or a
-            // filesystem that refuses direct I/O) is read through the cache.
-            if open.ahead.is_none() && ahead_ok.is_some() {
-                let end = header.page_segment + u64::from(record_first + record_pages) * page_bytes;
+            let end = header.page_segment + u64::from(record_first + record_pages) * page_bytes;
+            // Reading ahead starts at the first window read of a record and runs to the end
+            // of the pages this export takes. It pays for the thread and ring only on a
+            // record of several blocks; a window that does not follow the last, a record
+            // too small to gain from it and a filesystem that refuses direct I/O are read
+            // through the cache.
+            let ahead_ok = page_bytes.is_multiple_of(BLOCK_BYTES)
+                && pages_at.is_multiple_of(BLOCK_BYTES)
+                && end - pages_at >= MIN_AHEAD_BYTES;
+            if open.ahead.is_none() && ahead_ok {
                 open.ahead = crate::os::direct_file(&span.path, false)
                     .ok()
                     .and_then(|direct| ReadAhead::start(direct, pages_at, end).ok());
@@ -268,6 +273,12 @@ impl HostPin for FilePin {
         } else {
             None
         };
+        // The record's pages are all served: its file, thread and ring are not kept for the
+        // rest of the export. A chain of many records otherwise holds a descriptor or two and
+        // a thread for each until the export ends.
+        if window.first_page + window.page_count >= record_first + record_pages {
+            self.spans[window.record as usize].open = None;
+        }
         Ok(Checksums { pages, row })
     }
 }
@@ -478,6 +489,100 @@ mod tests {
         check(19, 5, false);
         check(14, 5, false);
         check(24, 16, true);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_pin_over_many_records_keeps_open_only_the_record_it_is_reading() {
+        let base = std::env::var_os("FLARE_OFFLOAD_TEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let directory = base.join(format!("flare-file-pin-many-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let geometry = [crate::testing::geometry(
+            16,
+            &[("k", 4096), ("v", 4096)],
+            4096,
+        )];
+        let page = 8192u64;
+        // One record file stands for every record of a long chain; a record of 1500 pages
+        // (12 MiB) is read ahead, the small ones are not.
+        let shape = |pages: u32| {
+            let mut header = Header::new(
+                &geometry,
+                [1; 32],
+                [2; 16],
+                key(16 * u64::from(pages), 9),
+                None,
+                [3; 16],
+                pages,
+                std::time::SystemTime::now(),
+            )
+            .unwrap();
+            header.row_checksum = 0;
+            let mut file = vec![0u8; header.length_with_row() as usize];
+            file[..crate::record::HEADER_BYTES].copy_from_slice(&header.encode().unwrap());
+            (header, file)
+        };
+        let (small, small_file) = shape(4);
+        let (large, large_file) = shape(1500);
+        let small_path = directory.join("small");
+        let large_path = directory.join("large");
+        std::fs::write(&small_path, small_file).unwrap();
+        std::fs::write(&large_path, large_file).unwrap();
+        let mut records = Vec::new();
+        let mut spans = Vec::new();
+        for index in 0..400u32 {
+            let (path, header, pages) = if index % 100 == 99 {
+                (&large_path, &large, 1500)
+            } else {
+                (&small_path, &small, 4)
+            };
+            records.push(HostRecord {
+                key: key(1000 + u64::from(index), 1),
+                generation: 1,
+                first_page: 0,
+                pages,
+                row: false,
+            });
+            spans.push(FileSpan::new(path.clone(), header.clone()));
+        }
+        let mut pin = FilePin {
+            chain: HostChain {
+                total_pages: records.iter().map(|r| u64::from(r.pages)).sum(),
+                row: false,
+                records,
+            },
+            spans,
+            page_bytes: page,
+            row_bytes: 4096,
+            keys: Vec::new(),
+            releases: Releases::default(),
+        };
+        let mut dst = vec![0u8; 500 * page as usize];
+        for record in 0..400u32 {
+            let pages = pin.chain.records[record as usize].pages;
+            let mut first = 0;
+            while first < pages {
+                let count = (pages - first).min(500);
+                let window = HostWindow {
+                    record,
+                    first_page: first,
+                    page_count: count,
+                    row: false,
+                };
+                pin.read(&window, &mut dst[..count as usize * page as usize])
+                    .unwrap();
+                first += count;
+                let open = pin.spans.iter().filter(|span| span.open.is_some()).count();
+                assert!(open <= 1, "{open} records held open at record {record}");
+            }
+            assert!(
+                pin.spans.iter().all(|span| span.open.is_none()),
+                "record {record} was left open once its pages were read"
+            );
+        }
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
