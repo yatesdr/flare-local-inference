@@ -46,6 +46,16 @@ impl wire::pool_server::Pool for Server {
     }
 
     type SessionStream = Replies;
+    type RankStream = Pin<
+        Box<dyn Stream<Item = std::result::Result<wire::RankServerMessage, tonic::Status>> + Send>,
+    >;
+
+    async fn rank(
+        &self,
+        _: tonic::Request<tonic::Streaming<wire::RankClientMessage>>,
+    ) -> std::result::Result<tonic::Response<Self::RankStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("no rank agents here"))
+    }
 
     async fn session(
         &self,

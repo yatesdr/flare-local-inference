@@ -516,6 +516,7 @@ impl Core {
                         parent: accept.parent.map(key_to),
                         record_bytes: accept.record_bytes,
                         channel,
+                        rank_channels: Vec::new(),
                     }),
                 );
             }

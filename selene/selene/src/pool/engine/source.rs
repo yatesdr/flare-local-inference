@@ -516,6 +516,7 @@ impl Engine {
             page_xxh3: Vec::new(),
             row_xxh3: 0,
             has_row: false,
+            rank_sums: Vec::new(),
         }));
     }
 
@@ -613,6 +614,7 @@ impl Engine {
             page_xxh3: sums.pages,
             row_xxh3: sums.row.unwrap_or(0),
             has_row: sums.row.is_some(),
+            rank_sums: Vec::new(),
         }));
     }
 

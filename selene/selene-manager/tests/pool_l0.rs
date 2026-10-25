@@ -717,7 +717,10 @@ async fn l1b_records_shorter_than_a_block_do_not_crowd_out_a_long_history_s_cand
     let reply = c_session.lookup(1, 5000, vec![]).await;
     let found = candidates_of(&reply);
     assert_eq!(found.len(), 3, "{found:?}");
-    assert!(found.iter().all(|(_, _, tokens)| *tokens >= 1024), "{found:?}");
+    assert!(
+        found.iter().all(|(_, _, tokens)| *tokens >= 1024),
+        "{found:?}"
+    );
     // A history shorter than a block has only the root bucket, so it still sees them.
     let reply = c_session.lookup(2, 500, vec![]).await;
     assert_eq!(candidates_of(&reply).len(), 8, "capped at max_candidates");

@@ -69,6 +69,10 @@ package selene.v2;
 service Pool {
   // Stateless. Safe to retry. Never changes manager state.
   rpc Hello(HelloRequest) returns (HelloReply);
+  // The data-only attachment of one peer rank of a multi-process instance
+  // (tensor-parallel ranks that are separate processes). One stream per agent
+  // process. See "Rank agents" below.
+  rpc Rank(stream RankClientMessage) returns (stream RankServerMessage);
   // Exactly one live Session per instance_id per manager incarnation. The first
   // ClientMessage must be `open`; the first ServerMessage is `opened`.
   rpc Session(stream ClientMessage) returns (stream ServerMessage);
@@ -413,6 +417,12 @@ message OpenSession {
   // How many claims this instance wants in flight; granted as
   // min(this, Limits.max_claims_in_flight). 0 means requester role off.
   uint32 claim_slots = 6;
+  // 32 random bytes. Non-empty marks a multi-process instance: its tensor-parallel
+  // ranks are separate processes, `scope.geometry.ranks` has one entry per rank (at
+  // least two), and this session is rank 0. Rank 0 alone decides (looks up, claims,
+  // puts, answers exports); each other rank attaches with `Rank` using this secret
+  // and moves only its own slice. See "Rank agents".
+  bytes rank_secret = 8;
 }
 
 enum OpenStatus {
@@ -826,6 +836,8 @@ enum ClaimReason {
   DEADLINE = 21;              // with state EXPIRED.
   NO_PROGRESS = 22;           // with state EXPIRED.
   UNKNOWN_CLAIM = 23;         // the manager has no such claim (after a manager restart, or a late release).
+  RANKS_DETACHED = 24;        // a peer rank of a multi-process instance is not attached (refused at once).
+  RANK_LOST = 25;             // an attached peer rank's stream ended during the transfer.
 }
 
 // Hold granted. Sent only after the source's PinAck (for a manager-store source,
@@ -855,6 +867,9 @@ message ClaimGranted {
   // checked by the source against the actual chain), else refused NO_WINDOWS at
   // once. A host-tier source (DRAM, NVMe) may stream with credits.
   bool retained = 7;
+  // A multi-process requester: the channel of each peer rank that is in channel mode
+  // (rank 0's is `channel`).
+  repeated RankChannel rank_channels = 8;
 }
 
 // Where a data-channel transfer is served. The byte framing of the channel is
@@ -903,6 +918,10 @@ message WindowReady {
   repeated uint64 page_xxh3 = 3;   // one per page, in order.
   uint64 row_xxh3 = 4;
   bool has_row = 5;
+  // A multi-process requester: each rank's slice transfer checksums, computed by the
+  // manager in one pass with its verification of the stored sums. `page_xxh3` and
+  // `row_xxh3` are then empty.
+  repeated RankSums rank_sums = 6;
 }
 
 // The requester finished reading the window: every copy that read it has
@@ -1008,6 +1027,8 @@ message ExportRequest {
   // on to the requester. No ExportFill is sent and no WindowFilled expected:
   // the windows are granted, and their checksums stated, on the channel.
   DataChannelRef channel = 12;
+  // A multi-process source: the channel of each peer rank that is in channel mode.
+  repeated RankChannel rank_channels = 13;
 }
 
 enum PinResult {
@@ -1054,6 +1075,10 @@ message WindowFilled {
   repeated uint64 page_xxh3 = 4;
   uint64 row_xxh3 = 5;
   bool has_row = 6;
+  // A multi-process source: the slice transfer checksums of the ranks this session
+  // attests (rank 0 and the peers that fill the window in shared memory). The other
+  // ranks state theirs on their own channel. `page_xxh3` and `row_xxh3` are empty.
+  repeated RankSums rank_sums = 7;
 }
 
 // Stop and release. Sent on any terminal state, on late pin, and when the
@@ -1137,6 +1162,8 @@ message PutAccept {
   PrefixKey parent = 4;
   uint64 record_bytes = 5;
   DataChannelRef channel = 6;      // DATA_CHANNEL only.
+  // A multi-process writer: the channel of each peer rank that is in channel mode.
+  repeated RankChannel rank_channels = 7;
 }
 
 // A window to fill, STAGING or ARENA region. At most Limits.window_credits
@@ -1153,6 +1180,8 @@ message PutFilled {
   repeated uint64 page_xxh3 = 3;
   uint64 row_xxh3 = 4;
   bool has_row = 5;
+  // A multi-process writer: as WindowFilled.rank_sums.
+  repeated RankSums rank_sums = 6;
 }
 
 // Concatenated in offset order, the first 4096 bytes are the record header and
@@ -1190,3 +1219,111 @@ message PutRefused {
 // later eviction attempts only: a refused put is not retried on Room; the record
 // has already moved to the next tier. Pushed once, never periodically.
 message Room { uint64 bytes = 1; }
+
+// ---------------------------------------------------------------------------
+// Rank agents: instances whose tensor-parallel ranks are separate processes
+// ---------------------------------------------------------------------------
+//
+// Rank 0 opens the one Session (OpenSession.rank_secret set) and decides
+// everything. Each other rank runs an agent that attaches with `Rank` and moves
+// only its own slice of every window: the slice of rank r of page i of a window is
+// at i * page_record_bytes + (the sum of the padded rank sizes before r), as
+// Geometry.ranks lays out a record. Records at rest are the ordinary composite
+// records (one checksum per page, one for the row): slices exist only in flight,
+// with transfer checksums (RankSums) the manager computes or verifies.
+//
+// An agent is in shared mode (it reads and writes the manager's shared windows in
+// place; window coordinates reach it through rank 0) or channel mode (its own data
+// channel, named in a `rank_channels` entry). The manager decides from the
+// connection (RankAttached.mode). Obligations belong to the agent's own identity
+// (instance_id, agent_nonce), never to "rank r": a replacement attachment
+// inherits and clears nothing.
+
+// Transfer checksums of one rank's slice of a window. Never stored.
+message RankSums {
+  uint32 rank = 1;
+  repeated uint64 page_xxh3 = 2;   // one per page of the window, in order.
+  uint64 row_xxh3 = 3;
+  bool has_row = 4;
+}
+
+// A peer rank's data channel for one transfer. Rank 0's is the message's own `channel`.
+message RankChannel {
+  uint32 rank = 1;
+  DataChannelRef channel = 2;
+}
+
+enum RankMode {
+  RANK_MODE_UNSPECIFIED = 0;
+  RANK_SHARED = 1;
+  RANK_CHANNEL = 2;
+}
+
+enum RankAttachStatus {
+  RANK_ATTACH_STATUS_UNSPECIFIED = 0;
+  RANK_OK = 1;
+  RANK_STALE_MANAGER = 2;
+  RANK_NO_SESSION = 3;            // rank 0 has not opened (or was superseded): retry with backoff.
+  RANK_BAD_SECRET = 4;
+  RANK_BAD_RANK = 5;              // out of range, or held by another live agent.
+  RANK_MIXED_MODE = 6;            // channel mode is required but the manager serves no data listener.
+  RANK_DRAIN_ONLY_REFUSED = 7;    // a drain-only attach names no retained obligation.
+}
+
+message RankClientMessage {
+  oneof m {
+    RankAttach attach = 1;
+    RankFence fence = 2;
+    RankGoodbye goodbye = 3;
+  }
+}
+
+message RankAttach {
+  uint64 manager_incarnation = 1;
+  bytes instance_id = 2;       // rank 0's.
+  bytes rank0_nonce = 3;       // rank 0's process_nonce.
+  uint32 rank = 4;             // 1 .. ranks-1.
+  bytes agent_nonce = 5;       // 16 random bytes, fresh per agent process.
+  bytes rank_secret = 6;
+  // Reconnect after rank 0's session ended, to discharge retained obligations only:
+  // no transfer is ever granted to a drain-only attachment.
+  bool drain_only = 7;
+  string name = 8;             // log only.
+}
+
+// The agent's own drain attestation for one transfer. The only thing besides
+// RankGoodbye{quiesced} and the process's exit that clears this agent's
+// obligations on shared windows.
+message RankFence {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    CLAIM = 1;    // id = claim_id of rank 0's session
+    EXPORT = 2;   // id = export_id
+    PUT = 3;      // id = put_id of rank 0's session
+  }
+  Kind kind = 1;
+  uint64 id = 2;
+  FenceOutcome outcome = 3;
+}
+
+message RankGoodbye { bool quiesced = 1; }
+
+message RankServerMessage {
+  oneof m {
+    RankAttached attached = 1;
+    RankClosing closing = 2;
+  }
+}
+
+message RankAttached {
+  RankAttachStatus status = 1;
+  // Assigned from the session-incarnation counter. A transfer is bound to it.
+  uint64 generation = 2;
+  RankMode mode = 3;
+}
+
+// The agent must stop work, drain, send its RankFences and RankGoodbye, and end.
+message RankClosing {
+  ClosingReason reason = 1;
+  string detail = 2;
+}
