@@ -189,7 +189,7 @@ pub struct Prepared {
     pub directory_lock: Option<record::DirectoryLock>,
     /// Rank zero's record connection to each peer rank, ranks 1 onward, when the ranks run as
     /// separate processes; see [`shard`].
-    pub(crate) shards: Vec<shard::Link>,
+    pub(crate) shards: Vec<flare_selene::shard::Link>,
     pub(crate) pool: Option<pool::PreparedPool>,
 }
 

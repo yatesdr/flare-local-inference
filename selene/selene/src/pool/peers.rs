@@ -3,10 +3,10 @@ use crate::{
     Error, Result,
     geometry::invalid,
     record,
-    shard::{BUSY, IDLE, Link, Reader, Writer, receive_frame},
+    shard::{BUSY, IDLE, Link, Reader, Writer, receive_frame, nonce},
 };
 use std::{
-    io::{ErrorKind, Read},
+    io::ErrorKind,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     time::{Duration, Instant},
 };
@@ -250,13 +250,6 @@ impl Link {
     }
 }
 
-fn nonce() -> Result<[u8; 16]> {
-    let mut random = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut source| source.read_exact(&mut random))
-        .map_err(|error| record::io_failure("read a prefix record token", error))?;
-    Ok(random)
-}
 #[cfg(test)]
 mod tests {
 
