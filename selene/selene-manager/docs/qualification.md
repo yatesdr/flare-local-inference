@@ -12,8 +12,8 @@ client (`tests/support/pool.rs`) and never model the manager's state machine.
 
 | Suite | What it proves |
 |---|---|
-| Unit (`src/**`) | Modules in isolation: the index and chain walks, window planning, the instance-list file, configuration, the record format, the arena, the disk worker, the store's admission and eviction rules, the data-channel modules, and the store-claim completion order. |
-| `tests/pool_l0.rs` | Hello, sessions and supersede, notices, generations, resync (every failure), lookup, readiness and the restart barrier, limits, shutdown drain. |
+| Unit (`src/**`) | Modules in isolation: the index and chain walks, window planning, configuration, the record format, the arena, the disk worker, the store's admission and eviction rules, the data-channel modules, and the store-claim completion order. |
+| `tests/pool_l0.rs` | Hello, sessions and supersede, notices, generations, live resync, lookup, recovery readiness, limits, shutdown drain. |
 | `tests/pool_claims.rs` | Claims between instances: retained and streamed copies byte for byte through the shared staging region, every refusal, timeouts, races, fencing and quarantine, Goodbye, stream blips, process replacement, and a real peer process that is killed or hung. |
 | `tests/pool_store.rs` | Put into the manager's store and claims on its records: persisted checksums, recovered NVMe records, damage at rest, a requester whose stream drops, put cancel and fence. |
 | `tests/pool_net.rs` | The network listener: sessions without shared memory, level-5 candidates, refusal of shared windows, TLS declared and RDMA withheld, the startup warnings and the refusal of RDMA with TLS. |
@@ -56,7 +56,7 @@ Client engine tests cover mutations following the snapshot cut and queue overflo
 **Lookup.** L1 to L3 `l1_to_l3_ordering_trimming_and_the_requesters_own_entries`;
 L4 `l4_instance_candidates_need_shared_memory_on_both_sides`, `l4_and_a22_remote_sessions_see_only_the_managers_records_as_level_five`;
 L5 to L8 `l5_to_l8_holes_limits_and_validation`, `x4_batch_chunk_and_chain_limits_are_enforced`;
-L9 `l9_not_ready_answers_with_a_retry_hint`; L10 to L15 client; A22 as L4.
+client tests cover the not-ready lookup response.
 
 **Claim state machine.** C1 `c1_a_gpu_chain_is_copied_through_retained_windows`, `c1b_small_windows_cut_records_and_carry_the_row_last`;
 C2 `c2_a_host_tier_claim_larger_than_staging_streams_with_credits`; C3 `u1_and_c3_a_put_is_stored_indexed_and_served_to_a_claim`;
@@ -106,9 +106,9 @@ the claim fails `COPY_ERROR`; a window streamed straight from NVMe would be serv
 A9 `u2_u8_...`; A10 `a10_...`; A11 `a11_...`; A21 `a21_a_pin_larger_than_the_reservation_fails_no_windows`;
 A3, A4, A12, A14, A16 to A20 client/Flare.
 
-**Stable instance id.** S2 `r2_r3_and_s2_...`; S3 `h10_...`, `s4_and_s7_...`; S4, S7 `s4_and_s7_...`;
+**Stable instance id.** S3 `h10_...`, `s4_and_s7_...`; S4, S7 `s4_and_s7_...`;
 S5, S6, S9 `s5_and_s6_the_predecessors_entries_are_hidden_until_the_new_snapshot`;
-S8 `s8_a_changed_instance_id_does_not_satisfy_the_barrier_and_ages_out`; S1 client.
+Recovery readiness is covered by `restart_serves_after_recovery_without_waiting_for_old_instances`; S1 client.
 
 ## Limitations
 

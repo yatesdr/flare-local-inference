@@ -2,13 +2,11 @@
 //!
 //! This module is self-contained so it can be unit-tested without starting a manager.
 
-use std::{io, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{io, net::SocketAddr, path::PathBuf};
 
 pub const DEFAULT_NAME: &str = "default";
 pub const DEFAULT_MEMORY: u64 = 1 << 30;
 pub const DEFAULT_STAGING: u64 = 4 << 30;
-pub const DEFAULT_SOURCE_WAIT: Duration = Duration::from_secs(10);
-pub const DEFAULT_INSTANCE_RETENTION: Duration = Duration::from_secs(7 * 86_400);
 pub const MIN_MEMORY: u64 = 4096;
 pub const MIN_STAGING: u64 = 8 << 20;
 pub const MIN_NVME: u64 = 8192;
@@ -37,11 +35,6 @@ pub struct Config {
     /// cannot be combined with TLS.
     pub rdma: bool,
     pub metrics: Option<SocketAddr>,
-    /// How long, after start, the manager waits for instances it served before to
-    /// resynchronise before it serves lookups, claims and puts.
-    pub source_wait: Duration,
-    /// Instances not seen for this long are no longer waited for.
-    pub instance_retention: Duration,
 }
 
 impl Default for Config {
@@ -66,8 +59,6 @@ impl Config {
             tls_key: None,
             rdma: false,
             metrics: None,
-            source_wait: DEFAULT_SOURCE_WAIT,
-            instance_retention: DEFAULT_INSTANCE_RETENTION,
         }
     }
 
@@ -199,11 +190,9 @@ pub fn help_text() -> String {
      --listen-data ADDR:PORT         where they copy bytes, default --listen's next port\n\
      --tls-cert PATH --tls-key PATH  TLS for --listen (clients verify against their CA)\n\
      --rdma                          offer RDMA (experimental; not with TLS)\n\
-     --source-wait DURATION          wait for remembered instances, default 10s\n\
-     --instance-retention DURATION   forget instances unseen this long, default 7d\n\
      --metrics ADDR:PORT\n\
      \n\
-     Sizes accept binary K, M, G and T suffixes; durations accept ms, s, m, h and d."
+     Sizes accept binary K, M, G and T suffixes."
         .to_string()
 }
 
@@ -277,14 +266,6 @@ where
                 config.rdma = true;
                 index += 1;
             }
-            "--source-wait" => {
-                config.source_wait = parse_duration(value(index)?)?;
-                index += 2;
-            }
-            "--instance-retention" => {
-                config.instance_retention = parse_duration(value(index)?)?;
-                index += 2;
-            }
             "--metrics" => {
                 config.metrics = Some(parse_address(value(index)?)?);
                 index += 2;
@@ -318,29 +299,6 @@ pub fn parse_size(text: &str) -> io::Result<u64> {
         .ok()
         .and_then(|value| value.checked_mul(multiplier))
         .ok_or_else(|| invalid(format!("invalid byte size {text:?}")))
-}
-
-/// Parse a duration such as `250ms`, `10s`, `5m`, `2h` or `7d`; a bare number is seconds.
-pub fn parse_duration(text: &str) -> io::Result<Duration> {
-    let (number, unit_millis) = if let Some(number) = text.strip_suffix("ms") {
-        (number, 1u64)
-    } else if let Some(number) = text.strip_suffix('s') {
-        (number, 1_000)
-    } else if let Some(number) = text.strip_suffix('m') {
-        (number, 60_000)
-    } else if let Some(number) = text.strip_suffix('h') {
-        (number, 3_600_000)
-    } else if let Some(number) = text.strip_suffix('d') {
-        (number, 86_400_000)
-    } else {
-        (text, 1_000)
-    };
-    number
-        .parse::<u64>()
-        .ok()
-        .and_then(|value| value.checked_mul(unit_millis))
-        .map(Duration::from_millis)
-        .ok_or_else(|| invalid(format!("invalid duration {text:?}")))
 }
 
 fn parse_address(text: &str) -> io::Result<SocketAddr> {
@@ -383,8 +341,6 @@ mod tests {
         assert_eq!(config.socket, PathBuf::from("/run/selene/default.sock"));
         assert_eq!(config.memory, 1 << 30);
         assert_eq!(config.staging, 4 << 30);
-        assert_eq!(config.source_wait, Duration::from_secs(10));
-        assert_eq!(config.instance_retention, Duration::from_secs(7 * 86_400));
         assert!(config.listen.is_none() && !config.rdma);
     }
 
@@ -398,20 +354,6 @@ mod tests {
         assert!(parse_size("").is_err());
         assert!(parse_size("1X").is_err());
         assert!(parse_size("K").is_err());
-    }
-
-    #[test]
-    fn durations_parse_with_units() {
-        assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
-        assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
-        assert_eq!(parse_duration("10").unwrap(), Duration::from_secs(10));
-        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
-        assert_eq!(
-            parse_duration("7d").unwrap(),
-            Duration::from_secs(7 * 86_400)
-        );
-        assert!(parse_duration("").is_err());
-        assert!(parse_duration("x").is_err());
     }
 
     #[test]
@@ -435,16 +377,10 @@ mod tests {
             "2G",
             "--staging",
             "16M",
-            "--source-wait",
-            "30s",
-            "--instance-retention",
-            "1d",
         ]);
         assert_eq!(config.nvme, 1 << 30);
         assert_eq!(config.memory, 2 << 30);
         assert_eq!(config.staging, 16 << 20);
-        assert_eq!(config.source_wait, Duration::from_secs(30));
-        assert_eq!(config.instance_retention, Duration::from_secs(86_400));
     }
 
     #[test]

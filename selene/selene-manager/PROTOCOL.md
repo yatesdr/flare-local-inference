@@ -62,18 +62,9 @@ the instance side (`flare-selene`, `selene::pool`) implements the other.
    different process (a restarted or competing one) never attests for another
    process's accesses; those windows and pins wait for the old process's exit
    (section 7.4).
-10. **Readiness: expected-source barrier.**
-    The manager persists the `instance_id`s it served, each with a last-seen time,
-    in a small file in its store directory (atomically replaced at session open
-    and close and periodically while sessions live). After a restart it is
-    `READY` when (a) disk recovery is complete and (b) every remembered instance
-    has either installed a snapshot or used up the bounded wait (default 10 s from
-    process start, configurable). Instances not seen within the retention period
-    (default 7 days, configurable) are forgotten. Because `instance_id` is stable
-    across restarts (decision 2), an instance that restarted along with the
-    manager returns under the same id and is satisfied as soon as its snapshot
-    installs; the full wait is paid only by an instance that is really gone (a
-    changed GPU set is a new id and the old one ages out).
+10. **Readiness follows recovery.** The manager serves lookups, claims and puts
+    once its own NVMe scan completes. Sources reconnect and announce independently;
+    a missing or partial source index can cause a miss, never grant a pin.
 11. **Transfer cost** uses the requester's rolling bandwidth for each copy level,
     seeded until a restore completes. The manager does not report per-source estimates.
 12. **Logical split versus physical page offset.** `Claim.begin_tokens`
@@ -582,8 +573,8 @@ Detected by stream error, EOF, a `SessionClosing`, or a different
 ### 8.2 Manager restart
 
 All sessions, claims, exports, windows and in-flight puts are gone. The new
-process picks a new incarnation, starts `RECOVERING` (its NVMe records), moves to
-`AWAITING_SOURCES` and then `READY` (the barrier of decision 10). In between:
+process picks a new incarnation and stays `RECOVERING` while scanning its NVMe
+records, then becomes `READY`. During recovery:
 
 - Hello and `OpenSession` work; notices and resyncs are accepted so sources can
   become synced.
@@ -597,8 +588,7 @@ process picks a new incarnation, starts `RECOVERING` (its NVMe records), moves t
 - Records the dead manager held in DRAM are lost; NVMe records are recovered.
   A writer dropped its source copy only at `Stored`, so there is nothing to
   resend; the record is simply gone and will be recomputed on demand.
-- Readiness is the expected-source barrier of decision 10: the manager reads its
-  persisted list of instance ids and waits, bounded, for each to resync.
+- Readiness does not wait for previous instances; source hints return as they resync.
 
 ### 8.3 Requester restart
 
@@ -613,15 +603,13 @@ the old stream end. Either way:
    quarantined until its process exit is confirmed (SIGKILL: immediate; a hung
    process stays quarantined);
 3. stops offering the old session's entries immediately; they are replaced
-   atomically when the new session's snapshot installs, or removed if no
-   successor appears (decision 18).
+   by the new session's live snapshot chunks, or remain absent if no
+   successor appears.
 
 The new process has no pool state: it opens a session under the same id, resyncs
 what it recovered, and its first lookup asks the manager directly. Its claim and
 put counters start afresh (new nonce), and it attests nothing for the old process.
-After a manager restart it also satisfies the readiness barrier as soon as its
-snapshot installs. There is no catalog
-mirror to rebuild and so no catalog-after-restart race. A request that arrived
+There is no catalog mirror to rebuild and so no catalog-after-restart race. A request that arrived
 before the session was open is admitted without pool candidates.
 
 ### 8.4 Source death

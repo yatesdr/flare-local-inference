@@ -2,7 +2,6 @@
 
 use super::{
     Violation,
-    barrier::Remembered,
     claims::{Claim, ClaimKey},
     index::{InstanceId, ScopeIndex, SourceId},
     limits::Limits,
@@ -17,11 +16,10 @@ use crate::{
     proto::v2::{self, server_message::M},
 };
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     os::fd::OwnedFd,
-    path::PathBuf,
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -71,12 +69,6 @@ pub struct PoolConfig {
     pub limits: Limits,
     /// How long a terminal claim's reply is kept to answer duplicates.
     pub reply_retention: Duration,
-    /// The expected-source barrier's bounded wait, from process start.
-    pub source_wait: Duration,
-    /// Instances not seen for this long are forgotten.
-    pub instance_retention: Duration,
-    /// The manager's store directory; the barrier list lives here.
-    pub store_directory: Option<PathBuf>,
     pub encryption: v2::Encryption,
     pub transports: Vec<v2::DataTransport>,
     /// The data channel instances without shared memory copy through, when the
@@ -91,9 +83,6 @@ impl Default for PoolConfig {
         Self {
             limits: Limits::default(),
             reply_retention: Duration::from_secs(60),
-            source_wait: Duration::from_secs(10),
-            instance_retention: Duration::from_secs(7 * 86_400),
-            store_directory: None,
             encryption: v2::Encryption::Plaintext,
             transports: vec![v2::DataTransport::Tcp],
             channel: None,
@@ -248,7 +237,6 @@ pub struct Core {
     pub(super) shared: Arc<Shared>,
     pub(super) incarnation: u64,
     pub(super) staging: Arena,
-    pub(super) started: Instant,
     pub(super) sessions: HashMap<u64, Session>,
     pub(super) next_session: u64,
     pub(super) instances: HashMap<InstanceId, Instance>,
@@ -270,11 +258,6 @@ pub struct Core {
     pub(super) state: v2::ReadinessState,
     pub(super) disk_recovered: bool,
     pub(super) recovered_records: u64,
-    pub(super) remembered: Remembered,
-    pub(super) expected: BTreeSet<InstanceId>,
-    pub(super) synced: BTreeSet<InstanceId>,
-    pub(super) barrier_dirty: bool,
-    pub(super) barrier_saved: Instant,
     pub(super) shutting_down: Option<oneshot::Sender<()>>,
     pub(super) euid: u32,
     pub(super) egid: u32,
@@ -329,17 +312,6 @@ impl Core {
             uid: euid,
             gid: egid,
         });
-        let remembered = match &cfg.store_directory {
-            Some(directory) => {
-                Remembered::load(directory, cfg.instance_retention, SystemTime::now())
-                    .unwrap_or_else(|error| {
-                        eprintln!("selene: warning: cannot read the instance list: {error}");
-                        Remembered::default()
-                    })
-            }
-            None => Remembered::default(),
-        };
-        let expected: BTreeSet<InstanceId> = remembered.ids().collect();
         let (events, receiver) = mpsc::channel(4096);
         let mut core = Self {
             cfg,
@@ -354,7 +326,6 @@ impl Core {
             shared: shared.clone(),
             incarnation,
             staging,
-            started: Instant::now(),
             sessions: HashMap::new(),
             next_session: 0,
             instances: HashMap::new(),
@@ -372,11 +343,6 @@ impl Core {
             state: v2::ReadinessState::Recovering,
             disk_recovered,
             recovered_records,
-            remembered,
-            expected,
-            synced: BTreeSet::new(),
-            barrier_dirty: false,
-            barrier_saved: Instant::now(),
             shutting_down: None,
             euid,
             egid,
@@ -665,10 +631,6 @@ impl Core {
                 ranks,
             },
         );
-        if self.remembered.touch(instance, SystemTime::now()) {
-            self.barrier_dirty = true;
-        }
-        self.save_barrier(true);
         let readiness = self.readiness_info();
         let scope_id = scope.id.to_vec();
         self.send(
@@ -721,7 +683,6 @@ impl Core {
             if let Some(scope) = self.scopes.get_mut(&session.scope) {
                 scope.index.clear(SourceId::Instance(session.instance));
             }
-            self.synced.remove(&session.instance);
         }
         self.session_claims_lost(sid, &session);
         self.puts_lost(&session);
@@ -731,10 +692,6 @@ impl Core {
         {
             self.rank0_lost(session.instance, session.nonce, ranks.secret);
         }
-        if self.remembered.touch(session.instance, SystemTime::now()) {
-            self.barrier_dirty = true;
-        }
-        self.save_barrier(true);
         self.update_readiness();
     }
 
@@ -831,25 +788,11 @@ impl Core {
     }
 
     pub(super) fn readiness_info(&self) -> v2::ReadinessInfo {
-        let waited = self.started.elapsed();
-        let remaining = self.cfg.source_wait.saturating_sub(waited);
-        let pending = self
-            .expected
-            .iter()
-            .filter(|id| !self.synced.contains(*id))
-            .count() as u32;
         v2::ReadinessInfo {
             state: self.state as i32,
             disk_recovered: self.disk_recovered,
             recovered_records: self.recovered_records,
             sources_connected: self.sources_connected(),
-            sources_synced: self.synced.len() as u32,
-            barrier_remaining_ms: if pending == 0 {
-                0
-            } else {
-                remaining.as_millis() as u32
-            },
-            sources_expected: pending,
             quarantined_bytes: self.quarantined_bytes(),
         }
     }
@@ -864,12 +807,8 @@ impl Core {
             v2::ReadinessState::Draining
         } else if !self.disk_recovered {
             v2::ReadinessState::Recovering
-        } else if self.expected.iter().all(|id| self.synced.contains(id))
-            || self.started.elapsed() >= self.cfg.source_wait
-        {
-            v2::ReadinessState::Ready
         } else {
-            v2::ReadinessState::AwaitingSources
+            v2::ReadinessState::Ready
         };
         let changed = next != self.state;
         self.state = next;
@@ -883,27 +822,6 @@ impl Core {
         }
     }
 
-    pub(super) fn mark_synced(&mut self, instance: InstanceId) {
-        self.synced.insert(instance);
-        self.update_readiness();
-    }
-
-    fn save_barrier(&mut self, force: bool) {
-        let Some(directory) = self.cfg.store_directory.clone() else {
-            return;
-        };
-        if !self.barrier_dirty && !force {
-            return;
-        }
-        self.remembered
-            .forget_older_than(self.cfg.instance_retention, SystemTime::now());
-        if let Err(error) = self.remembered.save(&directory) {
-            eprintln!("selene: warning: cannot write the instance list: {error}");
-        }
-        self.barrier_dirty = false;
-        self.barrier_saved = Instant::now();
-    }
-
     // ------------------------------------------------------------------ clock
 
     pub(super) fn tick(&mut self) {
@@ -913,20 +831,6 @@ impl Core {
         self.claim_timers(now);
         self.prune_retained();
         self.prune_procs();
-        // Keep live instances fresh in the persisted list.
-        if now.duration_since(self.barrier_saved) >= Duration::from_secs(5) {
-            let live: Vec<InstanceId> = self
-                .instances
-                .iter()
-                .filter(|(_, instance)| instance.current.is_some())
-                .map(|(id, _)| *id)
-                .collect();
-            for id in live {
-                self.remembered.touch(id, SystemTime::now());
-                self.barrier_dirty = true;
-            }
-            self.save_barrier(false);
-        }
         self.update_readiness();
         self.refresh_metrics();
         self.flush_overflowed();
@@ -1018,8 +922,6 @@ impl Core {
         gauge("state", info.state as u64);
         gauge("ready", u64::from(self.ready()));
         gauge("sessions", self.sessions.len() as u64);
-        gauge("sources_synced", u64::from(info.sources_synced));
-        gauge("sources_expected", u64::from(info.sources_expected));
         gauge("index_entries", entries as u64);
         gauge("claims_in_flight", in_flight as u64);
         gauge("claim_records", self.claims.len() as u64);

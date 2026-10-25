@@ -441,7 +441,6 @@ fn l0_06_multiprocess_kill_recovery() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_07_streaming_and_nvme_oversize() {
     let mut host = Host::new(65536, 2 * 1024 * 1024);
-    host.config.pool.source_wait = Duration::ZERO;
     host.start();
     let mut client = host.client().await;
     let bytes = client.store(key(128 * 64), None).await;
@@ -468,7 +467,6 @@ async fn l0_07_streaming_and_nvme_oversize() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_08_refill_and_split_units() {
     let mut refill = Host::new(65536, 1024 * 1024);
-    refill.config.pool.source_wait = Duration::ZERO;
     refill.start();
     let mut client = refill.client().await;
     client.store(key(128), None).await;
@@ -1106,7 +1104,6 @@ async fn l0_31_timed_out_publication_finishes_instead_of_orphaning() {
         64 * 1024 * 1024,
     );
     config.name = instance_name("timeout-publish");
-    config.pool.source_wait = Duration::ZERO;
     config.faults.pause_at = Some("before_rename".into());
     let signal = base.join("gate");
     config.faults.signal = Some(signal.clone());
@@ -1281,7 +1278,6 @@ async fn l0_40_detached_finalization_uses_the_put_namespace() {
         64 * 1024 * 1024,
     );
     config.name = instance_name("detached-ns");
-    config.pool.source_wait = Duration::ZERO;
     config.faults.delay_ms = 50;
     let mut host = Host::open_config(config);
     host.start();

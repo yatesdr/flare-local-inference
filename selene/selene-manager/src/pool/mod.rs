@@ -5,7 +5,6 @@
 //! through [`service::PoolService`]; it never blocks, and it answers each
 //! session through that session's bounded outbound queue.
 
-pub mod barrier;
 mod claims;
 pub mod core;
 pub mod index;

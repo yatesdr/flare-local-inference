@@ -258,7 +258,6 @@ fn rooted(label: &str) -> (std::path::PathBuf, selene_manager::store::Config) {
         64 * 1024 * 1024,
     );
     config.name = support::instance_name(label);
-    config.pool.source_wait = Duration::ZERO;
     (base, config)
 }
 

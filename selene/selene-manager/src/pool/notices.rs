@@ -127,9 +127,7 @@ impl Core {
             return Err(Violation::new("snapshot End without Begin"));
         }
         session.syncing = false;
-        let instance = session.instance;
         self.send(sid, M::ResyncAck(v2::ResyncAck {}));
-        self.mark_synced(instance);
         Ok(())
     }
 }
