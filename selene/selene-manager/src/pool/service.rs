@@ -34,9 +34,66 @@ impl Pool for PoolService {
 
     async fn rank(
         &self,
-        _request: Request<Streaming<v2::RankClientMessage>>,
+        request: Request<Streaming<v2::RankClientMessage>>,
     ) -> Result<Response<Self::RankStream>, Status> {
-        Err(Status::unimplemented("rank agents are not attached yet"))
+        let info = request.extensions().get::<PeerInfo>().cloned();
+        let mut inbound = request.into_inner();
+        let first = inbound
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("the stream ended before `attach`"))?;
+        let Some(v2::rank_client_message::M::Attach(attach)) = first.m else {
+            return Err(Status::invalid_argument(
+                "the first message must be `attach`",
+            ));
+        };
+        let (tx, rx) = mpsc::channel(OUTBOUND);
+        let (reply, answer) = oneshot::channel();
+        let peer = info.map_or(
+            OpenPeer {
+                unix: false,
+                pid: 0,
+                uid: 0,
+                gid: 0,
+            },
+            |info| OpenPeer {
+                unix: info.unix,
+                pid: info.pid,
+                uid: info.uid,
+                gid: info.gid,
+            },
+        );
+        let events = self.handle.events.clone();
+        events
+            .send(Event::RankOpen {
+                peer,
+                attach: Box::new(attach),
+                tx,
+                reply,
+            })
+            .await
+            .map_err(|_| Status::unavailable("the pool is stopped"))?;
+        let aid = answer
+            .await
+            .map_err(|_| Status::unavailable("the pool is stopped"))?;
+        if let Some(aid) = aid {
+            tokio::spawn(async move {
+                while let Ok(Some(message)) = inbound.message().await {
+                    let event = Event::RankMessage {
+                        aid,
+                        message: Box::new(message),
+                    };
+                    if events.send(event).await.is_err() {
+                        return;
+                    }
+                }
+                let _ = events.send(Event::RankClosed { aid }).await;
+            });
+        }
+        // A refused attach still delivers its `RankAttached` and then ends.
+        Ok(Response::new(Box::pin(
+            ReceiverStream::new(rx).map(Ok::<_, Status>),
+        )))
     }
 
     async fn hello(&self, request: Request<HelloRequest>) -> Result<Response<HelloReply>, Status> {
