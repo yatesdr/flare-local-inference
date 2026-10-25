@@ -56,9 +56,9 @@ manager has a certificate), presents the token and says which carrier moves the 
   writes back; the manager checks each fill against its grant before reading the payload into the
   window. A commit that reaches the session before the last fill reaches the channel waits for it.
 - **Fencing**: a transfer's windows go back to the store only after its handler has exited and
-  its connection is closed (RDMA: its queue pair moved to the error state and destroyed). A handler
-  that is not seen to exit within five seconds of the stop leaves its windows quarantined and
-  counted in the readiness `quarantined_bytes`; a late exit releases them. A remote instance
+  its connection is closed (RDMA: its queue pair moved to the error state and destroyed). A stopped handler
+  retains its windows until its exit is observed; readiness `quarantined_bytes` includes these
+  windows while the handler is draining. A remote instance
   never touches the manager's windows, so its own exit is not waited for.
 - **Limits**: a transfer that makes no progress for the claim's progress timeout (3 s by
   default) expires; a socket that stalls for 20 s fails. The metrics carry

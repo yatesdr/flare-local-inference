@@ -8,7 +8,7 @@
 
 use super::{
     Checked, Violation,
-    claims::{ClaimKey, Party},
+    claims::{Channel, ClaimKey, Party},
     core::{ChanOwner, Core, Event, Nonce, ProcKey, ScopeId},
     index::{Entry, InstanceId, SourceId, Tier},
     key_from, key_to,
@@ -61,7 +61,7 @@ pub(super) struct PutRec {
     /// What the store accepted: the parent it will link to and the first page it needs.
     pub accepted: Option<(Option<Key>, u32)>,
     /// Set when the writer's bytes arrive on the data channel.
-    pub channel: Option<PutChannel>,
+    pub channel: Option<Channel>,
     /// A commit that arrived before the data channel delivered every window: the
     /// channel and the session are separate streams, so it waits for the last fill.
     pub deferred_commit: Option<(u64, v2::PutCommit)>,
@@ -69,16 +69,6 @@ pub(super) struct PutRec {
     pub mp: Option<PutMp>,
     /// The writer's fence arrived; the put waits for its peers before releasing its windows.
     pub fenced: bool,
-}
-
-/// A put's data-channel transfer. Its windows are written only by the manager's
-/// handler, so the handler's exit is what lets them go back to the store.
-pub(super) struct PutChannel {
-    pub transfer: u64,
-    pub token: [u8; flare_selene::pool::frame::TOKEN_BYTES],
-    pub exited: bool,
-    pub stopped_at: Option<Instant>,
-    pub quarantined: bool,
 }
 
 /// Per-scope catalog feed from the store.
@@ -444,12 +434,10 @@ impl Core {
                 Some(layout) => hub.open_rank(channel::Kind::Put, layout.clone(), 0),
                 None => hub.open(channel::Kind::Put),
             } {
-                Ok((transfer, token)) => Some(PutChannel {
+                Ok((transfer, token)) => Some(Channel {
                     transfer,
                     token,
                     exited: false,
-                    stopped_at: None,
-                    quarantined: false,
                 }),
                 Err(error) => {
                     self.store_send(StoreCommand::Cancel {
@@ -747,7 +735,6 @@ impl Core {
             return;
         };
         if !open.exited {
-            open.stopped_at.get_or_insert_with(Instant::now);
             let quiet = self
                 .cfg
                 .channel
@@ -782,7 +769,6 @@ impl Core {
             return;
         };
         open.exited = true;
-        open.quarantined = false;
         self.puts_settle(key);
     }
 
@@ -1006,7 +992,6 @@ impl Core {
             if leg.ch.exited {
                 continue;
             }
-            leg.ch.stopped_at.get_or_insert_with(Instant::now);
             if hub.stop(leg.ch.transfer) {
                 leg.ch.exited = true;
                 quiet.push(leg.ch.transfer);

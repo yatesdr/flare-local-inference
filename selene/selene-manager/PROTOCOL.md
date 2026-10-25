@@ -492,8 +492,8 @@ ends short or over is a `COPY_ERROR`; `COPY_OK` waits for `END`.
 
 The manager's windows are read or written only by its own handler, so its exit is the manager's
 fence for them (the requester's `FenceAck` is accepted and idempotent, but no window waits for it).
-A handler that is not seen to exit within five seconds of the stop quarantines its windows, counted
-in `ReadinessInfo.quarantined_bytes`; seeing the exit later releases them.
+A stopped handler retains its windows until its exit is observed. These outstanding windows are
+counted in `ReadinessInfo.quarantined_bytes`, including handlers still draining normally.
 
 **Relay.** A claim whose source has no shared memory, or whose requester asks for
 `DATA_CHANNEL`, goes through the manager's staging in both cases; the two legs are independent
