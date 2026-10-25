@@ -175,7 +175,7 @@ impl Sources {
                 begin_tokens: wire.begin_tokens,
                 skip_pages: wire.skip_pages as usize,
                 nodes,
-                us_per_page: wire.est_us_per_page,
+
             },
             source,
             tier,

@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use crate::levels::Rate;
 use crate::{
     CheckpointId, Error, ExportRefusal, History, PageId, PrefixKey, Result, StateSlotId,
     index::NodeEvent,
@@ -1396,20 +1397,6 @@ impl DiskTransport for Staged {
     }
 }
 
-/// Exponentially weighted bytes per second of completed records in one direction.
-#[derive(Clone, Copy)]
-struct Rate(f64);
-
-impl Rate {
-    fn observe(&mut self, bytes: u64, elapsed: Duration) {
-        let seconds = elapsed.as_secs_f64();
-        if bytes == 0 || seconds <= 0.0 {
-            return;
-        }
-        self.0 = 0.8 * self.0 + 0.2 * (bytes as f64 / seconds);
-    }
-}
-
 struct Outbound {
     checkpoint: CheckpointId,
     key: PrefixKey,
@@ -1530,8 +1517,8 @@ impl DiskStore {
             maintenance: HashMap::new(),
             replacements: HashMap::new(),
             evicted: Vec::new(),
-            outbound_rate: Rate(rate),
-            inbound_rate: Rate(rate),
+            outbound_rate: Rate::new(rate),
+            inbound_rate: Rate::new(rate),
             announce: None,
             spill: false,
             retiring: Vec::new(),
@@ -3910,19 +3897,6 @@ mod tests {
         assert!(node.ready && !node.pinned());
         assert_eq!(store.stats().stored, 1);
         assert!(store.commit_record(root.key, Ok(0)).is_err());
-    }
-
-    #[test]
-    fn rates_weight_each_completed_record_and_ignore_empty_or_instant_ones() {
-        let mut rate = Rate(INITIAL_STAGED_DISK_RATE);
-        rate.observe(1_000_000_000, Duration::from_secs(1));
-        assert_eq!(rate.0, 0.8 * INITIAL_STAGED_DISK_RATE + 0.2 * 1e9);
-        let settled = rate.0;
-        rate.observe(0, Duration::from_secs(1));
-        rate.observe(4096, Duration::ZERO);
-        assert_eq!(rate.0, settled);
-        rate.observe(settled as u64 * 2, Duration::from_secs(1));
-        assert_eq!(rate.0, 0.8 * settled + 0.2 * (settled * 2.0).trunc());
     }
 
     #[test]

@@ -33,6 +33,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::levels::Rate;
 use crate::{
     CheckpointId, Error, ExportRefusal, History, PageId, PrefixKey, Result, StateSlotId,
     index::{NodeEvent, NodeNotice},
@@ -54,9 +55,6 @@ use super::{
 
 /// Windows of one record submitted to the transfer threads at a time.
 pub const IN_FLIGHT_WINDOWS: usize = crate::pool::WINDOW_CREDITS as usize;
-
-/// Weight of the newest observation in the transfer rate estimates.
-const RATE_WEIGHT: f64 = 0.2;
 
 /// Slabs holding one record. `durable` is set by the composite once the disk
 /// copy is complete; a standalone memory store treats every record as durable.
@@ -140,21 +138,6 @@ struct Inbound {
     pending: Pending,
 }
 
-/// Exponentially weighted bytes per second of completed windows.
-#[derive(Clone, Copy, Debug)]
-struct Rate(f64);
-
-impl Rate {
-    fn observe(&mut self, bytes: u64, elapsed: Duration) {
-        let seconds = elapsed.as_secs_f64();
-        if bytes == 0 || seconds <= 0.0 {
-            return;
-        }
-        let observed = bytes as f64 / seconds;
-        self.0 = (1.0 - RATE_WEIGHT) * self.0 + RATE_WEIGHT * observed;
-    }
-}
-
 /// The store's bookkeeping: the index, the pool, the per-record transfer
 /// state, and the counters. It submits windows through a caller-supplied
 /// function, so it is exercised without transfer threads.
@@ -198,8 +181,8 @@ impl Core {
             inbound: BTreeMap::new(),
             deferred: Vec::new(),
             stats: StoreStats::default(),
-            outbound_rate: Rate(INITIAL_MEMORY_RATE),
-            inbound_rate: Rate(INITIAL_MEMORY_RATE),
+            outbound_rate: Rate::new(INITIAL_MEMORY_RATE),
+            inbound_rate: Rate::new(INITIAL_MEMORY_RATE),
             next_job: 1,
             spill: false,
             retiring: Vec::new(),
@@ -2319,18 +2302,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Direction::In, Direction::Out]
         );
-    }
-
-    #[test]
-    fn rates_weight_recent_windows_and_ignore_empty_ones() {
-        let mut rate = Rate(1000.0);
-        rate.observe(0, Duration::from_secs(1));
-        rate.observe(500, Duration::ZERO);
-        assert_eq!(rate.0, 1000.0);
-        rate.observe(2000, Duration::from_secs(1));
-        assert!((rate.0 - 1200.0).abs() < 1e-9);
-        rate.observe(2000, Duration::from_secs(1));
-        assert!((rate.0 - 1360.0).abs() < 1e-9);
     }
 
     /// Marks every resident record as announced, as the hasher would have.

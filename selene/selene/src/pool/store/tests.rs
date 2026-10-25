@@ -217,9 +217,9 @@ impl PoolPort for FakePool {
             .evicted
             .push((key, tier, generation, heir));
     }
-    fn observe_restore(&self, level: Level, pages: usize, elapsed: Duration) {
+    fn observe_restore(&self, level: Level, bytes: u64, elapsed: Duration) {
         let mut ranking = self.ranking();
-        ranking.observe(level, pages, elapsed);
+        ranking.observe(level, bytes, elapsed);
         self.0.lock().unwrap().ranking = Some(ranking);
     }
     fn evictions_lost(&self) {
@@ -304,7 +304,7 @@ impl Rig {
         begin: u64,
         first_start: u64,
         ends: &[u64],
-        us: u32,
+        _us: u32,
     ) -> PoolCandidate {
         let mut previous = first_start;
         let nodes: Vec<plan::ChainNode> = ends
@@ -328,7 +328,7 @@ impl Rig {
                 begin_tokens: begin,
                 skip_pages: (begin / PT - first_start) as usize,
                 nodes,
-                us_per_page: us,
+
             },
             source: SourceRef {
                 instance: vec![source],
@@ -647,7 +647,7 @@ fn a_pool_part_is_never_planned_ahead_of_a_part_of_the_local_tiers() {
 
 #[test]
 fn a_second_part_not_worth_fetching_leaves_the_local_hit_alone() {
-    let mut rig = rig();
+    let mut rig = rig_with(Ranking::for_test(Level::DEFAULT_ORDER, &[(Level::HostNvme, 50_000_000.0)]));
     rig.local_hit(800, Local::Memory);
     rig.answer(vec![rig.candidate(
         Level::HostNvme,

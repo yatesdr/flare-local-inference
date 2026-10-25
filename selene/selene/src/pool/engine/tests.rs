@@ -349,7 +349,7 @@ pub(super) fn candidate(
                     tail_pages: *tail_pages,
                 })
                 .collect(),
-            us_per_page: 0,
+
         },
         source: SourceRef {
             instance: vec![source as u8],
@@ -710,7 +710,7 @@ fn a_refused_lookup_gives_no_candidates_and_a_good_reply_reaches_every_waiter() 
             row: true,
         }],
         skip_pages: 0,
-        est_us_per_page: 0,
+
     };
     let mut malformed = candidate.clone();
     malformed.key = Some(wire::PrefixKey {

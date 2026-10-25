@@ -1066,10 +1066,11 @@ impl Engine {
                 if claim.verdict_ok
                     && let Some(run) = self.requester.restores.get(&restore)
                     && run.parts[claim.part].copied
+                    && run.parts[claim.part].fetch.part.pages > 0
                 {
                     let part = &run.parts[claim.part].fetch.part;
                     self.shared
-                        .observe_restore(part.level, part.pages, claim.started.elapsed());
+                        .observe_restore(part.level, part.pages as u64 * self.st.page_record_bytes() + u64::from(part.row) * self.st.row_record_bytes(), claim.started.elapsed());
                 }
                 for window in claim.windows.values_mut() {
                     if let Some(slot) = window.slot.take() {

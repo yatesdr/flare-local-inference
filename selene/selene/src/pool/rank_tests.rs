@@ -426,6 +426,8 @@ fn fetch_for(
         history,
         identity: &identity(world),
         page_tokens: PT,
+        page_bytes: whole(world).0 as u64,
+        row_bytes: whole(world).1 as u64,
         resident: 0,
         before: u64::MAX,
         ranking: &ranking,
