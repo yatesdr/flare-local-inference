@@ -21,10 +21,12 @@ mod manager_tests;
 pub(crate) mod net;
 pub(crate) mod pins;
 mod probe;
+pub mod rank;
 pub mod rdma;
 mod shared;
 mod shm;
 mod startup;
+pub mod slice;
 #[cfg(test)]
 mod smoke_tests;
 mod store;
@@ -41,11 +43,13 @@ pub use exporter::{Checksums, HostChain, HostPin, HostRecord, HostWindow, PutByt
 pub use identity::{Geometry, RankPlanes, Scope, instance_id, process_nonce, scope_id};
 pub use lookup::{Answer, LookupState, LookupTicket};
 pub use pins::{FilePin, MemoryPin};
+pub use rank::{FrameReceiver, FrameSender, RankLink, RankSet};
 pub use shared::{
     ExportRequest, FetchFailure, FetchPart, PoolEvent, PoolFetch, PoolStatus, PutOutcome,
     PutRefusal, PutRequest, PutSource,
 };
 pub use startup::{Approve, PlannedRegion, RegisteredRegion};
+pub use slice::{RankSlice, SliceLayout, SliceSums};
 pub use store::{PoolPort, PooledStore};
 pub use tiers::{Releases, TierView};
 pub use types::{HeldRange, PoolCandidate, SourceRef, Tier};
