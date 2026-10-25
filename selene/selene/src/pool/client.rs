@@ -48,7 +48,7 @@ pub enum PoolAddress {
     TcpPlaintext(String),
 }
 
-/// Built from the flags. `start` never blocks on the network.
+/// Built from the flags for the startup connection.
 pub struct PoolConfig {
     pub address: PoolAddress,
     pub tenant: String,
@@ -84,6 +84,7 @@ pub struct PoolClient {
     next_fetch: u64,
     next_put: u64,
     registered: Vec<RegisteredRegion>,
+    probe_model: [u8; 32],
 }
 
 impl PoolClient {
@@ -130,6 +131,11 @@ impl PoolClient {
             super::net::Roots::System,
             STARTUP_WAIT,
         )
+    }
+
+    /// The instance-scoped namespace for startup probe records.
+    pub fn probe_model(&self) -> [u8; 32] {
+        self.probe_model
     }
 
     /// The ranges registered at startup, in the order they were registered. Empty when the
@@ -237,6 +243,10 @@ impl PoolClient {
             context: config.registration_context,
             rank_secret,
         });
+        let probe_model = super::probe::instance_probe_model(
+            &settings.scope.model_identity,
+            &settings.instance_id,
+        );
         let mut engine = Engine::new(
             settings.clone(),
             shared.clone(),
@@ -296,6 +306,7 @@ impl PoolClient {
             next_fetch: 0,
             next_put: 0,
             registered,
+            probe_model,
         })
     }
 

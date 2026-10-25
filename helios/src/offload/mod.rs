@@ -18,6 +18,7 @@
 mod adapter;
 #[cfg(all(test, feature = "runtime-package"))]
 mod gpu_tests;
+pub(crate) mod pool;
 mod registrar;
 pub mod shard;
 pub mod transfer;
@@ -184,8 +185,8 @@ impl PrefixCacheOffload {
         } else {
             pinned.div_ceil(ranks.max(1) as u64)
         };
-        // The pool's copier adds its own streams and events. The manager's shared
-        // regions are its memory, mapped here, so the instance holds no staging of its own.
+        // Pool copy streams and events are fixed headroom. Hello's shared regions or
+        // remote data staging are budgeted separately before sizing GPU caches.
         let tiers = if memory != 0 || disk {
             mapped.div_ceil(512) + STORE_DEVICE_MARGIN_BYTES
         } else {
@@ -266,7 +267,7 @@ pub struct Prepared {
     /// Rank zero's record connection to each peer rank, ranks 1 onward, when the ranks run as
     /// separate processes; see [`shard`].
     pub(crate) shards: Vec<shard::Link>,
-    pub pool: Option<PoolOptions>,
+    pub(crate) pool: Option<pool::PreparedPool>,
 }
 
 /// The loader's result: either prepared resources or the reason no store exists.
@@ -570,7 +571,7 @@ pub fn prepare_with_inputs(
         scanned,
         directory_lock,
         shards: Vec::new(),
-        pool: options.pool.clone(),
+        pool: None,
     })))
 }
 
@@ -638,7 +639,9 @@ pub fn open(prepared: Prepared) -> Result<Box<dyn PrefixStore>> {
         shards,
         pool,
     } = prepared;
-    let pool_geometry = pool.is_some().then(|| geometry.clone());
+    if let Some(pool) = &pool {
+        pool.start_copies(&contexts, geometry.clone())?;
+    }
     let transfers: Option<flare_selene::SharedCopier> = memory_pool
         .as_ref()
         .or(staging_pool.as_ref())
@@ -713,29 +716,13 @@ pub fn open(prepared: Prepared) -> Result<Box<dyn PrefixStore>> {
         (None, Some(disk)) => Some(Box::new(disk)),
         (None, None) => None,
     };
-    let (Some(pool), Some(pool_geometry)) = (pool, pool_geometry) else {
-        let store = local.ok_or("no prefix store tier is configured")?;
-        return Ok(Box::new(adapter::Host::new(store, false)));
-    };
-    // The pool's copier reads and writes the manager's shared memory, which
-    // registers with identical host and device addresses after the session opens.
-    let copier: flare_selene::SharedCopier = std::sync::Arc::new(std::sync::Mutex::new(
-        transfer::Transfers::start_unmapped(&contexts, pool_geometry.clone())?,
-    ));
-    let uuids = contexts
-        .iter()
-        .map(|&(_, device)| crate::cuda::device_uuid(device))
-        .collect::<Result<Vec<_>>>()?;
-    attach_pool(
-        local,
-        &pool,
-        identity,
-        &pool_geometry,
-        copier,
-        std::sync::Arc::new(registrar::PoolRegistrar),
-        uuids,
-        contexts[0].0,
-    )
+    match pool {
+        Some(pool) => pool.attach(local),
+        None => {
+            let store = local.ok_or("no prefix store tier is configured")?;
+            Ok(Box::new(adapter::Host::new(store, false)))
+        }
+    }
 }
 
 /// What a pool shares: the tenant, the model and the record layout.
@@ -766,45 +753,6 @@ fn pool_scope(
             row_record_bytes: layout.row_record_bytes,
         },
     })
-}
-
-/// Wrap the local tiers, if any, in a store attached to the pool. The client
-/// starts its thread and returns without waiting for the manager.
-#[allow(clippy::too_many_arguments)]
-fn attach_pool(
-    local: Option<Box<dyn HostStore>>,
-    pool: &PoolOptions,
-    identity: [u8; 32],
-    geometry: &[CacheGeometry],
-    copier: flare_selene::SharedCopier,
-    registrar: std::sync::Arc<dyn flare_selene::HostRegistrar + Send + Sync>,
-    gpu_uuids: Vec<[u8; 16]>,
-    registration_context: usize,
-) -> Result<Box<dyn PrefixStore>> {
-    use flare_selene::pool::{PoolConfig, PooledStore};
-    let address = pool_address(&pool.address)?;
-    let config = PoolConfig {
-        address,
-        tenant: pool.tenant.clone(),
-        ca: pool.ca.clone(),
-        scope: pool_scope(&pool.tenant, identity, geometry)?,
-        instance_name: format!("flare-{}", std::process::id()),
-        gpu_uuids,
-        export_slots: 2,
-        claim_slots: 2,
-        level_order: None,
-        registration_context,
-        approve: None,
-    };
-    let store = PooledStore::connect(
-        adapter::Tiers::new(local),
-        config,
-        copier.clone(),
-        registrar,
-    )?;
-    Ok(Box::new(
-        adapter::Host::new(Box::new(store), true).with_pool_copier(copier),
-    ))
 }
 
 /// Completion of work a store accepted earlier.
@@ -938,24 +886,6 @@ mod tests {
         ))
     }
 
-    struct NoRegistrar;
-    impl flare_selene::HostRegistrar for NoRegistrar {
-        fn register(
-            &self,
-            _context: usize,
-            _address: usize,
-            _bytes: usize,
-        ) -> flare_selene::Result<Box<dyn flare_selene::Registration>> {
-            Err(flare_selene::Error::new("no registration in this test"))
-        }
-        fn map_split(
-            &self,
-            _requests: &[(usize, i32, usize)],
-        ) -> flare_selene::Result<Box<dyn flare_selene::SplitMapping>> {
-            Err(flare_selene::Error::new("no split mapping in this test"))
-        }
-    }
-
     fn pool(address: &str) -> PoolOptions {
         PoolOptions {
             address: address.into(),
@@ -1022,7 +952,7 @@ mod tests {
             ..tiers.clone()
         };
         let (device, host) = tiers.headroom_bytes(1, &layout).unwrap();
-        // The pool adds a copier's streams and events and no host staging.
+        // Static headroom covers the copier; Hello's regions are budgeted at startup.
         assert_eq!(
             pooled.headroom_bytes(1, &layout).unwrap(),
             (device + STORE_DEVICE_MARGIN_BYTES, host)
@@ -1065,36 +995,6 @@ mod tests {
             scope.layout_fingerprint,
             geometry::fingerprint(&geometry[..1])
         );
-    }
-
-    #[test]
-    fn a_pooled_store_starts_without_waiting_for_the_manager_and_closes() {
-        let geometry = vec![flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)];
-        let copier = flare_selene::testing::StoppedCopier::shared(&geometry).unwrap();
-        let directory = test_directory();
-        std::fs::create_dir_all(&directory).unwrap();
-        let socket = directory.join("absent.sock");
-        let mut store = attach_pool(
-            None,
-            &pool(&format!("unix:{}", socket.display())),
-            [3; 32],
-            &geometry,
-            copier,
-            std::sync::Arc::new(NoRegistrar),
-            vec![[1; 16]],
-            0,
-        )
-        .unwrap();
-        // The client is local until a manager answers: nothing is found or fetched.
-        assert!(store.pooled());
-        let mut history = PrefixHistory::new([3; 32]);
-        history.append(&[7; 128], &[]).unwrap();
-        assert!(store.lookup(&history, 0, u64::MAX).is_none());
-        let mut events = Vec::new();
-        store.poll(&mut events).unwrap();
-        assert!(events.is_empty());
-        store.close().unwrap();
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

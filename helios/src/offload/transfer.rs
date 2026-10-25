@@ -388,7 +388,7 @@ impl Transfers {
 
     /// Start threads that copy to and from host memory registered with identical
     /// host and device addresses, which a job names directly. The shared pool
-    /// regions map and register after startup, so no slab pool describes them.
+    /// regions map and register during startup, so no slab pool describes them.
     pub fn start_unmapped(contexts: &[(usize, i32)], geometry: Vec<CacheGeometry>) -> Result<Self> {
         if contexts.is_empty() || contexts.len() != geometry.len() {
             return Err(invalid(format!(

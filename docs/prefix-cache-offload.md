@@ -802,6 +802,30 @@ sees no export requests. Local and pooled instances use the same GPU write-back
 and eviction policy from section 2.10. A pooled instance still reads
 its own memory and disk tiers first; the pool supplies what they lack.
 
+The loader attaches once before sizing and allocating GPU caches. The
+`Wait for prefix cache pool` startup phase waits up to ten seconds for the
+manager's first Hello. HTTP admission opens after loading and worker readiness;
+if the manager is absent, the instance starts on local tiers and never attaches
+later.
+
+Before any CUDA registration, the complete Hello plan must fit both budgets:
+the manager's arena plus staging on this host, or the client's data staging for
+a remote manager. Host supply is available physical memory less future local
+host allocations, a 2 GiB server allowance and five percent of total RAM for the
+system. Every GPU is charged one device byte per 512 registered host bytes,
+rounded up separately for each region, as for local registered tiers. Integrated
+GPUs also share the host-byte charge once per host. The check preserves runtime
+headroom, explicit memory limits and minimum execution/KV capacity; accepted
+charges reduce the remaining cache budget. A plan exceeding either budget
+registers nothing and produces one warning naming its sizes and the reason,
+then serving uses local tiers. Failure to observe host supply also refuses the
+pool with that reason.
+
+The startup registrar requires identical CUDA and host addresses. Its owning
+registrations survive reconnects to the same regions and remain alive through
+copy drain at close. A changed generation disables sharing with one warning;
+the instance continues locally and needs a restart to register the new regions.
+
 The worker's part is a set of defaulted `PrefixStore` hooks, all run on the
 model worker thread and none waiting on the network.
 
