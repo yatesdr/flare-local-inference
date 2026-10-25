@@ -17,7 +17,7 @@ fencing rules are in [PROTOCOL.md](PROTOCOL.md). Running it is in
 
 Use Rust 1.88 or newer (validated with 1.94.1 on Linux). Serving is async on tokio and speaks
 gRPC through tonic and prost over a Unix socket; the crate also depends on `flare-selene` (by
-path, for the identity functions), `blake2` and `twox-hash`.
+path, for shared record, index and wire types), and `blake2`.
 
 ```sh
 cargo build --release --locked
@@ -36,7 +36,7 @@ stale socket from a killed manager is removed once startup confirms nothing is l
 file system must support 4096-byte O_DIRECT reads and writes, rename and file/directory sync. Do
 not use a network file system.
 
-Options accept bytes with binary K/M/G/T suffixes, and durations with ms/s/m/h/d.
+Size options accept bytes with binary K/M/G/T suffixes.
 
 | Option | Default |
 |---|---|
@@ -46,13 +46,11 @@ Options accept bytes with binary K/M/G/T suffixes, and durations with ms/s/m/h/d
 | `--memory` | 1 GiB |
 | `--nvme` | 0 without `--root`; required with `--root` |
 | `--staging` | 4 GiB (minimum 8 MiB) |
-| `--write-budget` | 0 (unlimited) |
 | `--listen` | none; serve instances on other hosts at ADDR:PORT |
 | `--listen-data` | the host of `--listen`, next port; where those instances copy bytes |
 | `--tls-cert`, `--tls-key` | none; TLS for `--listen` |
 | `--rdma` | off; experimental, needs the `rdma` feature, not with TLS |
 | `--metrics` | disabled; when set, HTTP `GET /metrics` |
-| `--config` | none; a TOML file with the same keys, flags override |
 
 The manager prints a warning at startup when network listening is enabled and when RDMA is
 enabled, and refuses to start with RDMA and TLS together. See
@@ -89,7 +87,7 @@ experimental RDMA variant.
 | Path | What it holds |
 |---|---|
 | `src/pool/` | The pool actor: sessions, the announcement index, lookup, claims and fences, put, readiness. |
-| `src/store.rs`, `src/disk.rs`, `src/tree.rs`, `src/record.rs`, `src/arena.rs` | The manager's own store: DRAM arena, NVMe records, eviction, durability, recovery. |
+| `src/store.rs`, `src/disk.rs`, `src/record.rs`, `src/arena.rs` | The manager's own store: DRAM arena, NVMe records, eviction, durability, recovery. |
 | `src/local.rs` | Shared-memory regions, windows and process-exit (pidfd) reclaim. |
 | `src/control.rs`, `src/config.rs`, `src/main.rs` | Startup, listeners, shutdown, flags. |
 | `src/data/channel.rs` | The data channel instances without shared memory copy through: the listener, the per-transfer handlers and their fencing, over the stream and RDMA. |
@@ -109,8 +107,6 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 ```
 
-The tests that start managers need `/dev/shm` room; test containers need `--shm-size=4g`. The
-throughput smoke test (`l0_14`) puts records through the pool protocol and compares the bytes it
-gets back; `cargo run --release --locked --example throughput` runs it with reported rates.
+The tests that start managers need `/dev/shm` room; test containers need `--shm-size=4g`.
 
 The Flare instance-side client and its GPU integration live in the Flare repository.

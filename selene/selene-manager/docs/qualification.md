@@ -19,7 +19,7 @@ client (`tests/support/pool.rs`) and never model the manager's state machine.
 | `tests/pool_net.rs` | The network listener: sessions without shared memory, level-5 candidates, refusal of shared windows, TLS declared and RDMA withheld, the startup warnings and the refusal of RDMA with TLS. |
 | `tests/pool_channel.rs` | Instances on other hosts: a chain put and restored over TCP and TLS byte for byte (mid-record starts, persisted checksums), an instance that never connects, dies mid-window or mid-fill, a released claim, a lost session, corrupt and cancelled puts, no listener; with the `rdma` feature the same over RDMA on a queue pair per transfer. |
 | `tests/pool_relay.rs` | Copies between instances that share no memory with the manager: a host record and a GPU checkpoint relayed from a remote source to a remote and to a local requester, a source or a requester that dies mid-relay, a stalled source leg, a source that never connects, a source whose session is lost; every case ends with nothing quarantined and the same record relayable again. |
-| `tests/l0.rs` | The store engine through the pool protocol: admission and refusal classification, eviction and compaction, chain durability, crash and recovery, streaming and oversize records, budget and cancel, directory modes, failed-start cleanup, signal handling, kill/restart, and a throughput smoke test. |
+| `tests/l0.rs` | The store engine through the pool protocol: admission and refusal classification, eviction and compaction, chain durability, crash and recovery, streaming and oversize records, budget and cancel, directory modes, failed-start cleanup, signal handling, and kill/restart. |
 
 ## Running
 
@@ -81,13 +81,14 @@ F9 `d4_...`, `d3_...` and the hub unit tests (the handler has exited and the soc
 F10 the `over_rdma` hub tests and `r2_...` (the queue pair is destroyed before Closed); F6 the
 quarantine unit test (`windows_of_a_handler_that_cannot_be_seen_to_exit_are_quarantined`); F7, F8, F11, F13 client.
 
-**Restart and death.** R2, R3, R6 `r2_r3_and_s2_ready_when_remembered_sources_return_or_the_wait_ends`;
-R3b unit `a_crash_mid_write_leaves_the_previous_list`; R5 `i18_and_i19_...` (messages from a dead incarnation are dropped);
+**Restart and death.** R2, R3, R6 `restart_serves_after_recovery_without_waiting_for_old_instances`;
+R5 `i18_and_i19_...` (messages from a dead incarnation are dropped);
 R7, R8 `r7_and_r8_...`; R10 `r10_a_killed_source_fails_its_claims_and_frees_its_windows`;
 R11 `r11_a_source_blip_quarantines_until_the_export_end_arrives_on_a_new_session`;
 R13 `r13_...`; R1, R4, R9, R12, R14 client.
 
-**Two-source plan.** P1 to P13 client/Flare.
+**Single-source plan.** Client tests cover longest-prefix selection, fixed level order,
+resident-prefix trimming, endpoint rows and a failed fetch drained before local restore.
 
 **Limits.** X1 `x1_...`; X2 `c5_...`, `x1_...` (refusals are immediate); X4 `x4_...`, `l5_to_l8_...`;
 X5 `x5_a_deadline_is_clamped_to_the_managers_limit`; X3 client.
