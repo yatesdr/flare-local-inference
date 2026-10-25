@@ -5,12 +5,13 @@
 //! state machines, the resync and notice flow, and the drain-before-release
 //! rules, so each can be tested by scripting the manager's messages.
 
-mod coverage;
+pub(crate) mod coverage;
 mod hostfill;
 #[cfg(test)]
 mod net_tests;
 mod netio;
-mod requester;
+pub(crate) mod ranks;
+pub(crate) mod requester;
 mod source;
 #[cfg(test)]
 mod tests;
@@ -34,6 +35,8 @@ use super::{
     wire::{self, client_message::M as Out, server_message::M as In},
 };
 
+pub(crate) use ranks::Ranks;
+
 /// The protocol version this client speaks.
 pub const PROTOCOL: u32 = 2;
 /// How long a lookup may wait for its reply.
@@ -54,6 +57,10 @@ pub(crate) struct Settings {
     pub claim_slots: u32,
     /// The context made current when registering the shared regions.
     pub context: usize,
+    /// Where each rank's slice lies in a record.
+    pub slices: Arc<super::slice::SliceLayout>,
+    /// Set for rank 0 of a multi-process instance: the secret its peers attach with.
+    pub rank_secret: Option<[u8; 32]>,
 }
 
 impl Settings {
@@ -136,6 +143,8 @@ pub(crate) struct Engine {
     pub(crate) rdma_broken: Arc<std::sync::atomic::AtomicBool>,
     /// How the open session opens data-channel transfers, when it has no shared memory.
     pub(crate) dial: Option<Arc<dyn Dial>>,
+    /// The peer ranks of a multi-process instance.
+    pub(crate) ranks: Option<ranks::Ranks>,
 }
 
 impl Engine {
@@ -174,7 +183,13 @@ impl Engine {
             net_events,
             rdma_broken: Arc::default(),
             dial: None,
+            ranks: None,
         }
+    }
+
+    /// Make this the rank 0 of a multi-process instance.
+    pub(crate) fn set_ranks(&mut self, ranks: ranks::Ranks) {
+        self.ranks = Some(ranks);
     }
 
     pub(crate) fn registrar(&self) -> &dyn HostRegistrar {
@@ -315,9 +330,10 @@ impl Engine {
     }
 
     fn update_status(&self) {
+        let ranks_attached = self.ranks_attached();
         let status = match &self.sess {
             None => return,
-            Some(s) if !s.installed => PoolStatus::Connecting,
+            Some(s) if !s.installed || !ranks_attached => PoolStatus::Connecting,
             Some(s) if s.ready => PoolStatus::Ready,
             Some(_) => PoolStatus::NotReady,
         };
@@ -329,6 +345,7 @@ impl Engine {
     pub(crate) fn quiet(&self) -> bool {
         self.jobs.is_empty()
             && self.pending.is_empty()
+            && self.ranks.as_ref().is_none_or(|r| r.idle())
             && self.requester.is_empty()
             && self.source.is_empty()
             && self.writer.is_empty()
@@ -550,6 +567,7 @@ impl Engine {
     /// Returns whether another call has more to do right away.
     pub(crate) fn pump(&mut self, now: Instant) -> bool {
         self.collect_net();
+        self.collect_ranks();
         let mut replies = Vec::new();
         self.copier.lock().unwrap().poll(&mut replies);
         for reply in replies {
@@ -681,7 +699,99 @@ impl Engine {
 
     /// Whether the claim limit allows another restore: the pool must be ready.
     pub(crate) fn ready(&self) -> bool {
-        self.sess.as_ref().is_some_and(|s| s.installed && s.ready)
+        self.sess
+            .as_ref()
+            .is_some_and(|s| s.installed && s.ready && self.ranks_attached())
+    }
+
+    /// Every peer rank is attached to the manager this session is with.
+    fn ranks_attached(&self) -> bool {
+        match (&self.ranks, &self.sess) {
+            (None, _) => true,
+            (Some(ranks), Some(sess)) => ranks.attached(sess.header.manager_incarnation),
+            (Some(_), None) => false,
+        }
+    }
+
+    /// Apply what the peer ranks said since the last call.
+    fn collect_ranks(&mut self) {
+        use ranks::{RankEvent, XferOwner};
+        let Some(ranks) = self.ranks.as_mut() else {
+            return;
+        };
+        let events = ranks.poll();
+        let any = !events.is_empty();
+        for event in events {
+            match event {
+                RankEvent::WindowDone {
+                    rank,
+                    xfer,
+                    index,
+                    result,
+                    sums,
+                } => {
+                    let owner = self.ranks.as_ref().and_then(|r| r.owner(xfer));
+                    match owner {
+                        Some((XferOwner::Claim(claim), _)) => {
+                            self.on_peer_window_done(claim, rank, index, result)
+                        }
+                        Some((XferOwner::Export(export), _)) => {
+                            self.on_peer_export_window(export, rank, index, result, sums)
+                        }
+                        Some((XferOwner::Put(put), _)) => {
+                            self.on_peer_put_window(put, rank, index, result, sums)
+                        }
+                        None => {}
+                    }
+                }
+                RankEvent::Done {
+                    rank,
+                    xfer,
+                    result,
+                    quarantined,
+                } => {
+                    let owner = self.ranks.as_mut().and_then(|r| {
+                        let owner = r.owner(xfer);
+                        r.forget(xfer);
+                        owner
+                    });
+                    match owner {
+                        Some((XferOwner::Claim(claim), _)) => {
+                            self.on_peer_done(claim, rank, result, quarantined)
+                        }
+                        Some((XferOwner::Export(export), _)) => {
+                            self.on_peer_export_done(export, rank, result, quarantined)
+                        }
+                        Some((XferOwner::Put(put), _)) => {
+                            self.on_peer_put_done(put, rank, result, quarantined)
+                        }
+                        None => {}
+                    }
+                }
+                RankEvent::Detached { .. } => {}
+                RankEvent::Lost { rank, reason } => self.rank_lost(rank, &reason),
+            }
+        }
+        if any {
+            self.update_status();
+        }
+    }
+
+    /// A peer rank's link failed: whatever it was doing, nothing can show it stopped.
+    fn rank_lost(&mut self, rank: usize, reason: &str) {
+        eprintln!("warning: the link to rank {rank} failed ({reason}); the pool is off");
+        let open = self
+            .ranks
+            .as_ref()
+            .map(|ranks| ranks.open_on(rank))
+            .unwrap_or_default();
+        if open.is_empty() {
+            self.shared
+                .set_status(PoolStatus::Disabled(format!("rank {rank}'s link failed")));
+            self.shared.fail_lookups();
+            return;
+        }
+        self.quarantine();
     }
 
     // ---- shutdown -----------------------------------------------------------

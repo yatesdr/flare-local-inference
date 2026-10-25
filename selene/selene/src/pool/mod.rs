@@ -4,6 +4,7 @@
 //! one no pool type is constructed, so there is no thread, connection, mapping
 //! or allocation.
 
+mod agent;
 mod announce;
 mod cascade;
 mod client;
@@ -22,6 +23,8 @@ pub(crate) mod net;
 pub(crate) mod pins;
 mod probe;
 pub mod rank;
+#[cfg(test)]
+mod rank_tests;
 pub mod rdma;
 mod shared;
 mod shm;
@@ -37,6 +40,7 @@ pub(crate) mod wire {
 }
 mod types;
 
+pub use agent::{AgentConfig, RankAgent};
 pub use announce::{Announcer, IndexEntry, Notice, Snapshot};
 pub use client::{PoolAddress, PoolClient, PoolConfig, STARTUP_WAIT};
 pub use exporter::{Checksums, HostChain, HostPin, HostRecord, HostWindow, PutBytes};

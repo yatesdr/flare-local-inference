@@ -169,6 +169,16 @@ pub fn instance_id(
     hash.finalize().into()
 }
 
+/// 32 fresh random bytes: the secret rank 0 of a multi-process instance gives its peers.
+pub fn secret() -> Result<[u8; 32]> {
+    use std::io::Read;
+    let mut secret = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut secret))
+        .map_err(|error| Error::caused_by("cannot draw a rank secret", error))?;
+    Ok(secret)
+}
+
 /// 16 fresh random bytes naming this process; unchanged across reconnects.
 pub fn process_nonce() -> Result<[u8; 16]> {
     use std::io::Read;
