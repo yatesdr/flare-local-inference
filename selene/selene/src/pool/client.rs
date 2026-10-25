@@ -7,6 +7,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::JoinHandle,
+    time::Duration,
 };
 
 use tokio::sync::Notify;
@@ -24,8 +25,14 @@ use super::{
     identity::{self, Scope},
     lookup::{LookupState, LookupTicket},
     shared::{Command, PoolEvent, PoolFetch, PoolStatus, PutRequest, Shared},
+    startup::{RegisteredRegion, Startup},
     types::{HeldRange, Tier},
 };
+
+/// How long [`PoolClient::start`] waits for the manager at startup. A manager that has not
+/// answered by then is not used by this process at all: it runs on its local tiers, with one
+/// warning, and never attaches later (see [`PoolClient::start`]).
+pub const STARTUP_WAIT: Duration = Duration::from_secs(10);
 
 /// Where the manager listens.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,10 +77,26 @@ pub struct PoolClient {
     thread: Option<JoinHandle<Result<()>>>,
     next_fetch: u64,
     next_put: u64,
+    registered: Vec<RegisteredRegion>,
 }
 
 impl PoolClient {
-    /// Spawn the I/O thread and return at once, in [`PoolStatus::Connecting`].
+    /// Attach to the manager, once, at startup.
+    ///
+    /// Registering host memory with the GPU consumes device memory, so a serving instance does
+    /// it only before it admits requests. This call is that time. It spawns the I/O thread and
+    /// waits up to [`STARTUP_WAIT`] for the manager's first Hello; on that Hello the thread maps
+    /// the manager's shared regions and registers each through `registrar` (for a manager on
+    /// another host, this process's own data-channel staging), and `start` returns with the
+    /// ranges in [`PoolClient::registered_regions`]. From then on the client never calls the
+    /// registrar again: a reconnect after a manager restart continues with the same
+    /// registrations when the manager reports the same regions, and a manager that reports
+    /// different ones (it recreated them, so running instances must restart) turns the pool off
+    /// for this process, with one warning. A manager not reached in time, or a pool refused at
+    /// startup (version, encryption, scope or an untrusted certificate), leaves the process on
+    /// its local tiers, with one warning, for good: the client does not attach later. Start the
+    /// manager before the instance. The returned client is in [`PoolStatus::Connecting`] while
+    /// its session opens, or [`PoolStatus::Disabled`] when it will not attach.
     pub fn start(
         config: PoolConfig,
         copier: SharedCopier,
@@ -82,12 +105,30 @@ impl PoolClient {
         Self::start_trusting(config, copier, registrar, super::net::Roots::System)
     }
 
+    /// The ranges registered at startup, in the order they were registered. Empty when the
+    /// client did not attach.
+    pub fn registered_regions(&self) -> &[RegisteredRegion] {
+        &self.registered
+    }
+
     /// [`PoolClient::start`] with the trust store named, so a test can give one of its own.
     pub(crate) fn start_trusting(
         config: PoolConfig,
         copier: SharedCopier,
         registrar: Arc<dyn HostRegistrar + Send + Sync>,
         roots: super::net::Roots,
+    ) -> Result<PoolClient> {
+        Self::start_waiting(config, copier, registrar, roots, STARTUP_WAIT)
+    }
+
+    /// [`PoolClient::start_trusting`] with the startup wait named, so a test need not wait ten
+    /// seconds for a manager that is not there.
+    pub(crate) fn start_waiting(
+        config: PoolConfig,
+        copier: SharedCopier,
+        registrar: Arc<dyn HostRegistrar + Send + Sync>,
+        roots: super::net::Roots,
+        wait: Duration,
     ) -> Result<PoolClient> {
         let geometry = &config.scope.geometry;
         {
@@ -158,17 +199,34 @@ impl PoolClient {
             registrar,
         );
         let stop = Arc::new(AtomicBool::new(false));
+        let startup = Arc::new(Startup::new());
         let link = conn::Link {
             address: config.address,
             ca: config.ca,
             roots,
             wake,
             stop: stop.clone(),
+            startup: startup.clone(),
         };
         let thread = std::thread::Builder::new()
             .name("selene-pool".into())
             .spawn(move || conn::run(engine, link))
             .map_err(|e| Error::caused_by("cannot start the pool thread", e))?;
+        let registered = match startup.wait(wait) {
+            Ok(registered) => registered,
+            Err(timed_out) => {
+                if timed_out {
+                    let reason = format!(
+                        "the pool manager did not answer within {wait:?} of startup; this instance \
+                         uses its local tiers only and will not attach to the pool later \
+                         (start the manager before the instance)",
+                    );
+                    eprintln!("warning: {reason}");
+                    shared.set_status(PoolStatus::Disabled(reason));
+                }
+                Vec::new()
+            }
+        };
         Ok(PoolClient {
             shared,
             announce,
@@ -176,6 +234,7 @@ impl PoolClient {
             thread: Some(thread),
             next_fetch: 0,
             next_put: 0,
+            registered,
         })
     }
 

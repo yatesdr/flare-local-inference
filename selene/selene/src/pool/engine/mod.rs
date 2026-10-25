@@ -110,6 +110,8 @@ pub(crate) struct Engine {
     copier: SharedCopier,
     registrar: Arc<dyn HostRegistrar + Send + Sync>,
     sources: Sources,
+    /// What the first connect attached to; `None` until then.
+    pub(crate) attachment: Option<super::shm::Attachment>,
     pub(crate) sess: Option<Session>,
     /// Regions of a lost session, kept mapped until its copies have drained.
     draining: Vec<Arc<Regions>>,
@@ -168,6 +170,7 @@ impl Engine {
             closing: false,
             filler: None,
             net: None,
+            attachment: None,
             net_events,
             rdma_broken: Arc::default(),
             dial: None,
@@ -176,6 +179,11 @@ impl Engine {
 
     pub(crate) fn registrar(&self) -> &dyn HostRegistrar {
         &*self.registrar
+    }
+
+    /// Registration is over: from here every attempt to register host memory fails.
+    pub(crate) fn close_registration(&mut self) {
+        self.registrar = Arc::new(super::startup::ClosedRegistrar);
     }
 
     /// Copies are queued or running, so the copier needs polling soon.

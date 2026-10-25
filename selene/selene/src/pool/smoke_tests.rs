@@ -309,9 +309,26 @@ fn an_unreachable_manager_leaves_the_client_local_and_close_returns() {
     let path = std::env::temp_dir().join(format!("selene-smoke-none-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let (config, copier) = config(&path);
-    let mut client = PoolClient::start(config, copier, Arc::new(NoRegistrar)).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
-    assert_ne!(client.status(), PoolStatus::Ready);
+    let started = Instant::now();
+    let mut client = PoolClient::start_waiting(
+        config,
+        copier,
+        Arc::new(NoRegistrar),
+        net::Roots::System,
+        Duration::from_millis(300),
+    )
+    .unwrap();
+    // `start` returns when the wait is up, not before and not much after.
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let PoolStatus::Disabled(reason) = client.status() else {
+        panic!("{:?}", client.status());
+    };
+    assert!(
+        reason.contains("did not answer") && reason.contains("will not attach"),
+        "{reason}"
+    );
+    assert!(client.registered_regions().is_empty());
     let mut events = Vec::new();
     client.poll(&mut events).unwrap();
     client.close().unwrap();

@@ -188,3 +188,17 @@ impl Regions {
         }
     }
 }
+
+/// What the first connect attached this process to. It is decided once, while registration is
+/// open, and every later connect must find the same.
+pub(crate) enum Attachment {
+    /// The manager's shared files, mapped and registered.
+    Shm {
+        shared: wire::SharedMemory,
+        regions: std::sync::Arc<Regions>,
+    },
+    /// This process's own registered staging, for a manager on another host.
+    Net,
+    /// Nothing was registered; copies are off for the life of the process.
+    Nothing,
+}

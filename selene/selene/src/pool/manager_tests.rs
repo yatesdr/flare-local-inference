@@ -21,7 +21,7 @@ use crate::{
     pool::{
         Checksums, FetchPart, HostChain, HostPin, HostRecord, HostWindow, IndexEntry, LookupState,
         PoolAddress, PoolClient, PoolConfig, PoolEvent, PoolFetch, PoolStatus, PooledStore,
-        PutBytes, PutRequest, PutSource, Scope, Tier,
+        PutBytes, PutRequest, PutSource, STARTUP_WAIT, Scope, Tier,
     },
     record::checksum,
     testing::{GpuMemory, SimulatedGpu, TestHistory, geometry},
@@ -107,6 +107,8 @@ impl Manager {
         let socket = base.join("run/m.sock");
         let mut config = Config::dram_only(socket.clone(), memory);
         config.name = format!("selene-client-it-{}-{id}", std::process::id());
+        // Small and explicit: many managers run at once in a small /dev/shm.
+        config.staging = 16 << 20;
         let mut manager = Self {
             socket,
             base,
@@ -254,6 +256,10 @@ impl Drop for Manager {
     fn drop(&mut self) {
         self.stop();
         let _ = std::fs::remove_dir_all(&self.base);
+        // The manager keeps its region files across restarts; a test is done with them.
+        let _ = std::fs::remove_dir_all(
+            std::path::Path::new("/dev/shm/selene").join(&self.config.name),
+        );
     }
 }
 
@@ -759,6 +765,133 @@ fn announcements_survive_a_manager_restart_and_the_instances_reconnect() {
     wait("the record to be offered again", || offered(&requester));
     source.client.close().unwrap();
     requester.client.close().unwrap();
+}
+
+/// Counts what is registered, and refuses nothing.
+#[derive(Default)]
+struct CountingRegistrar {
+    calls: std::sync::Mutex<Vec<(usize, usize)>>,
+}
+impl HostRegistrar for CountingRegistrar {
+    fn register(&self, _: usize, address: usize, bytes: usize) -> Result<Box<dyn Registration>> {
+        self.calls.lock().unwrap().push((address, bytes));
+        Ok(Box::new(Registered))
+    }
+    fn map_split(&self, _: &[(usize, i32, usize)]) -> Result<Box<dyn SplitMapping>> {
+        Err("not used".into())
+    }
+}
+
+fn counted(manager: &Manager, registrar: &Arc<CountingRegistrar>, wait: Duration) -> PoolClient {
+    let (copier, _gpu) = SimulatedGpu::shared(&geo()).unwrap();
+    PoolClient::start_waiting(
+        config(manager, "counted", 1),
+        copier,
+        registrar.clone(),
+        super::net::Roots::System,
+        wait,
+    )
+    .unwrap()
+}
+
+fn inode(manager: &Manager, file: &str) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(
+        std::path::Path::new("/dev/shm/selene")
+            .join(&manager.config.name)
+            .join(file),
+    )
+    .unwrap()
+    .ino()
+}
+
+#[test]
+fn a_manager_restart_reuses_the_regions_and_the_client_registers_nothing_again() {
+    let mut manager = Manager::start();
+    let registrar = Arc::new(CountingRegistrar::default());
+    let client = counted(&manager, &registrar, STARTUP_WAIT);
+    let regions = client.registered_regions().to_vec();
+    assert_eq!(
+        regions.iter().map(|r| r.name).collect::<Vec<_>>(),
+        ["arena", "staging"],
+        "the startup registered the manager's two regions"
+    );
+    assert_eq!(registrar.calls.lock().unwrap().len(), 2);
+    wait("Ready", || client.status() == PoolStatus::Ready);
+    let (before, files) = (
+        client.topology(),
+        (inode(&manager, "arena"), inode(&manager, "staging")),
+    );
+
+    manager.restart();
+    wait("a session with the restarted manager", || {
+        client.topology() != before && client.status() == PoolStatus::Ready
+    });
+    assert_eq!(
+        (inode(&manager, "arena"), inode(&manager, "staging")),
+        files,
+        "the manager reopened the same files"
+    );
+    assert_eq!(
+        registrar.calls.lock().unwrap().len(),
+        2,
+        "the reconnect registered nothing"
+    );
+    assert_eq!(client.registered_regions(), regions);
+}
+
+#[test]
+fn a_changed_staging_size_turns_the_pool_off_for_a_running_instance() {
+    let mut manager = Manager::start();
+    let registrar = Arc::new(CountingRegistrar::default());
+    let mut client = counted(&manager, &registrar, STARTUP_WAIT);
+    wait("Ready", || client.status() == PoolStatus::Ready);
+
+    manager.stop();
+    manager.config.staging *= 2;
+    let _ = std::fs::remove_file(&manager.socket);
+    manager.run();
+    wait("the instance to notice", || {
+        matches!(client.status(), PoolStatus::Disabled(_))
+    });
+    let PoolStatus::Disabled(reason) = client.status() else {
+        unreachable!()
+    };
+    assert!(
+        reason.contains("recreated its shared memory") && reason.contains("restarted"),
+        "{reason}"
+    );
+    thread::sleep(Duration::from_millis(500));
+    assert!(matches!(client.status(), PoolStatus::Disabled(_)));
+    assert_eq!(
+        registrar.calls.lock().unwrap().len(),
+        2,
+        "nothing was registered late"
+    );
+    client.close().unwrap();
+}
+
+#[test]
+fn a_manager_that_is_not_there_at_startup_is_never_attached_to_later() {
+    let mut manager = Manager::start();
+    manager.stop();
+    let _ = std::fs::remove_file(&manager.socket);
+    let registrar = Arc::new(CountingRegistrar::default());
+    let started = Instant::now();
+    let mut client = counted(&manager, &registrar, Duration::from_millis(400));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(client.registered_regions().is_empty());
+    let PoolStatus::Disabled(reason) = client.status() else {
+        panic!("{:?}", client.status());
+    };
+    assert!(reason.contains("local tiers only"), "{reason}");
+
+    // The manager comes up after the instance gave up on it.
+    manager.run();
+    thread::sleep(Duration::from_secs(1));
+    assert!(matches!(client.status(), PoolStatus::Disabled(_)));
+    assert!(registrar.calls.lock().unwrap().is_empty());
+    client.close().unwrap();
 }
 
 struct NoStore;
