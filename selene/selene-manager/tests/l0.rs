@@ -74,7 +74,7 @@ fn l0_01_tree_insert_chain_remove_parity() {
             let parent = index.checked_sub(1).map(|index| keys[index]);
             let pages =
                 key.consumed_tokens / pt - parent.map_or(0, |parent| parent.consumed_tokens / pt);
-            tree.insert(*key, parent, [4; 16], pages as usize, true, ())
+            tree.insert(*key, parent, [4; 16], pages as usize, true, true, ())
                 .unwrap();
             tree.access_at(key, index as u64 + 1);
         }
@@ -86,11 +86,11 @@ fn l0_01_tree_insert_chain_remove_parity() {
         let skip = (1000 / pt - 700 / pt) as usize;
         assert_eq!(available - skip, (1990 / pt - 1000 / pt) as usize);
         assert!(
-            tree.insert(key(2000), Some(key(1999)), [0; 16], 0, true, ())
+            tree.insert(key(2000), Some(key(1999)), [0; 16], 0, true, true, ())
                 .is_err()
         );
         assert!(
-            tree.insert(key(2000), Some(keys[2]), [0; 16], 20, true, ())
+            tree.insert(key(2000), Some(keys[2]), [0; 16], 20, true, true, ())
                 .is_err()
         );
         assert_eq!(tree.node(&keys[2]).unwrap().children(), 0);
@@ -132,6 +132,7 @@ fn l0_02_leaf_lru_compaction_and_cascade() {
             parent.map(key),
             [0; 16],
             (tokens / 64 - parent.unwrap_or(0) / 64) as usize,
+            true,
             true,
             (),
         )

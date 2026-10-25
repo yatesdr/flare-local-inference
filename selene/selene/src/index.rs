@@ -272,6 +272,38 @@ impl<L> Index<L> {
         Ok(())
     }
 
+    pub fn access_at(&mut self, key: &PrefixKey, tick: u64) {
+        self.clock = self.clock.max(tick);
+        if let Some(node) = self.nodes.get_mut(key) {
+            node.accessed = tick;
+        }
+    }
+
+    /// Remove exactly one unpinned leaf, preserving its ancestry anchors.
+    pub fn remove_node(&mut self, key: &PrefixKey) -> Result<Node<L>> {
+        let node = self
+            .nodes
+            .get(key)
+            .ok_or_else(|| invalid("cannot remove an unindexed host record"))?;
+        if node.children != 0 || node.pinned() {
+            return Err(invalid(
+                "cannot remove a pinned host record or one with children",
+            ));
+        }
+        let node = self.nodes.remove(key).unwrap();
+        if let Some(keys) = self.buckets.get_mut(&node.bucket) {
+            keys.retain(|k| k != key);
+            if keys.is_empty() {
+                self.buckets.remove(&node.bucket);
+            }
+        }
+        if let Some(parent) = node.parent {
+            self.nodes.get_mut(&parent).unwrap().children -= 1;
+        }
+        self.notify(NodeEvent::Gone, &node);
+        Ok(node)
+    }
+
     pub fn touch(&mut self, key: &PrefixKey) {
         let tick = self.tick();
         if let Some(node) = self.nodes.get_mut(key) {
@@ -466,6 +498,18 @@ impl<L> Index<L> {
         }
         self.drop_row(&candidate);
         Some(Eviction::Compacted(candidate))
+    }
+}
+
+impl<L> std::ops::Index<&PrefixKey> for Index<L> {
+    type Output = Node<L>;
+    fn index(&self, key: &PrefixKey) -> &Self::Output {
+        &self.nodes[key]
+    }
+}
+impl<L> std::ops::IndexMut<&PrefixKey> for Index<L> {
+    fn index_mut(&mut self, key: &PrefixKey) -> &mut Self::Output {
+        self.nodes.get_mut(key).unwrap()
     }
 }
 
