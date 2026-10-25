@@ -307,3 +307,77 @@ fn ordinary_input_share_preserves_checkpoint_minimum_and_mapping() {
         ((1u64 << 30) - ordinary).div_ceil(2).div_ceil(512) + STORE_DEVICE_MARGIN_BYTES
     );
 }
+
+#[test]
+fn startup_keeps_registration_through_attachment_and_store_drain() {
+    use crate::pool::{Budget, PoolBuilder};
+    use crate::testing::{StoppedCopier, TrackingRegistrar, geometry};
+    use std::sync::Arc;
+    struct Copiers;
+    impl CopierFactory for Copiers {
+        fn mapped(
+            &self,
+            _: &[(usize, i32)],
+            geometry: Vec<CacheGeometry>,
+            _: &slab::SlabPool,
+        ) -> Result<crate::SharedCopier> {
+            StoppedCopier::shared(&geometry)
+        }
+        fn unmapped(
+            &self,
+            _: &[(usize, i32)],
+            geometry: Vec<CacheGeometry>,
+        ) -> Result<Box<dyn crate::PageCopier>> {
+            Ok(Box::new(StoppedCopier::new(&geometry)?))
+        }
+    }
+    let mut manager = selene_manager::testing::Manager::new();
+    manager.run();
+    let options = PrefixCacheOffload {
+        pool: Some(pool(&manager.address())),
+        ..Default::default()
+    };
+    let geometry = vec![geometry(64, &[("kv", 4096)], 4096)];
+    let registrar = Arc::new(TrackingRegistrar::default());
+    let mut startup = Startup::default();
+    assert!(startup.binding(0).is_none());
+    let (_, charges) = startup
+        .start_pool(
+            PoolBuilder {
+                options: options.pool.as_ref().unwrap(),
+                identity: [3; 32],
+                geometry: &geometry,
+                gpu_uuids: vec![[1; 16]],
+                registration_context: 0,
+                budget: Budget {
+                    host: Ok(u64::MAX),
+                    devices: vec![(u64::MAX, false)],
+                },
+                peers: None,
+                disk: false,
+            },
+            registrar.clone(),
+            |approved| {
+                assert!(approved);
+                Ok(true)
+            },
+        )
+        .unwrap();
+    assert!(charges[0] > 0);
+    let prepared = prepare(
+        &options,
+        std::path::Path::new("model.safetensors"),
+        [3; 32],
+        geometry,
+        vec![(0, 0)],
+    )
+    .unwrap();
+    startup.attach(prepared, &Copiers).unwrap();
+    let binding = startup.binding(0).unwrap();
+    assert_eq!(*registrar.drops.lock().unwrap(), 0);
+    let mut store = open(binding.take().unwrap(), &Copiers).unwrap();
+    startup.reset();
+    assert_eq!(*registrar.drops.lock().unwrap(), 0);
+    store.close().unwrap();
+    assert_eq!(*registrar.drops.lock().unwrap(), 2);
+}

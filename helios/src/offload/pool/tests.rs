@@ -1,4 +1,5 @@
 use super::*;
+use crate::offload::{CacheGeometry, PoolOptions};
 use flare_selene::{pool::PoolStatus, testing::TrackingRegistrar as Registrar};
 use selene_manager::testing::{Manager, wait};
 use std::{sync::Arc, thread};

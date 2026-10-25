@@ -605,3 +605,102 @@ fn free_space(path: &std::path::Path) -> Result<u64> {
 
 #[cfg(test)]
 mod tests;
+
+pub const HOST_SERVICE_HEADROOM_BYTES: u64 = 2 << 30;
+pub const HOST_SYSTEM_SHARE: u64 = 20;
+#[cfg(any(unix, test))]
+pub fn available_memory(meminfo: &str, total: usize) -> Result<usize> {
+    let available = meminfo.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next()? != "MemAvailable:" {
+            return None;
+        }
+        let kib = fields.next()?.parse::<usize>().ok()?;
+        (fields.next()? == "kB").then_some(kib)?.checked_mul(1024)
+    });
+    available.map(|n| n.min(total)).ok_or_else(|| {
+        crate::Error::new("Linux MemAvailable is required to size integrated GPU memory")
+    })
+}
+/// Keep the same server allowance and system share as integrated GPU planning.
+pub fn host_pool_budget(future: u64) -> Result<u64> {
+    #[cfg(unix)]
+    let (available, total) = {
+        let info = std::fs::read_to_string("/proc/meminfo").map_err(|e| e.to_string())?;
+        let total = info
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                (fields.next()? == "MemTotal:").then_some(())?;
+                let kib = fields.next()?.parse::<u64>().ok()?;
+                (fields.next()? == "kB").then_some(kib)?.checked_mul(1024)
+            })
+            .ok_or_else(|| {
+                crate::Error::new("Linux MemTotal is required to budget pool host memory")
+            })?;
+        (available_memory(&info, usize::MAX)? as u64, total)
+    };
+    #[cfg(windows)]
+    let (available, total) = unsafe {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut memory: MEMORYSTATUSEX = std::mem::zeroed();
+        memory.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if GlobalMemoryStatusEx(&mut memory) == 0 {
+            return Err(std::io::Error::last_os_error().to_string().into());
+        }
+        (memory.ullAvailPhys, memory.ullTotalPhys)
+    };
+    Ok(available
+        .saturating_sub(future)
+        .saturating_sub(HOST_SERVICE_HEADROOM_BYTES + total / HOST_SYSTEM_SHARE))
+}
+
+/// Resources retained from pre-sizing registration through the worker's store attachment.
+#[derive(Default)]
+pub struct Startup {
+    pool: Option<pool::PreparedPool>,
+    shared: Option<std::sync::Arc<Shared>>,
+}
+impl Startup {
+    pub fn start_pool(
+        &mut self,
+        builder: pool::PoolBuilder<'_>,
+        registrar: std::sync::Arc<dyn crate::HostRegistrar + Send + Sync>,
+        approve: impl FnOnce(bool) -> Result<bool>,
+    ) -> Result<(String, Vec<u64>)> {
+        let (mut pool, charges) = builder.start(registrar)?;
+        let summary = pool.summary()?;
+        if !approve(pool.approved())? {
+            pool.close()?;
+        }
+        self.pool = Some(pool);
+        Ok((summary, charges))
+    }
+    pub fn attach(
+        &mut self,
+        mut preparation: Preparation,
+        factory: &dyn CopierFactory,
+    ) -> Result<String> {
+        if let Preparation::Store(store) = &mut preparation
+            && let Some(mut pool) = self.pool.take()
+        {
+            pool.prepare_peer(store, factory)?;
+            store.pool = Some(pool);
+        }
+        let summary = preparation.summary();
+        self.shared = preparation.into_shared();
+        Ok(summary)
+    }
+    pub fn binding(&self, rank: usize) -> Option<Binding> {
+        self.shared
+            .as_ref()
+            .map(|shared| Binding::new(shared.clone(), rank))
+    }
+    pub fn shared(&self) -> Option<&Shared> {
+        self.shared.as_deref()
+    }
+    pub fn reset(&mut self) {
+        self.shared.take();
+        self.pool.take();
+    }
+}

@@ -18,8 +18,7 @@ pub struct NativeModel {
     _package_files: Vec<std::sync::Arc<std::fs::File>>,
     pub(super) server_config: serde_json::Value,
     engram: Vec<(std::sync::Arc<crate::engram::Shared>, usize)>,
-    offload: Option<std::sync::Arc<crate::offload::Shared>>,
-    pub(super) pool: Option<crate::offload::pool::PreparedPool>,
+    pub(super) offload: flare_selene::offload::Startup,
     cluster: Option<ClusterRank>,
     roce: Vec<Option<RoceSpec>>,
 }
@@ -604,8 +603,7 @@ impl NativeModel {
             ranks: Vec::new(),
             server_config,
             engram: Vec::new(),
-            offload: None,
-            pool: None,
+            offload: Default::default(),
             cluster,
             roce,
         };
@@ -827,7 +825,7 @@ impl NativeModel {
             .cluster
             .as_ref()
             .map(|cluster| (cluster.rank, cluster.world));
-        let mut prepared = crate::offload::prepare_with_inputs(
+        let prepared = crate::offload::prepare_with_inputs(
             &options.prefix_cache,
             root,
             identity,
@@ -836,14 +834,7 @@ impl NativeModel {
             staging,
             shard,
         )?;
-        if let crate::offload::Preparation::Store(store) = &mut prepared
-            && let Some(mut pool) = self.pool.take()
-        {
-            pool.prepare_peer(store, &crate::offload::transfer::Copiers)?;
-            store.pool = Some(pool);
-        }
-        let summary = prepared.summary();
-        self.offload = prepared.into_shared();
+        let summary = self.offload.attach(prepared, &crate::offload::transfer::Copiers)?;
         phase.finish(summary);
         Ok(())
     }
@@ -926,9 +917,7 @@ impl NativeModel {
             .enumerate()
             .map(|(index, rank)| {
                 let mut manifest = rank.execution_manifest()?;
-                if let Some(shared) = &self.offload {
-                    manifest.offload = Some(crate::offload::Binding::new(shared.clone(), index));
-                }
+                manifest.offload = self.offload.binding(index);
                 if let Some((shared, delivery_rank)) = self.engram.get(index) {
                     let events = shared
                         .index
@@ -963,7 +952,7 @@ impl NativeModel {
 
     /// The host prefix store this process prepared, before the model worker opens it.
     pub fn offload(&self) -> Option<&crate::offload::Shared> {
-        self.offload.as_deref()
+        self.offload.shared()
     }
 
     /// The RoCE transport local rank `rank` launches, if any.
@@ -974,8 +963,7 @@ impl NativeModel {
 
 impl Drop for NativeModel {
     fn drop(&mut self) {
-        self.offload.take();
-        self.pool.take();
+        self.offload.reset();
         self.engram.clear();
         // Rank zero owns the shared reservations and releases them after every peer.
         while self.ranks.pop().is_some() {}
@@ -1073,8 +1061,7 @@ mod tests {
             ranks: Vec::new(),
             server_config: serde_json::Value::Null,
             engram: Vec::new(),
-            offload: None,
-            pool: None,
+            offload: Default::default(),
             cluster: None,
             roce: Vec::new(),
         };
@@ -1096,7 +1083,7 @@ mod tests {
                     .prepare_offload(Path::new("unopened-package"), &options, &progress)
                     .unwrap();
             }
-            assert!(model.offload.is_none());
+            assert!(model.offload.shared().is_none());
         }
         let options = LoadOptions {
             prefix_cache: crate::offload::PrefixCacheOffload {

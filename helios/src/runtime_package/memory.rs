@@ -16,22 +16,14 @@ const HEADROOM_BYTES: u64 = 64 << 20;
 // A GPU that allocates from system memory (GB10) shares it with the operating system and with
 // the server's host allocations made after sizing: frontend workers, tokenizers and request
 // buffers took about 1.4 GiB on a DGX Spark. Caches leave room for both beyond the reserve.
-const INTEGRATED_HOST_BYTES: u64 = 2 << 30;
-const INTEGRATED_SYSTEM_SHARE: u64 = 20;
+use flare_selene::offload::{
+    HOST_SERVICE_HEADROOM_BYTES as INTEGRATED_HOST_BYTES,
+    HOST_SYSTEM_SHARE as INTEGRATED_SYSTEM_SHARE,
+};
 
 #[cfg(any(unix, test))]
 pub(super) fn shared_available(meminfo: &str, total: usize) -> Result<usize> {
-    let available = meminfo.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        if fields.next()? != "MemAvailable:" {
-            return None;
-        }
-        let kib = fields.next()?.parse::<usize>().ok()?;
-        (fields.next()? == "kB").then_some(kib)?.checked_mul(1024)
-    });
-    available
-        .map(|n| n.min(total))
-        .ok_or_else(|| invalid("Linux MemAvailable is required to size integrated GPU memory"))
+    Ok(flare_selene::offload::available_memory(meminfo, total)?)
 }
 
 impl NativeResources {
@@ -409,37 +401,6 @@ fn capacities(
     Ok((execution + cached, low, cached))
 }
 
-/// Keep the same server allowance and system share as integrated GPU planning.
-fn host_pool_budget(future: u64) -> Result<u64> {
-    #[cfg(unix)]
-    let (available, total) = {
-        let info = std::fs::read_to_string("/proc/meminfo").map_err(|e| e.to_string())?;
-        let total = info
-            .lines()
-            .find_map(|line| {
-                let mut fields = line.split_whitespace();
-                (fields.next()? == "MemTotal:").then_some(())?;
-                let kib = fields.next()?.parse::<u64>().ok()?;
-                (fields.next()? == "kB").then_some(kib)?.checked_mul(1024)
-            })
-            .ok_or_else(|| invalid("Linux MemTotal is required to budget pool host memory"))?;
-        (shared_available(&info, usize::MAX)? as u64, total)
-    };
-    #[cfg(windows)]
-    let (available, total) = unsafe {
-        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-        let mut memory: MEMORYSTATUSEX = std::mem::zeroed();
-        memory.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        if GlobalMemoryStatusEx(&mut memory) == 0 {
-            return Err(std::io::Error::last_os_error().to_string().into());
-        }
-        (memory.ullAvailPhys, memory.ullTotalPhys)
-    };
-    Ok(available
-        .saturating_sub(future)
-        .saturating_sub(INTEGRATED_HOST_BYTES + total / INTEGRATED_SYSTEM_SHARE))
-}
-
 impl NativeModel {
     /// Refuse an occupied limit smaller than the known fixed model storage before loading it.
     pub(super) unsafe fn check_memory_limit(
@@ -708,7 +669,8 @@ impl NativeModel {
                 page_tokens,
                 ceiling,
             )?;
-            let host = host_pool_budget(host_future).map_err(|error| error.to_string());
+            let host = flare_selene::offload::host_pool_budget(host_future)
+                .map_err(|error| error.to_string());
             let budget = crate::offload::pool::Budget {
                 host,
                 devices: available
@@ -725,27 +687,29 @@ impl NativeModel {
                 .iter()
                 .map(|rank| crate::cuda::device_uuid(rank.device))
                 .collect::<Result<Vec<_>>>()?;
-            let (prepared, charges) = crate::offload::pool::start(
-                pool,
-                super::model::offload_identity(&self.server_config)?,
-                &geometry,
-                uuids,
-                self.ranks[0].context as usize,
-                budget,
+            let cluster = self.cluster().map(|cluster| cluster.world);
+            let charges = crate::offload::pool::start(
+                &mut self.offload,
+                flare_selene::pool::PoolBuilder {
+                    options: pool,
+                    identity: super::model::offload_identity(&self.server_config)?,
+                    geometry: &geometry,
+                    gpu_uuids: uuids,
+                    registration_context: self.ranks[0].context as usize,
+                    budget,
+                    peers,
+                    disk: options.prefix_cache.disk.is_some()
+                        && options.prefix_cache.disk_limit != Some(0),
+                },
                 progress,
-                peers,
-                options.prefix_cache.disk.is_some() && options.prefix_cache.disk_limit != Some(0),
+                |approved| match cluster {
+                    Some(world) => Ok(agree.pool_approved(approved, world)?),
+                    None => Ok(true),
+                },
             )?;
-            let mut prepared = prepared;
-            if self.cluster().is_some()
-                && !agree.pool_approved(prepared.approved(), self.cluster().unwrap().world)?
-            {
-                prepared.close()?;
-            }
             for (available, charge) in available.iter_mut().zip(charges) {
                 *available = available.saturating_sub(charge);
             }
-            self.pool = Some(prepared);
         }
         let (local_rows, local_pages, _) = capacities(
             packages,
