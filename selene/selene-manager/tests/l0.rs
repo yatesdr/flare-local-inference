@@ -160,7 +160,6 @@ async fn l0_04_invalid_checksum_short_payload_and_offsets() {
     assert_eq!(host.gauge("staging_allocated_bytes"), 0);
     // Nothing the refused puts carried was indexed.
     let mut check = host.client().await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(check.records().await.is_empty());
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -620,8 +619,7 @@ async fn l0_21_live_disconnected_client_quarantine() {
     let ready = host.config.socket.with_extension("ready");
     wait(|| ready.exists());
     // The child's stream is gone but the process lives: the lease is quarantined.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(host.gauge("memory_allocated_bytes") > 0);
+    host.wait(|host| host.gauge("memory_allocated_bytes") > 0);
     let mut probe = host.client().await;
     assert_eq!(
         probe.put(key(256), None, PutOptions::default()).await,
@@ -945,16 +943,11 @@ async fn l0_31_timed_out_publication_finishes_instead_of_orphaning() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    // Let the 3 s no-progress timer end the call while the rename is paused.
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+        .await.expect("the publication did not time out").unwrap();
     assert_eq!(host.durable_records(), 0);
     fs::remove_file(&signal).unwrap();
-    let outcome = task.await.unwrap();
-    assert!(
-        matches!(outcome, PutOutcome::Stored(_))
-            || outcome == PutOutcome::Refused(v2::Reason::Invalid as u8),
-        "{outcome:?}"
-    );
+    assert_eq!(outcome, PutOutcome::Refused(v2::Reason::Invalid as u8));
     let deadline = Instant::now() + Duration::from_secs(10);
     while host.durable_records() != 1 {
         assert!(Instant::now() < deadline, "publication did not complete");
@@ -1079,7 +1072,6 @@ async fn l0_40_detached_finalization_uses_the_put_namespace() {
     assert!(tokens.contains(&64));
     assert!(tokens.contains(&(576 * 64)));
     let mut other = host.client_with(other_descriptor.clone()).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(other.records().await.is_empty());
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1114,7 +1106,6 @@ async fn l0_42_cancel_before_dispatch_withdraws_the_put() {
     let mut client = host.client().await;
     let id = client.send_begin(key(128), None).await;
     client.cancel_put(id).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
     client.fence_put(id).await;
     host.wait(|host| host.gauge("open_ops") == 0);
     let mut fresh = host.client().await;
@@ -1368,7 +1359,6 @@ async fn l0_51_rootless_child_that_cannot_fit_beside_its_parent_waits() {
             .await,
         PutOutcome::Refused(v2::Reason::Budget as u8)
     );
-    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         client
             .put(key(384), Some(key(128)), PutOptions::default())
@@ -1443,7 +1433,6 @@ async fn l0_53_room_reconsiders_the_arena_after_a_lease_releases() {
         waiter.put(key(64), None, PutOptions::default()).await,
         PutOutcome::Refused(v2::Reason::Budget as u8)
     );
-    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         waiter.put(key(64), None, PutOptions::default()).await,
         PutOutcome::Refused(v2::Reason::Budget as u8),
@@ -1919,7 +1908,6 @@ async fn l0_65_rootless_tail_shortage_waits_without_room() {
             .await,
         PutOutcome::Refused(v2::Reason::Budget as u8)
     );
-    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         client
             .put(key(14 * 64), Some(key(10 * 64)), PutOptions::default())
@@ -1954,7 +1942,6 @@ async fn l0_66_protected_parent_shortage_is_a_budget() {
             .await,
         PutOutcome::Refused(v2::Reason::Budget as u8)
     );
-    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         client
             .put(key(10 * 64), Some(key(5 * 64)), PutOptions::default())

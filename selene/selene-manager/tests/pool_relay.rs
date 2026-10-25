@@ -501,7 +501,6 @@ async fn r8_a_source_session_lost_mid_relay_fails_the_claim() {
         ..
     } = w;
     drop(source);
-    drop(conn);
     let _keep = tcp;
     let terminal = requester.claim_terminal(1).await;
     assert_eq!(
@@ -510,6 +509,7 @@ async fn r8_a_source_session_lost_mid_relay_fails_the_claim() {
         "{terminal:?}"
     );
     assert_eq!(terminal.reason, v2::ClaimReason::SourceLost as i32);
+    drop(conn);
     let _ = read_remote(&granted, &records).await;
     requester.fence(1, v2::FenceOutcome::Drained).await;
     assert_eq!(requester.readiness().await.quarantined_bytes, 0);

@@ -656,7 +656,7 @@ async fn r13_shutdown_drains_claims_then_closes_sessions() {
             v2::FenceOutcome::Drained,
         )
         .await;
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    source.barrier().await;
     requester.copy_result(1, v2::CopyOutcome::CopyOk).await;
     assert_eq!(
         requester.claim_terminal(1).await.state,

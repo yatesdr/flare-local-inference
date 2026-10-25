@@ -88,20 +88,13 @@ impl World {
         self.host.gauge("staging_allocated_bytes")
     }
 
-    /// The gauge is refreshed by the store's clock, so let it catch up first.
     async fn staging_now(&self) -> u64 {
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        self.host.wait(|host| host.gauge("staging_allocated_bytes") > 0);
         self.staging_used()
     }
 
     async fn staging_settles_at(&self, bytes: u64) {
-        for _ in 0..100 {
-            if self.staging_used() == bytes {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(self.staging_used(), bytes, "staging bytes in use");
+        self.host.wait(|host| host.gauge("staging_allocated_bytes") == bytes);
     }
 
     /// The source pins the whole chain as an honest source would.
@@ -201,8 +194,7 @@ impl World {
                 v2::FenceOutcome::Drained,
             )
             .await;
-        // Let the source's end reach the manager before the verdict.
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        self.source.barrier().await;
         self.requester
             .copy_result(claim_id, v2::CopyOutcome::CopyOk)
             .await;
@@ -797,7 +789,7 @@ async fn f2_a_window_the_source_may_still_write_waits_for_its_end() {
     let terminal = w.requester.claim_terminal(1).await;
     assert_eq!(terminal.reason, v2::ClaimReason::Cancelled as i32);
     w.requester.fence(1, v2::FenceOutcome::Drained).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    w.requester.barrier().await;
     assert_eq!(
         w.staging_used(),
         held,
@@ -835,7 +827,7 @@ async fn f3_a_window_the_requester_may_still_read_waits_for_its_fence() {
     w.requester.send(pool_release(1)).await;
     let terminal = w.requester.claim_terminal(1).await;
     assert!(terminal.fence_required);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    w.requester.barrier().await;
     assert_eq!(w.staging_used(), held, "the requester may still be reading");
     w.requester.fence(1, v2::FenceOutcome::Drained).await;
     w.staging_settles_at(0).await;
@@ -861,7 +853,7 @@ async fn f4_a_quarantined_party_keeps_its_windows_out_of_service() {
     w.requester.claim_terminal(1).await;
     assert_eq!(w.requester.readiness().await.quarantined_bytes, 0);
     w.requester.fence(1, v2::FenceOutcome::Quarantined).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    w.requester.barrier().await;
     let held = w.staging_now().await;
     assert!(held > 0);
     assert_eq!(
@@ -869,7 +861,7 @@ async fn f4_a_quarantined_party_keeps_its_windows_out_of_service() {
         partial.windows[0].length
     );
     // The process is still alive, so the windows stay out of service.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    w.requester.barrier().await;
     assert_eq!(w.staging_used(), held);
 }
 
@@ -915,7 +907,7 @@ async fn a1_and_a2_goodbye_clears_only_the_senders_obligations() {
     drop(requester.tx.clone());
     requester.ended = true;
     drop(requester);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    w.requester.barrier().await;
     assert_eq!(w.staging_used(), held, "the source's write is still open");
     w.source
         .export_end(
@@ -945,7 +937,7 @@ async fn a1_and_a2_goodbye_clears_only_the_senders_obligations() {
     w.source.goodbye(true).await;
     let source = std::mem::replace(&mut w.source, w.pool.open(&Ident::new("src-b")).await);
     drop(source);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    w.requester.barrier().await;
     assert_eq!(w.staging_used(), held, "the requester may still be reading");
     w.requester.fence(1, v2::FenceOutcome::Drained).await;
     w.staging_settles_at(0).await;
@@ -962,7 +954,7 @@ async fn r11_a_source_blip_quarantines_until_the_export_end_arrives_on_a_new_ses
     drop(old);
     let terminal = w.requester.claim_terminal(1).await;
     assert_eq!(terminal.reason, v2::ClaimReason::SourceLost as i32);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    w.source.barrier().await;
     assert_eq!(
         w.staging_used(),
         held,
@@ -1006,7 +998,7 @@ async fn s4_and_s7_a_new_process_attests_nothing_for_its_predecessor() {
     fresh.snapshot(vec![]).await;
     // Its acknowledgment of a claim id it never made resolves nothing.
     fresh.fence(1, v2::FenceOutcome::Drained).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    fresh.barrier().await;
     assert_eq!(
         w.staging_used(),
         held,
@@ -1175,7 +1167,8 @@ async fn r7_and_r8_a_killed_or_hung_requester_leaves_nothing_behind() {
             v2::FenceOutcome::Drained,
         )
         .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    source.barrier().await;
+    host.wait(|host| host.gauge("staging_allocated_bytes") > 0);
     let held = host.gauge("staging_allocated_bytes");
     assert!(held > 0);
 
@@ -1183,7 +1176,7 @@ async fn r7_and_r8_a_killed_or_hung_requester_leaves_nothing_behind() {
     unsafe { libc::kill(child.id() as i32, libc::SIGSTOP) };
     let cancel = source.export_cancel().await;
     assert_eq!(cancel.export_id, request.export_id);
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    source.barrier().await;
     assert_eq!(
         host.gauge("staging_allocated_bytes"),
         held,
@@ -1226,7 +1219,7 @@ async fn r10_a_killed_source_fails_its_claims_and_frees_its_windows() {
         .await;
     requester.claim_granted(1).await;
     wait_for_file(&flag);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    host.wait(|host| host.gauge("staging_allocated_bytes") > 0);
     assert!(host.gauge("staging_allocated_bytes") > 0);
     child.kill().unwrap();
     child.wait().unwrap();
