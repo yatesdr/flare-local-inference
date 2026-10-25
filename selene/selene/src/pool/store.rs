@@ -41,6 +41,10 @@ use super::{
 /// What the store uses of the pool client. [`PoolClient`] is the implementation;
 /// tests of the store's planning and sequencing substitute a recording one.
 pub trait PoolPort {
+    /// An instance-scoped probe namespace, when the port has a process identity.
+    fn probe_model(&self) -> Option<[u8; 32]> {
+        None
+    }
     fn begin_lookup(&self, history: &dyn History, held: Vec<HeldRange>) -> LookupTicket;
     fn fetch(&mut self, fetch: PoolFetch) -> Result<u64>;
     fn poll(&mut self, events: &mut Vec<PoolEvent>) -> Result<()>;
@@ -63,6 +67,9 @@ pub trait PoolPort {
 }
 
 impl PoolPort for PoolClient {
+    fn probe_model(&self) -> Option<[u8; 32]> {
+        Some(PoolClient::probe_model(self))
+    }
     fn begin_lookup(&self, history: &dyn History, held: Vec<HeldRange>) -> LookupTicket {
         PoolClient::begin_lookup(self, history, held)
     }
@@ -260,29 +267,18 @@ impl<S: HostStore> PooledStore<S, PoolClient> {
             layout: config.scope.layout_fingerprint,
         };
         let order = config.level_order;
-        // Two instances probing at once must not write or time each other's records.
-        let probe_model = super::probe::instance_probe_model(
-            &config.scope.model_identity,
-            &super::identity::instance_id(
-                &config.scope.tenant,
-                &config.scope.model_identity,
-                &config.scope.layout_fingerprint,
-                &config.gpu_uuids,
-            ),
-        );
         let pool = match ranks {
             Some(ranks) => PoolClient::start_ranked(config, ranks, copier, registrar)?,
             None => PoolClient::start(config, copier, registrar)?,
         };
-        let mut store = Self::new(inner, pool, identity, &layout);
-        store.probe_model = probe_model;
+        let store = Self::new(inner, pool, identity, &layout);
         store.with_pinned_order(order)
     }
 }
 
 impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
     pub fn new(mut inner: S, pool: P, identity: Identity, layout: &crate::Layout) -> Self {
-        let identity_model = identity.model;
+        let probe_model = pool.probe_model().unwrap_or(identity.model);
         inner.announce_to(pool.announcer());
         inner.cascade();
         Self {
@@ -304,7 +300,7 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             held: HashMap::new(),
             characterizer: Characterizer::new(PROBE_PAGES, None).ok(),
             characterized_for: None,
-            probe_model: identity_model,
+            probe_model,
             pool_fetched: 0,
             pool_fetch_failed: 0,
             pool_bytes_in: 0,
