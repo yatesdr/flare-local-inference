@@ -117,6 +117,48 @@ pub(crate) struct Ranks {
 }
 
 impl Ranks {
+    pub(super) fn open_peers(
+        &mut self,
+        owner: XferOwner,
+        channels: &[wire::RankChannel],
+        template: link::Open,
+        opened: &mut Vec<PeerPart>,
+    ) -> std::result::Result<(), String> {
+        for rank in 1..self.world() {
+            let channel = channels
+                .iter()
+                .find(|c| c.rank as usize == rank)
+                .and_then(|c| c.channel.clone());
+            let shared = channel.is_none();
+            let expected = if shared {
+                wire::RankMode::RankShared
+            } else {
+                wire::RankMode::RankChannel
+            };
+            let mut open = template.clone();
+            open.channel = channel;
+            let xfer = (self.mode(rank) == Some(expected))
+                .then(|| self.open(rank, owner, open))
+                .flatten();
+            let Some(xfer) = xfer else {
+                for peer in opened.iter_mut() {
+                    self.cancel(peer.xfer);
+                    peer.cancelled = true;
+                }
+                return Err(format!("rank {rank} is not attached in the granted mode"));
+            };
+            opened.push(PeerPart {
+                rank,
+                xfer,
+                shared,
+                done: None,
+                quarantined: false,
+                cancelled: false,
+            });
+        }
+        Ok(())
+    }
+
     /// Start the links. `set.links[i]` reaches rank `i + 1`; Hello goes out at once.
     pub(crate) fn new(
         set: RankSet,
@@ -399,52 +441,22 @@ impl super::Engine {
         }
         let (page_bytes, row_bytes) = (self.st.page_record_bytes(), self.st.row_record_bytes());
         let mut opened: Vec<PeerPart> = Vec::new();
-        for rank in 1..ranks.world() {
-            let channel = rank_channels
-                .iter()
-                .find(|c| c.rank as usize == rank)
-                .and_then(|c| c.channel.clone());
-            let shared = channel.is_none();
-            let expected = if shared {
-                wire::RankMode::RankShared
-            } else {
-                wire::RankMode::RankChannel
-            };
-            if ranks.mode(rank) != Some(expected) {
-                return Err(format!("rank {rank}'s attachment does not match its mode"));
-            }
-            let open = link::Open {
-                dir: link::Dir::Out as i32,
-                kind: wire::rank_fence::Kind::Export as i32,
-                fence_id: id,
-                records: records.to_vec(),
-                pages: pages.clone(),
-                has_slot: chain.is_some_and(|c| c.row.is_some()),
-                slot: chain.and_then(|c| c.row).map_or(0, |slot| slot.0),
-                channel,
-                page_bytes,
-                row_bytes,
-                host: chain.is_none(),
-                ..Default::default()
-            };
-            let Some(xfer) = ranks.open(rank, XferOwner::Export(id), open) else {
-                // Cancel the ones already started.
-                for peer in &opened {
-                    ranks.cancel(peer.xfer);
-                }
-                return Err(format!("rank {rank} is not attached"));
-            };
-            opened.push(PeerPart {
-                rank,
-                xfer,
-                shared,
-                done: None,
-                quarantined: false,
-                cancelled: false,
-            });
-        }
+        let open = link::Open {
+            dir: link::Dir::Out as i32,
+            kind: wire::rank_fence::Kind::Export as i32,
+            fence_id: id,
+            records: records.to_vec(),
+            pages: pages.clone(),
+            has_slot: chain.is_some_and(|c| c.row.is_some()),
+            slot: chain.and_then(|c| c.row).map_or(0, |slot| slot.0),
+            page_bytes,
+            row_bytes,
+            host: chain.is_none(),
+            ..Default::default()
+        };
+        let result = ranks.open_peers(XferOwner::Export(id), rank_channels, open, &mut opened);
         self.source.set_peers(id, opened);
-        Ok(())
+        result
     }
 
     /// Stop the peers of an export that is over or never started.
@@ -512,55 +524,23 @@ impl super::Engine {
         };
         let (page_bytes, row_bytes) = (self.st.page_record_bytes(), self.st.row_record_bytes());
         let mut opened: Vec<PeerPart> = Vec::new();
-        for rank in 1..ranks.world() {
-            let channel = rank_channels
-                .iter()
-                .find(|c| c.rank as usize == rank)
-                .and_then(|c| c.channel.clone());
-            let shared = channel.is_none();
-            let expected = if shared {
-                wire::RankMode::RankShared
-            } else {
-                wire::RankMode::RankChannel
-            };
-            if ranks.mode(rank) != Some(expected) {
-                for peer in &opened {
-                    ranks.cancel(peer.xfer);
-                }
-                return Err(format!("rank {rank}'s attachment does not match its mode"));
-            }
-            let open = link::Open {
-                dir: link::Dir::Out as i32,
-                kind: wire::rank_fence::Kind::Put as i32,
-                fence_id: id,
-                records: vec![setup.record.clone()],
-                pages: setup.pages.clone(),
-                has_slot: setup.row && !setup.host,
-                slot: setup.slot,
-                channel,
-                page_bytes,
-                row_bytes,
-                host: setup.host,
-                chain_first: setup.chain_first,
-                ..Default::default()
-            };
-            let Some(xfer) = ranks.open(rank, XferOwner::Put(id), open) else {
-                for peer in &opened {
-                    ranks.cancel(peer.xfer);
-                }
-                return Err(format!("rank {rank} is not attached"));
-            };
-            opened.push(PeerPart {
-                rank,
-                xfer,
-                shared,
-                done: None,
-                quarantined: false,
-                cancelled: false,
-            });
-        }
+        let open = link::Open {
+            dir: link::Dir::Out as i32,
+            kind: wire::rank_fence::Kind::Put as i32,
+            fence_id: id,
+            records: vec![setup.record.clone()],
+            pages: setup.pages.clone(),
+            has_slot: setup.row && !setup.host,
+            slot: setup.slot,
+            page_bytes,
+            row_bytes,
+            host: setup.host,
+            chain_first: setup.chain_first,
+            ..Default::default()
+        };
+        let result = ranks.open_peers(XferOwner::Put(id), rank_channels, open, &mut opened);
         self.writer.set_peers(id, opened);
-        Ok(())
+        result
     }
 
     /// Whether shared peers still owe their slice of one window of a put.
