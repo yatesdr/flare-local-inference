@@ -8,7 +8,7 @@
 //! has drained, and the export ends with exactly one `ExportEnd`.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -29,7 +29,7 @@ use super::{
     Engine, Owner,
     coverage::Coverage,
     hostfill::{FillDone, FillJob, FillOwner},
-    ranks::{PeerPart, PeerWindow, XferOwner},
+    ranks::{PeerPart, PeerWindow},
     requester::ExpectedRecord,
 };
 
@@ -628,7 +628,7 @@ impl Engine {
                             rank,
                             super::super::rank::link::Window {
                                 xfer,
-                                spec: Some(spec.clone()),
+                                spec: Some(spec),
                                 sums: None,
                             },
                         )

@@ -200,8 +200,6 @@ struct Win {
     spec: wire::WindowSpec,
     /// The staging slot a channel window lives in.
     slot: Option<u32>,
-    /// Where the window's bytes are, for checksums after an outgoing copy.
-    address: usize,
 }
 
 struct Xfer {
@@ -214,7 +212,6 @@ struct Xfer {
     shared: bool,
     /// The mapping this transfer was opened against, kept until it ends.
     regions: Option<Arc<Regions>>,
-    staging: Option<Arc<Staging>>,
     channel: Option<Channel>,
     channel_open: bool,
     ended: bool,
@@ -270,6 +267,11 @@ fn run(mut agent: Agent) -> Result<()> {
     runtime.block_on(async {
         let result = agent.serve().await;
         agent.finish().await;
+        let status = agent.status.clone();
+        let mut status = status.lock().unwrap();
+        if !matches!(*status, PoolStatus::Disabled(_)) {
+            *status = PoolStatus::Disabled("the agent stopped".into());
+        }
         result
     })
 }
@@ -723,7 +725,6 @@ impl Agent {
             slot: open.has_slot.then_some(StateSlotId(open.slot)),
             shared,
             regions: att.regions.clone(),
-            staging: self.staging.clone(),
             channel: None,
             channel_open: false,
             ended: false,
@@ -824,9 +825,8 @@ impl Agent {
             spec.index,
             Win {
                 jobs_left: 0,
-                spec: spec.clone(),
+                spec,
                 slot: None,
-                address: base,
             },
         );
         let jobs = jobs_of(
@@ -974,9 +974,8 @@ impl Agent {
             spec.index,
             Win {
                 jobs_left: 0,
-                spec: spec.clone(),
+                spec,
                 slot: Some(slot),
-                address: base,
             },
         );
         let jobs = jobs_of(
@@ -1033,9 +1032,8 @@ impl Agent {
             spec.index,
             Win {
                 jobs_left: 0,
-                spec: spec.clone(),
+                spec,
                 slot: Some(slot),
-                address: base,
             },
         );
         let jobs = jobs_of(
@@ -1111,7 +1109,7 @@ impl Agent {
         let Some(win) = run.windows.get(&index) else {
             return;
         };
-        let (spec, slot) = (win.spec.clone(), win.slot);
+        let (spec, slot) = (win.spec, win.slot);
         let (count, row) = (spec.page_count as usize, spec.row);
         let over = run.failed.is_some() || run.cancelled;
         let (shared, out) = (run.shared, run.out);

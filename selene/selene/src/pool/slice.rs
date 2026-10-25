@@ -342,13 +342,13 @@ mod tests {
         assert_eq!(whole.pages[0], whole2.pages[0]);
         assert_ne!(whole.pages[1], whole2.pages[1]);
         assert_eq!(whole.row, whole2.row);
-        for r in 0..3 {
+        for (r, before) in slices.iter().enumerate() {
             let now = layout.slice_sums(r, &bytes, 2, true).unwrap();
             if r == 1 {
-                assert_eq!(slices[r].pages[0], now.pages[0]);
-                assert_ne!(slices[r].pages[1], now.pages[1]);
+                assert_eq!(before.pages[0], now.pages[0]);
+                assert_ne!(before.pages[1], now.pages[1]);
             } else {
-                assert_eq!(slices[r], now);
+                assert_eq!(*before, now);
             }
         }
         assert!(layout.slice_sums(3, &bytes, 2, true).is_err());

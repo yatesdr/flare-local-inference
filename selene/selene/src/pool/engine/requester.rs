@@ -589,7 +589,7 @@ impl Engine {
                     rank,
                     super::super::rank::link::Window {
                         xfer,
-                        spec: Some(spec.clone()),
+                        spec: Some(spec),
                         sums: Some(super::super::rank::link::SliceSums {
                             pages: sums.page_xxh3,
                             row: sums.row_xxh3,

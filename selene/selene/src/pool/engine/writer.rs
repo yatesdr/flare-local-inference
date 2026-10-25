@@ -33,7 +33,7 @@ use super::{
     Engine, Owner,
     coverage::Coverage,
     hostfill::{FillJob, FillOwner},
-    ranks::{PeerPart, PeerWindow, XferOwner},
+    ranks::{PeerPart, PeerWindow},
     requester::ExpectedRecord,
 };
 
@@ -562,7 +562,7 @@ impl Engine {
                             rank,
                             super::super::rank::link::Window {
                                 xfer,
-                                spec: Some(spec.clone()),
+                                spec: Some(spec),
                                 sums: None,
                             },
                         )

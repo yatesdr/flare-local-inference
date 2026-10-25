@@ -472,16 +472,6 @@ impl Core {
             }
         }
     }
-
-    /// The requester's peer legs, for the end of a manager-store claim.
-    pub(super) fn finish_peer_legs(&mut self, key: ClaimKey) {
-        let (Some(claim), Some(hub)) = (self.claims.get(&key), self.cfg.channel.as_ref()) else {
-            return;
-        };
-        for leg in claim.mp.legs.iter().filter(|leg| !leg.source) {
-            hub.finish(leg.ch.transfer);
-        }
-    }
 }
 
 /// A window of a put, while its ranks fill it.

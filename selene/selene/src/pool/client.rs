@@ -220,6 +220,7 @@ impl PoolClient {
             );
         }
         let announce = Announcer::new(wake.clone());
+        let gpu_uuids = config.gpu_uuids.clone();
         let rank_secret = match &ranks {
             Some(_) => Some(identity::secret()?),
             None => None,
@@ -234,7 +235,6 @@ impl PoolClient {
             export_slots: config.export_slots,
             claim_slots: config.claim_slots,
             context: config.registration_context,
-            slices: slices.clone(),
             rank_secret,
         });
         let mut engine = Engine::new(
@@ -248,10 +248,13 @@ impl PoolClient {
             engine.set_ranks(super::engine::Ranks::new(
                 set,
                 slices,
-                secret,
-                settings.nonce,
-                settings.instance_id,
-                fingerprint,
+                super::engine::ranks::Identity {
+                    secret,
+                    nonce: settings.nonce,
+                    instance_id: settings.instance_id,
+                    fingerprint,
+                    gpus: gpu_uuids,
+                },
                 wake.clone(),
             )?);
         }
