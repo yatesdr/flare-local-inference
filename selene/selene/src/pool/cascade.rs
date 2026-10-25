@@ -151,7 +151,7 @@ impl Cascade {
             // Without its row the record can end no restore.
             return inner.retired(record.key, record.tier, Retirement::Dropped);
         }
-        let pin = match inner.pin_export(record.tier, record.key, record.generation, 0, true) {
+        let pin = match inner.pin_export(record.tier, record.key, 0, true) {
             Ok(pin) => pin,
             Err(_) => return self.failed(inner, record),
         };
@@ -162,7 +162,6 @@ impl Cascade {
             chain_pages: pin.chain().total_pages,
             tail_pages: record.tail_pages as u64,
             row: true,
-            generation: record.generation,
             source: PutSource::Host(Box::new(PinBytes {
                 pin,
                 page_bytes: self.page_bytes,
@@ -252,7 +251,7 @@ mod tests {
         let second: Vec<u8> = (0..2 * PAGE + ROW).map(|i| (i * 3 + 1) as u8).collect();
         let (a, b) = (first.as_ptr() as usize, second.as_ptr() as usize);
         let releases = Releases::default();
-        let nodes = [(key(48, 1), 1, 3), (key(80, 2), 2, 2)];
+        let nodes = [(key(48, 1), 3), (key(80, 2), 2)];
         let pin = MemoryPin {
             chain: host_chain(16, 0, true, &nodes),
             spans: vec![

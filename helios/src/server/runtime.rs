@@ -2017,7 +2017,6 @@ impl<'a> Worker<'a> {
                 StoreEvent::ExportRequested {
                     export,
                     key,
-                    generation,
                     begin_tokens,
                     want_row,
                     ..
@@ -2029,7 +2028,7 @@ impl<'a> Worker<'a> {
                         &mut self.exports,
                         next,
                         export,
-                        (key, generation, begin_tokens, want_row),
+                        (key, begin_tokens, want_row),
                     )?;
                 }
                 StoreEvent::ExportEnded { export } => {
@@ -2044,7 +2043,7 @@ impl<'a> Worker<'a> {
         // Eviction notices precede the next `store`, so a pool never learns of a
         // replacement before the removal it replaces.
         for evicted in self.scheduler.take_evictions() {
-            store.evicted(evicted.key, evicted.generation, evicted.heir.as_ref());
+            store.evicted(evicted.key, evicted.heir.as_ref());
         }
         if self.scheduler.take_evictions_lost() {
             store.evictions_lost();
@@ -2190,7 +2189,7 @@ fn serve_export(
     exports: &mut HashMap<crate::offload::ExportId, crate::cache::CheckpointId>,
     next: Option<crate::scheduler::NextAdmission>,
     export: crate::offload::ExportId,
-    (key, generation, begin_tokens, want_row): (crate::cache::PrefixKey, u64, u64, bool),
+    (key, begin_tokens, want_row): (crate::cache::PrefixKey, u64, bool),
 ) -> Result<()> {
     use crate::offload::ExportRefusal;
     let refuse = |store: &mut dyn crate::offload::PrefixStore, reason| {
@@ -2200,7 +2199,7 @@ fn serve_export(
     if exports.contains_key(&export) {
         return refuse(store, ExportRefusal::Busy);
     }
-    let id = match scheduler.checkpoint_by_generation(&key, generation) {
+    let id = match scheduler.checkpoint_by_key(&key) {
         Ok(id) => id,
         Err(reason) => return refuse(store, reason),
     };

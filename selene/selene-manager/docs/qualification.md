@@ -13,7 +13,7 @@ client (`tests/support/pool.rs`) and never model the manager's state machine.
 | Suite | What it proves |
 |---|---|
 | Unit (`src/**`) | Modules in isolation: the index and chain walks, window planning, configuration, the record format, the arena, the disk worker, the store's admission and eviction rules, the data-channel modules, and the store-claim completion order. |
-| `tests/pool_l0.rs` | Hello, sessions and supersede, notices, generations, live resync, lookup, recovery readiness, limits, shutdown drain. |
+| `tests/pool_l0.rs` | Hello, sessions and supersede, notices, content keys, live resync, lookup, recovery readiness, limits, shutdown drain. |
 | `tests/pool_claims.rs` | Claims between instances: retained and streamed copies byte for byte through the shared staging region, every refusal, timeouts, races, fencing and quarantine, Goodbye, stream blips, process replacement, and a real peer process that is killed or hung. |
 | `tests/pool_store.rs` | Put into the manager's store and claims on its records: persisted checksums, recovered NVMe records, damage at rest, a requester whose stream drops, put cancel and fence. |
 | `tests/pool_net.rs` | The network listener: sessions without shared memory, level-5 candidates, refusal of shared windows, TLS declared and RDMA withheld, the startup warnings and the refusal of RDMA with TLS. |
@@ -48,7 +48,7 @@ H7 `h7_malformed_scopes_are_refused`; H8 `h8_scopes_never_see_each_other`;
 H10 `h10_a_reconnect_supersedes_the_old_stream`.
 
 **Index notices and resync.** `snapshots_clear_on_begin_and_chunks_are_visible_before_end`;
-`i5_to_i9_generations_spills_compactions`; `i8_a_compacted_node_is_no_longer_an_endpoint_but_the_chain_holds`;
+`content_hints_spill_and_evict_independently_per_tier`; `i8_a_compacted_node_is_no_longer_an_endpoint_but_the_chain_holds`;
 `i9_a_leaf_leaves_its_page_only_ancestors_until_they_are_named`;
 `i15_a_snapshot_above_the_entry_bound_overflows`; `i18_and_i19_stale_incarnations_and_session_end`.
 Client engine tests cover mutations following the snapshot cut and queue overflow.

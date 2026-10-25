@@ -40,7 +40,7 @@ pub trait PoolPort {
     fn fetch(&mut self, fetch: PoolFetch) -> Result<u64>;
     fn poll(&mut self, events: &mut Vec<PoolEvent>) -> Result<()>;
     fn saved(&self, entry: IndexEntry);
-    fn evicted(&self, key: PrefixKey, tier: Tier, generation: u64, heir: Option<IndexEntry>);
+    fn evicted(&self, key: PrefixKey, tier: Tier, heir: Option<IndexEntry>);
     fn evictions_lost(&self);
     fn put(&mut self, request: PutRequest) -> Result<u64>;
     fn cancel_put(&mut self, id: u64);
@@ -66,8 +66,8 @@ impl PoolPort for PoolClient {
     fn saved(&self, entry: IndexEntry) {
         PoolClient::saved(self, entry)
     }
-    fn evicted(&self, key: PrefixKey, tier: Tier, generation: u64, heir: Option<IndexEntry>) {
-        PoolClient::evicted(self, key, tier, generation, heir)
+    fn evicted(&self, key: PrefixKey, tier: Tier, heir: Option<IndexEntry>) {
+        PoolClient::evicted(self, key, tier, heir)
     }
     fn evictions_lost(&self) {
         PoolClient::evictions_lost(self)
@@ -264,7 +264,6 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
                 Local::Disk => Level::HostNvme,
             },
             source: LOCAL,
-            generation: 0,
             key: hit.key,
             begin_tokens: hit.resident_tokens,
             skip_pages: hit.chain.skip_pages,
@@ -477,7 +476,6 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
                     events.push(StoreEvent::ExportRequested {
                         export: request.export,
                         key: request.key,
-                        generation: request.generation,
                         begin_tokens: request.begin_tokens,
                         want_row: request.want_row,
                         reserved_bytes: request.reserved_bytes,
@@ -486,7 +484,6 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
                 PoolEvent::Export(request) => match self.inner.pin_export(
                     request.tier,
                     request.key,
-                    request.generation,
                     request.begin_tokens,
                     request.want_row,
                 ) {
@@ -522,7 +519,6 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
                 tail_pages: checkpoint.tail_pages as u32,
                 row: true,
                 tier: Tier::Gpu,
-                generation: checkpoint.id.value(),
                 bytes: checkpoint.tail_pages as u64 * self.page_record_bytes
                     + self.row_record_bytes,
             },
@@ -561,12 +557,11 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
         PoolPort::evictions_lost(&self.pool);
     }
 
-    fn evicted(&mut self, key: PrefixKey, generation: u64, heir: Option<&PublishedCheckpoint>) {
+    fn evicted(&mut self, key: PrefixKey, heir: Option<&PublishedCheckpoint>) {
         PoolPort::evicted(
             &self.pool,
             key,
             Tier::Gpu,
-            generation,
             heir.map(|heir| IndexEntry {
                 key: heir.key,
                 parent: heir.parent,
@@ -574,7 +569,6 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
                 tail_pages: heir.tail_pages as u32,
                 row: true,
                 tier: Tier::Gpu,
-                generation: heir.id.value(),
                 bytes: heir.tail_pages as u64 * self.page_record_bytes + self.row_record_bytes,
             }),
         );

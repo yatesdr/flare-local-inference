@@ -1273,14 +1273,11 @@ impl HostStore for CompositeStore {
         &mut self,
         tier: PoolTier,
         key: PrefixKey,
-        generation: u64,
         begin_tokens: u64,
         want_row: bool,
     ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
         if tier == PoolTier::Nvme {
-            return self
-                .disk
-                .pin_export_files(key, generation, begin_tokens, want_row);
+            return self.disk.pin_export_files(key, begin_tokens, want_row);
         }
         // The memory records are flat: the disk index supplies the chain, and
         // each record on it must be resident with all its pages (and the row,
@@ -1308,8 +1305,7 @@ impl HostStore for CompositeStore {
             cursor = node.parent.ok_or(ExportRefusal::ChainGap)?;
         }
         chain.reverse();
-        self.memory
-            .pin_export_chain(&chain, generation, begin_tokens, want_row)
+        self.memory.pin_export_chain(&chain, begin_tokens, want_row)
     }
 
     fn stats(&self) -> StoreStats {
@@ -2561,10 +2557,7 @@ mod tests {
         // DRAM serves the resident copy, NVMe the file; both with committed checksums.
         let mut pins = Vec::new();
         for tier in [PoolTier::Dram, PoolTier::Nvme] {
-            let generation = entry(child.key, tier).generation;
-            let mut pin = store
-                .pin_export(tier, child.key, generation, 0, true)
-                .unwrap();
+            let mut pin = store.pin_export(tier, child.key, 0, true).unwrap();
             assert_eq!(pin.chain().total_pages, 20);
             let mut dst = vec![0u8; (PAGE_RECORD + ROW_RECORD) as usize];
             let window = HostWindow {
@@ -2911,25 +2904,11 @@ mod tests {
         let spills: Vec<_> = notices
             .iter()
             .filter_map(|n| match n {
-                Notice::Spilled {
-                    to,
-                    from_tier,
-                    from_generation,
-                } => Some((to.key, to.tier, *from_tier, *from_generation)),
+                Notice::Spilled { to, from_tier } => Some((to.key, to.tier, *from_tier)),
                 _ => None,
             })
             .collect();
-        let dram_generation = notices
-            .iter()
-            .find_map(|n| match n {
-                Notice::Saved(e) if e.tier == Pool::Dram && e.key == root.key => Some(e.generation),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(
-            spills,
-            [(root.key, Pool::Nvme, Pool::Dram, dram_generation)]
-        );
+        assert_eq!(spills, [(root.key, Pool::Nvme, Pool::Dram)]);
         assert!(!notices.iter().any(|n| matches!(
             n,
             Notice::Evicted { key, tier, .. } if *key == root.key && *tier == Pool::Dram

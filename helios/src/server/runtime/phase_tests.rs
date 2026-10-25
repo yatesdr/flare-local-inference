@@ -1255,7 +1255,6 @@ struct FakeStore {
     /// Each eviction notice with the number of `store` calls made before it.
     evicted: Vec<(
         crate::cache::PrefixKey,
-        u64,
         Option<crate::offload::PublishedCheckpoint>,
         usize,
     )>,
@@ -1344,11 +1343,10 @@ impl crate::offload::PrefixStore for FakeStore {
     fn evicted(
         &mut self,
         key: crate::cache::PrefixKey,
-        generation: u64,
         heir: Option<&crate::offload::PublishedCheckpoint>,
     ) {
         self.evicted
-            .push((key, generation, heir.cloned(), self.stored.len()));
+            .push((key, heir.cloned(), self.stored.len()));
     }
     fn evictions_lost(&mut self) {
         self.evictions_lost += 1;
@@ -1810,7 +1808,6 @@ fn export_request(
     crate::offload::StoreEvent::ExportRequested {
         export: crate::offload::ExportId(export),
         key,
-        generation,
         begin_tokens,
         want_row: true,
         reserved_bytes: 1 << 20,
@@ -1839,7 +1836,6 @@ fn an_export_pins_its_checkpoint_until_it_ends_and_releases_once() {
     let (export, chain) = store.exports.pop().unwrap();
     assert_eq!(export, crate::offload::ExportId(7));
     assert_eq!(chain.nodes.len(), 1);
-    assert_eq!(chain.nodes[0].generation, id.value());
     assert_eq!(chain.nodes[0].key, key);
     assert!(chain.row.is_some());
     assert_eq!(worker.exports.len(), 1);
@@ -1889,9 +1885,6 @@ fn exports_that_cannot_be_served_are_refused_without_a_pin() {
         .push_back(export_request(1, other.key_at(70).unwrap(), id.value(), 0));
     store
         .events
-        .push_back(export_request(2, key, id.value() + 1, 0));
-    store
-        .events
         .push_back(export_request(3, key, id.value(), 10_000));
     store
         .events
@@ -1906,7 +1899,6 @@ fn exports_that_cannot_be_served_are_refused_without_a_pin() {
         refused,
         [
             (1, NotFound),
-            (2, GenerationChanged),
             (3, ChainGap),
             (4, Busy)
         ]
@@ -1988,8 +1980,8 @@ fn pooled_and_local_stores_hear_of_evictions() {
         worker.service_store().unwrap();
         let evicted = &fake_store(&mut worker).evicted;
         assert_eq!(evicted.len(), 1);
-        assert_eq!((evicted[0].0, evicted[0].1), (key, id.value()));
-        assert!(evicted[0].2.is_none());
+        assert_eq!(evicted[0].0, key);
+        assert!(evicted[0].1.is_none());
         assert_eq!(publication.key, key);
     }
 }
@@ -3735,6 +3727,7 @@ fn write_back_does_not_take_capacity_from_the_next_admission() {
     store.write_back_outcomes.push_back(Queued);
     worker.attach_store(Some(Box::new(store)));
     let id = unpinned_checkpoint(&mut worker, 0, 64);
+    let key = worker.scheduler.publication(id).unwrap().key;
     let (incoming, generation) = fixture.incoming(vec![1; 150], 4);
     worker.pending.push_back(incoming);
     worker.service_store().unwrap();
@@ -3744,7 +3737,7 @@ fn write_back_does_not_take_capacity_from_the_next_admission() {
     assert_eq!(worker.scheduler.stats().active_requests, 1);
     assert!(worker.scheduler.cache().checkpoint(id).is_err());
     worker.service_store().unwrap();
-    assert_eq!(fake_store(&mut worker).evicted[0].1, id.value());
+    assert_eq!(fake_store(&mut worker).evicted[0].0, key);
     drop(generation);
 }
 
@@ -3876,8 +3869,7 @@ fn write_back_pins_survive_ancestor_compaction() {
     worker.service_store().unwrap();
     assert_eq!(pins(&worker, b), 0);
     let notice = &fake_store(&mut worker).evicted[0];
-    assert_eq!(notice.1, a.value());
-    assert_eq!(notice.2.as_ref().unwrap().id, b);
+    assert_eq!(notice.1.as_ref().unwrap().id, b);
     drop(generation);
 }
 

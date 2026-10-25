@@ -62,12 +62,10 @@ pub enum Notice {
     Spilled {
         to: Entry,
         from_tier: Tier,
-        from_generation: u64,
     },
     Evicted {
         key: Key,
         tier: Tier,
-        generation: u64,
         heir: Option<Entry>,
     },
 }
@@ -131,7 +129,6 @@ pub fn entry_from(entry: &v2::IndexEntry) -> Checked<Entry> {
         tail_pages: entry.tail_pages,
         row: entry.row,
         tier: tier_from(entry.tier)?,
-        generation: entry.generation,
         bytes: entry.bytes,
     })
 }
@@ -145,7 +142,6 @@ pub fn entry_to(entry: &Entry) -> v2::IndexEntry {
         tail_pages: entry.tail_pages,
         row: entry.row,
         tier: tier_to(entry.tier) as i32,
-        generation: entry.generation,
         bytes: entry.bytes,
     }
 }
@@ -173,11 +169,7 @@ pub fn notice_from(notice: &v2::Notice) -> Checked<Notice> {
             if to.tier <= from_tier {
                 return Err(Violation::new("Spilled must move to a lower tier"));
             }
-            Ok(Notice::Spilled {
-                to,
-                from_tier,
-                from_generation: spilled.from_generation,
-            })
+            Ok(Notice::Spilled { to, from_tier })
         }
         Some(Kind::Evicted(evicted)) => {
             let key = key_from(evicted.key.as_ref())?;
@@ -191,12 +183,7 @@ pub fn notice_from(notice: &v2::Notice) -> Checked<Notice> {
                 }
                 _ => return Err(Violation::new("eviction kind unspecified")),
             };
-            Ok(Notice::Evicted {
-                key,
-                tier,
-                generation: evicted.generation,
-                heir,
-            })
+            Ok(Notice::Evicted { key, tier, heir })
         }
         None => Err(Violation::new("empty notice")),
     }

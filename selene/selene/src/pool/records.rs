@@ -186,13 +186,12 @@ impl RankRecords for DeferredRecords {
     fn read(
         &mut self,
         key: PrefixKey,
-        _generation: u64,
         first: u32,
         pages: u32,
         row: bool,
         dst: &mut [u8],
     ) -> Result<Checksums> {
-        // Rank zero owns generations and holds every shard until the agent's read drains.
+        // Rank zero holds every shard until the agent's read drains.
         self.0
             .lock()
             .unwrap()

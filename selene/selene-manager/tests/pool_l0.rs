@@ -152,7 +152,6 @@ async fn h8_scopes_never_see_each_other() {
         source: Some(source_ref),
         tier: v2::Tier::Dram as i32,
         key: Some(pool::pkey(1024)),
-        generation: 1,
         begin_tokens: 0,
         want_row: true,
         mode: v2::CopyMode::SharedWindows as i32,
@@ -200,31 +199,18 @@ async fn h10_a_reconnect_supersedes_the_old_stream() {
 // ---------------------------------------------------------------- index (I)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn i5_to_i9_generations_spills_compactions() {
+async fn content_hints_spill_and_evict_independently_per_tier() {
     let mut host = host();
     host.start();
     let mut pool = Pool::connect(&host.config.socket).await;
     let mut a = source(&mut pool, &Ident::new("a")).await;
     let mut b = source(&mut pool, &Ident::new("b")).await;
-    // I5: a lower generation is ignored, an equal one replaces, a higher one replaces.
-    let mut e = entry(1024, None, v2::Tier::Dram, 5);
-    e.bytes = 100;
-    a.notices(vec![saved(e.clone())]).await;
-    let mut lower = e.clone();
-    lower.generation = 4;
-    lower.bytes = 1;
-    a.notices(vec![saved(lower)]).await;
-    let reply = b.lookup(1, 1024, 0).await;
-    assert_eq!(reply.candidates[0].generation, 5);
-    let mut higher = e.clone();
-    higher.generation = 6;
-    a.notices(vec![saved(higher)]).await;
-    assert_eq!(b.lookup(2, 1024, 0).await.candidates[0].generation, 6);
-    // I6: an eviction of an older generation does not remove a newer one.
-    a.notices(vec![evicted(1024, v2::Tier::Dram, 5)]).await;
-    assert_eq!(b.lookup(3, 1024, 0).await.candidates.len(), 1);
-    a.notices(vec![evicted(1024, v2::Tier::Dram, 6)]).await;
-    assert!(b.lookup(4, 1024, 0).await.candidates.is_empty());
+    // Hints are replaced by key in stream order; removal can cause only a miss.
+    a.notices(vec![saved(entry(1024, None, v2::Tier::Dram, 1))])
+        .await;
+    assert_eq!(b.lookup(1, 1024, 0).await.candidates.len(), 1);
+    a.notices(vec![evicted(1024, v2::Tier::Dram)]).await;
+    assert!(b.lookup(2, 1024, 0).await.candidates.is_empty());
     // I7: a spill adds the lower tier and removes the upper in one step.
     a.notices(vec![saved(entry(2048, None, v2::Tier::Gpu, 9))])
         .await;
@@ -241,13 +227,13 @@ async fn i5_to_i9_generations_spills_compactions() {
     let reply = b.lookup(6, 2048, 0).await;
     assert_eq!(reply.candidates.len(), 1);
     assert_eq!(reply.candidates[0].level, v2::Level::HostDram as i32);
-    // I23-ish: generations are per tier, so a low DRAM generation does not shadow GPU.
+    // Tiers remain independent for the same key.
     a.notices(vec![
         saved(entry(3072, None, v2::Tier::Gpu, 100)),
         saved(entry(3072, None, v2::Tier::Dram, 2)),
     ])
     .await;
-    a.notices(vec![evicted(3072, v2::Tier::Dram, 2)]).await;
+    a.notices(vec![evicted(3072, v2::Tier::Dram)]).await;
     let reply = b.lookup(7, 3072, 0).await;
     let at_3072: Vec<_> = reply
         .candidates
@@ -280,7 +266,6 @@ async fn i8_a_compacted_node_is_no_longer_an_endpoint_but_the_chain_holds() {
         kind: Some(v2::notice::Kind::Evicted(v2::Evicted {
             key: Some(pool::pkey(2048)),
             tier: v2::Tier::Dram as i32,
-            generation: 1,
             kind: v2::EvictKind::Compacted as i32,
             heir: Some(heir),
         })),
@@ -709,12 +694,12 @@ async fn i9_a_leaf_leaves_its_page_only_ancestors_until_they_are_named() {
             .collect()
     };
     // Only the leaf is named: nothing cascades in the manager.
-    a.notices(vec![evicted(3072, v2::Tier::Dram, 1)]).await;
+    a.notices(vec![evicted(3072, v2::Tier::Dram)]).await;
     assert_eq!(keys(&b.lookup(1, 3072, 0).await), vec![2048, 1024]);
     // The ancestors that left with it arrive as their own notices, one per node.
     a.notices(vec![
-        evicted(2048, v2::Tier::Dram, 1),
-        evicted(1024, v2::Tier::Dram, 1),
+        evicted(2048, v2::Tier::Dram),
+        evicted(1024, v2::Tier::Dram),
     ])
     .await;
     assert!(b.lookup(2, 3072, 0).await.candidates.is_empty());

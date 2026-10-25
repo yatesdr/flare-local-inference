@@ -36,7 +36,6 @@ pub struct Entry {
     pub tail_pages: u32,
     pub row: bool,
     pub tier: Tier,
-    pub generation: u64,
     pub bytes: u64,
 }
 
@@ -67,16 +66,12 @@ impl ScopeIndex {
         self.sources.get(&source)?.get(&(key, tier))
     }
 
-    /// Inserts or replaces by the generation rule: a larger generation replaces,
-    /// an equal one replaces (a compaction heir), a smaller one is ignored.
+    /// Upsert one content key and tier.
     /// Returns whether the stored entry changed.
     pub fn upsert(&mut self, source: SourceId, entry: Entry) -> bool {
         let set = self.sources.entry(source).or_default();
         let slot = (entry.key, entry.tier);
         if let Some(existing) = set.get(&slot) {
-            if existing.generation > entry.generation {
-                return false;
-            }
             if existing.bucket != entry.bucket {
                 if let Some(bucket) = self.buckets.get_mut(&existing.bucket) {
                     bucket.remove(&(source, slot.0, slot.1));
@@ -96,16 +91,14 @@ impl ScopeIndex {
         true
     }
 
-    /// Removes the entry only if its generation is at most `generation`.
-    pub fn remove(&mut self, source: SourceId, key: Key, tier: Tier, generation: u64) -> bool {
+    /// Remove one content key and tier.
+    pub fn remove(&mut self, source: SourceId, key: Key, tier: Tier) -> bool {
         let Some(set) = self.sources.get_mut(&source) else {
             return false;
         };
-        match set.get(&(key, tier)) {
-            Some(existing) if existing.generation <= generation => {}
-            _ => return false,
-        }
-        let removed = set.remove(&(key, tier)).expect("checked above");
+        let Some(removed) = set.remove(&(key, tier)) else {
+            return false;
+        };
         if set.is_empty() {
             self.sources.remove(&source);
         }
@@ -167,7 +160,6 @@ impl ScopeIndex {
 pub struct ChainStep {
     pub key: Key,
     pub tail_pages: u32,
-    pub generation: u64,
     pub row: bool,
 }
 
@@ -201,7 +193,6 @@ pub fn walk_chain(
     let mut nodes = vec![ChainStep {
         key: endpoint.key,
         tail_pages: endpoint.tail_pages,
-        generation: endpoint.generation,
         row: endpoint.row,
     }];
     let endpoint_end = end_of(endpoint.key);
@@ -224,7 +215,6 @@ pub fn walk_chain(
             nodes.push(ChainStep {
                 key: parent.key,
                 tail_pages: parent.tail_pages,
-                generation: parent.generation,
                 row: parent.row,
             });
         }
@@ -266,7 +256,6 @@ mod tests {
             tail_pages: tail,
             row: true,
             tier,
-            generation: 1,
             bytes: 10,
         }
     }
@@ -274,24 +263,16 @@ mod tests {
     const SOURCE: SourceId = SourceId::Instance([1; 16]);
 
     #[test]
-    fn generation_rules() {
+    fn content_entries_update_in_stream_order_and_eviction_cleans_buckets() {
         let mut index = ScopeIndex::default();
-        let mut e = entry(128, 1, None, 2, Tier::Dram);
-        e.generation = 5;
-        assert!(index.upsert(SOURCE, e.clone()));
-        let mut lower = e.clone();
-        lower.generation = 4;
-        lower.bytes = 99;
-        assert!(!index.upsert(SOURCE, lower));
-        assert_eq!(index.get(SOURCE, e.key, Tier::Dram).unwrap().bytes, 10);
-        let mut equal = e.clone();
-        equal.bytes = 77;
-        assert!(index.upsert(SOURCE, equal));
-        assert_eq!(index.get(SOURCE, e.key, Tier::Dram).unwrap().bytes, 77);
-        // An eviction of an older holding never removes a newer one.
-        assert!(!index.remove(SOURCE, e.key, Tier::Dram, 4));
-        assert!(index.remove(SOURCE, e.key, Tier::Dram, 5));
-        assert!(index.is_empty());
+        let entry = entry(128, 1, None, 2, Tier::Dram);
+        index.upsert(SOURCE, entry.clone());
+        let mut updated = entry.clone();
+        updated.bytes = 77;
+        index.upsert(SOURCE, updated);
+        assert_eq!(index.get(SOURCE, entry.key, Tier::Dram).unwrap().bytes, 77);
+        assert!(index.remove(SOURCE, entry.key, Tier::Dram));
+        assert!(!index.remove(SOURCE, entry.key, Tier::Dram));
         assert!(index.in_bucket(&[9; 16]).is_empty());
     }
 
@@ -299,14 +280,11 @@ mod tests {
     fn tiers_are_independent() {
         let mut index = ScopeIndex::default();
         let mut gpu = entry(128, 1, None, 2, Tier::Gpu);
-        gpu.generation = 100;
         let mut dram = entry(128, 1, None, 2, Tier::Dram);
-        dram.generation = 3;
         index.upsert(SOURCE, gpu.clone());
         index.upsert(SOURCE, dram.clone());
         assert_eq!(index.len(), 2);
-        // A host-tier eviction with a small generation leaves the GPU entry.
-        assert!(index.remove(SOURCE, dram.key, Tier::Dram, 3));
+        assert!(index.remove(SOURCE, dram.key, Tier::Dram));
         assert!(index.get(SOURCE, gpu.key, Tier::Gpu).is_some());
     }
 

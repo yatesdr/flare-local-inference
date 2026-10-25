@@ -72,7 +72,6 @@ pub(crate) fn entry_to(entry: &IndexEntry) -> wire::IndexEntry {
         tail_pages: entry.tail_pages,
         row: entry.row,
         tier: tier_to(entry.tier) as i32,
-        generation: entry.generation,
         bytes: entry.bytes,
     }
 }
@@ -84,24 +83,13 @@ pub(crate) fn notice_to(notice: &Notice) -> wire::Notice {
             Notice::Saved(entry) => Kind::Saved(wire::Saved {
                 entry: Some(entry_to(entry)),
             }),
-            Notice::Spilled {
-                to,
-                from_tier,
-                from_generation,
-            } => Kind::Spilled(wire::Spilled {
+            Notice::Spilled { to, from_tier } => Kind::Spilled(wire::Spilled {
                 to: Some(entry_to(to)),
                 from_tier: tier_to(*from_tier) as i32,
-                from_generation: *from_generation,
             }),
-            Notice::Evicted {
-                key,
-                tier,
-                generation,
-                heir,
-            } => Kind::Evicted(wire::Evicted {
+            Notice::Evicted { key, tier, heir } => Kind::Evicted(wire::Evicted {
                 key: Some(key_to(*key)),
                 tier: tier_to(*tier) as i32,
-                generation: *generation,
                 kind: if heir.is_some() {
                     wire::EvictKind::Compacted
                 } else {
@@ -170,12 +158,10 @@ impl Sources {
             plan: plan::Candidate {
                 level,
                 source: self.id(&source, tier),
-                generation: wire.generation,
                 key: key_from(wire.key.as_ref()?)?,
                 begin_tokens: wire.begin_tokens,
                 skip_pages: wire.skip_pages as usize,
                 nodes,
-
             },
             source,
             tier,

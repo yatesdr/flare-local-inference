@@ -179,7 +179,6 @@ impl Core {
 
     pub(super) fn catalog_event(&mut self, scope: ScopeId, event: proto::CatalogEvent) {
         use proto::catalog_event::Event as E;
-        let sequence = event.sequence;
         let Some(feed) = self.catalogs.get_mut(&scope) else {
             return;
         };
@@ -205,7 +204,6 @@ impl Core {
                 tail_pages: u32::try_from(entry.tail_pages).ok()?,
                 row: entry.row,
                 tier,
-                generation: sequence,
                 bytes: entry.bytes,
             })
         };
@@ -231,14 +229,14 @@ impl Core {
                         Tier::Dram => Tier::Nvme,
                         _ => Tier::Dram,
                     };
-                    state.index.remove(manager, entry.key, other, u64::MAX);
+                    state.index.remove(manager, entry.key, other);
                     state.index.upsert(manager, entry);
                 }
             }
             Some(E::Removed(key)) => {
                 if let Some(key) = key_of(&key) {
-                    state.index.remove(manager, key, Tier::Dram, u64::MAX);
-                    state.index.remove(manager, key, Tier::Nvme, u64::MAX);
+                    state.index.remove(manager, key, Tier::Dram);
+                    state.index.remove(manager, key, Tier::Nvme);
                 }
             }
             None => {}

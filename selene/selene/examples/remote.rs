@@ -399,7 +399,6 @@ fn main() {
             chain_pages: o.pages as u64,
             tail_pages: o.pages as u64,
             row: true,
-            generation: 1,
             source: PutSource::Host(Box::new(Record::new(record, o.pages, page))),
         };
         let began = Instant::now();
@@ -433,7 +432,6 @@ fn main() {
                     tail_pages: o.pages as u32,
                     row: true,
                     tier: Tier::Dram,
-                    generation: 1,
                     bytes: record_bytes as u64,
                 });
             }
@@ -459,7 +457,6 @@ fn main() {
                                     chain: HostChain {
                                         records: vec![HostRecord {
                                             key: request.key,
-                                            generation: request.generation,
                                             first_page: 0,
                                             pages: o.pages as u32,
                                             row: true,

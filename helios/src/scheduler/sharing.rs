@@ -8,8 +8,7 @@ use crate::offload::{ExportChain, ExportNode, ExportRefusal};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EvictedCheckpoint {
     pub key: PrefixKey,
-    pub generation: u64,
-    /// For a compaction, the child that kept its key and generation and took
+    /// For a compaction, the child that kept its key and took
     /// the removed checkpoint's parent and pages.
     pub heir: Option<PublishedCheckpoint>,
 }
@@ -46,7 +45,6 @@ impl RequestScheduler {
                 }
                 self.evictions.push(EvictedCheckpoint {
                     key: retired.key,
-                    generation: retired.checkpoint.value(),
                     heir,
                 });
             }
@@ -64,16 +62,13 @@ impl RequestScheduler {
         std::mem::take(&mut self.evictions_lost)
     }
 
-    pub fn checkpoint_by_generation(
+    pub fn checkpoint_by_key(
         &self,
         key: &PrefixKey,
-        generation: u64,
     ) -> std::result::Result<CheckpointId, ExportRefusal> {
-        match self.cache.ready_by_prefix(key) {
-            None => Err(ExportRefusal::NotFound),
-            Some(id) if id.value() == generation => Ok(id),
-            Some(_) => Err(ExportRefusal::GenerationChanged),
-        }
+        self.cache
+            .ready_by_prefix(key)
+            .ok_or(ExportRefusal::NotFound)
     }
 
     /// Describes what exporting `id` from `begin_tokens` on covers, root first and
@@ -112,7 +107,6 @@ impl RequestScheduler {
             }
             nodes.push(ExportNode {
                 key: checkpoint.prefix(),
-                generation: node.value(),
                 pages: checkpoint.tail_pages().to_vec(),
             });
         }

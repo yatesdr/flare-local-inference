@@ -203,7 +203,6 @@ impl State {
 fn reason(refusal: ExportRefusal) -> wire::ClaimReason {
     match refusal {
         ExportRefusal::NotFound => wire::ClaimReason::NotFound,
-        ExportRefusal::GenerationChanged => wire::ClaimReason::GenerationChanged,
         ExportRefusal::ChainGap => wire::ClaimReason::ChainGap,
         ExportRefusal::NoHeadroom => wire::ClaimReason::NoHeadroom,
         ExportRefusal::NoWindows => wire::ClaimReason::NoWindows,
@@ -282,7 +281,6 @@ impl Engine {
             export: ExportId(id),
             tier,
             key,
-            generation: request.generation,
             begin_tokens: request.begin_tokens,
             want_row: request.want_row,
             deadline,
@@ -307,9 +305,8 @@ impl Engine {
                 }
             })
             .collect();
-        let generations: Vec<u64> = chain.nodes.iter().map(|n| n.generation).collect();
         let row = chain.row.is_some();
-        self.pinned(export, records, generations, row, Pin::Gpu(chain));
+        self.pinned(export, records, row, Pin::Gpu(chain));
     }
 
     /// The store pinned a host-tier chain for the export.
@@ -325,11 +322,9 @@ impl Engine {
                 row: r.row,
             })
             .collect();
-        let generations = chain.records.iter().map(|r| r.generation).collect();
         self.pinned(
             export,
             records,
-            generations,
             chain.row,
             Pin::Host(Arc::new(Mutex::new(pin))),
         );
@@ -337,14 +332,7 @@ impl Engine {
 
     /// Answer an export request with the chain that was pinned for it, or
     /// release the pin if the export can no longer use it.
-    fn pinned(
-        &mut self,
-        export: ExportId,
-        expected: Vec<ExpectedRecord>,
-        generations: Vec<u64>,
-        row: bool,
-        pin: Pin,
-    ) {
+    fn pinned(&mut self, export: ExportId, expected: Vec<ExpectedRecord>, row: bool, pin: Pin) {
         let id = export.0;
         let release = |engine: &Engine, pin: Pin| {
             // A GPU pin is the worker's to release; a host pin releases on drop.
@@ -387,10 +375,8 @@ impl Engine {
         }
         let records: Vec<wire::Record> = expected
             .iter()
-            .zip(generations)
-            .map(|(r, generation)| wire::Record {
+            .map(|r| wire::Record {
                 key: Some(codec::key_to(r.key)),
-                generation,
                 first_page: r.first_page,
                 pages: r.pages,
                 row: r.row,

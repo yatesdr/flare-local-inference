@@ -144,7 +144,6 @@ pub async fn put_record(
             published_tail_pages: key.consumed_tokens / PAGE_TOKENS
                 - parent.map_or(0, |parent| parent.consumed_tokens / PAGE_TOKENS),
             mode: v2::CopyMode::DataChannel as i32,
-            generation: 1,
         }))
         .await;
     let accept = session

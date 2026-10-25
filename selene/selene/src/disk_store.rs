@@ -1550,7 +1550,9 @@ impl DiskStore {
     /// memory: the entry a record spilled here is announced as.
     pub fn announced_entry(&self, key: &PrefixKey) -> Option<IndexEntry> {
         let node = self.index.node(key).filter(|node| node.ready)?;
-        let generation = self.announce.as_ref()?.view.generation(key)?;
+        if !self.announce.as_ref()?.view.contains(key) {
+            return None;
+        }
         Some(IndexEntry {
             key: *key,
             parent: node.parent,
@@ -1558,7 +1560,6 @@ impl DiskStore {
             tail_pages: node.tail_pages as u32,
             row: node.row,
             tier: PoolTier::Nvme,
-            generation,
             bytes: node.tail_pages as u64 * self.layout.page_record_bytes
                 + if node.row {
                     self.layout.row_record_bytes
@@ -1590,17 +1591,14 @@ impl DiskStore {
     pub fn pin_export_files(
         &mut self,
         key: PrefixKey,
-        generation: u64,
         begin_tokens: u64,
         want_row: bool,
     ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
         let Some(a) = self.announce.as_ref() else {
             return Err(ExportRefusal::NotFound);
         };
-        match a.view.generation(&key) {
-            Some(held) if held == generation => {}
-            Some(_) => return Err(ExportRefusal::GenerationChanged),
-            None => return Err(ExportRefusal::NotFound),
+        if !a.view.contains(&key) {
+            return Err(ExportRefusal::NotFound);
         }
         let page_tokens = self.layout.page_tokens;
         let start_page = begin_tokens / page_tokens;
@@ -1614,12 +1612,14 @@ impl DiskStore {
                 .node(&cursor)
                 .filter(|node| node.ready)
                 .ok_or(ExportRefusal::ChainGap)?;
-            let held = a.view.generation(&cursor).ok_or(ExportRefusal::ChainGap)?;
+            if !a.view.contains(&cursor) {
+                return Err(ExportRefusal::ChainGap);
+            }
             if want_row && cursor == key && !node.row {
                 return Err(ExportRefusal::ChainGap);
             }
             keys.push(cursor);
-            nodes.push((cursor, held, node.tail_pages));
+            nodes.push((cursor, node.tail_pages));
             spans.push(FileSpan::new(
                 node.location.path.clone(),
                 node.location.header.clone(),
@@ -2027,20 +2027,16 @@ impl DiskStore {
         while self.used.saturating_sub(freed).saturating_add(bytes) > limit {
             let announce = self.announce.as_ref();
             let Some(key) = self.index.candidate(false, |node| {
-                announce.is_some_and(|a| a.view.generation(&node.key).is_some())
+                announce.is_some_and(|a| a.view.contains(&node.key))
             }) else {
                 break;
             };
-            let (Some(node), Some(generation)) = (
-                self.index.node(&key),
-                announce.and_then(|a| a.view.generation(&key)),
-            ) else {
+            let Some(node) = self.index.node(&key) else {
                 break;
             };
             let retiring = Retiring {
                 tier: PoolTier::Nvme,
                 key,
-                generation,
                 parent: node.parent,
                 bucket: node.bucket,
                 tail_pages: node.tail_pages,
@@ -2454,14 +2450,13 @@ impl HostStore for DiskStore {
         &mut self,
         tier: PoolTier,
         key: PrefixKey,
-        generation: u64,
         begin_tokens: u64,
         want_row: bool,
     ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
         if tier != PoolTier::Nvme {
             return Err(ExportRefusal::NotFound);
         }
-        self.pin_export_files(key, generation, begin_tokens, want_row)
+        self.pin_export_files(key, begin_tokens, want_row)
     }
 
     fn stats(&self) -> StoreStats {
@@ -4902,41 +4897,21 @@ mod tests {
         store.announce_to(announcer.clone());
         store.flush_announcements();
         let notices = announcer.take_batch(10).unwrap();
-        let generation = |key: &PrefixKey| {
-            notices.iter().find_map(|n| match n {
-                Notice::Saved(e) if e.key == *key => {
-                    assert_eq!(e.tier, PoolTier::Nvme);
-                    Some(e.generation)
-                }
-                _ => None,
-            })
-        };
-        assert_eq!(notices.len(), 2, "what the files hold is announced at once");
-        let (root_generation, leaf_generation) = (
-            generation(&root.key).unwrap(),
-            generation(&leaf.key).unwrap(),
-        );
-        assert_ne!(root_generation, leaf_generation);
-        // Wrong generation, wrong tier, unknown key.
-        assert_eq!(
-            store
-                .pin_export(PoolTier::Nvme, leaf.key, leaf_generation + 5, 0, true)
-                .err(),
-            Some(ExportRefusal::GenerationChanged)
+        assert_eq!(notices.len(), 2, "both files are announced");
+        assert!(
+            notices
+                .iter()
+                .all(|n| matches!(n, Notice::Saved(e) if e.tier == PoolTier::Nvme))
         );
         assert_eq!(
-            store
-                .pin_export(PoolTier::Dram, leaf.key, leaf_generation, 0, true)
-                .err(),
+            store.pin_export(PoolTier::Dram, leaf.key, 0, true).err(),
             Some(ExportRefusal::NotFound)
         );
-        let mut pin = store
-            .pin_export(PoolTier::Nvme, leaf.key, leaf_generation, 0, true)
-            .unwrap();
+        let mut pin = store.pin_export(PoolTier::Nvme, leaf.key, 0, true).unwrap();
         let chain = pin.chain().clone();
         assert_eq!(chain.records.len(), 2);
         assert_eq!(chain.total_pages, 20);
-        assert_eq!(chain.records[0].generation, root_generation);
+        assert_eq!(chain.records[0].key, root.key);
         assert!(store.index.nodes().all(|node| node.pinned()));
         // Pages and checksums come from the files.
         let window = HostWindow {
@@ -4977,7 +4952,7 @@ mod tests {
         assert_eq!(sums.pages[0], record::checksum(&leaf_pages[0]));
         // Starting inside the leaf needs only the leaf.
         let suffix = store
-            .pin_export(PoolTier::Nvme, leaf.key, leaf_generation, 700 + 640, false)
+            .pin_export(PoolTier::Nvme, leaf.key, 700 + 640, false)
             .unwrap();
         assert_eq!(suffix.chain().records.len(), 1);
         drop(suffix);
@@ -5081,9 +5056,7 @@ mod tests {
         store.set_spill(true);
         assert!(!store.make_room(PAGE_RECORD).unwrap());
         let retiring = store.take_retiring().remove(0);
-        let pin = store
-            .pin_export(PoolTier::Nvme, leaf.key, retiring.generation, 0, true)
-            .unwrap();
+        let pin = store.pin_export(PoolTier::Nvme, leaf.key, 0, true).unwrap();
 
         HostStore::retired(&mut store, leaf.key, PoolTier::Nvme, Retirement::Moved);
         assert!(unlinked(&log).is_empty(), "a pin still reads the file");

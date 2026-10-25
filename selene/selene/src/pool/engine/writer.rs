@@ -124,7 +124,6 @@ impl State {
                 return Some(PeerSetup {
                     record: wire::Record {
                         key: Some(codec::key_to(p.key)),
-                        generation: 0,
                         first_page: 0,
                         pages,
                         row: p.row,
@@ -142,7 +141,6 @@ impl State {
         Some(PeerSetup {
             record: wire::Record {
                 key: Some(codec::key_to(p.key)),
-                generation: 0,
                 first_page: 0,
                 pages,
                 row: p.row,
@@ -303,7 +301,6 @@ impl Engine {
             } else {
                 wire::CopyMode::SharedWindows
             } as i32,
-            generation: request.generation,
         }));
         self.writer.puts.insert(
             id,

@@ -256,7 +256,6 @@ fn a_client_connects_opens_a_session_syncs_announces_and_says_goodbye() {
         tail_pages: 1,
         row: true,
         tier: Tier::Gpu,
-        generation: 1,
         bytes: 8192,
     });
     let notices = || {

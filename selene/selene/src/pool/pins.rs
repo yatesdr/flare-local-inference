@@ -15,13 +15,13 @@ use super::{
 
 /// The records of an export: the nodes from the one holding the page that
 /// contains `begin_tokens` to the endpoint, each with the pages and first page
-/// it supplies. `nodes` are ascending `(key, generation, tail pages)`; the
+/// it supplies. `nodes` are ascending `(key, tail pages)`; the
 /// endpoint carries the row when `want_row`.
 pub(crate) fn host_chain(
     page_tokens: u64,
     begin_tokens: u64,
     want_row: bool,
-    nodes: &[(PrefixKey, u64, usize)],
+    nodes: &[(PrefixKey, usize)],
 ) -> HostChain {
     host_chain_kept(page_tokens, begin_tokens, want_row, nodes).0
 }
@@ -33,12 +33,12 @@ pub(crate) fn host_chain_kept(
     page_tokens: u64,
     begin_tokens: u64,
     want_row: bool,
-    nodes: &[(PrefixKey, u64, usize)],
+    nodes: &[(PrefixKey, usize)],
 ) -> (HostChain, Vec<usize>) {
     let start_page = begin_tokens / page_tokens;
     let mut records = Vec::new();
     let mut kept = Vec::new();
-    for (index, (key, generation, tail)) in nodes.iter().enumerate() {
+    for (index, (key, tail)) in nodes.iter().enumerate() {
         let end = key.consumed_tokens / page_tokens;
         let start = end.saturating_sub(*tail as u64);
         let from = start.max(start_page);
@@ -50,7 +50,6 @@ pub(crate) fn host_chain_kept(
         kept.push(index);
         records.push(HostRecord {
             key: *key,
-            generation: *generation,
             first_page: (from - start) as u32,
             pages: pages as u32,
             row: last && want_row,
@@ -292,11 +291,7 @@ mod tests {
     #[test]
     fn a_node_with_no_page_is_not_a_record_and_the_kept_positions_say_which_nodes_are() {
         // b ends in the page a ended in, so it holds none; c holds pages 50..100.
-        let nodes = [
-            (key(800, 1), 5, 50),
-            (key(805, 2), 6, 0),
-            (key(1600, 3), 7, 50),
-        ];
+        let nodes = [(key(800, 1), 50), (key(805, 2), 0), (key(1600, 3), 50)];
         let (chain, kept) = host_chain_kept(16, 0, true, &nodes);
         assert_eq!(kept, [0, 2]);
         assert_eq!(
@@ -304,7 +299,7 @@ mod tests {
             [key(800, 1), key(1600, 3)]
         );
         // The last node stays whatever it supplies: its row is the claim.
-        let tail = [(key(800, 1), 5, 50), (key(805, 2), 6, 0)];
+        let tail = [(key(800, 1), 50), (key(805, 2), 0)];
         let (chain, kept) = host_chain_kept(16, 0, true, &tail);
         assert_eq!(kept, [0, 1]);
         assert!(chain.records[1].row && chain.records[1].pages == 0);
@@ -313,7 +308,7 @@ mod tests {
     #[test]
     fn records_start_where_the_split_falls_and_a_split_in_the_last_page_leaves_a_row_only_tail() {
         // Pages of 16 tokens: a covers pages 0..50, b pages 50..100.
-        let nodes = [(key(800, 1), 5, 50), (key(1600, 2), 6, 50)];
+        let nodes = [(key(800, 1), 50), (key(1600, 2), 50)];
         let chain = host_chain(16, 0, true, &nodes);
         assert_eq!(chain.total_pages, 100);
         assert_eq!(chain.records[0].first_page, 0);
@@ -353,7 +348,7 @@ mod tests {
             pages: vec![11, 22, 33],
             row: Some(44),
         });
-        let nodes = [(key(48, 1), 1, 3)];
+        let nodes = [(key(48, 1), 3)];
         let mut pin = MemoryPin {
             chain: host_chain(16, 16, true, &nodes),
             spans: vec![MemorySpan {
@@ -436,7 +431,7 @@ mod tests {
         let path = directory.join("record");
         std::fs::write(&path, &file).unwrap();
         // The export starts at page 4 and takes the row.
-        let nodes = [(header.key, 1, pages as usize)];
+        let nodes = [(header.key, pages as usize)];
         let mut pin = FilePin {
             chain: host_chain(16, 4 * 16, true, &nodes),
             spans: vec![FileSpan::new(path, header.clone())],
@@ -549,7 +544,7 @@ mod tests {
     #[ignore]
     fn bench_read() {
         let (path, pages, header, page) = bench_shape();
-        let nodes = [(header.key, 1, pages as usize)];
+        let nodes = [(header.key, pages as usize)];
         let mut pin = FilePin {
             chain: host_chain(16, 0, true, &nodes),
             spans: vec![FileSpan::new(path, header.clone())],

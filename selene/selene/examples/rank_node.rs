@@ -216,7 +216,6 @@ fn pin(world: usize, key: flare_selene::PrefixKey) -> Box<dyn HostPin> {
         chain: HostChain {
             records: vec![HostRecord {
                 key,
-                generation: 11,
                 first_page: 0,
                 pages: PAGES as u32,
                 row: true,
@@ -354,7 +353,6 @@ fn source(args: &Args) {
         tail_pages: PAGES as u32,
         row: true,
         tier: Tier::Dram,
-        generation: 11,
         bytes: (PAGES * page + row) as u64,
     });
     say("ready");

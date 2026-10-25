@@ -29,22 +29,13 @@ impl Core {
             Notice::Saved(entry) => {
                 index.upsert(source, entry);
             }
-            Notice::Spilled {
-                to,
-                from_tier,
-                from_generation,
-            } => {
+            Notice::Spilled { to, from_tier } => {
                 let key = to.key;
                 index.upsert(source, to);
-                index.remove(source, key, from_tier, from_generation);
+                index.remove(source, key, from_tier);
             }
-            Notice::Evicted {
-                key,
-                tier,
-                generation,
-                heir,
-            } => {
-                index.remove(source, key, tier, generation);
+            Notice::Evicted { key, tier, heir } => {
+                index.remove(source, key, tier);
                 if let Some(heir) = heir {
                     index.upsert(source, heir);
                 }

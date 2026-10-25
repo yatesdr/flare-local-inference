@@ -6,10 +6,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
 };
 
 use tokio::sync::Notify;
@@ -34,7 +31,6 @@ pub struct IndexEntry {
     /// The record carries the state row, so it can end a restore.
     pub row: bool,
     pub tier: Tier,
-    pub generation: u64,
     pub bytes: u64,
 }
 
@@ -44,12 +40,10 @@ pub enum Notice {
     Spilled {
         to: IndexEntry,
         from_tier: Tier,
-        from_generation: u64,
     },
     Evicted {
         key: PrefixKey,
         tier: Tier,
-        generation: u64,
         heir: Option<IndexEntry>,
     },
 }
@@ -73,7 +67,6 @@ impl State {
     fn upsert(&mut self, entry: &IndexEntry) -> bool {
         let slot = (entry.key, entry.tier);
         match self.entries.get(&slot) {
-            Some(held) if held.generation > entry.generation => false,
             Some(_) => {
                 self.entries.insert(slot, entry.clone());
                 true
@@ -86,16 +79,8 @@ impl State {
         }
     }
 
-    fn remove(&mut self, key: PrefixKey, tier: Tier, generation: u64) -> bool {
-        if self
-            .entries
-            .get(&(key, tier))
-            .is_some_and(|held| held.generation <= generation)
-        {
-            self.entries.remove(&(key, tier));
-            return true;
-        }
-        false
+    fn remove(&mut self, key: PrefixKey, tier: Tier) -> bool {
+        self.entries.remove(&(key, tier)).is_some()
     }
 
     fn push(&mut self, notice: Notice) {
@@ -116,8 +101,6 @@ impl State {
 pub struct Announcer {
     state: Arc<Mutex<State>>,
     wake: Arc<Notify>,
-    /// Next generation to hand out in the DRAM and NVMe tiers.
-    generations: Arc<[AtomicU64; 2]>,
 }
 
 impl Announcer {
@@ -131,19 +114,7 @@ impl Announcer {
                 max_entries: DEFAULT_MAX_ENTRIES,
             })),
             wake,
-            generations: Arc::new([AtomicU64::new(1), AtomicU64::new(1)]),
         }
-    }
-
-    /// A generation for a new holding in a host tier: strictly increasing per
-    /// tier for the life of the process. GPU generations are the checkpoint ids.
-    pub fn next_generation(&self, tier: Tier) -> u64 {
-        let counter = match tier {
-            Tier::Dram => &self.generations[0],
-            Tier::Nvme => &self.generations[1],
-            Tier::Gpu => panic!("GPU generations are checkpoint ids"),
-        };
-        counter.fetch_add(1, Ordering::Relaxed)
     }
 
     /// A holding appeared. Never blocks and never fails the caller.
@@ -158,16 +129,15 @@ impl Announcer {
 
     /// A holding moved down the cascade: `to` is added and the `from` holding
     /// removed as one step, so a lookup never sees neither.
-    pub fn spilled(&self, to: IndexEntry, from: (Tier, u64)) {
+    pub fn spilled(&self, to: IndexEntry, from: Tier) {
         let mut state = self.state.lock().unwrap();
         let key = to.key;
         let added = state.upsert(&to);
-        let removed = state.remove(key, from.0, from.1);
+        let removed = state.remove(key, from);
         if added || removed {
             state.push(Notice::Spilled {
                 to,
-                from_tier: from.0,
-                from_generation: from.1,
+                from_tier: from,
             });
         }
         drop(state);
@@ -176,17 +146,12 @@ impl Announcer {
 
     /// A holding was removed. `heir` is the single child that took over its
     /// pages when compaction removed the node as an endpoint.
-    pub fn evicted(&self, key: PrefixKey, tier: Tier, generation: u64, heir: Option<IndexEntry>) {
+    pub fn evicted(&self, key: PrefixKey, tier: Tier, heir: Option<IndexEntry>) {
         let mut state = self.state.lock().unwrap();
-        let removed = state.remove(key, tier, generation);
+        let removed = state.remove(key, tier);
         let updated = heir.as_ref().is_some_and(|heir| state.upsert(heir));
         if removed || updated {
-            state.push(Notice::Evicted {
-                key,
-                tier,
-                generation,
-                heir,
-            });
+            state.push(Notice::Evicted { key, tier, heir });
         }
         drop(state);
         self.wake.notify_one();
@@ -276,7 +241,7 @@ mod tests {
         }
     }
 
-    fn entry(n: u64, tier: Tier, generation: u64) -> IndexEntry {
+    fn entry(n: u64, tier: Tier, _generation: u64) -> IndexEntry {
         IndexEntry {
             key: key(n),
             parent: None,
@@ -284,7 +249,6 @@ mod tests {
             tail_pages: 1,
             row: true,
             tier,
-            generation,
             bytes: 4096,
         }
     }
@@ -303,30 +267,11 @@ mod tests {
         a.begin_session();
         a.saved(entry(1, Tier::Gpu, 5));
         a.saved(entry(1, Tier::Dram, 2));
-        a.spilled(entry(1, Tier::Nvme, 3), (Tier::Dram, 2));
+        a.spilled(entry(1, Tier::Nvme, 3), Tier::Dram);
         let snapshot = a.snapshot();
         let mut tiers: Vec<_> = snapshot.entries.iter().map(|e| e.tier).collect();
         tiers.sort();
         assert_eq!(tiers, [Tier::Gpu, Tier::Nvme]);
-    }
-
-    #[test]
-    fn older_generations_never_replace_or_remove_newer_ones() {
-        let a = announcer();
-        a.begin_session();
-        a.saved(entry(1, Tier::Gpu, 5));
-        a.saved(entry(1, Tier::Gpu, 3));
-        a.evicted(key(1), Tier::Gpu, 4, None);
-        // Only the first save changed anything.
-        assert_eq!(drain(&a).len(), 1);
-        assert_eq!(a.len(), 1);
-        a.evicted(key(1), Tier::Gpu, 5, None);
-        assert_eq!(a.len(), 0);
-        // A GPU generation below a host one for the same key does not shadow it.
-        a.saved(entry(2, Tier::Dram, 9));
-        a.saved(entry(2, Tier::Gpu, 1));
-        a.evicted(key(2), Tier::Gpu, 1, None);
-        assert_eq!(a.snapshot().entries[0].tier, Tier::Dram);
     }
 
     #[test]
@@ -337,7 +282,7 @@ mod tests {
         a.saved(entry(2, Tier::Gpu, 2));
         let mut heir = entry(2, Tier::Gpu, 2);
         heir.tail_pages = 2;
-        a.evicted(key(1), Tier::Gpu, 1, Some(heir.clone()));
+        a.evicted(key(1), Tier::Gpu, Some(heir.clone()));
         let snapshot = a.snapshot();
         assert_eq!(snapshot.entries, [heir]);
     }
@@ -369,7 +314,7 @@ mod tests {
         for n in 0..QUEUE_BOUND as u64 + 5 {
             a.saved(entry(n, Tier::Gpu, 1));
         }
-        a.evicted(key(3), Tier::Gpu, 1, None);
+        a.evicted(key(3), Tier::Gpu, None);
         let snapshot = a.snapshot();
         assert!(snapshot.entries.iter().all(|e| e.key != key(3)));
         assert_eq!(snapshot.entries.len(), QUEUE_BOUND + 4);
@@ -409,7 +354,7 @@ mod tests {
         a.saved(entry(1, Tier::Gpu, 1));
         let before = a.snapshot();
         a.saved(entry(2, Tier::Gpu, 1));
-        a.evicted(key(1), Tier::Gpu, 1, None);
+        a.evicted(key(1), Tier::Gpu, None);
         let notices = drain(&a);
         assert_eq!(notices.len(), 2);
         // The entry was in the snapshot and its eviction arrives after it.

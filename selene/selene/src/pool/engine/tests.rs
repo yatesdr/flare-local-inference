@@ -327,7 +327,6 @@ pub(super) fn candidate(
         plan: plan::Candidate {
             level,
             source: plan::SourceId(source),
-            generation: 4,
             key: end,
             begin_tokens: 0,
             skip_pages: 0,
@@ -362,7 +361,6 @@ pub(super) fn part(
         part: plan::Part {
             level: candidate.plan.level,
             source: candidate.plan.source,
-            generation: candidate.plan.generation,
             begin_tokens: begin,
             end: candidate.plan.key,
             first_page,
@@ -397,7 +395,6 @@ pub(super) fn records(fetch: &PoolFetch) -> Vec<wire::Record> {
         .enumerate()
         .map(|(i, k)| wire::Record {
             key: Some(super::super::codec::key_to(*k)),
-            generation: 4,
             first_page: 0,
             pages: nodes[i].tail_pages as u32,
             row: i + 1 == nodes.len(),
@@ -497,7 +494,6 @@ fn the_session_opens_with_a_snapshot_and_becomes_ready_when_it_installs() {
         tail_pages: 1,
         row: true,
         tier: Tier::Dram,
-        generation: 1,
         bytes: PAGE,
     });
     let out = rig.open_session(Some(rig.regions.clone()));
@@ -521,7 +517,6 @@ fn notices_follow_the_snapshot_in_order_and_the_manager_not_ready_stops_lookups_
             tail_pages: 1,
             row: true,
             tier: Tier::Gpu,
-            generation: n,
             bytes: PAGE,
         });
     }
@@ -542,7 +537,6 @@ fn notices_follow_the_snapshot_in_order_and_the_manager_not_ready_stops_lookups_
         tail_pages: 1,
         row: true,
         tier: Tier::Gpu,
-        generation: 9,
         bytes: PAGE,
     });
     rig.engine.pump(rig.now);
@@ -564,7 +558,6 @@ fn a_resync_request_from_the_manager_takes_a_new_snapshot() {
         tail_pages: 1,
         row: true,
         tier: Tier::Gpu,
-        generation: 1,
         bytes: PAGE,
     });
     rig.engine.pump(rig.now);
@@ -633,7 +626,6 @@ fn a_refused_lookup_gives_no_candidates_and_a_good_reply_reaches_every_waiter() 
             session_incarnation: 3,
         }),
         key: Some(super::super::codec::key_to(key(64, 1))),
-        generation: 2,
         begin_tokens: 0,
         pages: 1,
         bytes: PAGE,
@@ -641,7 +633,6 @@ fn a_refused_lookup_gives_no_candidates_and_a_good_reply_reaches_every_waiter() 
         nodes: vec![wire::ChainNode {
             key: Some(super::super::codec::key_to(key(64, 1))),
             tail_pages: 1,
-            generation: 2,
             row: true,
         }],
         skip_pages: 0,
@@ -1069,7 +1060,6 @@ pub(super) fn export_request(id: u64, reserved: u64) -> In {
         requester_instance_id: vec![4; 16],
         tier: wire::Tier::Gpu as i32,
         key: Some(super::super::codec::key_to(key(192, 2))),
-        generation: 4,
         begin_tokens: 0,
         want_row: true,
         pin_deadline_ms: 250,
@@ -1085,12 +1075,10 @@ pub(super) fn chain() -> ExportChain {
         nodes: vec![
             ExportNode {
                 key: key(128, 1),
-                generation: 3,
                 pages: vec![PageId(20), PageId(21)],
             },
             ExportNode {
                 key: key(192, 2),
-                generation: 4,
                 pages: vec![PageId(22)],
             },
         ],
@@ -1124,7 +1112,10 @@ fn pinned_export(rig: &mut Rig) -> u64 {
         (ack[0].total_pages, ack[0].row, ack[0].records.len()),
         (3, true, 2)
     );
-    assert_eq!(ack[0].records[1].generation, 4);
+    assert_eq!(
+        ack[0].records[1].key,
+        Some(super::super::codec::key_to(key(192, 2)))
+    );
     40
 }
 
@@ -1415,7 +1406,6 @@ mod host {
             chain: HostChain {
                 records: vec![HostRecord {
                     key: key(192, 2),
-                    generation: 4,
                     first_page: 0,
                     pages: 2,
                     row: false,
@@ -1558,7 +1548,6 @@ pub(super) fn gpu_put(parent: Option<PrefixKey>) -> crate::pool::PutRequest {
         chain_pages: 3,
         tail_pages: 3,
         row: true,
-        generation: 4,
         source: crate::pool::PutSource::Gpu {
             pages: vec![PageId(20), PageId(21), PageId(22)],
             slot: StateSlotId(5),
@@ -1883,7 +1872,6 @@ fn expected_records_follow_flooring_for_unaligned_splits_and_row_only_tails() {
     let part = |begin, end, chain: &[PrefixKey], pages, row| plan::Part {
         level: Level::HostDram,
         source: plan::SourceId(1),
-        generation: 1,
         begin_tokens: begin,
         end,
         first_page: 0,
@@ -1934,15 +1922,13 @@ fn mutations_after_a_snapshot_cut_follow_its_last_chunk() {
         tail_pages: 1,
         row: true,
         tier: Tier::Gpu,
-        generation: 1,
         bytes: PAGE,
     };
     rig.announce.saved(entry.clone());
     let mut out = rig.send(In::ResyncRequired(wire::ResyncRequired {
         reason: wire::ResyncReason::ResyncStateLost as i32,
     }));
-    rig.announce
-        .evicted(entry.key, entry.tier, entry.generation, None);
+    rig.announce.evicted(entry.key, entry.tier, None);
     for _ in 0..3 {
         rig.engine.pump(rig.now);
         out.extend(rig.engine.take_out());

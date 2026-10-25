@@ -113,7 +113,6 @@ fn pin(world: usize, key: PrefixKey, generation: u64, pages: usize) -> Box<dyn H
         chain: HostChain {
             records: vec![HostRecord {
                 key,
-                generation,
                 first_page: 0,
                 pages: pages as u32,
                 row: true,
@@ -433,7 +432,7 @@ fn fetch_for(
     let candidate = answer
         .candidates
         .iter()
-        .find(|c| c.plan.source == part.source && c.plan.generation == part.generation)
+        .find(|c| c.plan.source == part.source)
         .unwrap()
         .clone();
     PoolFetch {
@@ -482,7 +481,6 @@ fn offer(source: &Source, history: &TestHistory, world: usize, pages: usize) -> 
         tail_pages: pages as u32,
         row: true,
         tier: Tier::Dram,
-        generation: 11,
         bytes: (pages * page + row) as u64,
     });
     key
@@ -591,7 +589,6 @@ fn publish(source: &Instance, history: &TestHistory, world: usize, pages: usize)
         tail_pages: pages as u32,
         row: true,
         tier: Tier::Gpu,
-        generation: 5,
         bytes: (pages * page + row) as u64,
     });
     key
@@ -612,7 +609,7 @@ fn wait_offered(client: &PoolClient, history: &TestHistory) {
 fn serve_export(source: &mut Instance, key: PrefixKey, pages: usize) {
     let export = source.event("an export request", |e| match e {
         PoolEvent::Export(request) => {
-            assert_eq!((request.tier, request.generation), (Tier::Gpu, 5));
+            assert_eq!(request.tier, Tier::Gpu);
             Some(request.export)
         }
         _ => None,
@@ -622,7 +619,6 @@ fn serve_export(source: &mut Instance, key: PrefixKey, pages: usize) {
         ExportChain {
             nodes: vec![ExportNode {
                 key,
-                generation: 5,
                 pages: (0..pages).map(|p| PageId(20 + p as u32)).collect(),
             }],
             skip_pages: 0,
@@ -794,7 +790,6 @@ fn put_from(writer: &mut Instance, history: &TestHistory, pages: usize) -> Prefi
             chain_pages: pages as u64,
             tail_pages: pages as u64,
             row: true,
-            generation: 1,
             source: PutSource::Gpu {
                 pages: (0..pages).map(|p| PageId(20 + p as u32)).collect(),
                 slot: StateSlotId(5),
@@ -1256,13 +1251,11 @@ impl RankRecords for RankFiles {
     fn read(
         &mut self,
         _key: PrefixKey,
-        generation: u64,
         first_page: u32,
         pages: u32,
         row: bool,
         dst: &mut [u8],
     ) -> Result<Checksums> {
-        assert_eq!(generation, 11, "the generation the index holds");
         self.serve(first_page, pages, row, dst)
     }
     fn fill(
@@ -1298,7 +1291,6 @@ fn zero_pin(world: usize, key: PrefixKey, pages: usize) -> Box<dyn HostPin> {
         chain: HostChain {
             records: vec![HostRecord {
                 key,
-                generation: 11,
                 first_page: 0,
                 pages: pages as u32,
                 row: true,
@@ -1359,7 +1351,6 @@ fn host_export(
         tail_pages: pages as u32,
         row: true,
         tier: Tier::Dram,
-        generation: 11,
         bytes: (pages * page + row) as u64,
     });
     wait_offered(&requester.client, &history);
@@ -1482,7 +1473,6 @@ fn host_put(manager: &Manager, world: usize, reach: &[Reach]) {
             chain_pages: pages as u64,
             tail_pages: pages as u64,
             row: true,
-            generation: 1,
             source: PutSource::Host(Box::new(ZeroBytes(RankFiles {
                 world,
                 rank: 0,

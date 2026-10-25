@@ -294,7 +294,6 @@ fn candidate(
         tier: tier_to(entry.tier) as i32,
         source: Some(source),
         key: Some(key_to(entry.key)),
-        generation: entry.generation,
         begin_tokens: begin,
         pages: walk.pages,
         bytes: walk.pages * geometry.page_bytes + if entry.row { geometry.row_bytes } else { 0 },
@@ -305,7 +304,6 @@ fn candidate(
             .map(|node| v2::ChainNode {
                 key: Some(key_to(node.key)),
                 tail_pages: node.tail_pages,
-                generation: node.generation,
                 row: node.row,
             })
             .collect(),

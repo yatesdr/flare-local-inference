@@ -363,7 +363,6 @@ impl Client {
             published_tail_pages: chain_pages
                 - parent.map_or(0, |parent| parent.consumed_tokens / page_tokens),
             mode: v2::CopyMode::SharedWindows as i32,
-            generation: 1,
         }
     }
 
@@ -594,26 +593,9 @@ impl Client {
         (outcomes.pop().unwrap(), right)
     }
 
-    /// Runs several claims at once on this session. A claim refused only because its
-    /// entry changed between the lookup and the claim is looked up and tried again.
+    /// Run several claims at once on this session.
     pub async fn get_many(&mut self, specs: Vec<GetSpec>) -> Vec<GetOutcome> {
-        let mut outcomes = self.claim_all(&specs).await;
-        for (spec, outcome) in specs.iter().zip(outcomes.iter_mut()) {
-            for _ in 0..5 {
-                if *outcome != GetOutcome::Refused(v2::ClaimReason::GenerationChanged) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                let again = GetSpec {
-                    keys: spec.keys.clone(),
-                    skip: spec.skip,
-                    pages: spec.pages,
-                    options: spec.options,
-                };
-                *outcome = self.claim_all(&[again]).await.remove(0);
-            }
-        }
-        outcomes
+        self.claim_all(&specs).await
     }
 
     async fn claim_all(&mut self, specs: &[GetSpec]) -> Vec<GetOutcome> {

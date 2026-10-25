@@ -300,18 +300,12 @@ impl PoolClient {
         self.announce.forget_gpu();
     }
 
-    pub fn spilled(&self, to: IndexEntry, from: (Tier, u64)) {
+    pub fn spilled(&self, to: IndexEntry, from: Tier) {
         self.announce.spilled(to, from);
     }
 
-    pub fn evicted(
-        &self,
-        key: crate::PrefixKey,
-        tier: Tier,
-        generation: u64,
-        heir: Option<IndexEntry>,
-    ) {
-        self.announce.evicted(key, tier, generation, heir);
+    pub fn evicted(&self, key: crate::PrefixKey, tier: Tier, heir: Option<IndexEntry>) {
+        self.announce.evicted(key, tier, heir);
     }
 
     /// Identifies the manager and link of the current session (zero before any
