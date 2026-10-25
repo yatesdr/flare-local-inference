@@ -890,7 +890,7 @@ pub struct ServingOptions {
             .map(|value| if value == "staged" { Transport::Staged } else { Transport::Direct }))]
     pub prefix_cache_disk_transport: Option<Transport>,
 
-    /// Share prefix checkpoints through a pool manager at `unix:PATH` or `HOST:PORT` [default: not shared].
+    /// Share prefix checkpoints at `unix:PATH`, TLS `HOST:PORT`, or `plain:HOST:PORT` [default: not shared].
     #[arg(long, value_name = "ADDRESS", value_parser = parse_pool_address,
         help_heading = "Prefix cache options")]
     pub prefix_cache_pool: Option<String>,
@@ -900,10 +900,13 @@ pub struct ServingOptions {
         requires = "prefix_cache_pool", help_heading = "Prefix cache options")]
     pub prefix_cache_pool_tenant: Option<String>,
 
-    /// CA certificate that the pool manager's TLS certificate must chain to; set, the connection must
-    /// be TLS [default: plaintext].
-    #[arg(long, value_name = "FILE", requires = "prefix_cache_pool",
-        help_heading = "Prefix cache options")]
+    /// CA certificate that the TLS pool manager's certificate must chain to [default: host trust store].
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "prefix_cache_pool",
+        help_heading = "Prefix cache options"
+    )]
     pub prefix_cache_pool_ca: Option<PathBuf>,
 }
 
@@ -1840,6 +1843,19 @@ mod tests {
             "host:70000",
             ":9000",
             "a b:9000",
+            "plain:",
+            "plain:host",
+            "plain::9000",
+            "plain:host:0",
+            "plain:host:70000",
+            "plain:host:+9000",
+            "plain:unix:/run/selene.sock",
+            "plain:plain:host:9000",
+            "http://host:9000",
+            "host:extra:9000",
+            "[invalid]:9000",
+            "plain:[::1:9000",
+            "host/path:9000",
         ] {
             assert!(
                 rejected(&[
@@ -1851,7 +1867,14 @@ mod tests {
                 "{bad}"
             );
         }
-        for address in ["unix:/run/selene.sock", "10.0.0.5:7000", "selene.local:7000"] {
+        for address in [
+            "unix:/run/selene.sock",
+            "10.0.0.5:7000",
+            "selene.local:7000",
+            "plain:selene.local:7000",
+            "[::1]:7000",
+            "plain:[::1]:7000",
+        ] {
             let args = run(&[
                 "flare",
                 "run",
