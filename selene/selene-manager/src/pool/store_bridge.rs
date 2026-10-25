@@ -168,30 +168,23 @@ impl Core {
     }
 
     pub(super) fn catalog_event(&mut self, scope: ScopeId, event: proto::CatalogEvent) {
-        use proto::catalog_event::Event as E;
+        use proto::CatalogEvent as E;
         let Some(feed) = self.catalogs.get_mut(&scope) else {
             return;
         };
-        let to_entry = |entry: &proto::CatalogEntry| -> Option<Entry> {
+        let to_entry = |entry: &crate::store::EntryData| -> Option<Entry> {
             if entry.unreadable {
                 return None;
             }
-            let key = key_of(entry.key.as_ref()?)?;
-            let parent = if entry.has_parent {
-                Some(key_of(entry.parent.as_ref()?)?)
-            } else {
-                None
-            };
-            let tier = match proto::Tier::try_from(entry.tier).ok()? {
-                proto::Tier::Dram => Tier::Dram,
-                proto::Tier::Nvme => Tier::Nvme,
-                _ => return None,
+            let tier = match entry.tier {
+                0 => Tier::Dram,
+                _ => Tier::Nvme,
             };
             Some(Entry {
-                key,
-                parent,
-                bucket: entry.bucket.as_slice().try_into().ok()?,
-                tail_pages: u32::try_from(entry.tail_pages).ok()?,
+                key: entry.key,
+                parent: entry.parent,
+                bucket: entry.bucket,
+                tail_pages: entry.tail_pages,
                 row: entry.row,
                 tier,
                 bytes: entry.bytes,
@@ -201,19 +194,19 @@ impl Core {
             return;
         };
         let manager = SourceId::Manager;
-        match event.event {
-            Some(E::SnapshotBegin(_)) => feed.snapshot = Some(Vec::new()),
-            Some(E::Entry(entry)) => {
+        match event {
+            E::SnapshotBegin => feed.snapshot = Some(Vec::new()),
+            E::Entry(entry) => {
                 if let (Some(snapshot), Some(entry)) = (feed.snapshot.as_mut(), to_entry(&entry)) {
                     snapshot.push(entry);
                 }
             }
-            Some(E::SnapshotEnd(_)) => {
+            E::SnapshotEnd => {
                 if let Some(snapshot) = feed.snapshot.take() {
                     state.index.replace(manager, snapshot);
                 }
             }
-            Some(E::Added(entry)) | Some(E::Changed(entry)) => {
+            E::Added(entry) | E::Changed(entry) => {
                 if let Some(entry) = to_entry(&entry) {
                     let other = match entry.tier {
                         Tier::Dram => Tier::Nvme,
@@ -223,13 +216,10 @@ impl Core {
                     state.index.upsert(manager, entry);
                 }
             }
-            Some(E::Removed(key)) => {
-                if let Some(key) = key_of(&key) {
-                    state.index.remove(manager, key, Tier::Dram);
-                    state.index.remove(manager, key, Tier::Nvme);
-                }
+            E::Removed(key) => {
+                state.index.remove(manager, key, Tier::Dram);
+                state.index.remove(manager, key, Tier::Nvme);
             }
-            None => {}
         }
     }
 
@@ -1437,14 +1427,6 @@ impl Core {
             });
         }
     }
-}
-
-fn key_of(key: &proto::Key) -> Option<Key> {
-    let digest: [u8; 16] = key.digest.as_slice().try_into().ok()?;
-    (key.consumed_tokens != 0).then_some(Key {
-        consumed_tokens: key.consumed_tokens,
-        digest,
-    })
 }
 
 /// Where a record header keeps its row checksum: after the magic, version, flags, identity,
