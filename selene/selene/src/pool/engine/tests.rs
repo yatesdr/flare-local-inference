@@ -1281,6 +1281,35 @@ fn a_fetch_is_refused_with_one_failed_event_when_the_pool_is_not_ready() {
     assert_eq!(fetched(&rig.events()).len(), 1);
 }
 
+#[test]
+fn restores_beyond_the_claim_slots_wait_for_a_slot_instead_of_being_refused() {
+    let mut rig = Rig::new();
+    rig.open();
+    let mut started = Vec::new();
+    for id in 1..=3 {
+        let mut fetch = single_part();
+        fetch.id = id;
+        let out = rig.command(Command::Fetch(fetch.clone()));
+        started.push((fetch, pick!(out, Claim)));
+    }
+    assert_eq!(started[0].1.len(), 1);
+    assert_eq!(started[1].1.len(), 1);
+    assert!(started[2].1.is_empty(), "two slots are taken: the third waits");
+    assert!(fetched(&rig.events()).is_empty(), "waiting is not failing");
+    // The first restore ends and the third takes its slot.
+    let claim = started[0].1[0].claim_id;
+    rig.send(granted(claim, &started[0].0));
+    windows_for(&mut rig, claim);
+    rig.drain_copies();
+    let out = rig.send(terminal(
+        claim,
+        wire::ClaimState::Copied,
+        wire::ClaimReason::ReasonNone,
+        true,
+    ));
+    assert_eq!(pick!(out, Claim).len(), 1, "the waiting restore claims the freed slot");
+}
+
 // ---- exports ----------------------------------------------------------------
 
 pub(super) fn export_request(id: u64, reserved: u64) -> In {
