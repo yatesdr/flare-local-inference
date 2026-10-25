@@ -99,6 +99,41 @@ Startup order is the root lock, NVMe recovery, shared-memory reclaim, then the s
 manager on the same root or the same `--name` exits at once; a stale socket is replaced only after
 confirming nothing is listening.
 
+## Start the manager before the instance
+
+An instance attaches to the pool once, at startup, and never later. Registering the manager's
+shared memory with the GPU consumes device memory, which a serving instance must not do, so Flare
+registers the manager's `arena` and `staging` files before it admits requests and only then. An
+instance that starts while the manager is down waits for it up to 10 seconds
+(`flare_selene::pool::STARTUP_WAIT`), then runs on its local tiers only, prints one warning, and does
+not attach when the manager comes up afterwards: restart it to use the pool. The same holds for an
+instance whose manager's certificate it does not trust, or whose protocol, encryption or scope
+differs, and for one running when the manager recreates its regions (a size changed): it keeps
+serving on its local tiers and prints one warning.
+
+Order the manager first. With compose, give the manager a health check and make the instance wait
+for it:
+
+```yaml
+services:
+  manager:
+    image: ${MANAGER_IMAGE:-selene:local}
+    # ... the options of deploy/compose.yaml ...
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/selene/pool.sock"]
+      interval: 1s
+      retries: 30
+  flare:
+    image: ${FLARE_IMAGE}
+    depends_on:
+      manager:
+        condition: service_healthy
+```
+
+With systemd, give the instance's unit `Requires=selene.service` and `After=selene.service`. Restarting
+the manager alone is safe for running instances as long as its `--memory` and `--staging` are
+unchanged; changing either means restarting the instances too.
+
 ## Readiness and restarts
 
 The manager is `READY` (lookups, claims and puts are served) when disk recovery is complete and
