@@ -1130,6 +1130,24 @@ fn child_peer() {
                     session.window_ready(1).await;
                     std::fs::write(&flag, b"ready").unwrap();
                 }
+                "reconnecter" => {
+                    // Opens a session and does nothing else; after the manager restarted and
+                    // `go` exists it opens another, as a client reconnecting does.
+                    let mut session = pool.open(&Ident::new("idle")).await;
+                    session.snapshot(vec![]).await;
+                    std::fs::write(&flag, b"ready").unwrap();
+                    let go = flag.with_extension("go");
+                    while !go.exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    drop(session);
+                    drop(pool);
+                    let mut pool = Pool::connect(&socket).await;
+                    // Only the session: no snapshot, no claim, no put.
+                    let _session = pool.open(&Ident::new("idle")).await;
+                    std::fs::write(flag.with_extension("back"), b"back").unwrap();
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
                 "source" => {
                     let mut session = pool.open(&Ident::new("src")).await;
                     session.snapshot(vec![]).await;
@@ -1185,6 +1203,42 @@ fn wait_for_file(path: &std::path::Path) {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_manager_releases_its_regions_when_the_previous_runs_processes_reopen_a_session() {
+    let mut host = host();
+    host.start();
+    let flag = flag_path("reconnecter");
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let child = Kill(spawn_child("reconnecter", &host.config.socket, &flag));
+    wait_for_file(&flag);
+    host.stop();
+    // A crash leaves the holders file as the live manager last wrote it; a graceful stop has
+    // emptied it, so write what a crash would have left: the child, and nobody else.
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", child.0.id())).unwrap();
+    let start = stat[stat.rfind(')').unwrap() + 1..]
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .to_owned();
+    std::fs::write(
+        host.shm_directory().join("holders"),
+        format!("{} {start}\n", child.0.id()),
+    )
+    .unwrap();
+    host.start();
+    assert_eq!(host.gauge("pool_regions_held"), 1, "the child is a holder");
+    // Nothing the child does but reopen its session ends the hold: it asks for no window.
+    std::fs::write(flag.with_extension("go"), b"go").unwrap();
+    wait_for_file(&flag.with_extension("back"));
+    host.wait(|host| host.gauge("pool_regions_held") == 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

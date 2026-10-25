@@ -562,7 +562,13 @@ impl Local {
         // A process of the previous run that reconnects has drained what it did under the
         // dead manager before it did (PROTOCOL.md section 8.1), so its hold is over.
         if let (SessionKind::Local { pid }, Some(prior)) = (kind, &mut self.prior) {
-            prior.holders.remove(&pid);
+            if prior.holders.remove(&pid).is_some() {
+                eprintln!(
+                    "selene: instance '{}': process {pid} of the previous run reconnected, {} left",
+                    self.instance,
+                    prior.holders.len()
+                );
+            }
             self.settle_prior();
         }
         self.persist_holders();
@@ -606,9 +612,16 @@ impl Local {
             .retain(|_, record| !(record.closed && record.exited && record.reported));
         if let Some(prior) = &mut self.prior {
             let before = prior.holders.len();
-            prior
-                .holders
-                .retain(|_, pidfd| !pidfd.as_ref().is_some_and(pidfd_exited));
+            let instance = &self.instance;
+            prior.holders.retain(|pid, pidfd| {
+                let gone = pidfd.as_ref().is_some_and(pidfd_exited);
+                if gone {
+                    eprintln!(
+                        "selene: instance '{instance}': process {pid} of the previous run exited"
+                    );
+                }
+                !gone
+            });
             if prior.holders.len() != before {
                 self.settle_prior();
                 self.persist_holders();
@@ -1291,9 +1304,11 @@ impl Prior {
         if holders.is_empty() {
             return None;
         }
+        let mut pids: Vec<_> = holders.keys().copied().collect();
+        pids.sort_unstable();
         eprintln!(
             "selene: instance '{instance}' holds its shared regions until {} process(es) of the \
-             previous run reconnect or exit",
+             previous run reconnect or exit (pids {pids:?})",
             holders.len()
         );
         let mut extents = arena.reserve_all();
