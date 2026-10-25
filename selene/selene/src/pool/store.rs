@@ -341,6 +341,10 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
 }
 
 impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
+    fn reused(&mut self, key: PrefixKey) {
+        self.inner.reused(key);
+    }
+
     fn pooled(&self) -> bool {
         true
     }

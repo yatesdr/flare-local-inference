@@ -945,6 +945,11 @@ impl CompositeStore {
 }
 
 impl HostStore for CompositeStore {
+    fn reused(&mut self, key: PrefixKey) {
+        self.memory.reused(key);
+        self.disk.reused(key);
+    }
+
     fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit> {
         self.stats.lookups += 1;
         let (memory, stale) = (&self.memory, &self.stale);

@@ -226,6 +226,8 @@ pub trait HostStore {
     fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
         self.store(checkpoint)
     }
+    /// A request reused this GPU checkpoint: refresh any retained host record.
+    fn reused(&mut self, _key: PrefixKey) {}
     /// Copy a looked-up chain into the ticket's ids. An error means no event follows.
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()>;
     /// Report completed work. `Err` means the store can no longer report

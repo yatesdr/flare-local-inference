@@ -2197,60 +2197,69 @@ fn admit_with_host_store(
     metrics: &super::metrics::Metrics,
 ) -> Result<RequestHandle> {
     let plan = scheduler.plan_admission(&spec)?;
-    use crate::offload::LookupOutcome;
-    let mut before = u64::MAX;
-    let hit = loop {
-        let Some(hit) =
-            store.lookup_for(pool_lookup, plan.history(), plan.resident_tokens(), before)
-        else {
-            if before == u64::MAX {
-                metrics.host_lookup_outcome(LookupOutcome::NoMatch);
+    let reused = (plan.resident_tokens() != 0)
+        .then(|| plan.history().key_at(plan.resident_tokens()))
+        .flatten();
+    let result = (|| {
+        use crate::offload::LookupOutcome;
+        let mut before = u64::MAX;
+        let hit = loop {
+            let Some(hit) =
+                store.lookup_for(pool_lookup, plan.history(), plan.resident_tokens(), before)
+            else {
+                if before == u64::MAX {
+                    metrics.host_lookup_outcome(LookupOutcome::NoMatch);
+                }
+                break None;
+            };
+            metrics.host_lookup_cost(&hit, prefill_rate);
+            if crate::offload::worth_fetching(&hit, prefill_rate) {
+                break Some(hit);
             }
-            break None;
+            metrics.host_lookup_outcome(LookupOutcome::CostRejected);
+            before = hit.consumed_tokens;
         };
-        metrics.host_lookup_cost(&hit, prefill_rate);
-        if crate::offload::worth_fetching(&hit, prefill_rate) {
-            break Some(hit);
-        }
-        metrics.host_lookup_outcome(LookupOutcome::CostRejected);
-        before = hit.consumed_tokens;
-    };
-    let Some(hit) = hit else {
-        let handle = scheduler.admit_planned(spec, plan, None)?.handle;
-        // Lookups count once per admitted request, not per attempt of a waiting one.
-        scheduler.record_host_lookup();
-        return Ok(handle);
-    };
-    let inbound = crate::scheduler::InboundRequest {
-        key: hit.key,
-        consumed_tokens: hit.consumed_tokens,
-        pages: hit.pages,
-    };
-    let admitted = match scheduler.admit_planned(spec.clone(), plan, Some(inbound)) {
-        Ok(admitted) => admitted,
-        Err(Error::Admission(AdmissionError::Capacity(_))) => {
-            metrics.host_lookup_outcome(LookupOutcome::CapacityRejected);
-            let handle = scheduler.admit(spec)?;
+        let Some(hit) = hit else {
+            let handle = scheduler.admit_planned(spec, plan, None)?.handle;
+            // Lookups count once per admitted request, not per attempt of a waiting one.
             scheduler.record_host_lookup();
             return Ok(handle);
+        };
+        let inbound = crate::scheduler::InboundRequest {
+            key: hit.key,
+            consumed_tokens: hit.consumed_tokens,
+            pages: hit.pages,
+        };
+        let admitted = match scheduler.admit_planned(spec.clone(), plan, Some(inbound)) {
+            Ok(admitted) => admitted,
+            Err(Error::Admission(AdmissionError::Capacity(_))) => {
+                metrics.host_lookup_outcome(LookupOutcome::CapacityRejected);
+                let handle = scheduler.admit(spec)?;
+                scheduler.record_host_lookup();
+                return Ok(handle);
+            }
+            Err(error) => return Err(error),
+        };
+        scheduler.record_host_lookup();
+        let Some(ticket) = admitted.ticket else {
+            metrics.host_lookup_outcome(LookupOutcome::Admitted);
+            return Ok(admitted.handle);
+        };
+        let key = ticket.key;
+        if store.fetch(hit, ticket).is_err() {
+            metrics.host_lookup_outcome(LookupOutcome::EnqueueRejected);
+            // No event follows a rejected fetch; this request is the ticket's only
+            // waiter, so retire it and admit the request again without the store.
+            scheduler.finish_inbound(key, false)?;
+            return scheduler.admit(spec);
         }
-        Err(error) => return Err(error),
-    };
-    scheduler.record_host_lookup();
-    let Some(ticket) = admitted.ticket else {
         metrics.host_lookup_outcome(LookupOutcome::Admitted);
-        return Ok(admitted.handle);
-    };
-    let key = ticket.key;
-    if store.fetch(hit, ticket).is_err() {
-        metrics.host_lookup_outcome(LookupOutcome::EnqueueRejected);
-        // No event follows a rejected fetch; this request is the ticket's only
-        // waiter, so retire it and admit the request again without the store.
-        scheduler.finish_inbound(key, false)?;
-        return scheduler.admit(spec);
+        Ok(admitted.handle)
+    })();
+    if result.is_ok() && let Some(key) = reused {
+        store.reused(key);
     }
-    metrics.host_lookup_outcome(LookupOutcome::Admitted);
-    Ok(admitted.handle)
+    result
 }
 
 fn cancel_stopped(
