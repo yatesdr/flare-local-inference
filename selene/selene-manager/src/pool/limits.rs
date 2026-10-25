@@ -11,10 +11,8 @@ pub fn to_proto(limits: &Limits) -> v2::Limits {
         max_chain_nodes: limits.max_chain_nodes,
         max_boundaries: limits.max_boundaries,
         max_notices_per_batch: limits.max_notices_per_batch,
-        max_unacked_notices: limits.max_unacked_notices,
         max_resync_chunk_entries: limits.max_resync_chunk_entries,
         max_resync_entries: limits.max_resync_entries,
-        max_resync_buffered_notices: limits.max_resync_buffered_notices,
         max_claims_in_flight: limits.max_claims_in_flight,
         max_export_slots: limits.max_export_slots,
         window_credits: limits.window_credits,
@@ -23,7 +21,6 @@ pub fn to_proto(limits: &Limits) -> v2::Limits {
         pin_deadline_ms: limits.pin_deadline_ms,
         progress_timeout_ms: limits.progress_timeout_ms,
         max_open_puts: limits.max_open_puts,
-        resync_timeout_ms: limits.resync_timeout_ms,
     }
 }
 

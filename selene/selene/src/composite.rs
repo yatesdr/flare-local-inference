@@ -2536,7 +2536,7 @@ mod tests {
         let mut events = Vec::new();
         poll_until(&mut store, &mut events, |store| {
             let _ = store;
-            if let Some((_, batch)) = announcer.take_batch(100) {
+            if let Some(batch) = announcer.take_batch(100) {
                 notices.extend(batch);
             }
             notices
@@ -2862,7 +2862,7 @@ mod tests {
             while !done(notices) {
                 assert!(Instant::now() < deadline, "notices: {notices:?}");
                 store.poll(&mut Vec::new()).unwrap();
-                if let Some((_, batch)) = announcer.take_batch(100) {
+                if let Some(batch) = announcer.take_batch(100) {
                     notices.extend(batch);
                 }
                 std::thread::sleep(Duration::from_millis(1));

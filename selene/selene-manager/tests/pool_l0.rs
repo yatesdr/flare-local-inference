@@ -15,7 +15,6 @@ fn host() -> Host {
     // Tight timers keep the timeout cases quick.
     host.config.pool.limits.pin_deadline_ms = 300;
     host.config.pool.limits.progress_timeout_ms = 600;
-    host.config.pool.limits.resync_timeout_ms = 400;
     host.config.pool.reply_retention = Duration::from_millis(1500);
     host
 }
@@ -201,62 +200,6 @@ async fn h10_a_reconnect_supersedes_the_old_stream() {
 // ---------------------------------------------------------------- index (I)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn i1_to_i4_notices_apply_in_order_and_gaps_demand_a_resync() {
-    let mut host = host();
-    host.start();
-    let mut pool = Pool::connect(&host.config.socket).await;
-    let mut a = pool.open(&Ident::new("a")).await;
-    // I4: a notice before the first resync is refused.
-    a.send_notices_at(1, vec![saved(entry(1024, None, v2::Tier::Dram, 1))])
-        .await;
-    assert_eq!(
-        a.resync_required().await.reason,
-        v2::ResyncReason::ResyncGap as i32
-    );
-    a.snapshot(vec![]).await;
-    // I1: in order.
-    let ack = a
-        .notices(vec![saved(entry(1024, None, v2::Tier::Dram, 1))])
-        .await;
-    assert_eq!(ack.applied_through, 1);
-    let mut b = source(&mut pool, &Ident::new("b")).await;
-    assert_eq!(b.lookup(1, 1024, 0).await.candidates.len(), 1);
-    // I2: a duplicate batch changes nothing.
-    a.send_notices_at(1, vec![saved(entry(1024, None, v2::Tier::Dram, 1))])
-        .await;
-    let ack = a
-        .take(|m| match m {
-            M::NoticeAck(ack) => Some(*ack),
-            _ => None,
-        })
-        .await;
-    assert_eq!(ack.applied_through, 1);
-    assert_eq!(b.lookup(2, 1024, 0).await.candidates.len(), 1);
-    // I3: a gap drops the batch and demands a snapshot; later notices are ignored.
-    a.send_notices_at(5, vec![saved(entry(2048, None, v2::Tier::Dram, 1))])
-        .await;
-    assert_eq!(
-        a.resync_required().await.reason,
-        v2::ResyncReason::ResyncGap as i32
-    );
-    a.send_notices_at(2, vec![saved(entry(2048, None, v2::Tier::Dram, 1))])
-        .await;
-    assert_eq!(
-        b.lookup(3, 2048, 0).await.candidates.len(),
-        1,
-        "only the old entry"
-    );
-    assert!(
-        b.lookup(4, 2048, 0).await.candidates.iter().all(|c| c
-            .key
-            .as_ref()
-            .unwrap()
-            .consumed_tokens
-            == 1024)
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn i5_to_i9_generations_spills_compactions() {
     let mut host = host();
     host.start();
@@ -356,166 +299,14 @@ async fn i8_a_compacted_node_is_no_longer_an_endpoint_but_the_chain_holds() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn i10_to_i15_snapshots_install_atomically() {
-    let mut host = host();
-    host.start();
-    let mut pool = Pool::connect(&host.config.socket).await;
-    let mut a = pool.open(&Ident::new("a")).await;
-    let mut b = source(&mut pool, &Ident::new("b")).await;
-    // I10: a snapshot at watermark 3 with a delta stream from 4.
-    a.seq = 3;
-    let installed = a
-        .snapshot_at(
-            vec![entry(1024, None, v2::Tier::Dram, 1)],
-            3,
-            vec![saved(entry(2048, None, v2::Tier::Dram, 1))],
-        )
-        .await;
-    assert_eq!(
-        (
-            installed.watermark,
-            installed.entries,
-            installed.applied_through
-        ),
-        (3, 1, 4)
-    );
-    assert_eq!(b.lookup(1, 2048, 0).await.candidates.len(), 2);
-    // A15: expected_next is W + 1 + buffered applied; 5 applies, 4 is skipped.
-    a.send_notices_at(4, vec![saved(entry(3072, None, v2::Tier::Dram, 1))])
-        .await;
-    a.send_notices_at(5, vec![saved(entry(4096, None, v2::Tier::Dram, 1))])
-        .await;
-    let ack = a
-        .take(|m| match m {
-            M::NoticeAck(ack) if ack.applied_through >= 5 => Some(*ack),
-            _ => None,
-        })
-        .await;
-    assert_eq!(ack.applied_through, 5);
-    // I14: a second begin abandons the first; only the second installs.
-    a.send(c::M::ResyncBegin(v2::ResyncBegin {
-        resync_id: 50,
-        watermark: 5,
-    }))
-    .await;
-    a.send(c::M::ResyncChunk(v2::ResyncChunk {
-        resync_id: 50,
-        chunk_index: 0,
-        entries: vec![entry(5120, None, v2::Tier::Dram, 1)],
-    }))
-    .await;
-    let installed = a
-        .snapshot_at(vec![entry(6144, None, v2::Tier::Dram, 1)], 5, vec![])
-        .await;
-    assert_eq!(installed.entries, 1);
-    let reply = b.lookup(2, 6144, 0).await;
-    let keys: Vec<u64> = reply
-        .candidates
-        .iter()
-        .map(|c| c.key.as_ref().unwrap().consumed_tokens)
-        .collect();
-    assert_eq!(keys, vec![6144]);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn i11_to_i13_bad_resyncs() {
-    let mut host = host();
-    host.config.pool.limits.max_resync_buffered_notices = 2;
-    host.start();
-    let mut pool = Pool::connect(&host.config.socket).await;
-    let mut a = source(&mut pool, &Ident::new("a")).await;
-    a.notices(vec![saved(entry(1024, None, v2::Tier::Dram, 1))])
-        .await;
-    let mut b = source(&mut pool, &Ident::new("b")).await;
-    // I11: buffered deltas must start at W + 1.
-    a.send(c::M::ResyncBegin(v2::ResyncBegin {
-        resync_id: 1,
-        watermark: 1,
-    }))
-    .await;
-    a.send_notices_at(3, vec![saved(entry(2048, None, v2::Tier::Dram, 1))])
-        .await;
-    assert_eq!(
-        a.resync_required().await.reason,
-        v2::ResyncReason::ResyncGap as i32
-    );
-    // The installed entries stay as hints.
-    assert_eq!(b.lookup(1, 1024, 0).await.candidates.len(), 1);
-    // I12: more buffered deltas than the bound.
-    a.send(c::M::ResyncBegin(v2::ResyncBegin {
-        resync_id: 2,
-        watermark: 1,
-    }))
-    .await;
-    a.send_notices_at(
-        2,
-        (0..3)
-            .map(|n| saved(entry(4096 + n * 64, None, v2::Tier::Dram, 1)))
-            .collect(),
-    )
-    .await;
-    assert_eq!(
-        a.resync_required().await.reason,
-        v2::ResyncReason::ResyncOverflow as i32
-    );
-    // I13: a chunk hole, a wrong count and an unknown id.
-    a.send(c::M::ResyncBegin(v2::ResyncBegin {
-        resync_id: 3,
-        watermark: 1,
-    }))
-    .await;
-    a.send(c::M::ResyncChunk(v2::ResyncChunk {
-        resync_id: 3,
-        chunk_index: 1,
-        entries: vec![],
-    }))
-    .await;
-    assert_eq!(
-        a.resync_required().await.reason,
-        v2::ResyncReason::ResyncBad as i32
-    );
-    a.send(c::M::ResyncBegin(v2::ResyncBegin {
-        resync_id: 4,
-        watermark: 1,
-    }))
-    .await;
-    a.send(c::M::ResyncEnd(v2::ResyncEnd {
-        resync_id: 4,
-        chunks: 0,
-        entries: 7,
-    }))
-    .await;
-    assert_eq!(
-        a.resync_required().await.reason,
-        v2::ResyncReason::ResyncBad as i32
-    );
-    a.send(c::M::ResyncEnd(v2::ResyncEnd {
-        resync_id: 99,
-        chunks: 0,
-        entries: 0,
-    }))
-    .await;
-    assert_eq!(
-        a.resync_required().await.reason,
-        v2::ResyncReason::ResyncBad as i32
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn i15_a_snapshot_above_the_entry_bound_overflows() {
     let mut host = host();
     host.config.pool.limits.max_resync_entries = 3;
     host.start();
     let mut pool = Pool::connect(&host.config.socket).await;
     let mut a = pool.open(&Ident::new("a")).await;
-    a.send(c::M::ResyncBegin(v2::ResyncBegin {
-        resync_id: 1,
-        watermark: 0,
-    }))
-    .await;
+    a.send(c::M::ResyncBegin(v2::ResyncBegin {})).await;
     a.send(c::M::ResyncChunk(v2::ResyncChunk {
-        resync_id: 1,
-        chunk_index: 0,
         entries: (1..=4)
             .map(|n| entry(n * 1024, None, v2::Tier::Dram, 1))
             .collect(),
@@ -525,26 +316,6 @@ async fn i15_a_snapshot_above_the_entry_bound_overflows() {
         a.resync_required().await.reason,
         v2::ResyncReason::ResyncOverflow as i32
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a13_a_stalled_resync_times_out_without_holding_anyone() {
-    let mut host = host();
-    host.start();
-    let mut pool = Pool::connect(&host.config.socket).await;
-    let mut a = pool.open(&Ident::new("a")).await;
-    let mut b = pool.open(&Ident::new("b")).await;
-    a.send(c::M::ResyncBegin(v2::ResyncBegin {
-        resync_id: 1,
-        watermark: 0,
-    }))
-    .await;
-    // Another session's resync is unaffected while a stalls.
-    b.snapshot(vec![entry(1024, None, v2::Tier::Dram, 1)]).await;
-    let required = a.resync_required().await;
-    assert_eq!(required.reason, v2::ResyncReason::ResyncTimeout as i32);
-    let mut c_session = source(&mut pool, &Ident::new("c")).await;
-    assert_eq!(c_session.lookup(1, 1024, 0).await.candidates.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1149,12 +920,11 @@ async fn x4_batch_chunk_and_chain_limits_are_enforced() {
     let mut pool = Pool::connect(&host.config.socket).await;
     // More notices than a batch may carry closes the session.
     let mut a = source(&mut pool, &Ident::new("a")).await;
-    a.send_notices_at(
-        1,
-        (1..=3)
+    a.send(c::M::Notices(v2::NoticeBatch {
+        notices: (1..=3)
             .map(|n| saved(entry(n * 1024, None, v2::Tier::Dram, 1)))
             .collect(),
-    )
+    }))
     .await;
     let closing = a.closed().await.expect("closing");
     assert_eq!(
@@ -1163,14 +933,8 @@ async fn x4_batch_chunk_and_chain_limits_are_enforced() {
     );
     // So does a resync chunk with too many entries.
     let mut b = pool.open(&Ident::new("b")).await;
-    b.send(c::M::ResyncBegin(v2::ResyncBegin {
-        resync_id: 1,
-        watermark: 0,
-    }))
-    .await;
+    b.send(c::M::ResyncBegin(v2::ResyncBegin {})).await;
     b.send(c::M::ResyncChunk(v2::ResyncChunk {
-        resync_id: 1,
-        chunk_index: 0,
         entries: (1..=3)
             .map(|n| entry(n * 1024, None, v2::Tier::Dram, 1))
             .collect(),
@@ -1217,4 +981,40 @@ async fn x4_batch_chunk_and_chain_limits_are_enforced() {
         "a three-node chain exceeds max_chain_nodes: {keys:?}"
     );
     assert!(keys.contains(&2048));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshots_clear_on_begin_and_chunks_are_visible_before_end() {
+    let mut host = host();
+    host.start();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    let mut a = source(&mut pool, &Ident::new("a")).await;
+    let mut b = source(&mut pool, &Ident::new("b")).await;
+    a.notices(vec![saved(entry(1024, None, v2::Tier::Dram, 1))])
+        .await;
+    assert_eq!(b.lookup(1, 8192, 0).await.candidates.len(), 1);
+    a.send(c::M::ResyncBegin(v2::ResyncBegin {})).await;
+    a.barrier().await;
+    assert!(b.lookup(2, 8192, 0).await.candidates.is_empty());
+    a.send(c::M::ResyncChunk(v2::ResyncChunk {
+        entries: vec![entry(2048, None, v2::Tier::Dram, 1)],
+    }))
+    .await;
+    a.barrier().await;
+    assert_eq!(
+        b.lookup(3, 8192, 0).await.candidates[0]
+            .key
+            .as_ref()
+            .unwrap()
+            .consumed_tokens,
+        2048
+    );
+    // Restarting a snapshot clears even a partial predecessor.
+    a.snapshot(vec![entry(4096, None, v2::Tier::Dram, 1)]).await;
+    let found = b.lookup(4, 8192, 0).await.candidates;
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].key.as_ref().unwrap().consumed_tokens, 4096);
+    a.notices(vec![saved(entry(6144, None, v2::Tier::Dram, 1))])
+        .await;
+    assert_eq!(b.lookup(5, 8192, 0).await.candidates.len(), 2);
 }

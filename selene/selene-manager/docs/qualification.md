@@ -47,13 +47,11 @@ H6 `h6_a_unix_peer_of_the_same_user_gets_shared_memory`, `h6_a_tcp_session_has_n
 H7 `h7_malformed_scopes_are_refused`; H8 `h8_scopes_never_see_each_other`;
 H10 `h10_a_reconnect_supersedes_the_old_stream`.
 
-**Index notices and resync.** I1 to I4 `i1_to_i4_notices_apply_in_order_and_gaps_demand_a_resync`;
-I5 to I7 `i5_to_i9_generations_spills_compactions`; I8 `i8_a_compacted_node_is_no_longer_an_endpoint_but_the_chain_holds`;
-I9 `i9_a_leaf_leaves_its_page_only_ancestors_until_they_are_named`;
-I10, I14, A15 `i10_to_i15_snapshots_install_atomically`; I11 to I13 `i11_to_i13_bad_resyncs`;
-I15 `i15_a_snapshot_above_the_entry_bound_overflows`; I16, I17 client;
-I18, I19 `i18_and_i19_stale_incarnations_and_session_end`; A13 `a13_a_stalled_resync_times_out_without_holding_anyone`;
-A23 `i5_to_i9_generations_spills_compactions`.
+**Index notices and resync.** `snapshots_clear_on_begin_and_chunks_are_visible_before_end`;
+`i5_to_i9_generations_spills_compactions`; `i8_a_compacted_node_is_no_longer_an_endpoint_but_the_chain_holds`;
+`i9_a_leaf_leaves_its_page_only_ancestors_until_they_are_named`;
+`i15_a_snapshot_above_the_entry_bound_overflows`; `i18_and_i19_stale_incarnations_and_session_end`.
+Client engine tests cover mutations following the snapshot cut and queue overflow.
 
 **Lookup.** L1 to L3 `l1_to_l3_ordering_trimming_and_the_requesters_own_entries`;
 L4 `l4_instance_candidates_need_shared_memory_on_both_sides`, `l4_and_a22_remote_sessions_see_only_the_managers_records_as_level_five`;

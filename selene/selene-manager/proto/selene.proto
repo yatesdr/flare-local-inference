@@ -229,15 +229,14 @@ message HelloReply {
 // with the reason named on that request, or fails the session if the limit is
 // structural (batch sizes). All counts are per session unless stated.
 message Limits {
+  reserved 6, 9, 18;
   uint32 max_concurrent_lookups = 1;    // default 8
   uint32 max_candidates = 2;            // per LookupReply; default 8
   uint32 max_chain_nodes = 3;           // per candidate and per Record list; default 4096
   uint32 max_boundaries = 4;            // per LookupRequest; default 8192
   uint32 max_notices_per_batch = 5;     // default 256
-  uint32 max_unacked_notices = 6;       // sent but not covered by NoticeAck; default 16384
   uint32 max_resync_chunk_entries = 7;  // default 1024
   uint32 max_resync_entries = 8;        // per session snapshot; default 4 million
-  uint32 max_resync_buffered_notices = 9;  // deltas held while a snapshot streams; default 65536
   uint32 max_claims_in_flight = 10;     // per requester; default 2 (design: per-GPU export limit)
   uint32 max_export_slots = 11;         // upper bound on OpenSession.export_slots; default 2
   uint32 window_credits = 12;           // unreleased windows per claim or put; default 2
@@ -247,7 +246,6 @@ message Limits {
   uint32 pin_deadline_ms = 15;          // how long a source has to answer ExportRequest; default 250
   uint32 progress_timeout_ms = 16;      // no window fill/release for this long expires a claim; default 3000
   uint32 max_open_puts = 17;            // per writer; default 4
-  uint32 resync_timeout_ms = 18;        // ResyncBegin to installed; default 5000
 }
 
 // Mapped MAP_SHARED by the client at these paths. The files persist across
@@ -354,6 +352,7 @@ message ClientMessage {
 }
 
 message ServerMessage {
+  reserved 12;
   reserved 44;
   Header header = 1;
   oneof m {
@@ -363,8 +362,7 @@ message ServerMessage {
 
     // Index.
     ResyncRequired resync_required = 10;
-    ResyncInstalled resync_installed = 11;
-    NoticeAck notice_ack = 12;
+    ResyncAck resync_ack = 11;
 
     // Requester role.
     LookupReply lookup_reply = 20;
@@ -441,10 +439,8 @@ message SessionOpened {
   uint32 export_slots = 4;
   uint32 claim_slots = 5;
   ReadinessInfo readiness = 6;
-  // Always true after OPEN_OK: the manager holds no entries for this instance
-  // until it completes a resync, even an empty one, and rejects NoticeBatch until
-  // then. Lookups, claims and puts are served normally (a restarted requester
-  // asks the manager directly and needs no index of its own).
+  // Always true after OPEN_OK: Begin starts the initial holdings snapshot.
+  // Lookups, claims and puts do not require this instance to advertise holdings.
   bool resync_required = 7;
 }
 
@@ -551,81 +547,20 @@ message Evicted {
   IndexEntry heir = 5;   // present iff kind == COMPACTED.
 }
 
-// notices[i] has sequence first_sequence + i. Sequences start at 1 in each
-// session and rise by one per notice, across batches and across resyncs (a
-// resync does not renumber). A batch has at most Limits.max_notices_per_batch
-// entries; a larger batch fails the session. The manager applies a batch only
-// if first_sequence <= expected_next, skipping notices below expected_next;
-// first_sequence > expected_next is a gap (ResyncRequired). Notices are rejected
-// until the first resync completes.
-message NoticeBatch {
-  uint64 first_sequence = 1;
-  repeated Notice notices = 2;
-}
-
-// Highest sequence the manager has applied without a gap. The client may have at
-// most Limits.max_unacked_notices notices beyond this outstanding; when it would
-// exceed that (or its own queue bound), it drops its unsent queue and starts a
-// resync instead of blocking.
-message NoticeAck { uint64 applied_through = 1; }
-
-// Snapshot: begin, chunks, end, all on the ordered stream. `watermark` W means
-// the snapshot reflects exactly the notices with sequence <= W and none above.
-// Notices with sequence > W may be sent while the snapshot streams; the manager
-// buffers them (bounded by max_resync_buffered_notices) and, at ResyncEnd,
-// replaces the session's entries with the snapshot and applies the buffered
-// notices in order, as one atomic step with respect to lookups. The buffered
-// notices must begin at exactly W + 1 (or be empty) or the resync fails with
-// ResyncRequired{RESYNC_GAP}. After the install the session's expected_next is
-// W + 1 + the number of buffered notices applied. The whole exchange must finish
-// within Limits.resync_timeout_ms of ResyncBegin or the staged data is dropped
-// with RESYNC_TIMEOUT, so a stalled resync cannot hold the scope. The snapshot
-// the client sends covers every announced holding (GPU and host tiers) as of one
-// cut taken under the same lock that assigns sequences (client-api.md section 2).
-// A second ResyncBegin abandons the first. A client-
-// initiated resync is always legal; the manager also demands one.
-message ResyncBegin {
-  uint64 resync_id = 1;
-  uint64 watermark = 2;
-}
-// Entries are unique by (key, tier); parents need not precede children. At most
-// Limits.max_resync_chunk_entries per chunk and Limits.max_resync_entries per snapshot.
-message ResyncChunk {
-  uint64 resync_id = 1;
-  uint32 chunk_index = 2;   // 0, 1, 2, ... without holes.
-  repeated IndexEntry entries = 3;
-}
-message ResyncEnd {
-  uint64 resync_id = 1;
-  uint32 chunks = 2;
-  uint64 entries = 3;       // total, for the manager to check it saw all of them.
-}
-
+// The ordered stream carries snapshot chunks before later notices. Begin clears
+// the source's hints; chunks upsert live, so lookups may see a partial snapshot.
+message NoticeBatch { reserved 1; repeated Notice notices = 2; }
+message ResyncBegin { reserved 1, 2; }
+message ResyncChunk { reserved 1, 2; repeated IndexEntry entries = 3; }
+message ResyncEnd { reserved 1, 2, 3; }
+message ResyncAck { reserved 1, 2, 3, 4; }
 enum ResyncReason {
   RESYNC_REASON_UNSPECIFIED = 0;
-  RESYNC_STATE_LOST = 1;   // the manager dropped this session's entries (internal fault).
-  RESYNC_GAP = 2;          // a notice batch or the buffered deltas skipped a sequence.
-  RESYNC_OVERFLOW = 3;     // the manager's per-session bounds were exceeded.
-  RESYNC_BAD = 4;          // chunk hole, count mismatch, or unknown resync_id.
-  RESYNC_TIMEOUT = 5;      // ResyncBegin to ResyncEnd exceeded Limits.resync_timeout_ms.
+  RESYNC_STATE_LOST = 1;
+  reserved 2, 4, 5;
+  RESYNC_OVERFLOW = 3;
 }
-
-// The manager discarded this session's pending notices and (for RESYNC_GAP and
-// RESYNC_OVERFLOW) kept the last installed snapshot's entries as stale until the new
-// snapshot installs. The client must send a new snapshot. `applied_through` is
-// informational.
-message ResyncRequired {
-  ResyncReason reason = 1;
-  uint64 applied_through = 2;
-}
-
-message ResyncInstalled {
-  uint64 resync_id = 1;
-  uint64 watermark = 2;
-  uint64 entries = 3;
-  // Highest sequence applied after installing the snapshot and the buffered notices.
-  uint64 applied_through = 4;
-}
+message ResyncRequired { ResyncReason reason = 1; reserved 2; }
 
 // ---------------------------------------------------------------------------
 // Lookup

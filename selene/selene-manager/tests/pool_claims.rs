@@ -20,7 +20,6 @@ fn host() -> Host {
     let mut host = Host::dram_only(2 * 1024 * 1024);
     host.config.pool.limits.pin_deadline_ms = 300;
     host.config.pool.limits.progress_timeout_ms = 600;
-    host.config.pool.limits.resync_timeout_ms = 400;
     host.config.pool.reply_retention = Duration::from_millis(1500);
     host
 }

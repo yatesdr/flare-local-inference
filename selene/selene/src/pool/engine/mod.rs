@@ -71,11 +71,7 @@ impl Settings {
 }
 
 struct Resync {
-    id: u64,
-    watermark: u64,
     chunks: VecDeque<Vec<wire::IndexEntry>>,
-    sent_chunks: u32,
-    entries: u64,
     begun: bool,
     ended: bool,
 }
@@ -87,9 +83,6 @@ pub(crate) struct Session {
     installed: bool,
     ready: bool,
     resync: Option<Resync>,
-    next_resync: u64,
-    acked: u64,
-    sent_through: u64,
     pub(crate) export_slots: u32,
 }
 
@@ -270,9 +263,6 @@ impl Engine {
                 .as_ref()
                 .is_some_and(|r| r.state == wire::ReadinessState::Ready as i32),
             resync: None,
-            next_resync: 0,
-            acked: 0,
-            sent_through: 0,
             export_slots,
         });
         self.shared.set_status(PoolStatus::Connecting);
@@ -287,23 +277,14 @@ impl Engine {
         let Some(sess) = self.sess.as_mut() else {
             return;
         };
-        sess.next_resync += 1;
         let per_chunk = (sess.limits.max_resync_chunk_entries as usize).max(1);
         let entries: Vec<wire::IndexEntry> = snapshot.entries.iter().map(codec::entry_to).collect();
-        let total = entries.len() as u64;
         sess.resync = Some(Resync {
-            id: sess.next_resync,
-            watermark: snapshot.watermark,
             chunks: entries.chunks(per_chunk).map(|c| c.to_vec()).collect(),
-            sent_chunks: 0,
-            entries: total,
             begun: false,
             ended: false,
         });
         sess.installed = false;
-        // The snapshot covers every notice up to its watermark.
-        sess.sent_through = sess.sent_through.max(snapshot.watermark);
-        sess.acked = sess.acked.max(snapshot.watermark);
         self.update_status();
     }
 
@@ -394,23 +375,14 @@ impl Engine {
                 let snapshot = self.announce.snapshot();
                 self.begin_resync(snapshot);
             }
-            In::ResyncInstalled(installed) => {
+            In::ResyncAck(_) => {
                 if let Some(sess) = self.sess.as_mut()
-                    && sess
-                        .resync
-                        .as_ref()
-                        .is_some_and(|r| r.id == installed.resync_id)
+                    && sess.resync.as_ref().is_some_and(|r| r.ended)
                 {
                     sess.resync = None;
                     sess.installed = true;
-                    sess.acked = sess.acked.max(installed.applied_through);
                 }
                 self.update_status();
-            }
-            In::NoticeAck(ack) => {
-                if let Some(sess) = self.sess.as_mut() {
-                    sess.acked = sess.acked.max(ack.applied_through);
-                }
             }
             In::LookupReply(reply) => self.on_lookup_reply(now, reply),
             In::ClaimGranted(granted) => self.on_claim_granted(now, granted),
@@ -621,15 +593,8 @@ impl Engine {
         if self.sess.is_none() {
             return false;
         }
-        let overflow = self.announce.overflowed()
-            || self.sess.as_ref().is_some_and(|s| {
-                s.limits.max_unacked_notices > 0
-                    && s.sent_through.saturating_sub(s.acked)
-                        >= u64::from(s.limits.max_unacked_notices)
-            });
-        if overflow {
-            let snapshot = self.announce.snapshot();
-            self.begin_resync(snapshot);
+        if self.announce.overflowed() {
+            self.begin_resync(self.announce.snapshot());
         }
         let mut more = false;
         let mut messages = Vec::new();
@@ -638,49 +603,32 @@ impl Engine {
             if let Some(resync) = sess.resync.as_mut() {
                 if !resync.begun {
                     resync.begun = true;
-                    messages.push(Out::ResyncBegin(wire::ResyncBegin {
-                        resync_id: resync.id,
-                        watermark: resync.watermark,
-                    }));
+                    messages.push(Out::ResyncBegin(wire::ResyncBegin {}));
                 } else if let Some(entries) = resync.chunks.pop_front() {
-                    messages.push(Out::ResyncChunk(wire::ResyncChunk {
-                        resync_id: resync.id,
-                        chunk_index: resync.sent_chunks,
-                        entries,
-                    }));
-                    resync.sent_chunks += 1;
+                    messages.push(Out::ResyncChunk(wire::ResyncChunk { entries }));
                 } else if !resync.ended {
                     resync.ended = true;
-                    messages.push(Out::ResyncEnd(wire::ResyncEnd {
-                        resync_id: resync.id,
-                        chunks: resync.sent_chunks,
-                        entries: resync.entries,
-                    }));
+                    messages.push(Out::ResyncEnd(wire::ResyncEnd {}));
                 }
                 more = !resync.ended;
             }
         }
-        let begun = self
+        let snapshot_sent = self
             .sess
             .as_ref()
-            .is_some_and(|s| s.resync.as_ref().is_none_or(|r| r.begun));
+            .is_some_and(|s| s.resync.as_ref().is_none_or(|r| r.ended));
         for message in messages {
             self.emit(message);
         }
-        if begun {
+        if snapshot_sent {
             let max = self
                 .sess
                 .as_ref()
                 .map_or(1, |s| s.limits.max_notices_per_batch.max(1) as usize);
-            if let Some((first, notices)) = self.announce.take_batch(max) {
-                let count = notices.len() as u64;
+            if let Some(notices) = self.announce.take_batch(max) {
                 self.emit(Out::Notices(wire::NoticeBatch {
-                    first_sequence: first,
                     notices: notices.iter().map(codec::notice_to).collect(),
                 }));
-                if let Some(sess) = self.sess.as_mut() {
-                    sess.sent_through = sess.sent_through.max(first + count - 1);
-                }
                 more = true;
             }
         }

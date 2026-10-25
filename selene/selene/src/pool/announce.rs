@@ -1,11 +1,8 @@
 //! The announcement index: what this instance holds, in every tier, and the
 //! ordered notices that tell the manager about changes.
 //!
-//! One mutex covers the announced set, the sequence counter and the unsent
-//! queue, so a snapshot is a single cut: its watermark is the counter at that
-//! moment and its entries are exactly the effect of notices up to it. Callers
-//! (the worker, the host tiers) never wait on the network: a full queue is
-//! dropped and a snapshot takes its place.
+//! One mutex covers holdings and the unsent queue. A snapshot takes one cut and
+//! discards earlier queued notices. A full queue requests another snapshot.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -57,30 +54,22 @@ pub enum Notice {
     },
 }
 
-/// The announced set as of sequence `watermark`.
+/// A cut of the announced holdings.
 #[derive(Debug)]
 pub struct Snapshot {
-    pub watermark: u64,
     pub entries: Vec<IndexEntry>,
 }
 
 struct State {
     entries: HashMap<(PrefixKey, Tier), IndexEntry>,
-    /// Notices are queued and numbered only while a session is open.
+    /// Notices are queued only while a session is open.
     active: bool,
-    /// Highest sequence assigned in this session.
-    sequence: u64,
     queue: VecDeque<Notice>,
     overflowed: bool,
     max_entries: usize,
 }
 
 impl State {
-    /// Sequence of the notice at the front of the queue.
-    fn front(&self) -> u64 {
-        self.sequence - self.queue.len() as u64 + 1
-    }
-
     fn upsert(&mut self, entry: &IndexEntry) -> bool {
         let slot = (entry.key, entry.tier);
         match self.entries.get(&slot) {
@@ -118,7 +107,6 @@ impl State {
             self.overflowed = true;
             return;
         }
-        self.sequence += 1;
         self.queue.push_back(notice);
     }
 }
@@ -138,7 +126,6 @@ impl Announcer {
             state: Arc::new(Mutex::new(State {
                 entries: HashMap::new(),
                 active: false,
-                sequence: 0,
                 queue: VecDeque::new(),
                 overflowed: false,
                 max_entries: DEFAULT_MAX_ENTRIES,
@@ -226,16 +213,13 @@ impl Announcer {
         self.state.lock().unwrap().max_entries = max;
     }
 
-    /// A session opened: numbering restarts at 1, and the first snapshot is
-    /// the cut at watermark 0.
+    /// A session opened: take its initial holdings.
     pub(crate) fn begin_session(&self) -> Snapshot {
         let mut state = self.state.lock().unwrap();
         state.active = true;
-        state.sequence = 0;
         state.queue.clear();
         state.overflowed = false;
         Snapshot {
-            watermark: 0,
             entries: state.entries.values().cloned().collect(),
         }
     }
@@ -247,15 +231,12 @@ impl Announcer {
         state.overflowed = false;
     }
 
-    /// One cut: the watermark is the counter now and the entries are exactly the
-    /// effect of notices up to it. Notices up to the watermark that were still
-    /// queued are discarded; later ones follow the snapshot.
+    /// Take the holdings and discard notices already represented by this cut.
     pub(crate) fn snapshot(&self) -> Snapshot {
         let mut state = self.state.lock().unwrap();
         state.queue.clear();
         state.overflowed = false;
         Snapshot {
-            watermark: state.sequence,
             entries: state.entries.values().cloned().collect(),
         }
     }
@@ -265,15 +246,14 @@ impl Announcer {
         self.state.lock().unwrap().overflowed
     }
 
-    /// Up to `max` unsent notices and the sequence of the first.
-    pub(crate) fn take_batch(&self, max: usize) -> Option<(u64, Vec<Notice>)> {
+    /// Up to `max` unsent notices.
+    pub(crate) fn take_batch(&self, max: usize) -> Option<Vec<Notice>> {
         let mut state = self.state.lock().unwrap();
         if state.queue.is_empty() || max == 0 {
             return None;
         }
-        let first = state.front();
         let count = max.min(state.queue.len());
-        Some((first, state.queue.drain(..count).collect()))
+        Some(state.queue.drain(..count).collect())
     }
 
     pub fn len(&self) -> usize {
@@ -313,24 +293,8 @@ mod tests {
         Announcer::new(Arc::new(Notify::new()))
     }
 
-    fn drain(announcer: &Announcer) -> (u64, Vec<Notice>) {
+    fn drain(announcer: &Announcer) -> Vec<Notice> {
         announcer.take_batch(usize::MAX).unwrap()
-    }
-
-    #[test]
-    fn notices_are_numbered_from_one_in_each_session() {
-        let a = announcer();
-        a.saved(entry(1, Tier::Gpu, 1));
-        a.begin_session();
-        a.saved(entry(2, Tier::Gpu, 2));
-        a.saved(entry(3, Tier::Gpu, 3));
-        let (first, notices) = drain(&a);
-        assert_eq!((first, notices.len()), (1, 2));
-        a.saved(entry(4, Tier::Gpu, 4));
-        assert_eq!(drain(&a).0, 3);
-        a.begin_session();
-        a.saved(entry(5, Tier::Gpu, 5));
-        assert_eq!(drain(&a).0, 1);
     }
 
     #[test]
@@ -344,7 +308,6 @@ mod tests {
         let mut tiers: Vec<_> = snapshot.entries.iter().map(|e| e.tier).collect();
         tiers.sort();
         assert_eq!(tiers, [Tier::Gpu, Tier::Nvme]);
-        assert_eq!(snapshot.watermark, 3);
     }
 
     #[test]
@@ -355,7 +318,7 @@ mod tests {
         a.saved(entry(1, Tier::Gpu, 3));
         a.evicted(key(1), Tier::Gpu, 4, None);
         // Only the first save changed anything.
-        assert_eq!(drain(&a).1.len(), 1);
+        assert_eq!(drain(&a).len(), 1);
         assert_eq!(a.len(), 1);
         a.evicted(key(1), Tier::Gpu, 5, None);
         assert_eq!(a.len(), 0);
@@ -393,11 +356,10 @@ mod tests {
         let snapshot = a.snapshot();
         assert!(!a.overflowed());
         assert_eq!(snapshot.entries.len(), QUEUE_BOUND + 1);
-        // The overflowing save was applied to the set, never queued; the next
-        // notice is numbered after the watermark.
+        // The overflowing save is in the snapshot; later saves remain queued.
         a.saved(entry(u64::MAX / 128, Tier::Gpu, 1));
-        let (first, notices) = drain(&a);
-        assert_eq!((first, notices.len()), (snapshot.watermark + 1, 1));
+        let notices = drain(&a);
+        assert_eq!(notices.len(), 1);
     }
 
     #[test]
@@ -437,7 +399,7 @@ mod tests {
         a.saved(entry(2, Tier::Gpu, 1));
         a.saved(entry(3, Tier::Gpu, 1));
         assert_eq!(a.len(), 2);
-        assert_eq!(drain(&a).1.len(), 2);
+        assert_eq!(drain(&a).len(), 2);
     }
 
     #[test]
@@ -448,11 +410,9 @@ mod tests {
         let before = a.snapshot();
         a.saved(entry(2, Tier::Gpu, 1));
         a.evicted(key(1), Tier::Gpu, 1, None);
-        let (first, notices) = drain(&a);
-        assert_eq!(first, before.watermark + 1);
+        let notices = drain(&a);
         assert_eq!(notices.len(), 2);
         // The entry was in the snapshot and its eviction arrives after it.
         assert_eq!(before.entries.len(), 1);
-        assert_eq!(before.watermark, 1);
     }
 }

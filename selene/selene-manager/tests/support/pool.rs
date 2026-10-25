@@ -305,9 +305,8 @@ impl Pool {
             incarnation: self.hello.manager_incarnation,
             sid: opened.session_incarnation,
             opened,
-            seq: 0,
+            barrier_id: u64::MAX,
             backlog: VecDeque::new(),
-            resync_id: 0,
             ended: false,
             shm,
         }
@@ -350,10 +349,8 @@ pub struct Session {
     pub incarnation: u64,
     pub sid: u64,
     pub opened: v2::SessionOpened,
-    /// The last notice sequence assigned.
-    pub seq: u64,
+    pub barrier_id: u64,
     pub backlog: VecDeque<M>,
-    pub resync_id: u64,
     pub ended: bool,
     pub shm: Option<Shm>,
 }
@@ -464,80 +461,34 @@ impl Session {
 
     // ------------------------------------------------------------ index
 
-    pub async fn snapshot(&mut self, entries: Vec<v2::IndexEntry>) -> v2::ResyncInstalled {
-        let watermark = self.seq;
-        self.snapshot_at(entries, watermark, vec![]).await
-    }
-
-    /// A snapshot at an explicit watermark with deltas sent while it streams.
-    pub async fn snapshot_at(
-        &mut self,
-        entries: Vec<v2::IndexEntry>,
-        watermark: u64,
-        deltas: Vec<v2::Notice>,
-    ) -> v2::ResyncInstalled {
-        self.resync_id += 1;
-        let id = self.resync_id;
-        self.send(c::M::ResyncBegin(v2::ResyncBegin {
-            resync_id: id,
-            watermark,
-        }))
-        .await;
-        if !deltas.is_empty() {
-            self.send(c::M::Notices(v2::NoticeBatch {
-                first_sequence: watermark + 1,
-                notices: deltas.clone(),
-            }))
-            .await;
-        }
-        let mut chunks = 0;
-        let total = entries.len() as u64;
+    pub async fn snapshot(&mut self, entries: Vec<v2::IndexEntry>) {
+        self.send(c::M::ResyncBegin(v2::ResyncBegin {})).await;
         for chunk in entries.chunks(512) {
             self.send(c::M::ResyncChunk(v2::ResyncChunk {
-                resync_id: id,
-                chunk_index: chunks,
                 entries: chunk.to_vec(),
             }))
             .await;
-            chunks += 1;
         }
-        self.send(c::M::ResyncEnd(v2::ResyncEnd {
-            resync_id: id,
-            chunks,
-            entries: total,
-        }))
-        .await;
-        self.seq = watermark + deltas.len() as u64;
-        self.take(|m| match m {
-            M::ResyncInstalled(installed) if installed.resync_id == id => Some(*installed),
-            _ => None,
-        })
-        .await
+        self.send(c::M::ResyncEnd(v2::ResyncEnd {})).await;
+        self.take(|m| matches!(m, M::ResyncAck(_)).then_some(()))
+            .await;
     }
 
-    /// Sends notices with the next sequence numbers and waits for the ack.
-    pub async fn notices(&mut self, notices: Vec<v2::Notice>) -> v2::NoticeAck {
-        let first = self.seq + 1;
-        self.seq += notices.len() as u64;
-        let through = self.seq;
-        self.send(c::M::Notices(v2::NoticeBatch {
-            first_sequence: first,
-            notices,
-        }))
-        .await;
-        self.take(|m| match m {
-            M::NoticeAck(ack) if ack.applied_through >= through => Some(*ack),
-            _ => None,
+    /// An ordered lookup reply confirms that prior messages were processed.
+    pub async fn barrier(&mut self) {
+        self.barrier_id -= 1;
+        self.lookup_request(v2::LookupRequest {
+            lookup_id: self.barrier_id,
+            boundaries: vec![],
+            before_tokens: 0,
+            resident_tokens: 0,
         })
-        .await
+        .await;
     }
 
-    pub async fn send_notices_at(&mut self, first: u64, notices: Vec<v2::Notice>) {
-        self.send(c::M::Notices(v2::NoticeBatch {
-            first_sequence: first,
-            notices,
-        }))
-        .await;
+    pub async fn notices(&mut self, notices: Vec<v2::Notice>) {
+        self.send(c::M::Notices(v2::NoticeBatch { notices })).await;
+        self.barrier().await;
     }
 
     pub async fn resync_required(&mut self) -> v2::ResyncRequired {

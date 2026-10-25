@@ -99,7 +99,6 @@ impl Rig {
     fn notices(&self) -> Vec<Notice> {
         self.announcer
             .take_batch(1000)
-            .map(|(_, notices)| notices)
             .unwrap_or_default()
     }
 }

@@ -6,7 +6,7 @@
 //! an entry belongs to and when a source's entries go away.
 
 use crate::Key;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 pub type InstanceId = [u8; 16];
 pub type Bucket = [u8; 16];
@@ -245,20 +245,6 @@ pub fn walk_chain(
         skip_pages: u32::try_from(start - first_node_start).ok()?,
         pages: endpoint_end - start,
     })
-}
-
-/// A snapshot being staged for one session, keyed by `(key, tier)` so a repeated
-/// entry replaces rather than duplicates.
-pub struct Staged {
-    pub resync_id: u64,
-    pub watermark: u64,
-    pub started: std::time::Instant,
-    pub chunks: u32,
-    /// Entries received so far, counting repeats.
-    pub received: u64,
-    pub entries: BTreeMap<(Key, Tier), Entry>,
-    /// Notices above the watermark, buffered while the snapshot streams.
-    pub buffered: Vec<(u64, super::Notice)>,
 }
 
 #[cfg(test)]

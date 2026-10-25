@@ -246,19 +246,8 @@ impl Rig {
             self.engine.pump(self.now);
             out.extend(self.engine.take_out());
         }
-        let id = out
-            .iter()
-            .find_map(|m| match &m.m {
-                Some(Out::ResyncBegin(b)) => Some(b.resync_id),
-                _ => None,
-            })
-            .expect("a snapshot begins");
-        self.send(In::ResyncInstalled(wire::ResyncInstalled {
-            resync_id: id,
-            watermark: 0,
-            entries: 0,
-            applied_through: 0,
-        }));
+        assert!(out.iter().any(|m| matches!(m.m, Some(Out::ResyncBegin(_)))));
+        self.send(In::ResyncAck(wire::ResyncAck {}));
         self.events();
         out
     }
@@ -516,9 +505,7 @@ fn the_session_opens_with_a_snapshot_and_becomes_ready_when_it_installs() {
     let chunks = pick!(out, ResyncChunk);
     let end = pick!(out, ResyncEnd);
     assert_eq!((begin.len(), chunks.len(), end.len()), (1, 1, 1));
-    assert_eq!(begin[0].watermark, 0);
     assert_eq!(chunks[0].entries.len(), 1);
-    assert_eq!((end[0].chunks, end[0].entries), (1, 1));
     assert_eq!(rig.shared.status(), PoolStatus::Ready);
 }
 
@@ -542,10 +529,7 @@ fn notices_follow_the_snapshot_in_order_and_the_manager_not_ready_stops_lookups_
     let out = rig.engine.take_out();
     let batches = pick!(out, Notices);
     assert_eq!(batches.len(), 1);
-    assert_eq!(
-        (batches[0].first_sequence, batches[0].notices.len()),
-        (1, 3)
-    );
+    assert_eq!(batches[0].notices.len(), 3);
     rig.send(In::Readiness(wire::ReadinessInfo {
         state: wire::ReadinessState::AwaitingSources as i32,
         ..Default::default()
@@ -563,55 +547,14 @@ fn notices_follow_the_snapshot_in_order_and_the_manager_not_ready_stops_lookups_
     });
     rig.engine.pump(rig.now);
     assert_eq!(
-        pick!(rig.engine.take_out(), Notices)[0].first_sequence,
-        4,
+        pick!(rig.engine.take_out(), Notices)[0].notices.len(),
+        1,
         "notices still flow"
     );
 }
 
 #[test]
-fn too_many_unacknowledged_notices_trigger_a_resync_and_nothing_is_lost_across_the_cut() {
-    let mut rig = Rig::new();
-    rig.limits.max_unacked_notices = 4;
-    rig.open();
-    let save = |rig: &Rig, n: u64| {
-        rig.announce.saved(IndexEntry {
-            key: key(n * 64, n as u8),
-            parent: None,
-            bucket: [0; 16],
-            tail_pages: 1,
-            row: true,
-            tier: Tier::Gpu,
-            generation: n,
-            bytes: PAGE,
-        })
-    };
-    for n in 1..=4 {
-        save(&rig, n);
-    }
-    rig.engine.pump(rig.now);
-    let sent = pick!(rig.engine.take_out(), Notices);
-    assert_eq!(sent[0].notices.len(), 4);
-    save(&rig, 5);
-    // No ack for the first four: the next pass resyncs instead of waiting.
-    let mut out = Vec::new();
-    for _ in 0..4 {
-        rig.engine.pump(rig.now);
-        out.extend(rig.engine.take_out());
-    }
-    let begin = pick!(out, ResyncBegin);
-    assert_eq!(begin.len(), 1);
-    assert_eq!(begin[0].watermark, 5);
-    let chunks = pick!(out, ResyncChunk);
-    assert_eq!(chunks.iter().map(|c| c.entries.len()).sum::<usize>(), 5);
-    assert!(
-        pick!(out, Notices).is_empty(),
-        "the snapshot already holds the fifth"
-    );
-}
-
-#[test]
-fn a_resync_request_from_the_manager_takes_a_new_snapshot_at_a_new_watermark() {
+fn a_resync_request_from_the_manager_takes_a_new_snapshot() {
     let mut rig = Rig::new();
     rig.open();
     rig.announce.saved(IndexEntry {
@@ -627,24 +570,17 @@ fn a_resync_request_from_the_manager_takes_a_new_snapshot_at_a_new_watermark() {
     rig.engine.pump(rig.now);
     rig.engine.take_out();
     let mut out = rig.send(In::ResyncRequired(wire::ResyncRequired {
-        reason: wire::ResyncReason::ResyncGap as i32,
-        applied_through: 0,
+        reason: wire::ResyncReason::ResyncStateLost as i32,
     }));
     for _ in 0..4 {
         rig.engine.pump(rig.now);
         out.extend(rig.engine.take_out());
     }
     let begin = pick!(out, ResyncBegin);
-    assert_eq!((begin.len(), begin[0].watermark), (1, 1));
+    assert_eq!(begin.len(), 1);
     assert_eq!(pick!(out, ResyncChunk)[0].entries.len(), 1);
-    // The stale install of the first resync does nothing; the new one does.
     assert_eq!(rig.shared.status(), PoolStatus::Connecting);
-    rig.send(In::ResyncInstalled(wire::ResyncInstalled {
-        resync_id: begin[0].resync_id,
-        watermark: 1,
-        entries: 1,
-        applied_through: 1,
-    }));
+    rig.send(In::ResyncAck(wire::ResyncAck {}));
     assert_eq!(rig.shared.status(), PoolStatus::Ready);
 }
 
@@ -1985,4 +1921,40 @@ fn expected_records_follow_flooring_for_unaligned_splits_and_row_only_tails() {
     );
     // The pages must add up to what the plan says.
     assert!(expected_records(64, &part(0, n2, &[n1, n2], 99, true), &nodes).is_none());
+}
+
+#[test]
+fn mutations_after_a_snapshot_cut_follow_its_last_chunk() {
+    let mut rig = Rig::new();
+    rig.open();
+    let entry = IndexEntry {
+        key: key(64, 1),
+        parent: None,
+        bucket: [0; 16],
+        tail_pages: 1,
+        row: true,
+        tier: Tier::Gpu,
+        generation: 1,
+        bytes: PAGE,
+    };
+    rig.announce.saved(entry.clone());
+    let mut out = rig.send(In::ResyncRequired(wire::ResyncRequired {
+        reason: wire::ResyncReason::ResyncStateLost as i32,
+    }));
+    rig.announce
+        .evicted(entry.key, entry.tier, entry.generation, None);
+    for _ in 0..3 {
+        rig.engine.pump(rig.now);
+        out.extend(rig.engine.take_out());
+    }
+    let end = out
+        .iter()
+        .position(|m| matches!(m.m, Some(Out::ResyncEnd(_))))
+        .unwrap();
+    let notice = out
+        .iter()
+        .position(|m| matches!(m.m, Some(Out::Notices(_))))
+        .unwrap();
+    assert!(end < notice);
+    assert_eq!(pick!(out, ResyncChunk)[0].entries.len(), 1);
 }
