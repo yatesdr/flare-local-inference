@@ -4901,7 +4901,7 @@ mod tests {
         announcer.begin_session();
         store.announce_to(announcer.clone());
         store.flush_announcements();
-        let (_, notices) = announcer.take_batch(10).unwrap();
+        let notices = announcer.take_batch(10).unwrap();
         let generation = |key: &PrefixKey| {
             notices.iter().find_map(|n| match n {
                 Notice::Saved(e) if e.key == *key => {

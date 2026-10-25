@@ -4,7 +4,7 @@ use super::{
     Violation,
     barrier::Remembered,
     claims::{Claim, ClaimKey},
-    index::{InstanceId, ScopeIndex, SourceId, Staged},
+    index::{InstanceId, ScopeIndex, SourceId},
     limits::Limits,
     ranks::{Agent, Ranks, Retained},
     store_bridge::{CatalogFeed, Link, PutKey, PutRec, StoreHandle},
@@ -203,12 +203,8 @@ pub(super) struct Session {
     pub pid: u32,
     pub export_slots: u32,
     pub claim_slots: u32,
-    /// The manager holds no entries for this session until a snapshot installs.
     pub need_resync: bool,
-    /// `ResyncRequired` was sent for the current need and not yet answered.
-    pub resync_requested: bool,
-    pub expected_next: u64,
-    pub staged: Option<Staged>,
+    pub syncing: bool,
     pub lookups: HashSet<u64>,
     /// `Goodbye` with this value was received.
     pub goodbye: Option<bool>,
@@ -662,9 +658,7 @@ impl Core {
                 export_slots,
                 claim_slots,
                 need_resync: true,
-                resync_requested: false,
-                expected_next: 1,
-                staged: None,
+                syncing: false,
                 lookups: HashSet::new(),
                 goodbye: None,
                 overflowed: false,
@@ -919,7 +913,6 @@ impl Core {
         self.claim_timers(now);
         self.prune_retained();
         self.prune_procs();
-        self.resync_timers(now);
         // Keep live instances fresh in the persisted list.
         if now.duration_since(self.barrier_saved) >= Duration::from_secs(5) {
             let live: Vec<InstanceId> = self

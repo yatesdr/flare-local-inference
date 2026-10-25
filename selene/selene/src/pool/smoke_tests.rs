@@ -116,14 +116,9 @@ impl wire::pool_server::Pool for Server {
                             })),
                         })
                     }
-                    Some(Out::ResyncEnd(end)) => Some(wire::ServerMessage {
+                    Some(Out::ResyncEnd(_)) => Some(wire::ServerMessage {
                         header,
-                        m: Some(In::ResyncInstalled(wire::ResyncInstalled {
-                            resync_id: end.resync_id,
-                            watermark: 0,
-                            entries: end.entries,
-                            applied_through: 0,
-                        })),
+                        m: Some(In::ResyncAck(wire::ResyncAck {})),
                     }),
                     _ => None,
                 };

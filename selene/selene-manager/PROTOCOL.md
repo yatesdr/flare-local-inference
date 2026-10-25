@@ -161,10 +161,9 @@ client                                         manager
   | OpenSession{M, instance_id, scope, slots} --->|
   |<---- SessionOpened{S, scope_id, slots, resync_required}
   |  check: scope_id equal
-  | ResyncBegin / Chunk* / End  (may be empty) -->|   installs snapshot
-  |<---- ResyncInstalled
+  | ResyncBegin / Chunk* / End  (may be empty) -->|   applies hints live
+  |<---- ResyncAck
   | NoticeBatch ... ----------------------------->|
-  |<---- NoticeAck ...                            |
   | Lookup / Claim / Put at any time after open (when READY)
 ```
 
@@ -188,80 +187,22 @@ client                                         manager
 - Reconnect uses exponential backoff with a cap; no more than one Hello in
   flight. While disconnected the client is in `Local` state (the client's state).
 
-## 3. Index notices and resync
+## 3. Index hints and resync
 
-Sequence numbers start at 1 per session and never reset. The client assigns them
-when it creates a notice.
+Each session announces its current GPU, DRAM and NVMe holdings. Notices upsert,
+spill or evict hints on the ordered control stream. Claims still validate and pin
+the actual source before copying; the index grants no ownership.
 
-The client assigns sequence numbers inside the same critical section that updates
-its announcement index (the client's announcement index): the announced set and the
-sequence counter move together, which is what makes a snapshot cut meaningful.
+A snapshot consists of Begin, bounded chunks and End. Begin clears this source's
+hints; each chunk is applied live. End is acknowledged. Lookups may see a partial
+snapshot and miss during this short interval. A second Begin clears a partial
+predecessor too. Session supersession and disconnection remove that session's hints.
 
-Manager rules per session (`expected_next` starts at 1; no notice is accepted
-before the first resync installs; after an install it is `W + 1 + n`, where `n`
-is the number of buffered notices applied):
-
-| Arriving batch | Action |
-|---|---|
-| `first_sequence == expected_next` | apply all, `expected_next += n` |
-| `first_sequence < expected_next` | skip the already applied prefix, apply the rest |
-| `first_sequence > expected_next` | gap: drop it, send `ResyncRequired{RESYNC_GAP}`, ignore notices until a snapshot installs |
-| more than `max_notices_per_batch` | protocol violation, close |
-
-Apply rules (all idempotent):
-
-- `Saved{entry}`: upsert by (key, tier) if `entry.generation >=` the stored one.
-- `Spilled{to, from_tier, from_generation}`: upsert `to` as above and remove the
-  `from_tier` entry if its generation `<= from_generation`, as one step.
-- `Evicted{key, tier, generation}`: remove the (key, tier) entry if its
-  generation `<= generation`. `COMPACTED` also upserts `heir` (same key and
-  generation as the child, new parent and `tail_pages`). Page-only ancestors that
-  leave with a leaf arrive as separate notices; nothing cascades in the manager.
-- The manager never trusts an entry for a claim; it only uses it to choose a
-  source and to answer lookups.
-
-Snapshot and deltas:
-
-```
-client                                        manager
-  | ... NoticeBatch(seq .. W) sent earlier ----->|   applied or skipped
-  | ResyncBegin{id, watermark W} --------------->|   start staging
-  | NoticeBatch(first=W+1 ...) ----------------->|   buffered (bounded)
-  | ResyncChunk{id, 0..k} ---------------------->|   staged
-  | ResyncEnd{id, chunks, entries} ------------->|
-  |                                              |   atomically: replace this session's
-  |                                              |   entries with the snapshot, then apply
-  |                                              |   buffered notices in order
-  |<---- ResyncInstalled{id, W, entries, applied_through}
-```
-
-- The snapshot reflects exactly notices `<= W` and covers every announced
-  holding, GPU and host tiers alike. The client copies its announcement index and
-  reads the sequence counter under the single lock that assigns sequences, so the
-  snapshot and `W` are one cut. Notices `<= W` still queued are discarded by the
-  client; notices `> W` are sent after `ResyncBegin`.
-- Buffered notices must be contiguous from `W + 1` (or empty), else `RESYNC_GAP`;
-  a hole inside the buffer is the same.
-- Resync duration is bounded: `ResyncBegin` to `ResyncEnd` must complete within
-  `resync_timeout_ms`, else the staged data is dropped and the manager sends
-  `RESYNC_TIMEOUT`. Stalled resyncs therefore cannot hold the scope.
-- A second `ResyncBegin` abandons the staged one. For a session that superseded
-  an earlier one of the same `instance_id`, installing the snapshot also deletes
-  the predecessor's entries, in the same step: until then the predecessor's
-  entries are hidden from lookups, after it only the new set is visible.
-- Unknown `resync_id`, a chunk hole, or a count mismatch gives `RESYNC_BAD`.
-- Lookups during staging see the old entries; at install they see the new ones;
-  never a mix.
-- **Overflow, manager side:** more than `max_resync_buffered_notices` buffered, or
-  more than `max_resync_entries` staged, or unacked notices beyond
-  `max_unacked_notices`: `ResyncRequired{RESYNC_OVERFLOW}`; staged data is
-  dropped; installed entries stay as hints until the next snapshot.
-- **Overflow, client side:** if the client's unsent queue passes its bound, it
-  drops the queue, sets a flag, and sends a new snapshot (client-initiated resync
-  is always legal). The client never blocks the model worker on the notice path.
-- Resync work is paced: the client sends at most one chunk per scheduling pass.
-  The manager stages a bounded number of resyncs at once (per session one), each
-  under the timeout above, so a slow or dead sender frees its slot by timing out.
+The client takes holdings and clears its unsent queue under one lock. Changes
+after that cut follow the last snapshot chunk. Queue overflow or lost GPU eviction
+notices request another snapshot without blocking the worker. Entry, chunk and
+batch bounds remain enforced. There are no notice sequences, delta buffers,
+watermarks or snapshot timeout.
 
 ## 4. Lookup
 
@@ -424,7 +365,7 @@ that does not know it (restarted, or the claim was cancelled and forgotten).
 | `FenceAck`, `ExportEnd` | first per (claim, party) counts |
 | `PinAck` | first per export counts; a late `PINNED` is released |
 | `ExportCancel` | idempotent; unknown export answered `ExportEnd{RELEASED, DRAINED}` |
-| `NoticeBatch` | skipped below `expected_next` |
+| `NoticeBatch` | applied in stream order |
 | `PutCancel` | idempotent |
 
 Nothing promises exactly-once delivery across a process death; every state above
@@ -791,7 +732,6 @@ published. Waiting restores use the bounded claim-slot queue.
 | Claims in flight per requester | 2 | manager | `CLAIM_LIMIT`, immediate |
 | Headroom at the source | per check, section 6 | source's model worker | `NO_HEADROOM`, immediate, never waits |
 | Retained staging for a GPU export | whole export reserved before the pin | manager reserves, source checks | `NO_WINDOWS`, immediate |
-| Resync duration | `resync_timeout_ms` 5000 | manager | `RESYNC_TIMEOUT` |
 | Pin answer time | `pin_deadline_ms` 250 | manager timer | `SOURCE_TIMEOUT`, late pin released |
 | Window credits (streamed claims and puts) | 2 | manager | no more windows until a release |
 | Claim deadline | clamped to 30 s | manager | `EXPIRED{DEADLINE}` |

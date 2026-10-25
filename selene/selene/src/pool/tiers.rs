@@ -241,7 +241,7 @@ mod tests {
         assert_eq!(view.generation(&key(1)), None);
         // A node never announced is not retired.
         view.retire(&key(9));
-        let (_, notices) = announcer.take_batch(100).unwrap();
+        let notices = announcer.take_batch(100).unwrap();
         let kinds: Vec<_> = notices
             .iter()
             .map(|n| match n {
