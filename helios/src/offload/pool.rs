@@ -1,20 +1,13 @@
-//! Attach and budget pool regions before cache allocation and admission.
-
-use std::sync::{Arc, Mutex};
-
+//! Bind the pool's startup registration to the final CUDA cache geometry.
+use super::{CacheGeometry, PoolOptions, PrefixStore, registrar, transfer};
+use crate::{Result, startup::StartupProgress};
+pub(crate) use flare_selene::pool::Budget;
 use flare_selene::{
     HostStore, Layout, PageCopier,
     copier::{Job, Reply},
-    pool::{
-        AgentConfig, PlannedRegion, PoolClient, PoolConfig, PooledStore, RankAgent, RankSet,
-        RegisteredRegion, pool_address, pool_scope,
-    },
+    pool::PoolBuilder,
 };
-
-use super::{CacheGeometry, PoolOptions, PrefixStore, registrar, transfer};
-use crate::{Result, startup::StartupProgress};
-
-pub(crate) use flare_selene::pool::Budget;
+use std::sync::{Arc, Mutex};
 
 /// Registration precedes cache sizing; copying starts with the final cache geometry.
 struct Copier {
@@ -46,14 +39,9 @@ impl PageCopier for Copier {
 }
 
 pub(crate) struct PreparedPool {
-    client: Option<PoolClient>,
-    agent: Option<RankAgent>,
-    records: Option<super::shard::DeferredRecords>,
-    listener: Option<(std::net::TcpListener, [u8; 16])>,
+    pool: flare_selene::pool::PreparedPool,
     copier: Arc<Mutex<Copier>>,
-    identity: flare_selene::plan::Identity,
 }
-
 impl PreparedPool {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
@@ -75,7 +63,7 @@ impl PreparedPool {
             registration_context,
             budget,
             progress,
-            Arc::new(registrar::PoolRegistrar),
+            Arc::new(registrar::CudaRegistrar),
             peers,
             disk,
         )
@@ -91,147 +79,54 @@ impl PreparedPool {
         budget: Budget,
         progress: &StartupProgress,
         registrar: Arc<dyn flare_selene::HostRegistrar + Send + Sync>,
-        mut peers: Option<super::shard::PoolPeers>,
+        peers: Option<super::shard::PoolPeers>,
         disk: bool,
     ) -> Result<(Self, Vec<u64>)> {
-        let listener = peers.as_mut().and_then(|peers| peers.listener.take());
         let phase = progress.phase("Wait for prefix cache pool", None);
         let copier = Arc::new(Mutex::new(Copier {
             layout: Layout::new(geometry)?,
             transfers: None,
         }));
-        let devices = budget.devices.clone();
-        let all_ranks = if let Some(peers) = &peers {
-            vec![geometry[0].clone(); peers.gpu_uuids.len()]
-        } else {
-            geometry.to_vec()
-        };
-        let scope = pool_scope(&options.tenant, identity, &all_ranks)?;
-        let identity = flare_selene::plan::Identity {
-            tenant: scope.tenant.clone(),
-            model: scope.model_identity,
-            layout: scope.layout_fingerprint,
-        };
-        let config = PoolConfig {
-            address: pool_address(&options.address)?,
-            tenant: options.tenant.clone(),
-            ca: options.ca.clone(),
-            scope,
-            instance_name: format!("flare-{}", std::process::id()),
-            gpu_uuids: peers
-                .as_ref()
-                .map_or(gpu_uuids, |peers| peers.gpu_uuids.clone()),
-            export_slots: 2,
-            claim_slots: 2,
-            level_order: None,
-            registration_context,
-            approve: Some(Arc::new(move |plan| budget.approve(plan))),
-        };
-        let (client, agent, records) = match peers {
-            Some(mut peers) if peers.rank != 0 => {
-                let records = disk.then(super::shard::DeferredRecords::default);
-                let agent = RankAgent::start(AgentConfig {
-                    address: config.address,
-                    ca: config.ca,
-                    scope: config.scope,
-                    rank: peers.rank,
-                    world: all_ranks.len(),
-                    instance_name: config.instance_name,
-                    link: peers.links.remove(0).into_rank_link()?,
-                    copier: copier.clone(),
-                    registrar,
-                    registration_context,
-                    gpu_uuid: config.gpu_uuids[peers.rank],
-                    records: records.clone().map(|records| {
-                        Box::new(records) as Box<dyn flare_selene::pool::RankRecords>
-                    }),
-                    approve: config.approve,
-                })?;
-                (None, Some(agent), records)
-            }
-            peers => {
-                let client = match peers {
-                    Some(peers) => PoolClient::start_ranked(
-                        config,
-                        RankSet {
-                            links: peers
-                                .links
-                                .into_iter()
-                                .map(super::shard::Link::into_rank_link)
-                                .collect::<flare_selene::Result<_>>()?,
-                        },
-                        copier.clone(),
-                        registrar,
-                    )?,
-                    None => PoolClient::start(config, copier.clone(), registrar)?,
-                };
-                (Some(client), None, None)
-            }
-        };
-        let mut prepared = Self {
-            client,
-            agent,
-            records,
-            listener,
-            copier,
+        let (pool, charges) = PoolBuilder {
+            options,
             identity,
-        };
-        if prepared.registered_regions().is_empty() {
-            // Finish attachment before caches consume its startup allowance.
-            prepared.close()?;
+            geometry,
+            gpu_uuids,
+            registration_context,
+            budget,
+            peers,
+            disk,
         }
-        let plan: Vec<_> = prepared
+        .start(copier.clone(), registrar)?;
+        let plan: Vec<_> = pool
             .registered_regions()
             .iter()
-            .map(|region| PlannedRegion {
+            .map(|region| flare_selene::pool::PlannedRegion {
                 name: region.name,
                 bytes: region.bytes as u64,
             })
             .collect();
         let (host, device) = Budget::costs(&plan)?;
-        let charges = Budget {
-            host: Ok(0),
-            devices,
-        }
-        .charges(host, device);
         phase.finish(if plan.is_empty() {
             "local tiers only".into()
         } else {
             format!("{host} host bytes · {device} device bytes per GPU")
         });
-        Ok((prepared, charges))
+        Ok((Self { pool, copier }, charges))
     }
-
-    fn registered_regions(&self) -> &[RegisteredRegion] {
-        match (&self.client, &self.agent) {
-            (Some(client), _) => client.registered_regions(),
-            (_, Some(agent)) => agent.registered_regions(),
-            _ => &[],
-        }
-    }
-
     pub(crate) fn take_listener(&mut self) -> Option<(std::net::TcpListener, [u8; 16])> {
-        self.listener.take()
+        self.pool.take_listener()
     }
-
     pub(crate) fn approved(&self) -> bool {
-        !self.registered_regions().is_empty()
+        self.pool.approved()
     }
-
     pub(crate) fn close(&mut self) -> Result<()> {
-        if let Some(client) = &mut self.client {
-            client.close()?;
-        }
-        if let Some(agent) = &mut self.agent {
-            agent.close()?;
-        }
-        Ok(())
+        Ok(self.pool.close()?)
     }
-
     pub(crate) fn prepare_peer(&mut self, prepared: &super::Prepared) -> Result<()> {
-        if self.agent.is_some() {
+        if self.pool.agent.is_some() {
             self.start_copies(&prepared.contexts, prepared.geometry.clone())?;
-            if let Some(records) = &self.records
+            if let Some(records) = &self.pool.records
                 && prepared.directory_lock.is_some()
             {
                 records.bind(
@@ -267,18 +162,9 @@ impl PreparedPool {
     }
 
     pub(super) fn attach(self, local: Option<Box<dyn HostStore>>) -> Result<Box<dyn PrefixStore>> {
-        let layout = self.copier.lock().unwrap().layout.clone();
-        let store = PooledStore::new(
-            flare_selene::pool::Tiers::new(local),
-            self.client
-                .ok_or("a pool rank agent cannot serve rank zero's store")?,
-            self.identity,
-            &layout,
-        );
-        Ok(Box::new(store))
+        Ok(self.pool.attach(local)?)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,11 +326,12 @@ mod tests {
             let (prepared, charges) = start(&manager, registrar.clone(), budget);
             wait(|| {
                 matches!(
-                    prepared.client.as_ref().unwrap().status(),
+                    prepared.pool.client.as_ref().unwrap().status(),
                     PoolStatus::Disabled(_)
                 )
             });
-            let PoolStatus::Disabled(reason) = prepared.client.as_ref().unwrap().status() else {
+            let PoolStatus::Disabled(reason) = prepared.pool.client.as_ref().unwrap().status()
+            else {
                 unreachable!()
             };
             assert!(
@@ -454,6 +341,7 @@ mod tests {
             assert_eq!(charges, [0]);
             assert!(
                 prepared
+                    .pool
                     .client
                     .as_ref()
                     .unwrap()
@@ -518,7 +406,7 @@ mod tests {
         assert!(started.elapsed() < flare_selene::pool::STARTUP_WAIT + Duration::from_secs(5));
         assert_eq!(charges, [0]);
         assert!(matches!(
-            prepared.client.as_ref().unwrap().status(),
+            prepared.pool.client.as_ref().unwrap().status(),
             PoolStatus::Disabled(_)
         ));
         manager.run();
@@ -569,13 +457,13 @@ mod tests {
                 .to_string()
                 .contains("layouts disagree")
         );
-        wait(|| prepared.client.as_ref().unwrap().status() == PoolStatus::Ready);
-        let topology = prepared.client.as_ref().unwrap().topology();
+        wait(|| prepared.pool.client.as_ref().unwrap().status() == PoolStatus::Ready);
+        let topology = prepared.pool.client.as_ref().unwrap().topology();
         manager.stop();
         manager.run();
         wait(|| {
-            prepared.client.as_ref().unwrap().topology() != topology
-                && prepared.client.as_ref().unwrap().status() == PoolStatus::Ready
+            prepared.pool.client.as_ref().unwrap().topology() != topology
+                && prepared.pool.client.as_ref().unwrap().status() == PoolStatus::Ready
         });
         assert_eq!(registrar.calls.lock().unwrap().len(), 2);
         manager.stop();
@@ -583,13 +471,13 @@ mod tests {
         manager.run();
         wait(|| {
             matches!(
-                prepared.client.as_ref().unwrap().status(),
+                prepared.pool.client.as_ref().unwrap().status(),
                 PoolStatus::Disabled(_)
             )
         });
         assert_eq!(registrar.calls.lock().unwrap().len(), 2);
         assert_eq!(*registrar.drops.lock().unwrap(), 0);
-        prepared.client.as_mut().unwrap().close().unwrap();
+        prepared.pool.client.as_mut().unwrap().close().unwrap();
         assert_eq!(*registrar.drops.lock().unwrap(), 2);
         let mut store = prepared.attach(None).unwrap();
         let mut history = crate::cache::PrefixHistory::new([3; 32]);
@@ -664,14 +552,18 @@ mod tests {
             )
             .unwrap();
             let (peer, charges) = peer.join().unwrap();
-            assert!(peer.agent.is_some() && peer.client.is_none() && peer.records.is_none());
+            assert!(
+                peer.pool.agent.is_some()
+                    && peer.pool.client.is_none()
+                    && peer.pool.records.is_none()
+            );
             if reject {
                 assert_eq!(charges, [0]);
                 assert!(!peer.approved());
                 assert!(peer_registrar.calls.lock().unwrap().is_empty());
                 wait(|| {
                     matches!(
-                        zero.client.as_ref().unwrap().status(),
+                        zero.pool.client.as_ref().unwrap().status(),
                         PoolStatus::Disabled(_)
                     )
                 });
@@ -682,10 +574,10 @@ mod tests {
                 store.close().unwrap();
             } else {
                 assert!(peer.approved());
-                wait(|| zero.client.as_ref().unwrap().status() == PoolStatus::Ready);
-                wait(|| peer.agent.as_ref().unwrap().status() == PoolStatus::Ready);
+                wait(|| zero.pool.client.as_ref().unwrap().status() == PoolStatus::Ready);
+                wait(|| peer.pool.agent.as_ref().unwrap().status() == PoolStatus::Ready);
                 assert_eq!(
-                    zero.identity.layout,
+                    zero.pool.identity.layout,
                     super::super::geometry::fingerprint(&vec![
                         flare_selene::testing::geometry(
                             64,

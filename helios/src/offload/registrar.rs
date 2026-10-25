@@ -6,34 +6,6 @@ use crate::cuda::{self, DeviceHostParts, HostRegistration};
 
 pub(super) struct CudaRegistrar;
 
-/// Registers the pool's shared-memory regions. The pool's copier names their
-/// host addresses directly in copies, so a registration whose device address
-/// differs from its host address is refused.
-pub(super) struct PoolRegistrar;
-
-impl HostRegistrar for PoolRegistrar {
-    fn register(
-        &self,
-        context: usize,
-        address: usize,
-        bytes: usize,
-    ) -> Result<Box<dyn Registration>> {
-        let registration = CudaRegistrar.register(context, address, bytes)?;
-        if registration.device_address() != address as u64 {
-            return Err(flare_selene::Error::new(
-                "pool memory needs identical host and device addresses",
-            ));
-        }
-        Ok(registration)
-    }
-
-    fn map_split(&self, _requests: &[(usize, i32, usize)]) -> Result<Box<dyn SplitMapping>> {
-        Err(flare_selene::Error::new(
-            "the pool does not use split mappings",
-        ))
-    }
-}
-
 impl HostRegistrar for CudaRegistrar {
     fn register(
         &self,
