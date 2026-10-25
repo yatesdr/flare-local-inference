@@ -1,4 +1,5 @@
 //! Preparation and assembly of local and pooled checkpoint stores.
+pub mod sharded;
 use crate::{
     CacheGeometry, HostStore, Layout, Result, composite, disk, disk_store, geometry, input, memory,
     pool, pool::PoolOptions, record, shard, slab,
