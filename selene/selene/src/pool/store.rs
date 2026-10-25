@@ -24,7 +24,7 @@ use crate::{
     characterize::{Characterizer, Level, Pages},
     index::Match,
     plan::{self, Identity, Plan, Request, SourceId, Which},
-    store::{INITIAL_MEMORY_RATE, INITIAL_PREFILL_RATE, INITIAL_STAGED_DISK_RATE, worth_transfer},
+    store::INITIAL_PREFILL_RATE,
 };
 
 use super::{
@@ -146,11 +146,6 @@ const PLANS: usize = 256;
 const RETRIES: u32 = 2;
 /// Copies out of the GPU in flight beyond which a publication is declined.
 const COPY_QUEUE: usize = 16;
-/// How long a record seen in a lookup answer counts as held elsewhere.
-const HELD_FOR: Duration = Duration::from_secs(30);
-/// Holdings remembered from lookup answers before the memory is cleared.
-const HELD_MAX: usize = 4096;
-
 /// The keys a history has at the positions a plan mentions, kept so that a
 /// plan can be rebuilt after the request's history is gone.
 struct KeptHistory {
@@ -214,8 +209,6 @@ pub struct PooledStore<S: HostStore, P: PoolPort = PoolClient> {
     puts: Vec<(u64, PutOutcome)>,
     /// Moves of the last local tier's records to the manager.
     cascade: Cascade,
-    /// Records lookup answers showed in a host tier of the pool, with when.
-    held: HashMap<PrefixKey, (Level, Instant)>,
     characterizer: Option<Characterizer>,
     characterized: bool,
     /// What the synthetic probe records are keyed by: the model and, once connected, this instance.
@@ -226,8 +219,6 @@ pub struct PooledStore<S: HostStore, P: PoolPort = PoolClient> {
     pool_fetch_failed: u64,
     /// Bytes the pool parts copied into the device.
     pool_bytes_in: u64,
-    /// Write-backs declined because restoring the record would not beat recompute.
-    declined: u64,
 }
 
 impl<S: HostStore> PooledStore<S, PoolClient> {
@@ -301,14 +292,12 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             pool_events: Vec::new(),
             puts: Vec::new(),
             cascade: Cascade::new(layout),
-            held: HashMap::new(),
             characterizer: Characterizer::new(PROBE_PAGES, None).ok(),
             characterized: false,
             probe_model,
             pool_fetched: 0,
             pool_fetch_failed: 0,
             pool_bytes_in: 0,
-            declined: 0,
         }
     }
 
@@ -379,78 +368,8 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
 
     // ---- publication -----------------------------------------------------------
 
-    /// Remember which records the pool's host tiers held when a lookup asked.
-    fn remember_held(&mut self, now: Instant, candidates: &[PoolCandidate]) {
-        if self.held.len() >= HELD_MAX {
-            self.held
-                .retain(|_, (_, seen)| now.duration_since(*seen) < HELD_FOR);
-            if self.held.len() >= HELD_MAX {
-                self.held.clear();
-            }
-        }
-        for candidate in candidates {
-            let level = candidate.plan.level;
-            if matches!(level, Level::HostDram | Level::HostNvme) {
-                for key in candidate
-                    .plan
-                    .nodes
-                    .iter()
-                    .map(|node| node.key)
-                    .chain([candidate.plan.key])
-                {
-                    self.held.insert(key, (level, now));
-                }
-            }
-        }
-    }
-
-    /// Whether a host tier of the pool at least as close as the one a
-    /// publication would be copied into held `key` recently.
-    fn held_as_close(&self, key: &PrefixKey) -> bool {
-        let Some((level, seen)) = self.held.get(key) else {
-            return false;
-        };
-        let closest = match self.inner.closest_tier() {
-            Some(Local::Memory) => Level::HostDram,
-            _ => Level::HostNvme,
-        };
-        seen.elapsed() < HELD_FOR && (*level == Level::HostDram || closest == Level::HostNvme)
-    }
-
-    /// Whether restoring `checkpoint` from the first host tier would beat
-    /// recomputing what it adds, at the measured rate of that tier or its first
-    /// estimate. What it adds is the tokens past its parent's endpoint, so a
-    /// checkpoint a few tokens beyond a stored parent (a row and no page) is
-    /// not worth a row's worth of transfer, while a long record always is.
-    fn worth_keeping(&self, checkpoint: &PublishedCheckpoint) -> bool {
-        let bytes = checkpoint.tail_pages as u64 * self.page_record_bytes + self.row_record_bytes;
-        let initial = match self.inner.closest_tier() {
-            Some(Local::Disk) => INITIAL_STAGED_DISK_RATE,
-            _ => INITIAL_MEMORY_RATE,
-        };
-        let measured = self.inner.stats().inbound_rate;
-        let rate = if measured > 0.0 { measured } else { initial };
-        let gained = checkpoint.key.consumed_tokens
-            - checkpoint
-                .parent
-                .map_or(0, |parent| parent.consumed_tokens)
-                .min(checkpoint.key.consumed_tokens);
-        worth_transfer(gained, bytes as f64 / rate, self.prefill_rate)
-    }
-
-    /// Copy `checkpoint` to the first host tier now, if that is worth it:
-    /// `Oversize` (never stored) when restoring what it adds would not beat
-    /// recomputing it, counted in the skipped stores, `Present` when the pool already holds
-    /// it in a tier at least as close, `Retry(Queue)` when too many copies are
-    /// in flight, and otherwise what the tier answers.
+    /// Queue a copy into the first host tier, bounded by the copy queue.
     fn copy_out(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
-        if !self.worth_keeping(checkpoint) {
-            self.declined += 1;
-            return Ok(StoreOutcome::Oversize);
-        }
-        if self.held_as_close(&checkpoint.key) {
-            return Ok(StoreOutcome::Present);
-        }
         if self.inner.stats().outbound_in_flight >= COPY_QUEUE {
             return Ok(StoreOutcome::Retry(StoreReason::Queue));
         }
@@ -753,7 +672,6 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
             return local;
         };
         let now = Instant::now();
-        self.remember_held(now, &answer.candidates);
         let pool: Vec<PoolCandidate> = answer
             .candidates
             .iter()
@@ -989,8 +907,6 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
 
     fn stats(&self) -> StoreStats {
         let mut stats = self.inner.stats();
-        // A declined write-back is a store that was skipped.
-        stats.store_skipped += self.declined;
         stats.fetched += self.pool_fetched;
         stats.fetch_failed += self.pool_fetch_failed;
         stats.bytes_in += self.pool_bytes_in;

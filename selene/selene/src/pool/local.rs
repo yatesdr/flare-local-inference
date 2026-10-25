@@ -37,6 +37,10 @@ impl HostStore for Tiers {
         }
     }
 
+    fn closest_tier(&self) -> Option<Tier> {
+        self.0.as_ref().and_then(|tiers| tiers.closest_tier())
+    }
+
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> crate::Result<()> {
         match &mut self.0 {
             Some(tiers) => tiers.fetch(hit, ticket),
