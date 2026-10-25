@@ -546,7 +546,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub fn hex(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         write!(text, "{byte:02x}").unwrap();
