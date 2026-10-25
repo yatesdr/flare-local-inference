@@ -22,7 +22,7 @@ use super::{
     engine::{Engine, Settings},
     exporter::HostPin,
     identity::{self, Scope},
-    lookup::{LookupState, LookupTicket},
+    lookup::LookupTicket,
     rank::RankSet,
     shared::{Command, PoolEvent, PoolFetch, PoolStatus, PutRequest, Shared},
     startup::{Approve, RegisteredRegion, Startup},
@@ -55,7 +55,6 @@ pub struct PoolConfig {
     pub ca: Option<PathBuf>,
     /// Model identity, layout fingerprint and record geometry.
     pub scope: Scope,
-    pub instance_name: String,
     /// The instance's GPUs; the instance id is derived from them and is stable
     /// across restarts.
     pub gpu_uuids: Vec<[u8; 16]>,
@@ -212,7 +211,6 @@ impl PoolClient {
         let settings = Arc::new(Settings {
             instance_id,
             nonce: identity::process_nonce()?,
-            name: config.instance_name,
             scope: config.scope,
             scope_id,
             export_slots: config.export_slots,
@@ -325,11 +323,6 @@ impl PoolClient {
             history.token_count(),
             resident,
         )
-    }
-
-    /// Never waits for a reply.
-    pub fn lookup_state(&self, ticket: &LookupTicket) -> LookupState {
-        ticket.state()
     }
 
     /// Begin a restore from the pool. An error means nothing was accepted and

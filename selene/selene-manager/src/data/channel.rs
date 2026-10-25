@@ -270,7 +270,8 @@ impl Hub {
     }
 
     /// Whether connections are encrypted.
-    pub fn encrypted(&self) -> bool {
+    #[cfg(test)]
+    fn encrypted(&self) -> bool {
         self.inner.acceptor.is_some()
     }
 

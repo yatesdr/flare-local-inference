@@ -125,7 +125,6 @@ pub enum PutRefusal {
     Budget,
     /// The record can never fit.
     Oversize,
-    Quota,
     /// The metadata did not match what was accepted.
     Invalid,
     /// The manager has as many puts open as it allows.

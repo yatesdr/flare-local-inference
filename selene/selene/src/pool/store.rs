@@ -155,40 +155,13 @@ impl<S: HostStore> PooledStore<S, PoolClient> {
         copier: crate::SharedCopier,
         registrar: std::sync::Arc<dyn crate::HostRegistrar + Send + Sync>,
     ) -> Result<Self> {
-        Self::attach(inner, config, None, copier, registrar)
-    }
-
-    /// Rank 0 of a multi-process instance (see [`PoolClient::start_ranked`]): `inner` is this
-    /// rank's host tier, holding this rank's slices of the records, and `copier` serves this
-    /// rank only. The peer ranks serve their own slices of host-tier exports and puts through
-    /// their agents' [`RankRecords`](super::agent::RankRecords).
-    pub fn connect_ranked(
-        inner: S,
-        config: super::client::PoolConfig,
-        ranks: super::rank::RankSet,
-        copier: crate::SharedCopier,
-        registrar: std::sync::Arc<dyn crate::HostRegistrar + Send + Sync>,
-    ) -> Result<Self> {
-        Self::attach(inner, config, Some(ranks), copier, registrar)
-    }
-
-    fn attach(
-        inner: S,
-        config: super::client::PoolConfig,
-        ranks: Option<super::rank::RankSet>,
-        copier: crate::SharedCopier,
-        registrar: std::sync::Arc<dyn crate::HostRegistrar + Send + Sync>,
-    ) -> Result<Self> {
         let layout = copier.lock().unwrap().layout().clone();
         let identity = Identity {
             tenant: config.scope.tenant.clone(),
             model: config.scope.model_identity,
             layout: config.scope.layout_fingerprint,
         };
-        let pool = match ranks {
-            Some(ranks) => PoolClient::start_ranked(config, ranks, copier, registrar)?,
-            None => PoolClient::start(config, copier, registrar)?,
-        };
+        let pool = PoolClient::start(config, copier, registrar)?;
         let store = Self::new(inner, pool, identity, &layout);
         Ok(store)
     }

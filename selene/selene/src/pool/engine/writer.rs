@@ -226,7 +226,6 @@ fn refusal(reason: i32) -> PutOutcome {
         Ok(R::Inflight) => PutOutcome::Refused(PutRefusal::Inflight),
         Ok(R::Budget) => PutOutcome::Refused(PutRefusal::Budget),
         Ok(R::Oversize) => PutOutcome::Refused(PutRefusal::Oversize),
-        Ok(R::Quota) => PutOutcome::Refused(PutRefusal::Quota),
         Ok(R::Invalid) => PutOutcome::Refused(PutRefusal::Invalid),
         Ok(R::Queue) => PutOutcome::Refused(PutRefusal::Queue),
         Ok(R::Io) => PutOutcome::Refused(PutRefusal::Io),

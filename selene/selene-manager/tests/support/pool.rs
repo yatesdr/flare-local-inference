@@ -260,7 +260,6 @@ impl Pool {
             m: Some(c::M::Open(v2::OpenSession {
                 manager_incarnation: incarnation,
                 instance_id: ident.instance_id.to_vec(),
-                instance_name: ident.name.clone(),
                 scope: Some(ident.scope.clone()),
                 process_nonce: ident.nonce.to_vec(),
                 export_slots: ident.export_slots,

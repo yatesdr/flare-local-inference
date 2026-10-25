@@ -39,7 +39,6 @@ pub(crate) fn channel_ref(hub: &crate::data::channel::Hub, token: &[u8]) -> v2::
         } as i32,
         address: hub.address().to_string(),
         token: token.to_vec(),
-        rdma: Vec::new(),
     }
 }
 

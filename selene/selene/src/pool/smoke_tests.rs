@@ -107,7 +107,6 @@ impl wire::pool_server::Pool for Server {
                                     id.to_vec()
                                 },
                                 export_slots: 0,
-                                claim_slots: 0,
                                 readiness: Some(wire::ReadinessInfo {
                                     state: wire::ReadinessState::Ready as i32,
                                     ..Default::default()
@@ -221,7 +220,6 @@ fn config(path: &std::path::Path) -> (PoolConfig, crate::SharedCopier) {
                 row_record_bytes: 4096,
             },
         },
-        instance_name: "smoke".into(),
         gpu_uuids: vec![[7; 16]],
         export_slots: 2,
         claim_slots: 2,

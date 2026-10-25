@@ -56,7 +56,6 @@ fn config_at(address: PoolAddress, name: &str, world: usize, gpus: Vec<[u8; 16]>
         tenant: "t".into(),
         ca: None,
         scope: scope(world),
-        instance_name: name.into(),
         gpu_uuids: gpus,
         export_slots: 2,
         claim_slots: 2,
@@ -329,7 +328,6 @@ fn instance_with(
                 scope: scope(world),
                 rank,
                 world,
-                instance_name: format!("agent-{rank}"),
                 link,
                 copier,
                 registrar: match &faults.registrar {
@@ -1632,7 +1630,6 @@ fn when_rank_zero_turns_the_pool_off_its_agents_do_too() {
         scope: scope(2),
         rank: 1,
         world: 2,
-        instance_name: "agent-1".into(),
         link: peer,
         copier,
         registrar: Arc::new(OkRegistrar),

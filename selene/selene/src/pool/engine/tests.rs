@@ -169,7 +169,6 @@ fn settings(export_slots: u32) -> Arc<Settings> {
     Arc::new(Settings {
         instance_id: [9; 16],
         nonce: [5; 16],
-        name: "test".into(),
         scope: Scope {
             tenant: "t".into(),
             model_identity: [1; 32],
@@ -231,7 +230,6 @@ impl Rig {
             session_incarnation: SESSION,
             scope_id: vec![3; 32],
             export_slots: 2,
-            claim_slots: 2,
             readiness: Some(wire::ReadinessInfo {
                 state: wire::ReadinessState::Ready as i32,
                 ..Default::default()
@@ -602,7 +600,7 @@ fn a_lookup_that_times_out_is_cancelled_ends_without_candidates_and_pauses_new_o
 }
 
 #[test]
-fn a_refused_lookup_gives_no_candidates_and_a_good_reply_reaches_every_waiter() {
+fn lookup_replies_reach_only_their_ticket_and_refusals_pause_new_lookups() {
     let mut rig = Rig::new();
     rig.open();
     let t1 = rig
@@ -612,12 +610,13 @@ fn a_refused_lookup_gives_no_candidates_and_a_good_reply_reaches_every_waiter() 
         .shared
         .begin_lookup(rig.now, vec![key(0, 0), key(64, 1)], 128, 0);
     let mut commands = rig.shared.take_commands();
-    assert_eq!(commands.len(), 1);
+    assert_eq!(commands.len(), 2);
     let Command::Lookup(sent) = commands.remove(0) else {
         panic!()
     };
     let id = sent.id;
     rig.command(Command::Lookup(sent));
+    rig.command(commands.remove(0));
     let candidate = wire::Candidate {
         level: wire::Level::HostDram as i32,
         tier: wire::Tier::Dram as i32,
@@ -648,11 +647,14 @@ fn a_refused_lookup_gives_no_candidates_and_a_good_reply_reaches_every_waiter() 
         candidates: vec![malformed, candidate],
         retry_after_ms: 0,
     }));
-    for ticket in [&t1, &t2] {
-        match ticket.state() {
-            crate::pool::LookupState::Ready(answer) => assert_eq!(answer.candidates.len(), 1),
-            other => panic!("{other:?}"),
-        }
+    match t1.state() {
+        crate::pool::LookupState::Ready(answer) => assert_eq!(answer.candidates.len(), 1),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(t2.state(), crate::pool::LookupState::Pending));
+    drop(t2);
+    for command in rig.shared.take_commands() {
+        rig.command(command);
     }
     let t3 = rig
         .shared

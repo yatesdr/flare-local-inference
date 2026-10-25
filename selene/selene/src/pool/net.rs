@@ -1002,7 +1002,6 @@ mod tests {
                 transport: wire::DataTransport::Tcp as i32,
                 address: self.listener.local_addr().unwrap().to_string(),
                 token: vec![token; TOKEN_BYTES],
-                rdma: vec![],
             }
         }
 

@@ -44,7 +44,6 @@ async fn h6_a_tcp_session_has_no_shared_memory_and_serves_exports_over_the_data_
         session.opened.export_slots, 2,
         "an instance without shared memory is a source whose windows are relayed"
     );
-    assert_eq!(session.opened.claim_slots, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

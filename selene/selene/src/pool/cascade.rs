@@ -211,7 +211,6 @@ impl Cascade {
                 PutRefusal::Budget
                 | PutRefusal::Queue
                 | PutRefusal::NotReady
-                | PutRefusal::Quota
                 | PutRefusal::Oversize,
             ) => {
                 self.failures.remove(&(record.tier, record.key));

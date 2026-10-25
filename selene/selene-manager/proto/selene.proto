@@ -378,8 +378,7 @@ message OpenSession {
   // offered from that moment and are replaced atomically when the newer session's
   // snapshot installs.
   bytes instance_id = 2;
-  // Free text for logs and metrics labels. Not an identity.
-  string instance_name = 3;
+  reserved 3;
   Scope scope = 4;
   // 16 random bytes, fresh per process, constant across reconnects of the same
   // process. Same nonce on a second Session = reconnect of one process (fence-class
@@ -416,7 +415,7 @@ message SessionOpened {
   uint64 session_incarnation = 2;
   bytes scope_id = 3;
   uint32 export_slots = 4;
-  uint32 claim_slots = 5;
+  reserved 5;
   ReadinessInfo readiness = 6;
   // Always true after OPEN_OK: Begin starts the initial holdings snapshot.
   // Lookups, claims and puts do not require this instance to advertise holdings.
@@ -771,8 +770,7 @@ message DataChannelRef {
   DataTransport transport = 1;
   string address = 2;       // host:port of the manager's data listener.
   bytes token = 3;          // opaque, 32 bytes.
-  // RDMA only: the manager's connection parameters, opaque to this contract.
-  bytes rdma = 4;
+  reserved 4;
 }
 
 // A window in a manager-owned region. All offsets and lengths are multiples of
@@ -1017,7 +1015,7 @@ enum Reason {
   INFLIGHT = 2;    // a put for the same key is running.
   BUDGET = 3;      // out of write budget or full: the writer advances the record to the next tier now; no retry loop.
   OVERSIZE = 4;    // can never fit; do not retry.
-  QUOTA = 5;       // reserved.
+  reserved 5;
   INVALID = 6;
   QUEUE = 7;       // max_open_puts reached.
   IO = 8;          // a manager device error; the manager is unhealthy.
@@ -1168,7 +1166,7 @@ message RankAttach {
   bytes agent_nonce = 5;       // 16 random bytes, fresh per agent process.
   bytes rank_secret = 6;
   reserved 7;
-  string name = 8;             // log only.
+  reserved 8;
 }
 
 // The agent's own drain attestation for one transfer. The only thing besides

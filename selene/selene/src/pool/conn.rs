@@ -464,7 +464,6 @@ async fn establish(engine: &mut Engine, link: &Link) -> std::result::Result<Esta
     let open = wire::OpenSession {
         manager_incarnation: hello.manager_incarnation,
         instance_id: st.instance_id.to_vec(),
-        instance_name: st.name.clone(),
         scope: Some(super::codec::scope_to(&st.scope)),
         process_nonce: st.nonce.to_vec(),
         rank_secret: st.rank_secret.map(|s| s.to_vec()).unwrap_or_default(),
