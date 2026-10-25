@@ -1023,9 +1023,7 @@ impl Core {
             return;
         };
         for peer in mp.peers.iter_mut().filter(|p| p.proc == agent) {
-            if peer.fence == Party::Pending
-                || peer.fence == Party::Quarantined && party == Party::Drained
-            {
+            if peer.fence == Party::Pending {
                 peer.fence = party;
             }
         }
