@@ -102,7 +102,7 @@ impl Core {
     pub(super) fn mp_side(
         &mut self,
         sid: u64,
-        key: ClaimKey,
+        owner: &dyn Fn(usize) -> ChanOwner,
         kind: channel::Kind,
         legs: &mut Vec<RankLeg>,
     ) -> Result<Option<MpSide>, v2::ClaimReason> {
@@ -132,8 +132,7 @@ impl Core {
                     .map(|hub| hub.open_rank(kind, layout.clone(), rank as usize));
                 match opened {
                     Some(Ok((transfer, token))) => {
-                        self.channels
-                            .insert(transfer, ChanOwner::ClaimRank(key, legs.len()));
+                        self.channels.insert(transfer, owner(legs.len()));
                         legs.push(RankLeg {
                             rank,
                             source: kind == channel::Kind::Put,
@@ -483,4 +482,32 @@ impl Core {
             hub.finish(leg.ch.transfer);
         }
     }
+}
+
+/// A window of a put, while its ranks fill it.
+pub struct PutWin {
+    pub region: Region,
+    /// The record-relative page this window's pages start at.
+    pub first_page: u32,
+    pub offset: u64,
+    pub pages: u32,
+    pub row: bool,
+    /// Writers still to report, one bit per accessor like a claim window's.
+    pub writers: u64,
+    pub stated: Vec<Option<SliceSums>>,
+    pub arrived: bool,
+}
+
+/// What a put adds when its writer is a multi-process instance.
+pub struct PutMp {
+    pub layout: Arc<SliceLayout>,
+    pub peers: Vec<MpPeer>,
+    pub legs: Vec<RankLeg>,
+    pub windows: BTreeMap<u32, PutWin>,
+    /// Passes running on the put's windows.
+    pub passes: u32,
+    /// The whole-page checksums the passes computed, by record page, and the row's: what
+    /// the record keeps, whatever the ranks' own checksums were.
+    pub whole: Vec<Option<u64>>,
+    pub row: Option<u64>,
 }

@@ -34,6 +34,8 @@ pub(super) enum ChanOwner {
     /// The source leg of a claim relayed through the manager.
     Source(ClaimKey),
     Put(PutKey),
+    /// A peer rank's leg of a put; the index is into the put's `mp.legs`.
+    PutRank(PutKey, usize),
 }
 
 pub type Nonce = [u8; 16];
@@ -168,6 +170,12 @@ pub enum Event {
     },
     /// A data-channel handler reported.
     Channel(channel::Event),
+    /// A window assembly pass of a put finished.
+    PutPass {
+        key: super::store_bridge::PutKey,
+        index: u32,
+        result: Result<super::pass::PassOut, super::pass::PassError>,
+    },
     /// A window assembly pass finished.
     Pass {
         key: super::claims::ClaimKey,
@@ -473,6 +481,7 @@ impl Core {
             Event::Catalog { scope, event } => self.catalog_event(scope, event),
             Event::Channel(event) => self.channel_event(event),
             Event::Pass { key, index, result } => self.pass_done(key, index, result),
+            Event::PutPass { key, index, result } => self.put_pass_done(key, index, result),
             Event::Shutdown { done } => self.begin_shutdown(done),
         }
         self.flush_overflowed();
@@ -949,6 +958,11 @@ impl Core {
             .chain(self.puts.keys().map(|key| (key.0, key.1)))
             .chain(self.agents.values().map(|agent| agent.proc()))
             .chain(self.claims.values().flat_map(|claim| claim.mp.peer_procs()))
+            .chain(self.puts.values().flat_map(|rec| {
+                rec.mp
+                    .iter()
+                    .flat_map(|mp| mp.peers.iter().filter(|p| p.shared).map(|p| p.proc))
+            }))
             .collect();
         let now = Instant::now();
         let mut forget = Vec::new();

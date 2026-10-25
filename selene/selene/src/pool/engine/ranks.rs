@@ -56,6 +56,12 @@ pub(crate) struct PeerPart {
     pub(crate) cancelled: bool,
 }
 
+/// A window shared peers have not all drained, and the slice checksums of those that did.
+pub(crate) struct PeerWindow {
+    pub(crate) left: std::collections::BTreeSet<usize>,
+    pub(crate) sums: Vec<(usize, crate::pool::SliceSums)>,
+}
+
 /// Who a transfer belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum XferOwner {
@@ -478,22 +484,113 @@ impl super::Engine {
         self.drive_export_now(export);
     }
 
-    pub(crate) fn on_peer_put_window(
+    /// Start every peer rank's part of an accepted put. The record's pages are the writer's
+    /// chain pages from the first the manager needs.
+    pub(super) fn open_put_peers(
         &mut self,
-        _put: u64,
-        _rank: usize,
-        _index: u32,
-        _result: std::result::Result<(), String>,
-        _sums: Option<SliceSums>,
-    ) {
+        id: u64,
+        pages: u32,
+        rank_channels: &[wire::RankChannel],
+    ) -> std::result::Result<(), String> {
+        let Some(setup) = self.writer.peer_setup(id, pages) else {
+            return Err("a multi-process instance writes GPU pages only".into());
+        };
+        let Some(ranks) = self.ranks.as_mut() else {
+            return Ok(());
+        };
+        let (page_bytes, row_bytes) = (self.st.page_record_bytes(), self.st.row_record_bytes());
+        let mut opened: Vec<PeerPart> = Vec::new();
+        for rank in 1..ranks.world() {
+            let channel = rank_channels
+                .iter()
+                .find(|c| c.rank as usize == rank)
+                .and_then(|c| c.channel.clone());
+            let shared = channel.is_none();
+            let expected = if shared {
+                wire::RankMode::RankShared
+            } else {
+                wire::RankMode::RankChannel
+            };
+            if ranks.mode(rank) != Some(expected) {
+                for peer in &opened {
+                    ranks.cancel(peer.xfer);
+                }
+                return Err(format!("rank {rank}'s attachment does not match its mode"));
+            }
+            let open = link::Open {
+                dir: link::Dir::Out as i32,
+                kind: wire::rank_fence::Kind::Put as i32,
+                fence_id: id,
+                records: vec![setup.record.clone()],
+                pages: setup.pages.clone(),
+                has_slot: setup.row,
+                slot: setup.slot,
+                channel,
+                page_bytes,
+                row_bytes,
+                ..Default::default()
+            };
+            let Some(xfer) = ranks.open(rank, XferOwner::Put(id), open) else {
+                for peer in &opened {
+                    ranks.cancel(peer.xfer);
+                }
+                return Err(format!("rank {rank} is not attached"));
+            };
+            opened.push(PeerPart {
+                rank,
+                xfer,
+                shared,
+                done: None,
+                quarantined: false,
+                cancelled: false,
+            });
+        }
+        self.writer.set_peers(id, opened);
+        Ok(())
     }
 
+    /// Whether shared peers still owe their slice of one window of a put.
+    pub(super) fn put_peers_left(&self, put: u64, window: u32) -> bool {
+        self.writer.peers_left(put, window)
+    }
+
+    /// Stop the peers of a put that is over.
+    pub(super) fn cancel_put_peers_if_over(&mut self, put: u64) {
+        let cancels = self.writer.take_uncancelled(put);
+        if let Some(ranks) = &self.ranks {
+            for xfer in cancels {
+                ranks.cancel(xfer);
+            }
+        }
+    }
+
+    /// A shared-memory peer drained its slice of one window of a put.
+    pub(crate) fn on_peer_put_window(
+        &mut self,
+        put: u64,
+        rank: usize,
+        index: u32,
+        result: std::result::Result<(), String>,
+        sums: Option<SliceSums>,
+    ) {
+        if !self.writer.peer_window_done(put, rank, index, result, sums) {
+            return;
+        }
+        self.put_after_peer_window(put, index);
+    }
+
+    /// A peer rank ended its part of a put.
     pub(crate) fn on_peer_put_done(
         &mut self,
-        _put: u64,
-        _rank: usize,
-        _result: std::result::Result<(), String>,
-        _quarantined: bool,
+        put: u64,
+        rank: usize,
+        result: std::result::Result<(), String>,
+        quarantined: bool,
     ) {
+        self.writer.peer_done(put, rank, result, quarantined);
+        if quarantined {
+            return self.quarantine();
+        }
+        self.put_drive_now(put);
     }
 }
