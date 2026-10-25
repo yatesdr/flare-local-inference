@@ -1461,7 +1461,7 @@ mod tests {
 
     fn certificate() -> (Arc<rustls::ServerConfig>, rustls::RootCertStore) {
         use rustls::pki_types::{CertificateDer, pem::PemObject};
-        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let generated = crate::testing::certificate();
         let pem = generated.cert.pem();
         let config = server_config(
             pem.as_bytes(),
@@ -1933,8 +1933,7 @@ mod tests {
                 assert!(why.contains("does not offer RDMA"), "{why}");
                 assert!(matches!(next(&mut events).await, Event::Failed { .. }));
                 // TLS and RDMA do not mix at the hub either.
-                let generated =
-                    rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+                let generated = crate::testing::certificate();
                 let tls = server_config(
                     generated.cert.pem().as_bytes(),
                     generated.signing_key.serialize_pem().as_bytes(),

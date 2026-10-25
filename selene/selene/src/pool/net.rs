@@ -1396,7 +1396,7 @@ mod tests {
         (TlsConnector, rustls::pki_types::ServerName<'static>),
         std::path::PathBuf,
     ) {
-        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let generated = selene_manager::testing::certificate();
         let dir = std::env::temp_dir().join(format!(
             "selene-net-tls-{}-{}",
             std::process::id(),

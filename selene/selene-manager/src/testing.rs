@@ -104,3 +104,7 @@ pub fn free_address() -> std::net::SocketAddr {
         }
     }
 }
+
+pub fn certificate() -> rcgen::CertifiedKey<rcgen::KeyPair> {
+    rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap()
+}

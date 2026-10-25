@@ -64,7 +64,7 @@ pub(super) fn network_manager_with(tls: bool, rdma: bool) -> Manager {
     net.metrics = Some(free());
     net.rdma = rdma;
     if tls {
-        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let generated = selene_manager::testing::certificate();
         let (cert, key) = (
             manager.base.join("server.pem"),
             manager.base.join("server-key.pem"),
@@ -226,31 +226,7 @@ fn identity() -> Identity {
     }
 }
 
-/// A host pin over known bytes, serving the checksums it was given.
-pub(super) struct TestPin {
-    chain: HostChain,
-    data: Vec<u8>,
-    sums: Vec<u64>,
-    row: u64,
-}
-
-impl HostPin for TestPin {
-    fn chain(&self) -> &HostChain {
-        &self.chain
-    }
-    fn read(&mut self, window: &HostWindow, dst: &mut [u8]) -> Result<Checksums> {
-        let from = window.first_page as usize * PAGE;
-        let n = window.page_count as usize * PAGE;
-        dst[..n].copy_from_slice(&self.data[from..from + n]);
-        if window.row {
-            dst[n..].copy_from_slice(&self.data[self.data.len() - ROW..]);
-        }
-        Ok(Checksums {
-            pages: self.sums[window.first_page as usize..][..window.page_count as usize].to_vec(),
-            row: window.row.then_some(self.row),
-        })
-    }
-}
+use crate::testing::{BytesPin as TestPin, RecordBytes as Bytes};
 
 fn pin_for(key: PrefixKey, generation: u64, pages: usize) -> Box<dyn HostPin> {
     let data: Vec<u8> = (0..pages * PAGE + ROW)
@@ -271,9 +247,7 @@ fn pin_for(key: PrefixKey, generation: u64, pages: usize) -> Box<dyn HostPin> {
             total_pages: pages as u64,
             row: true,
         },
-        data,
-        sums,
-        row,
+        bytes: Bytes { data, sums, row, page_bytes: PAGE, row_bytes: ROW },
     })
 }
 
@@ -394,34 +368,6 @@ fn an_instance_restores_a_neighbours_host_record_through_the_real_manager() {
     drop(gpu);
 }
 
-/// Bytes for a put, with the checksums they carry.
-struct Bytes {
-    data: Vec<u8>,
-    sums: Vec<u64>,
-    row: u64,
-}
-
-impl PutBytes for Bytes {
-    fn fill(
-        &mut self,
-        first_page: u64,
-        page_count: u32,
-        row: bool,
-        dst: &mut [u8],
-    ) -> Result<Checksums> {
-        let from = first_page as usize * PAGE;
-        let n = page_count as usize * PAGE;
-        dst[..n].copy_from_slice(&self.data[from..from + n]);
-        if row {
-            dst[n..].copy_from_slice(&self.data[self.data.len() - ROW..]);
-        }
-        Ok(Checksums {
-            pages: self.sums[first_page as usize..][..page_count as usize].to_vec(),
-            row: row.then_some(self.row),
-        })
-    }
-}
-
 fn put_request(history: &TestHistory, pages: usize) -> (PutRequest, PrefixKey) {
     let key = history.key_at(pages as u64 * PT).unwrap();
     let data: Vec<u8> = (0..pages * PAGE + ROW)
@@ -439,7 +385,7 @@ fn put_request(history: &TestHistory, pages: usize) -> (PutRequest, PrefixKey) {
             chain_pages: pages as u64,
             tail_pages: pages as u64,
             row: true,
-            source: PutSource::Host(Box::new(Bytes { data, sums, row })),
+            source: PutSource::Host(Box::new(Bytes { data, sums, row, page_bytes: PAGE, row_bytes: ROW })),
         },
         key,
     )
@@ -1043,7 +989,7 @@ fn a_record_the_manager_already_holds_is_released_without_waiting_for_a_copy() {
             chain_pages: 4,
             tail_pages: 4,
             row: true,
-            source: PutSource::Host(Box::new(Bytes { data, sums, row })),
+            source: PutSource::Host(Box::new(Bytes { data, sums, row, page_bytes: PAGE, row_bytes: ROW })),
         })
         .unwrap();
     let outcome = writer.event("the put", |e| match e {
@@ -1766,9 +1712,7 @@ impl TestPinParts {
                 total_pages: pages as u64,
                 row: true,
             },
-            data,
-            sums,
-            row,
+            bytes: Bytes { data, sums, row, page_bytes: PAGE, row_bytes: ROW },
         })
     }
 }

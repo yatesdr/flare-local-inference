@@ -142,9 +142,6 @@ pub struct Client {
     pub pool: Pool,
     pub session: Session,
     pub descriptor: Descriptor,
-    /// When the last `put` was granted and filled each window.
-    pub grants: Vec<Instant>,
-    pub fills: Vec<Instant>,
     next_put: u64,
     next_claim: u64,
     next_lookup: u64,
@@ -237,8 +234,6 @@ impl Client {
             pool,
             session,
             descriptor,
-            grants: Vec::new(),
-            fills: Vec::new(),
             next_put: 0,
             next_claim: 0,
             next_lookup: 0,
@@ -422,8 +417,6 @@ impl Client {
     }
 
     pub async fn put(&mut self, key: Key, parent: Option<Key>, options: PutOptions) -> PutOutcome {
-        self.grants.clear();
-        self.fills.clear();
         let (id, start) = self.start_put(key, parent).await;
         let accept = match start {
             PutStart::Accepted(accept) => accept,
@@ -470,7 +463,6 @@ impl Client {
                 Next::Grant(grant) => grant.window.unwrap(),
             };
             grants += 1;
-            self.grants.push(Instant::now());
             if options.cancel == Some(CancelAt::Grant) {
                 self.abandon_put(id).await;
                 return PutOutcome::Cancelled;
@@ -514,7 +506,6 @@ impl Client {
                         ..Default::default()
                     }))
                     .await;
-                self.fills.push(Instant::now());
             }
             covered += window.length;
             if options

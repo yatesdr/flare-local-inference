@@ -1515,33 +1515,7 @@ fn a_host_pin_the_export_cannot_use_is_dropped() {
 
 // ---- puts ---------------------------------------------------------------------
 
-/// Bytes for a host-sourced put whose persisted checksums are given, not computed.
-pub(super) struct Bytes {
-    data: Vec<u8>,
-    sums: Vec<u64>,
-    row: u64,
-}
-
-impl crate::pool::PutBytes for Bytes {
-    fn fill(
-        &mut self,
-        first_page: u64,
-        page_count: u32,
-        row: bool,
-        dst: &mut [u8],
-    ) -> Result<crate::pool::Checksums> {
-        let from = first_page as usize * PAGE as usize;
-        let n = page_count as usize * PAGE as usize;
-        dst[..n].copy_from_slice(&self.data[from..from + n]);
-        if row {
-            dst[n..].copy_from_slice(&self.data[self.data.len() - ROW as usize..]);
-        }
-        Ok(crate::pool::Checksums {
-            pages: self.sums[first_page as usize..][..page_count as usize].to_vec(),
-            row: row.then_some(self.row),
-        })
-    }
-}
+pub(super) use crate::testing::RecordBytes as Bytes;
 
 pub(super) fn gpu_put(parent: Option<PrefixKey>) -> crate::pool::PutRequest {
     crate::pool::PutRequest {
@@ -1754,6 +1728,8 @@ fn bytes_a_store_supplies_are_committed_with_the_checksums_it_persists() {
         data,
         sums: vec![101, 102, 103],
         row: 104,
+        page_bytes: PAGE as usize,
+        row_bytes: ROW as usize,
     };
     let mut request = gpu_put(None);
     request.source = crate::pool::PutSource::Host(Box::new(source));

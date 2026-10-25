@@ -197,7 +197,7 @@ async fn d2_a_put_and_a_claim_over_tls() {
     use rustls::pki_types::{CertificateDer, pem::PemObject};
     let dir = std::env::temp_dir().join(format!("selene-chan-tls-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let generated = selene_manager::testing::certificate();
     let pem = generated.cert.pem();
     let (cert, key_file) = (dir.join("server.pem"), dir.join("server-key.pem"));
     std::fs::write(&cert, &pem).unwrap();

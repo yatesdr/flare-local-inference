@@ -144,7 +144,7 @@ async fn a_remote_session_cannot_use_shared_windows() {
 
 /// A self-signed certificate for `localhost`, as PEM files in `dir`.
 fn certificate(dir: &std::path::Path) -> (PathBuf, PathBuf, String) {
-    let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let generated = selene_manager::testing::certificate();
     let cert = dir.join("server.pem");
     let key = dir.join("server-key.pem");
     let pem = generated.cert.pem();
@@ -184,7 +184,7 @@ async fn h4_a_tls_manager_declares_tls_and_offers_no_rdma() {
     let session = tls.open(&Ident::new("far")).await;
     assert_eq!(session.opened.status, v2::OpenStatus::OpenOk as i32);
     // A client that does not hold the manager's CA is refused before any call.
-    let other = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let other = selene_manager::testing::certificate();
     let refused = Endpoint::from_shared(format!("https://localhost:{}", net.address.port()))
         .unwrap()
         .tls_config(

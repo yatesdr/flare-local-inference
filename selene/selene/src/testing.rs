@@ -387,3 +387,54 @@ impl crate::HostRegistrar for TrackingRegistrar {
         Err("not used".into())
     }
 }
+
+/// Whole-record bytes with the checksums supplied by a test.
+pub struct RecordBytes {
+    pub data: Vec<u8>,
+    pub sums: Vec<u64>,
+    pub row: u64,
+    pub page_bytes: usize,
+    pub row_bytes: usize,
+}
+impl crate::pool::PutBytes for RecordBytes {
+    fn fill(
+        &mut self,
+        first: u64,
+        pages: u32,
+        row: bool,
+        dst: &mut [u8],
+    ) -> Result<crate::pool::Checksums> {
+        let from = first as usize * self.page_bytes;
+        let n = pages as usize * self.page_bytes;
+        dst[..n].copy_from_slice(&self.data[from..from + n]);
+        if row {
+            dst[n..].copy_from_slice(&self.data[self.data.len() - self.row_bytes..]);
+        }
+        Ok(crate::pool::Checksums {
+            pages: self.sums[first as usize..][..pages as usize].to_vec(),
+            row: row.then_some(self.row),
+        })
+    }
+}
+pub struct BytesPin {
+    pub chain: crate::pool::HostChain,
+    pub bytes: RecordBytes,
+}
+impl crate::pool::HostPin for BytesPin {
+    fn chain(&self) -> &crate::pool::HostChain {
+        &self.chain
+    }
+    fn read(
+        &mut self,
+        window: &crate::pool::HostWindow,
+        dst: &mut [u8],
+    ) -> Result<crate::pool::Checksums> {
+        crate::pool::PutBytes::fill(
+            &mut self.bytes,
+            u64::from(window.first_page),
+            window.page_count,
+            window.row,
+            dst,
+        )
+    }
+}
