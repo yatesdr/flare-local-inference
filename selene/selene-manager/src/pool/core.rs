@@ -610,6 +610,13 @@ impl Core {
             self.watch_catalog(scope.id);
             self.check_staging(&scope);
         }
+        // Opening the session is the process telling the manager it is back: the store's
+        // connection for it is made now, not at its first window, because a restarted manager
+        // holds its shared regions until every process of the previous run has made one (and a
+        // process that is refused claims for the hold would never get to its first window).
+        if let Some(pid) = started_pid {
+            self.link_for(proc_key, scope.id, pid);
+        }
         self.instances.insert(
             instance,
             Instance {
@@ -922,6 +929,10 @@ impl Core {
             |name: &str, value: u64| text.push_str(&format!("selene_pool_{name} {value}\n"));
         gauge("state", info.state as u64);
         gauge("ready", u64::from(self.ready()));
+        gauge(
+            "regions_held",
+            u64::from(self.cfg.held.load(std::sync::atomic::Ordering::Acquire)),
+        );
         gauge("sessions", self.sessions.len() as u64);
         gauge("index_entries", entries as u64);
         gauge("claims_in_flight", in_flight as u64);
