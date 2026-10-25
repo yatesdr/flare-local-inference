@@ -14,6 +14,12 @@ impl Tiers {
 }
 
 impl HostStore for Tiers {
+    fn write_back_reserve(&self, largest_pages: usize, prefill_rate: f64) -> usize {
+        self.0.as_ref().map_or(largest_pages, |tiers| {
+            tiers.write_back_reserve(largest_pages, prefill_rate)
+        })
+    }
+
     fn reused(&mut self, key: PrefixKey) {
         if let Some(tiers) = &mut self.0 {
             tiers.reused(key);

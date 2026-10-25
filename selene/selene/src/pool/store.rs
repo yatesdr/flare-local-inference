@@ -341,6 +341,10 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
 }
 
 impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
+    fn write_back_reserve(&self, largest_pages: usize, prefill_rate: f64) -> usize {
+        self.inner.write_back_reserve(largest_pages, prefill_rate)
+    }
+
     fn reused(&mut self, key: PrefixKey) {
         self.inner.reused(key);
     }

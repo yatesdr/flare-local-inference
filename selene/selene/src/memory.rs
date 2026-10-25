@@ -1288,6 +1288,15 @@ impl MemoryStore {
 }
 
 impl HostStore for MemoryStore {
+    fn write_back_reserve(&self, largest_pages: usize, prefill_rate: f64) -> usize {
+        crate::store::write_back_reserve(
+            largest_pages,
+            &self.core.layout,
+            self.core.outbound_rate.0,
+            prefill_rate,
+        )
+    }
+
     fn reused(&mut self, key: PrefixKey) {
         self.core.reused(&key);
     }

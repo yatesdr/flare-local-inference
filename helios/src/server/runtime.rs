@@ -2029,7 +2029,10 @@ impl<'a> Worker<'a> {
             store.published(&publication)?;
         }
         let next = next_admission(&self.scheduler, &self.parked, &self.pending);
-        for id in self.scheduler.write_back_candidates(next) {
+        let reserve = store.write_back_reserve(
+            self.scheduler.largest_admission_pages(), self.prefill_rate,
+        );
+        for id in self.scheduler.write_back_candidates(next, reserve) {
             // Like exports, copy-outs must leave the next admission and decode room.
             if !self.scheduler.export_fits(id, next) {
                 continue;
@@ -2045,7 +2048,7 @@ impl<'a> Worker<'a> {
                 }
                 progress |= matches!(outcome, StoreOutcome::Queued | StoreOutcome::Present);
                 if outcome == StoreOutcome::Present
-                    && self.scheduler.write_back_candidates(next).is_empty()
+                    && self.scheduler.write_back_candidates(next, reserve).is_empty()
                 {
                     break;
                 }
