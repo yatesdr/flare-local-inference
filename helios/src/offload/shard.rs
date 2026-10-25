@@ -14,6 +14,11 @@
 //! holds the row. Every rank then deletes or truncates its files to match, so the index rank zero
 //! builds describes every host's directory.
 
+mod pool;
+mod records;
+pub use pool::{PoolOffer, PoolPeers, pool_peer, pool_rank_zero};
+pub(crate) use records::DeferredRecords;
+
 use std::{
     collections::HashMap,
     io::{ErrorKind, Read, Write},
@@ -445,33 +450,7 @@ impl Link {
         if let Some(error) = &self.broken {
             return Err(error.clone());
         }
-        let mut buffer = [0u8; 64 << 10];
-        loop {
-            if self.received.len() >= 5 {
-                let length = u32::from_le_bytes(self.received[1..5].try_into().unwrap()) as usize;
-                if length > FRAME_LIMIT {
-                    return Err(self.fail(invalid("prefix record frame exceeds its limit")));
-                }
-                if self.received.len() >= 5 + length {
-                    let tag = self.received[0];
-                    let payload = self.received[5..5 + length].to_vec();
-                    self.received.drain(..5 + length);
-                    return Ok(Some((tag, payload)));
-                }
-            }
-            match self.stream.read(&mut buffer) {
-                Ok(0) => return Err(self.fail(invalid("prefix record connection closed"))),
-                Ok(count) => self.received.extend_from_slice(&buffer[..count]),
-                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(None),
-                Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                Err(error) => {
-                    return Err(self.fail(record::io_failure(
-                        "receive on a prefix record connection",
-                        error,
-                    )));
-                }
-            }
-        }
+        receive_frame(&mut self.stream, &mut self.received).map_err(|error| self.fail(error))
     }
 
     /// Wait up to `timeout` for a frame tagged `tag`.
@@ -488,6 +467,36 @@ impl Link {
                 return Err(self.fail(invalid("prefix record peer did not answer in time")));
             }
             std::thread::sleep(IDLE);
+        }
+    }
+}
+
+fn receive_frame(stream: &mut TcpStream, received: &mut Vec<u8>) -> Result<Option<(u8, Vec<u8>)>> {
+    let mut buffer = [0u8; 64 << 10];
+    loop {
+        if received.len() >= 5 {
+            let length = u32::from_le_bytes(received[1..5].try_into().unwrap()) as usize;
+            if length > FRAME_LIMIT {
+                return Err(invalid("prefix record frame exceeds its limit"));
+            }
+            if received.len() >= 5 + length {
+                let tag = received[0];
+                let payload = received[5..5 + length].to_vec();
+                received.drain(..5 + length);
+                return Ok(Some((tag, payload)));
+            }
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) => return Err(invalid("prefix record connection closed")),
+            Ok(count) => received.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(None),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => {
+                return Err(record::io_failure(
+                    "receive on a prefix record connection",
+                    error,
+                ));
+            }
         }
     }
 }
@@ -981,7 +990,8 @@ pub(super) fn transport(
 /// A peer rank's record service: its staged transport, driven by rank zero over one connection.
 pub struct Service {
     thread: Option<JoinHandle<Result<()>>>,
-    finished: Receiver<Result<()>>,
+    finished: Option<Receiver<Result<()>>>,
+    pool: Option<super::pool::PreparedPool>,
     /// What this rank joined with, for the startup report.
     pub summary: String,
 }
@@ -993,14 +1003,24 @@ impl Service {
     /// shutdown open: after [`JOB_TIMEOUT`] the service is reported as not
     /// drained, and its resources are retained by the caller.
     pub fn join(mut self) -> Result<()> {
-        let result = match self.finished.recv_timeout(JOB_TIMEOUT) {
-            Ok(result) => result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(invalid(
-                "rank zero did not close the prefix record service in time",
-            )),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                Err(invalid("the prefix record service ended without a result"))
+        // The agent drains before the record service can release its directory and transfers.
+        if let Some(pool) = &mut self.pool {
+            if let Err(error) = pool.close() {
+                std::mem::forget(self);
+                return Err(invalid(error.to_string()));
             }
+        }
+        let result = match &self.finished {
+            None => Ok(()),
+            Some(finished) => match finished.recv_timeout(JOB_TIMEOUT) {
+                Ok(result) => result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(invalid(
+                    "rank zero did not close the prefix record service in time",
+                )),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(invalid("the prefix record service ended without a result"))
+                }
+            },
         };
         if let Some(thread) = self.thread.take() {
             // The service reports its result before it returns.
@@ -1353,7 +1373,11 @@ pub fn join_rank_zero(store: Option<&Shared>, peers: &mut [RankStream]) -> Resul
     use crate::execution::rendezvous;
 
     let mut prepared = store.map(Shared::lock);
-    let prepared = prepared.as_mut().and_then(|guard| guard.as_mut());
+    let mut prepared = prepared.as_mut().and_then(|guard| guard.as_mut());
+    let pool_listener = prepared
+        .as_mut()
+        .and_then(|prepared| prepared.pool.as_mut())
+        .and_then(super::pool::PreparedPool::take_listener);
     let enabled = match &prepared {
         Some(prepared) => mirrored(prepared)?,
         None => false,
@@ -1380,7 +1404,11 @@ pub fn join_rank_zero(store: Option<&Shared>, peers: &mut [RankStream]) -> Resul
         .collect::<Result<Vec<_>>>()?;
     let remote: Vec<SocketAddr> = addresses.iter().map(|(remote, _)| *remote).collect();
     let local: Vec<SocketAddr> = addresses.iter().map(|(_, local)| *local).collect();
-    let listener = if enabled {
+    let (pool_listener, token) = match pool_listener {
+        Some((listener, token)) => (Some(listener), token),
+        None => (None, nonce()?),
+    };
+    let listener = if enabled && pool_listener.is_none() {
         let wildcard = match local.first().map(|local| local.is_ipv4()) {
             Some(true) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             Some(false) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
@@ -1391,9 +1419,9 @@ pub fn join_rank_zero(store: Option<&Shared>, peers: &mut [RankStream]) -> Resul
                 .map_err(|error| record::io_failure("listen for prefix record peers", error))?,
         )
     } else {
-        None
+        pool_listener
     };
-    let token = nonce()?;
+    let listener = listener.filter(|_| enabled);
     let world = peers.len() + 1;
     let layout = prepared
         .as_ref()
@@ -1556,7 +1584,15 @@ pub fn join_peer(
         )));
     }
     if !enabled {
-        return Ok(None);
+        let pool = store
+            .and_then(Shared::take)
+            .and_then(|mut prepared| prepared.pool.take());
+        return Ok(pool.map(|pool| Service {
+            thread: None,
+            finished: None,
+            pool: Some(pool),
+            summary: "pool rank agent".into(),
+        }));
     }
     if records[1..].iter().any(|record| record.first() != Some(&1)) {
         return Err(invalid(
@@ -1640,7 +1676,7 @@ pub fn join_peer(
         staged,
         directory,
         fingerprint: prepared.fingerprint,
-        geometry: prepared.geometry,
+        geometry: prepared.geometry.clone(),
         link,
         _lock: lock,
     };
@@ -1655,7 +1691,8 @@ pub fn join_peer(
         .map_err(|error| invalid(format!("cannot start the prefix record service: {error}")))?;
     Ok(Some(Service {
         thread: Some(thread),
-        finished: outcome,
+        finished: Some(outcome),
+        pool: prepared.pool.take(),
         summary,
     }))
 }
@@ -1666,7 +1703,7 @@ mod tests {
     use flare_selene::testing::{StoppedCopier, geometry};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn directory(test: &str) -> PathBuf {
+    pub(super) fn directory(test: &str) -> PathBuf {
         let directory =
             std::env::temp_dir().join(format!("flare-shard-{test}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
@@ -1684,7 +1721,7 @@ mod tests {
         )
     }
 
-    fn connected() -> (TcpStream, TcpStream) {
+    pub(super) fn connected() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         (client, listener.accept().unwrap().0)
