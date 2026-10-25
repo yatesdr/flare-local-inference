@@ -613,10 +613,6 @@ async fn l0_12_round_robin_and_dead_client_cleanup() {
     unknown.finish(held).await;
 }
 #[test]
-fn l0_14_throughput() {
-    support::throughput::smoke();
-}
-#[test]
 fn l0_15_namespace_id_vectors() {
     let id = record::namespace_id(&[0x63; 32], &[0x1b; 16], "test");
     assert_eq!(

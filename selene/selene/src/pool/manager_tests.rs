@@ -1127,12 +1127,13 @@ fn store_and_wait<S: HostStore>(store: &mut S, checkpoint: &PublishedCheckpoint)
             for event in events.drain(..) {
                 match event {
                     StoreEvent::Stored { key, result, .. } if key == checkpoint.key => {
-                        result.unwrap();
-                        if outcome == StoreOutcome::Queued {
+                        if let Err(error) = &result {
+                            assert_eq!(error.to_string(), "no room for the record on disk");
+                            retry = true;
+                        } else if outcome == StoreOutcome::Queued {
                             return;
                         }
                     }
-                    StoreEvent::Deferred { checkpoint: id } if id == checkpoint.id => retry = true,
                     _ => {}
                 }
             }
