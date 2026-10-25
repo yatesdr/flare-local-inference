@@ -338,7 +338,9 @@ pub fn pattern(bytes: &mut [u8], seed: u64) {
 pub struct IdentityRegistrar;
 struct IdentityRegistration(usize);
 impl crate::Registration for IdentityRegistration {
-    fn device_address(&self) -> u64 { self.0 as u64 }
+    fn device_address(&self) -> u64 {
+        self.0 as u64
+    }
 }
 impl crate::HostRegistrar for IdentityRegistrar {
     fn register(&self, _: usize, address: usize, _: usize) -> Result<Box<dyn crate::Registration>> {
@@ -346,5 +348,42 @@ impl crate::HostRegistrar for IdentityRegistrar {
     }
     fn map_split(&self, _: &[(usize, i32, usize)]) -> Result<Box<dyn crate::SplitMapping>> {
         Err("split mapping is not provided by this fixture".into())
+    }
+}
+
+#[derive(Default)]
+pub struct TrackingRegistrar {
+    pub calls: std::sync::Mutex<Vec<usize>>,
+    pub drops: std::sync::Arc<std::sync::Mutex<usize>>,
+}
+struct Registration {
+    address: usize,
+    pub drops: std::sync::Arc<std::sync::Mutex<usize>>,
+}
+impl crate::Registration for Registration {
+    fn device_address(&self) -> u64 {
+        self.address as u64
+    }
+}
+impl Drop for Registration {
+    fn drop(&mut self) {
+        *self.drops.lock().unwrap() += 1;
+    }
+}
+impl crate::HostRegistrar for TrackingRegistrar {
+    fn register(
+        &self,
+        _: usize,
+        address: usize,
+        bytes: usize,
+    ) -> crate::Result<Box<dyn crate::Registration>> {
+        self.calls.lock().unwrap().push(bytes);
+        Ok(Box::new(Registration {
+            address,
+            drops: self.drops.clone(),
+        }))
+    }
+    fn map_split(&self, _: &[(usize, i32, usize)]) -> crate::Result<Box<dyn crate::SplitMapping>> {
+        Err("not used".into())
     }
 }

@@ -121,7 +121,11 @@ impl Cascade {
 
     /// Take what the local tier wants to move and start puts, without waiting
     /// for any. With the manager not ready every record is dropped at once.
-    pub(crate) fn pump<S: HostStore, P: PoolPort>(&mut self, inner: &mut S, pool: &mut P) {
+    pub(crate) fn pump<S: crate::store::TierStore, P: PoolPort>(
+        &mut self,
+        inner: &mut S,
+        pool: &mut P,
+    ) {
         let ready = pool.ready();
         inner.set_spill(ready);
         let chosen = inner.take_retiring();
@@ -146,7 +150,12 @@ impl Cascade {
         }
     }
 
-    fn begin<S: HostStore, P: PoolPort>(&mut self, inner: &mut S, pool: &mut P, record: Retiring) {
+    fn begin<S: crate::store::TierStore, P: PoolPort>(
+        &mut self,
+        inner: &mut S,
+        pool: &mut P,
+        record: Retiring,
+    ) {
         if !record.row {
             // Without its row the record can end no restore.
             return inner.retired(record.key, record.tier, Retirement::Dropped);
@@ -177,7 +186,7 @@ impl Cascade {
         }
     }
 
-    fn failed<S: HostStore>(&mut self, inner: &mut S, record: Retiring) {
+    fn failed<S: crate::store::TierStore>(&mut self, inner: &mut S, record: Retiring) {
         if self.failures.len() >= FAILURES_MAX {
             self.failures.clear();
         }
@@ -193,7 +202,7 @@ impl Cascade {
     }
 
     /// A put ended. False when it was not one of the cascade's.
-    pub(crate) fn ended<S: HostStore>(
+    pub(crate) fn ended<S: crate::store::TierStore>(
         &mut self,
         inner: &mut S,
         id: u64,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::store::TierStore;
 use std::sync::{Arc, Mutex};
 
 /// Records which pool hooks reached it.
@@ -12,9 +13,7 @@ impl HostStore for Hooks {
     fn write_back(&mut self, _: &PublishedCheckpoint) -> crate::Result<StoreOutcome> {
         Ok(StoreOutcome::Present)
     }
-    fn closest_tier(&self) -> Option<Tier> {
-        Some(Tier::Memory)
-    }
+
     fn fetch(&mut self, _: HostHit, _: InboundTicket) -> crate::Result<()> {
         Ok(())
     }
@@ -26,6 +25,22 @@ impl HostStore for Hooks {
     }
     fn close(&mut self) -> crate::Result<()> {
         Ok(())
+    }
+}
+
+impl crate::store::TierStore for Hooks {
+    fn pin_export(
+        &mut self,
+        tier: crate::pool::Tier,
+        _: PrefixKey,
+        _: u64,
+        _: bool,
+    ) -> std::result::Result<Box<dyn crate::pool::HostPin>, ExportRefusal> {
+        self.0.lock().unwrap().push(format!("pin {tier:?}"));
+        Err(ExportRefusal::ChainGap)
+    }
+    fn closest_tier(&self) -> Option<Tier> {
+        Some(Tier::Memory)
     }
     fn cascade(&mut self) {
         self.0.lock().unwrap().push("cascade".into());
@@ -42,16 +57,6 @@ impl HostStore for Hooks {
             .lock()
             .unwrap()
             .push(format!("retired {tier:?} {how:?}"));
-    }
-    fn pin_export(
-        &mut self,
-        tier: crate::pool::Tier,
-        _: PrefixKey,
-        _: u64,
-        _: bool,
-    ) -> std::result::Result<Box<dyn crate::pool::HostPin>, ExportRefusal> {
-        self.0.lock().unwrap().push(format!("pin {tier:?}"));
-        Err(ExportRefusal::ChainGap)
     }
 }
 

@@ -1,6 +1,7 @@
 //! The host tiers announce what they hold and serve it as exports, against the
 //! real memory store and a simulated GPU.
 
+use crate::store::TierStore;
 use std::{sync::Arc, time::Duration};
 
 use tokio::sync::Notify;

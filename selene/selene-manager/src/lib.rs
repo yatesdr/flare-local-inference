@@ -20,3 +20,6 @@ pub fn invalid(message: impl Into<String>) -> io::Error {
 }
 
 pub use flare_selene::PrefixKey as Key;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;

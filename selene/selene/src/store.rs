@@ -176,7 +176,7 @@ pub enum StoreReason {
 }
 
 /// A record a host tier would drop under pressure. The tier keeps it, and the
-/// chain it needs, until [`HostStore::retired`] says what became of its move.
+/// chain it needs, until [`TierStore::retired`] says what became of its move.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Retiring {
     pub tier: PoolTier,
@@ -256,6 +256,26 @@ pub trait HostStore {
     /// worker delivered them, so the announced holdings may be stale and must be
     /// announced again in full.
     fn evictions_lost(&mut self) {}
+    /// Start looking for pool candidates for a request that just queued. `None`
+    /// when no lookup is wanted or possible.
+    fn begin_lookup(&mut self, _history: &dyn History) -> Option<LookupTicket> {
+        None
+    }
+    /// [`HostStore::lookup`] for a request that holds `ticket`. Without a ticket,
+    /// or while its lookup has no answer, this is the local lookup.
+    fn lookup_for(
+        &mut self,
+        _ticket: Option<&LookupTicket>,
+        history: &dyn History,
+        resident: u64,
+        before: u64,
+    ) -> Option<HostHit> {
+        self.lookup(history, resident, before)
+    }
+}
+
+/// Internal cooperation between local tiers and the pool.
+pub(crate) trait TierStore: HostStore {
     /// Announce what this store's tiers hold, now and as they change, through
     /// `announcer`, and serve them as exports. Nothing is recorded before this.
     fn announce_to(&mut self, _announcer: Announcer) {}
@@ -284,28 +304,12 @@ pub trait HostStore {
     /// instead of dropping them. Set whenever the manager's availability changes.
     fn set_spill(&mut self, _enabled: bool) {}
     /// Records the last local tier wants to move to the manager, coldest first.
-    /// Each stays in place until [`HostStore::retired`] reports its move.
+    /// Each stays in place until [`TierStore::retired`] reports its move.
     fn take_retiring(&mut self) -> Vec<Retiring> {
         Vec::new()
     }
     /// The move of a retiring record ended.
     fn retired(&mut self, _key: PrefixKey, _tier: PoolTier, _how: Retirement) {}
-    /// Start looking for pool candidates for a request that just queued. `None`
-    /// when no lookup is wanted or possible.
-    fn begin_lookup(&mut self, _history: &dyn History) -> Option<LookupTicket> {
-        None
-    }
-    /// [`HostStore::lookup`] for a request that holds `ticket`. Without a ticket,
-    /// or while its lookup has no answer, this is the local lookup.
-    fn lookup_for(
-        &mut self,
-        _ticket: Option<&LookupTicket>,
-        history: &dyn History,
-        resident: u64,
-        before: u64,
-    ) -> Option<HostHit> {
-        self.lookup(history, resident, before)
-    }
 }
 
 pub(crate) fn write_back_reserve(

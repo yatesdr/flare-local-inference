@@ -120,7 +120,7 @@ struct Restore {
     started: Instant,
 }
 
-pub struct PooledStore<S: HostStore, P: PoolPort = PoolClient> {
+pub(crate) struct PooledStore<S: crate::store::TierStore, P: PoolPort = PoolClient> {
     inner: S,
     pool: P,
     identity: Identity,
@@ -145,7 +145,7 @@ pub struct PooledStore<S: HostStore, P: PoolPort = PoolClient> {
     pool_bytes_in: u64,
 }
 
-impl<S: HostStore> PooledStore<S, PoolClient> {
+impl<S: crate::store::TierStore> PooledStore<S, PoolClient> {
     /// Attach `inner` to the pool named by `config`. Starts the pool client's
     /// thread; the store is usable at once and shares nothing until the
     /// session is ready. `copier` is a page copier dedicated to the pool.
@@ -166,7 +166,7 @@ impl<S: HostStore> PooledStore<S, PoolClient> {
     }
 }
 
-impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
+impl<S: crate::store::TierStore, P: PoolPort> PooledStore<S, P> {
     pub fn new(mut inner: S, pool: P, identity: Identity, layout: &crate::Layout) -> Self {
         inner.announce_to(pool.announcer());
         inner.cascade();
@@ -263,7 +263,7 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
     }
 }
 
-impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
+impl<S: crate::store::TierStore, P: PoolPort> PooledStore<S, P> {
     fn pool_finished(
         &mut self,
         id: u64,
@@ -312,7 +312,7 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
     }
 }
 
-impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
+impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
     fn write_back_reserve(&self, largest_pages: usize, prefill_rate: f64) -> usize {
         self.inner.write_back_reserve(largest_pages, prefill_rate)
     }

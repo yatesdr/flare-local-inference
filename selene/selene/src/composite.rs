@@ -33,6 +33,7 @@
 //! have landed; when the parent's own write fails, those children fail too,
 //! because their memory copies hold only their tail pages.
 
+use crate::store::TierStore;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -1245,72 +1246,6 @@ impl HostStore for CompositeStore {
         polled
     }
 
-    fn cascade(&mut self) {
-        self.pooled = true;
-    }
-
-    fn set_spill(&mut self, enabled: bool) {
-        self.disk.set_spill(enabled);
-    }
-
-    fn take_retiring(&mut self) -> Vec<Retiring> {
-        self.disk.take_retiring()
-    }
-
-    fn retired(&mut self, key: PrefixKey, tier: PoolTier, how: Retirement) {
-        self.disk.retired(key, tier, how);
-    }
-
-    fn closest_tier(&self) -> Option<Tier> {
-        Some(Tier::Memory)
-    }
-
-    fn announce_to(&mut self, announcer: Announcer) {
-        if let Err(error) = self.memory.announce_records(announcer.clone()) {
-            eprintln!("warning: host memory records will not be shared: {error}");
-        }
-        self.disk.announce_records(announcer);
-    }
-
-    fn pin_export(
-        &mut self,
-        tier: PoolTier,
-        key: PrefixKey,
-        begin_tokens: u64,
-        want_row: bool,
-    ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
-        if tier == PoolTier::Nvme {
-            return self.disk.pin_export_files(key, begin_tokens, want_row);
-        }
-        // The memory records are flat: the disk index supplies the chain, and
-        // each record on it must be resident with all its pages (and the row,
-        // at the endpoint when wanted).
-        let page_tokens = self.disk.layout().page_tokens;
-        let start_page = begin_tokens / page_tokens;
-        let mut chain = Vec::new();
-        let mut cursor = key;
-        loop {
-            let node = self
-                .disk
-                .index()
-                .node(&cursor)
-                .ok_or(ExportRefusal::NotFound)?;
-            let row = want_row && cursor == key;
-            if !self.resident(&cursor, node.tail_pages, row) {
-                return Err(ExportRefusal::ChainGap);
-            }
-            chain.push(cursor);
-            let start =
-                (cursor.consumed_tokens / page_tokens).saturating_sub(node.tail_pages as u64);
-            if start <= start_page {
-                break;
-            }
-            cursor = node.parent.ok_or(ExportRefusal::ChainGap)?;
-        }
-        chain.reverse();
-        self.memory.pin_export_chain(&chain, begin_tokens, want_row)
-    }
-
     fn stats(&self) -> StoreStats {
         let memory = self.memory.stats();
         let disk = self.disk.stats();
@@ -1368,6 +1303,68 @@ impl HostStore for CompositeStore {
         self.jobs.clear();
         self.stale.clear();
         Ok(())
+    }
+}
+
+impl crate::store::TierStore for CompositeStore {
+    fn announce_to(&mut self, announcer: Announcer) {
+        if let Err(error) = self.memory.announce_records(announcer.clone()) {
+            eprintln!("warning: host memory records will not be shared: {error}");
+        }
+        self.disk.announce_records(announcer);
+    }
+    fn pin_export(
+        &mut self,
+        tier: PoolTier,
+        key: PrefixKey,
+        begin_tokens: u64,
+        want_row: bool,
+    ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
+        if tier == PoolTier::Nvme {
+            return self.disk.pin_export_files(key, begin_tokens, want_row);
+        }
+        // The memory records are flat: the disk index supplies the chain, and
+        // each record on it must be resident with all its pages (and the row,
+        // at the endpoint when wanted).
+        let page_tokens = self.disk.layout().page_tokens;
+        let start_page = begin_tokens / page_tokens;
+        let mut chain = Vec::new();
+        let mut cursor = key;
+        loop {
+            let node = self
+                .disk
+                .index()
+                .node(&cursor)
+                .ok_or(ExportRefusal::NotFound)?;
+            let row = want_row && cursor == key;
+            if !self.resident(&cursor, node.tail_pages, row) {
+                return Err(ExportRefusal::ChainGap);
+            }
+            chain.push(cursor);
+            let start =
+                (cursor.consumed_tokens / page_tokens).saturating_sub(node.tail_pages as u64);
+            if start <= start_page {
+                break;
+            }
+            cursor = node.parent.ok_or(ExportRefusal::ChainGap)?;
+        }
+        chain.reverse();
+        self.memory.pin_export_chain(&chain, begin_tokens, want_row)
+    }
+    fn closest_tier(&self) -> Option<Tier> {
+        Some(Tier::Memory)
+    }
+    fn cascade(&mut self) {
+        self.pooled = true;
+    }
+    fn set_spill(&mut self, enabled: bool) {
+        self.disk.set_spill(enabled);
+    }
+    fn take_retiring(&mut self) -> Vec<Retiring> {
+        self.disk.take_retiring()
+    }
+    fn retired(&mut self, key: PrefixKey, tier: PoolTier, how: Retirement) {
+        self.disk.retired(key, tier, how);
     }
 }
 

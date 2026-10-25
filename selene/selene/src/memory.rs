@@ -27,6 +27,7 @@
 //! supplies chains, and `fetch_chain` reads page counts from the slabs. Such a
 //! store answers no lookups of its own.
 
+use crate::store::TierStore;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, PoisonError},
@@ -1355,44 +1356,6 @@ impl HostStore for MemoryStore {
         Ok(())
     }
 
-    fn closest_tier(&self) -> Option<Tier> {
-        Some(Tier::Memory)
-    }
-
-    fn announce_to(&mut self, announcer: Announcer) {
-        if let Err(error) = self.announce_records(announcer) {
-            eprintln!("warning: host memory records will not be shared: {error}");
-        }
-    }
-
-    fn set_spill(&mut self, enabled: bool) {
-        self.core.spill = enabled && !self.core.flat && self.announce.is_some();
-    }
-
-    fn take_retiring(&mut self) -> Vec<Retiring> {
-        std::mem::take(&mut self.core.retiring)
-    }
-
-    fn retired(&mut self, key: PrefixKey, tier: PoolTier, how: Retirement) {
-        if tier == PoolTier::Dram {
-            self.core.retired(&key, how);
-        }
-    }
-
-    fn pin_export(
-        &mut self,
-        tier: PoolTier,
-        key: PrefixKey,
-        begin_tokens: u64,
-        want_row: bool,
-    ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
-        if tier != PoolTier::Dram || self.core.flat {
-            return Err(ExportRefusal::NotFound);
-        }
-        let chain = self.export_chain(&key, begin_tokens)?;
-        self.pin_export_chain(&chain, begin_tokens, want_row)
-    }
-
     fn stats(&self) -> StoreStats {
         self.core.stats()
     }
@@ -1420,6 +1383,41 @@ impl HostStore for MemoryStore {
         self.core.abandon();
         self.events.clear();
         Ok(())
+    }
+}
+
+impl crate::store::TierStore for MemoryStore {
+    fn announce_to(&mut self, announcer: Announcer) {
+        if let Err(error) = self.announce_records(announcer) {
+            eprintln!("warning: host memory records will not be shared: {error}");
+        }
+    }
+    fn pin_export(
+        &mut self,
+        tier: PoolTier,
+        key: PrefixKey,
+        begin_tokens: u64,
+        want_row: bool,
+    ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
+        if tier != PoolTier::Dram || self.core.flat {
+            return Err(ExportRefusal::NotFound);
+        }
+        let chain = self.export_chain(&key, begin_tokens)?;
+        self.pin_export_chain(&chain, begin_tokens, want_row)
+    }
+    fn closest_tier(&self) -> Option<Tier> {
+        Some(Tier::Memory)
+    }
+    fn set_spill(&mut self, enabled: bool) {
+        self.core.spill = enabled && !self.core.flat && self.announce.is_some();
+    }
+    fn take_retiring(&mut self) -> Vec<Retiring> {
+        std::mem::take(&mut self.core.retiring)
+    }
+    fn retired(&mut self, key: PrefixKey, tier: PoolTier, how: Retirement) {
+        if tier == PoolTier::Dram {
+            self.core.retired(&key, how);
+        }
     }
 }
 

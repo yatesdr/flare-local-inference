@@ -253,7 +253,10 @@ impl PreparedPool {
         }
         Ok(())
     }
-    pub fn attach(self, local: Option<Box<dyn HostStore>>) -> Result<Box<dyn HostStore>> {
+    pub(crate) fn attach(
+        self,
+        local: Option<Box<dyn crate::store::TierStore>>,
+    ) -> Result<Box<dyn HostStore>> {
         Ok(Box::new(PooledStore::new(
             super::local::Tiers::new(local),
             self.client
@@ -289,3 +292,6 @@ impl HostRegistrar for PoolRegistrar {
         Err(crate::Error::new("the pool does not use split mappings"))
     }
 }
+
+#[cfg(test)]
+mod tests;

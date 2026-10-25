@@ -1,3 +1,4 @@
+use crate::store::TierStore;
 use std::sync::{Arc, Mutex};
 
 use super::*;
@@ -72,9 +73,7 @@ impl HostStore for FakeLocal {
         state.stored.push(checkpoint.key);
         Ok(state.store_outcome.unwrap_or(StoreOutcome::Queued))
     }
-    fn closest_tier(&self) -> Option<Local> {
-        Some(Local::Memory)
-    }
+
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()> {
         let mut state = self.0.lock().unwrap();
         if state.reject_fetch {
@@ -96,20 +95,11 @@ impl HostStore for FakeLocal {
     fn close(&mut self) -> Result<()> {
         Ok(())
     }
+}
+
+impl crate::store::TierStore for FakeLocal {
     fn announce_to(&mut self, _: Announcer) {
         self.0.lock().unwrap().announced = true;
-    }
-    fn cascade(&mut self) {
-        self.0.lock().unwrap().cascaded = true;
-    }
-    fn set_spill(&mut self, enabled: bool) {
-        self.0.lock().unwrap().spill = Some(enabled);
-    }
-    fn take_retiring(&mut self) -> Vec<Retiring> {
-        std::mem::take(&mut self.0.lock().unwrap().retiring)
-    }
-    fn retired(&mut self, key: PrefixKey, _: Tier, how: Retirement) {
-        self.0.lock().unwrap().retired.push((key, how));
     }
     fn pin_export(
         &mut self,
@@ -124,6 +114,21 @@ impl HostStore for FakeLocal {
             Some(reason) => Err(reason),
             None => Ok(Box::new(NoPin(key))),
         }
+    }
+    fn closest_tier(&self) -> Option<Local> {
+        Some(Local::Memory)
+    }
+    fn cascade(&mut self) {
+        self.0.lock().unwrap().cascaded = true;
+    }
+    fn set_spill(&mut self, enabled: bool) {
+        self.0.lock().unwrap().spill = Some(enabled);
+    }
+    fn take_retiring(&mut self) -> Vec<Retiring> {
+        std::mem::take(&mut self.0.lock().unwrap().retiring)
+    }
+    fn retired(&mut self, key: PrefixKey, _: Tier, how: Retirement) {
+        self.0.lock().unwrap().retired.push((key, how));
     }
 }
 

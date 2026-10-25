@@ -571,7 +571,7 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
             }
         })
         .transpose()?;
-    let local: Option<Box<dyn HostStore>> = match (memory, disk) {
+    let local: Option<Box<dyn crate::store::TierStore>> = match (memory, disk) {
         (Some(memory), Some(disk)) => Some(Box::new(composite::CompositeStore::new(memory, disk)?)),
         (Some(memory), None) => Some(Box::new(memory)),
         (None, Some(disk)) => Some(Box::new(disk)),
