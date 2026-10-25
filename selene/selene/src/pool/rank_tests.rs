@@ -3,13 +3,16 @@
 //! instance of the same shape holds, slice by slice.
 
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
 use crate::{
-    CacheGeometry, History, PageId, PrefixKey, Result, StateSlotId,
+    CacheGeometry, History, PageCopier, PageId, PrefixKey, Result, StateSlotId,
     characterize::Ranking,
     geometry::fingerprint,
     plan::{self, Identity, Request},
@@ -18,7 +21,7 @@ use crate::{
         PoolAddress, PoolClient, PoolConfig, PoolEvent, PoolFetch, PoolStatus, Scope, Tier,
         agent::{AgentConfig, RankAgent},
         manager_tests::{Manager, OkRegistrar, PT, history_of, wait},
-        rank::{RankSet, memory_links},
+        rank::{RankLink, RankSet, memory_links},
     },
     record::checksum,
     testing::{GpuMemory, SimulatedGpu, TestHistory, geometry},
@@ -175,12 +178,112 @@ fn instance_reaching(manager: &Manager, world: usize, reach: &[Reach]) -> Instan
 
 /// As [`instance_reaching`]; the GPUs, and so the instance, differ with `seed`.
 fn instance_seeded(manager: &Manager, world: usize, reach: &[Reach], seed: u8) -> Instance {
+    instance_with(manager, world, reach, seed, &Faults::default())
+}
+
+/// What a test does to a rank of an instance.
+#[derive(Default)]
+struct Faults {
+    /// Rank r's copier holds its replies while the gate is shut, and fails them when asked.
+    gates: Vec<(usize, Arc<Gate>)>,
+    /// Rank r's link to rank 0 can be cut.
+    cuts: Vec<(usize, Arc<AtomicBool>)>,
+}
+
+struct Gate {
+    open: AtomicBool,
+    fail: AtomicBool,
+}
+
+impl Gate {
+    fn shut() -> Arc<Self> {
+        Arc::new(Self {
+            open: AtomicBool::new(false),
+            fail: AtomicBool::new(false),
+        })
+    }
+}
+
+/// A simulated GPU whose completions wait for a gate.
+struct GatedGpu {
+    inner: SimulatedGpu,
+    gate: Arc<Gate>,
+    held: Vec<crate::Reply>,
+}
+
+impl crate::PageCopier for GatedGpu {
+    fn layout(&self) -> &crate::Layout {
+        self.inner.layout()
+    }
+    fn submit(&mut self, job: crate::Job) -> Result<()> {
+        self.inner.submit(job)
+    }
+    fn poll(&mut self, replies: &mut Vec<crate::Reply>) {
+        self.inner.poll(&mut self.held);
+        if self.gate.open.load(Ordering::SeqCst) {
+            for mut reply in self.held.drain(..) {
+                if self.gate.fail.load(Ordering::SeqCst) {
+                    reply.result = Err("injected copy failure".into());
+                }
+                replies.push(reply);
+            }
+        }
+    }
+    fn in_flight(&self) -> usize {
+        self.inner.in_flight() + self.held.len()
+    }
+    fn close(&mut self) -> Result<()> {
+        self.inner.close()
+    }
+}
+
+/// A link that fails for both ends once cut.
+fn cuttable(link: RankLink, cut: Arc<AtomicBool>) -> RankLink {
+    struct Tx(Box<dyn crate::pool::FrameSender>, Arc<AtomicBool>);
+    impl crate::pool::FrameSender for Tx {
+        fn send(&mut self, frame: Vec<u8>) -> Result<()> {
+            if self.1.load(Ordering::SeqCst) {
+                return Err("the link was cut".into());
+            }
+            self.0.send(frame)
+        }
+    }
+    struct Rx(Box<dyn crate::pool::FrameReceiver>, Arc<AtomicBool>);
+    impl crate::pool::FrameReceiver for Rx {
+        fn recv(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>> {
+            if self.1.load(Ordering::SeqCst) {
+                return Err("the link was cut".into());
+            }
+            self.0.recv(timeout)
+        }
+    }
+    RankLink {
+        sender: Box::new(Tx(link.sender, cut.clone())),
+        receiver: Box::new(Rx(link.receiver, cut)),
+    }
+}
+
+fn instance_with(
+    manager: &Manager,
+    world: usize,
+    reach: &[Reach],
+    seed: u8,
+    faults: &Faults,
+) -> Instance {
     let mut links = Vec::new();
     let mut peer_ends = Vec::new();
-    for _ in 1..world {
+    for rank in 1..world {
         let (zero, peer) = memory_links();
-        links.push(zero);
-        peer_ends.push(peer);
+        match faults.cuts.iter().find(|(r, _)| *r == rank) {
+            Some((_, cut)) => {
+                links.push(cuttable(zero, cut.clone()));
+                peer_ends.push(cuttable(peer, cut.clone()));
+            }
+            None => {
+                links.push(zero);
+                peer_ends.push(peer);
+            }
+        }
     }
     let (copier, gpu0) = SimulatedGpu::shared(&[local()]).unwrap();
     let gpus: Vec<[u8; 16]> = (0..world).map(|r| [seed + r as u8; 16]).collect();
@@ -200,7 +303,18 @@ fn instance_seeded(manager: &Manager, world: usize, reach: &[Reach], seed: u8) -
     let mut agents = Vec::new();
     for (index, link) in peer_ends.into_iter().enumerate() {
         let rank = index + 1;
-        let (copier, gpu) = SimulatedGpu::shared(&[local()]).unwrap();
+        let (copier, gpu) = match faults.gates.iter().find(|(r, _)| *r == rank) {
+            Some((_, gate)) => {
+                let (inner, gpu) = SimulatedGpu::new(&[local()]).unwrap();
+                let copier: crate::SharedCopier = Arc::new(std::sync::Mutex::new(GatedGpu {
+                    inner,
+                    gate: gate.clone(),
+                    held: Vec::new(),
+                }));
+                (copier, gpu)
+            }
+            None => SimulatedGpu::shared(&[local()]).unwrap(),
+        };
         memory.push(gpu);
         agents.push(
             RankAgent::start(AgentConfig {
@@ -785,4 +899,293 @@ fn three_ranks_on_channels_put_and_another_multi_process_instance_restores() {
         &[Reach::Network, Reach::Network, Reach::Network],
         Some(&[Reach::Local, Reach::Network, Reach::Local]),
     );
+}
+
+// ---- faults ------------------------------------------------------------------------
+
+/// A single-process source offering a four-page host record, a multi-process requester
+/// with `faults`, and a fetch of the record that the source's pin has not yet served.
+struct Scenario {
+    source: Source,
+    requester: Instance,
+    world: usize,
+    pages: usize,
+    key: PrefixKey,
+    scratch: [u32; 4],
+}
+
+fn scenario(manager: &Manager, world: usize, reach: &[Reach], faults: &Faults) -> Scenario {
+    let source = source(manager, world);
+    let mut requester = instance_with(manager, world, reach, 2, faults);
+    wait("the source", || source.client.status() == PoolStatus::Ready);
+    requester.ready();
+    let history = history_of(4000);
+    let pages = 4;
+    let key = offer(&source, &history, world, pages);
+    wait_offered(&requester.rank0, &history);
+    let scratch = [100, 101, 102, 103];
+    let fetch = fetch_for(&requester.rank0, world, &history, pages, &scratch);
+    requester.rank0.fetch(fetch).unwrap();
+    Scenario {
+        source,
+        requester,
+        world,
+        pages,
+        key,
+        scratch,
+    }
+}
+
+impl Scenario {
+    /// The source pins and serves the record, with `pin` unless a test supplies its own.
+    fn serve(&mut self, pin_for: Option<Box<dyn HostPin>>) {
+        let export = loop {
+            let mut events = Vec::new();
+            self.source.client.poll(&mut events).unwrap();
+            if let Some(request) = events.into_iter().find_map(|e| match e {
+                PoolEvent::Export(request) => Some(request),
+                _ => None,
+            }) {
+                break request;
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
+        let pin = pin_for.unwrap_or_else(|| pin(self.world, self.key, 11, self.pages));
+        self.source.client.host_pinned(export.export, pin);
+    }
+
+    fn fetched(&mut self) -> std::result::Result<u64, String> {
+        self.requester.event("the restore", |e| match e {
+            PoolEvent::Fetched { result, .. } => {
+                Some(result.as_ref().map(|b| *b).map_err(|f| f.error.to_string()))
+            }
+            _ => None,
+        })
+    }
+
+    /// No further `Fetched` is ever reported for this restore.
+    fn assert_no_more_events(&mut self) {
+        thread::sleep(Duration::from_millis(300));
+        self.requester.poll();
+        assert!(
+            !self
+                .requester
+                .events
+                .iter()
+                .any(|e| matches!(e, PoolEvent::Fetched { .. })),
+            "a second result"
+        );
+    }
+}
+
+#[test]
+fn a_restore_is_reported_only_after_every_rank_drained_and_no_rank_is_read_early() {
+    let manager = Manager::start();
+    let gate = Gate::shut();
+    let faults = Faults {
+        gates: vec![(1, gate.clone())],
+        cuts: Vec::new(),
+    };
+    let mut scenario = scenario(&manager, 2, &[Reach::Local, Reach::Local], &faults);
+    scenario.serve(None);
+    // Rank 0 finishes its own copies; rank 1's replies are held by its gate.
+    wait("rank 0 to have its pages", || {
+        scenario.requester.memory[0].pages.lock().unwrap().len() == scenario.pages
+    });
+    wait("rank 1 to have started its copies", || {
+        !scenario.requester.memory[1]
+            .pages
+            .lock()
+            .unwrap()
+            .is_empty()
+    });
+    thread::sleep(Duration::from_millis(400));
+    scenario.requester.poll();
+    assert!(
+        !scenario
+            .requester
+            .events
+            .iter()
+            .any(|e| matches!(e, PoolEvent::Fetched { .. })),
+        "nothing is reported while a rank has not drained: {:?}",
+        scenario.requester.events
+    );
+    gate.open.store(true, Ordering::SeqCst);
+    let (page, row) = whole(2);
+    assert_eq!(scenario.fetched(), Ok((scenario.pages * page + row) as u64));
+    assert_slices(&scenario.requester, 2, scenario.pages, &scenario.scratch);
+    scenario.assert_no_more_events();
+    scenario.requester.close();
+}
+
+#[test]
+fn a_rank_whose_copy_fails_fails_the_whole_restore_once_and_the_next_restore_works() {
+    let manager = Manager::start();
+    let gate = Gate::shut();
+    gate.fail.store(true, Ordering::SeqCst);
+    gate.open.store(true, Ordering::SeqCst);
+    let faults = Faults {
+        gates: vec![(1, gate.clone())],
+        cuts: Vec::new(),
+    };
+    let mut scenario = scenario(&manager, 2, &[Reach::Local, Reach::Local], &faults);
+    scenario.serve(None);
+    let failure = scenario.fetched().expect_err("a rank failed");
+    assert!(failure.contains("rank 1"), "{failure}");
+    scenario.assert_no_more_events();
+    // Nothing is left leased: the same restore, with the rank healthy again, succeeds.
+    gate.fail.store(false, Ordering::SeqCst);
+    let history = history_of(4000);
+    let scratch = [200, 201, 202, 203];
+    let fetch = fetch_for(
+        &scenario.requester.rank0,
+        2,
+        &history,
+        scenario.pages,
+        &scratch,
+    );
+    scenario.requester.rank0.fetch(fetch).unwrap();
+    scenario.serve(None);
+    let (page, row) = whole(2);
+    assert_eq!(scenario.fetched(), Ok((scenario.pages * page + row) as u64));
+    assert_slices(&scenario.requester, 2, scenario.pages, &scratch);
+    scenario.requester.close();
+}
+
+#[test]
+fn a_cut_link_with_a_rank_still_copying_stops_the_pool_and_reports_nothing() {
+    let manager = Manager::start();
+    let gate = Gate::shut();
+    let cut = Arc::new(AtomicBool::new(false));
+    let faults = Faults {
+        gates: vec![(1, gate.clone())],
+        cuts: vec![(1, cut.clone())],
+    };
+    let mut scenario = scenario(&manager, 2, &[Reach::Local, Reach::Local], &faults);
+    scenario.serve(None);
+    wait("rank 0 to have its pages", || {
+        scenario.requester.memory[0].pages.lock().unwrap().len() == scenario.pages
+    });
+    wait("rank 1 to have started its copies", || {
+        !scenario.requester.memory[1]
+            .pages
+            .lock()
+            .unwrap()
+            .is_empty()
+    });
+    cut.store(true, Ordering::SeqCst);
+    // The pool can no longer account for rank 1's copies: polling fails, as a copy that
+    // cannot be drained does, and no result is ever given for pages it may still write.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut events = Vec::new();
+        match scenario.requester.rank0.poll(&mut events) {
+            Err(_) => break,
+            Ok(()) => assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, PoolEvent::Fetched { .. })),
+                "a result was given for pages a rank may still write"
+            ),
+        }
+        assert!(Instant::now() < deadline, "the pool was not stopped");
+        thread::sleep(Duration::from_millis(5));
+    }
+    // Let the stuck rank finish so the test can clean up.
+    gate.open.store(true, Ordering::SeqCst);
+    let _ = scenario.requester.rank0.close();
+}
+
+#[test]
+fn a_stored_checksum_that_is_wrong_fails_the_restore_before_any_rank_copies() {
+    let manager = Manager::start();
+    let mut scenario = scenario(
+        &manager,
+        2,
+        &[Reach::Local, Reach::Local],
+        &Faults::default(),
+    );
+    // The source's pin states a wrong persisted checksum for page 2.
+    let mut bad = pin(2, scenario.key, 11, scenario.pages);
+    // SAFETY of the downcast: `pin` builds a `Pin`; flip a sum through its serving side by
+    // reading through a wrapper instead.
+    struct Corrupt(Box<dyn HostPin>);
+    impl HostPin for Corrupt {
+        fn chain(&self) -> &HostChain {
+            self.0.chain()
+        }
+        fn read(&mut self, window: &HostWindow, dst: &mut [u8]) -> Result<Checksums> {
+            let mut sums = self.0.read(window, dst)?;
+            if let Some(sum) = sums
+                .pages
+                .get_mut(2usize.saturating_sub(window.first_page as usize))
+            {
+                *sum ^= 1;
+            }
+            Ok(sums)
+        }
+    }
+    bad = Box::new(Corrupt(bad));
+    scenario.serve(Some(bad));
+    let failure = scenario.fetched().expect_err("the checksum is wrong");
+    assert!(
+        failure.contains("Checksum") || failure.contains("Failed"),
+        "{failure}"
+    );
+    for (rank, memory) in scenario.requester.memory.iter().enumerate() {
+        assert!(
+            memory.pages.lock().unwrap().is_empty(),
+            "rank {rank} copied a page of a window that failed its checksum"
+        );
+    }
+    scenario.assert_no_more_events();
+    scenario.requester.close();
+}
+
+#[test]
+fn a_manager_that_restarts_is_reattached_by_every_rank_and_restores_again() {
+    let mut manager = Manager::start();
+    let mut requester = instance(&manager, 2);
+    requester.ready();
+    manager.restart();
+    // Rank 0 reconnects and every agent attaches again, then a restore from a fresh source
+    // works.
+    let mut scenario_source = source(&manager, 2);
+    wait("the source", || {
+        scenario_source.client.status() == PoolStatus::Ready
+    });
+    wait("rank 0 to be Ready again", || {
+        requester.rank0.status() == PoolStatus::Ready
+    });
+    let history = history_of(4000);
+    let pages = 4;
+    let key = offer(&scenario_source, &history, 2, pages);
+    wait_offered(&requester.rank0, &history);
+    let scratch = [100, 101, 102, 103];
+    let fetch = fetch_for(&requester.rank0, 2, &history, pages, &scratch);
+    requester.rank0.fetch(fetch).unwrap();
+    let export = loop {
+        let mut events = Vec::new();
+        scenario_source.client.poll(&mut events).unwrap();
+        if let Some(request) = events.into_iter().find_map(|e| match e {
+            PoolEvent::Export(request) => Some(request),
+            _ => None,
+        }) {
+            break request;
+        }
+        thread::sleep(Duration::from_millis(2));
+    };
+    scenario_source
+        .client
+        .host_pinned(export.export, pin(2, key, 11, pages));
+    let (page, row) = whole(2);
+    let result = requester.event("the restore", |e| match e {
+        PoolEvent::Fetched { result, .. } => {
+            Some(result.as_ref().map(|b| *b).map_err(|f| f.error.to_string()))
+        }
+        _ => None,
+    });
+    assert_eq!(result, Ok((pages * page + row) as u64));
+    assert_slices(&requester, 2, pages, &scratch);
+    requester.close();
 }
