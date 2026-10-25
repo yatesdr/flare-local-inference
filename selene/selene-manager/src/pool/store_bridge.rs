@@ -993,7 +993,7 @@ impl Core {
         for key in keys {
             if let Some(mp) = self.puts.get_mut(&key).and_then(|rec| rec.mp.as_mut()) {
                 for peer in mp.peers.iter_mut().filter(|p| p.proc == process) {
-                    if matches!(peer.fence, Party::Pending | Party::Quarantined) || gone {
+                    if peer.fence == Party::Pending || gone {
                         peer.fence = Party::Drained;
                     }
                 }
@@ -1441,6 +1441,92 @@ pub(super) fn persisted_checksums(metadata: &[u8]) -> Option<(Vec<u64>, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quarantined_put_peer_is_retained_until_its_process_exits() {
+        use super::super::{core::Proc, mp::MpPeer};
+        use flare_selene::pool::{Geometry, RankPlanes, SliceLayout};
+        use std::{collections::BTreeMap, sync::Arc};
+        let (mut core, _handle, _events) = Core::new(
+            Default::default(),
+            Default::default(),
+            crate::arena::Arena::new(4096).unwrap(),
+            true,
+            0,
+            None,
+        );
+        let process = ([1; 16], [2; 16]);
+        core.procs.insert(
+            process,
+            Proc {
+                pid: None,
+                pidfd: None,
+                exited: false,
+                claim_hw: 0,
+                put_hw: 0,
+                idle_since: None,
+                link: None,
+            },
+        );
+        let key = ([3; 16], [4; 16], 1);
+        let layout = Arc::new(
+            SliceLayout::new(&Geometry {
+                page_tokens: 64,
+                ranks: vec![
+                    RankPlanes {
+                        plane_bytes: vec![4096],
+                        row_bytes: 4096
+                    };
+                    2
+                ],
+                page_record_bytes: 8192,
+                row_record_bytes: 8192,
+            })
+            .unwrap(),
+        );
+        core.puts.insert(
+            key,
+            PutRec {
+                phase: PutPhase::Finished,
+                link: Link {
+                    connection: 1,
+                    generation: 1,
+                    namespace: [0; 32],
+                },
+                unfilled: 0,
+                fence: Party::Drained,
+                refused: false,
+                key: Key::default(),
+                chain_pages: 0,
+                row: true,
+                accepted: None,
+                channel: None,
+                deferred_commit: None,
+                fenced: true,
+                mp: Some(PutMp {
+                    layout,
+                    peers: vec![MpPeer {
+                        rank: 1,
+                        proc: process,
+                        shared: true,
+                        fence: Party::Quarantined,
+                    }],
+                    legs: Vec::new(),
+                    windows: BTreeMap::new(),
+                    passes: 0,
+                    whole: Vec::new(),
+                    row: None,
+                }),
+            },
+        );
+        core.party_quiesced(process);
+        assert_eq!(
+            core.puts[&key].mp.as_ref().unwrap().peers[0].fence,
+            Party::Quarantined
+        );
+        core.proc_exited(process);
+        assert!(!core.puts.contains_key(&key));
+    }
 
     #[test]
     fn the_row_checksum_sits_where_the_header_keeps_it_and_set_checksums_rewrites_the_table() {
