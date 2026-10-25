@@ -35,6 +35,58 @@ pub struct MpSide {
     pub peers: Vec<MpPeer>,
 }
 
+pub fn peers_quiet(peers: &[MpPeer], exited: impl Fn(&ProcKey) -> bool) -> bool {
+    peers
+        .iter()
+        .all(|peer| !peer.shared || peer.fence == Party::Drained || exited(&peer.proc))
+}
+
+pub fn rank_sums(sums: Vec<v2::RankSums>) -> Vec<(usize, SliceSums)> {
+    sums.into_iter()
+        .map(|s| {
+            (
+                s.rank as usize,
+                SliceSums {
+                    pages: s.page_xxh3,
+                    row: s.has_row.then_some(s.row_xxh3),
+                },
+            )
+        })
+        .collect()
+}
+
+pub fn accept_parts(
+    stated: &mut Vec<Option<SliceSums>>,
+    writers: &mut u64,
+    parts: Vec<(usize, SliceSums)>,
+    slot: u32,
+    pages: u32,
+    row: bool,
+) -> Result<Option<Vec<SliceSums>>, ()> {
+    let bit = 1u64.checked_shl(slot).ok_or(())?;
+    if *writers & bit == 0 {
+        return Ok(None);
+    }
+    for (rank, sums) in parts {
+        if sums.pages.len() != pages as usize || sums.row.is_some() != row {
+            return Err(());
+        }
+        match stated.get_mut(rank) {
+            Some(entry @ None) => *entry = Some(sums),
+            _ => return Err(()),
+        }
+    }
+    *writers &= !bit;
+    if *writers != 0 {
+        return Ok(None);
+    }
+    stated
+        .drain(..)
+        .collect::<Option<Vec<_>>>()
+        .map(Some)
+        .ok_or(())
+}
+
 /// A peer rank's data-channel leg.
 pub struct RankLeg {
     pub rank: u32,
@@ -71,6 +123,17 @@ pub struct MpState {
 }
 
 impl MpState {
+    pub fn quiet(&self, source: bool, exited: impl Fn(&ProcKey) -> bool) -> bool {
+        let side = if source { &self.src } else { &self.req };
+        side.as_ref()
+            .is_none_or(|side| peers_quiet(&side.peers, exited))
+            && self
+                .legs
+                .iter()
+                .filter(|leg| leg.source == source)
+                .all(|leg| leg.ch.exited)
+    }
+
     /// Bit `rank` of a window's reader mask: the legs that must read it before it is free.
     pub fn leg_readers(&self) -> u64 {
         self.legs
@@ -255,26 +318,20 @@ impl Core {
         let Some(window) = claim.windows.get_mut(index as usize) else {
             return;
         };
-        if window.phase != Phase::SourceWrite || window.arrived || window.writers & (1 << slot) == 0
-        {
+        if window.phase != Phase::SourceWrite || window.arrived {
             return;
         }
-        for (rank, sums) in parts {
-            match window.stated.get_mut(rank) {
-                Some(entry @ None) => *entry = Some(sums),
-                // An unknown rank, or one that already stated: a repeat is no vote.
-                _ => {
-                    return self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
-                }
-            }
-        }
-        window.writers &= !(1 << slot);
-        if window.writers != 0 {
-            return;
-        }
-        let stated: Option<Vec<SliceSums>> = window.stated.drain(..).collect();
-        let Some(stated) = stated else {
-            return self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
+        let stated = match accept_parts(
+            &mut window.stated,
+            &mut window.writers,
+            parts,
+            slot,
+            window.plan.page_count,
+            window.plan.row,
+        ) {
+            Ok(Some(stated)) => stated,
+            Ok(None) => return,
+            Err(()) => return self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError),
         };
         window.arrived = true;
         self.window_arrived(key, index as usize, Stated::Ranks(stated));
@@ -479,4 +536,31 @@ pub struct PutMp {
     /// the record keeps, whatever the ranks' own checksums were.
     pub whole: Vec<Option<u64>>,
     pub row: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_rank_statements_cannot_complete_a_window() {
+        let sums = SliceSums {
+            pages: vec![7],
+            row: None,
+        };
+        let mut stated = vec![None];
+        let mut writers = 1;
+        assert!(
+            accept_parts(
+                &mut stated,
+                &mut writers,
+                vec![(0, sums.clone()), (0, sums)],
+                0,
+                1,
+                false
+            )
+            .is_err()
+        );
+        assert_eq!(writers, 1, "a rejected batch must not discharge its writer");
+    }
 }

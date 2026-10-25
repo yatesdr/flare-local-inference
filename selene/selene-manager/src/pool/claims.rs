@@ -1407,19 +1407,7 @@ impl Core {
                 self.reclaim(key);
                 return Ok(());
             }
-            let parts = m
-                .rank_sums
-                .into_iter()
-                .map(|sums| {
-                    (
-                        sums.rank as usize,
-                        SliceSums {
-                            pages: sums.page_xxh3,
-                            row: sums.has_row.then_some(sums.row_xxh3),
-                        },
-                    )
-                })
-                .collect();
+            let parts = super::mp::rank_sums(m.rank_sums);
             self.stated_part(key, index as u32, parts, 0);
             return Ok(());
         }
@@ -2148,31 +2136,8 @@ impl Core {
         };
         // A multi-process requester's peers: a shared-memory one answers for itself (its own
         // attestation, or its process's exit); one on a leg is fenced by the handler's exit.
-        let peers_ok = claim.mp.req.as_ref().is_none_or(|side| {
-            side.peers.iter().all(|peer| {
-                !peer.shared
-                    || matches!(peer.fence, Party::Drained)
-                    || self.proc_exited_flag(&peer.proc)
-            })
-        }) && claim
-            .mp
-            .legs
-            .iter()
-            .filter(|leg| !leg.source)
-            .all(|leg| leg.ch.exited);
-        // A multi-process source's peers likewise.
-        let source_peers_ok = claim.mp.src.as_ref().is_none_or(|side| {
-            side.peers.iter().all(|peer| {
-                !peer.shared
-                    || matches!(peer.fence, Party::Drained)
-                    || self.proc_exited_flag(&peer.proc)
-            })
-        }) && claim
-            .mp
-            .legs
-            .iter()
-            .filter(|leg| leg.source)
-            .all(|leg| leg.ch.exited);
+        let peers_ok = claim.mp.quiet(false, |proc| self.proc_exited_flag(proc));
+        let source_peers_ok = claim.mp.quiet(true, |proc| self.proc_exited_flag(proc));
         // The assembly pass reads manager memory too.
         let quiet = claim.mp.passes == 0;
         let (source_ok, requester_ok) = (
