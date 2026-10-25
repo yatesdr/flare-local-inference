@@ -136,20 +136,9 @@ pub fn instance_name(label: &str) -> String {
 
 /// A probed loopback port for a manager's metrics endpoint. The probe can lose the port to
 /// another process before the manager binds it; `Host::start` retries with a fresh one.
-fn free_metrics_address() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-    drop(listener);
-    address
-}
+fn free_metrics_address() -> String { selene_manager::testing::free_address().to_string() }
 
-pub fn wait(mut condition: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !condition() {
-        assert!(Instant::now() < deadline, "condition timed out");
-        thread::sleep(Duration::from_millis(5));
-    }
-}
+pub fn wait(condition: impl FnMut() -> bool) { selene_manager::testing::wait("manager test", condition); }
 
 pub struct Host {
     pub base: PathBuf,
@@ -219,11 +208,7 @@ impl Host {
     }
 
     pub fn wait(&self, mut condition: impl FnMut(&Host) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while !condition(self) {
-            assert!(Instant::now() < deadline, "condition timed out");
-            thread::sleep(Duration::from_millis(5));
-        }
+        selene_manager::testing::wait("host condition", || condition(self));
     }
 
     pub fn start(&mut self) {

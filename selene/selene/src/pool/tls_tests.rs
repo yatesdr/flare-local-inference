@@ -2,7 +2,7 @@ use super::*;
 use crate::pool::net::{self, Roots};
 
 fn roots(manager: &Manager) -> Roots {
-    let (_, ca) = manager.remote().unwrap();
+    let (_, ca) = remote(&manager).unwrap();
     Roots::Fixed(net::trusted(ca.as_deref(), &Roots::System).unwrap())
 }
 
@@ -32,7 +32,7 @@ fn ready(client: &PoolClient) {
 
 #[test]
 fn a_client_with_a_ca_connects_to_a_tls_manager() {
-    let manager = Manager::start_network(true);
+    let manager = network_manager(true);
     let mut client = connect(config(&manager, "ca", 1), Roots::System);
     ready(&client);
     assert!(!client.registered_regions().is_empty());
@@ -41,7 +41,7 @@ fn a_client_with_a_ca_connects_to_a_tls_manager() {
 
 #[test]
 fn a_client_without_a_ca_file_trusts_the_hosts_store() {
-    let manager = Manager::start_network(true);
+    let manager = network_manager(true);
     let mut config = config(&manager, "roots", 1);
     config.ca = None;
     let mut client = connect(config, roots(&manager));
@@ -51,7 +51,7 @@ fn a_client_without_a_ca_file_trusts_the_hosts_store() {
 
 #[test]
 fn an_untrusted_manager_disables_the_pool_without_registration() {
-    let manager = Manager::start_network(true);
+    let manager = network_manager(true);
     let mut config = config(&manager, "untrusted", 1);
     config.ca = None;
     let mut client = connect(config, other_roots());
@@ -68,7 +68,7 @@ fn an_untrusted_manager_disables_the_pool_without_registration() {
 
 #[test]
 fn a_ca_file_overrides_the_hosts_store() {
-    let manager = Manager::start_network(true);
+    let manager = network_manager(true);
     let mut client = connect(config(&manager, "override", 1), other_roots());
     ready(&client);
     client.close().unwrap();
@@ -76,7 +76,7 @@ fn a_ca_file_overrides_the_hosts_store() {
 
 #[test]
 fn a_plaintext_address_is_explicit() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     let config = config(&manager, "plain", 1);
     assert!(matches!(config.address, PoolAddress::TcpPlaintext(_)));
     let mut client = connect(config, Roots::System);
@@ -86,7 +86,7 @@ fn a_plaintext_address_is_explicit() {
 
 #[test]
 fn a_client_with_a_ca_never_downgrades_to_plaintext() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     let mut config = config(&manager, "downgrade", 1);
     let PoolAddress::TcpPlaintext(address) = config.address else {
         panic!()

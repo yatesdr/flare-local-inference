@@ -80,7 +80,7 @@ fn peer_registration_budget_disables_the_whole_ranked_instance() {
             assert_eq!(charges, [0]);
             assert!(!peer.approved());
             assert!(peer_registrar.calls.lock().unwrap().is_empty());
-            wait(|| {
+            wait("startup", || {
                 matches!(
                     zero.client.as_ref().unwrap().status(),
                     PoolStatus::Disabled(_)
@@ -89,8 +89,8 @@ fn peer_registration_budget_disables_the_whole_ranked_instance() {
             zero.close().unwrap();
         } else {
             assert!(peer.approved());
-            wait(|| zero.client.as_ref().unwrap().status() == PoolStatus::Ready);
-            wait(|| peer.agent.as_ref().unwrap().status() == PoolStatus::Ready);
+            wait("startup", || zero.client.as_ref().unwrap().status() == PoolStatus::Ready);
+            wait("startup", || peer.agent.as_ref().unwrap().status() == PoolStatus::Ready);
             assert_eq!(
                 zero.identity.layout,
                 super::super::geometry::fingerprint(&vec![

@@ -88,7 +88,7 @@ fn over_budget_startup_registers_nothing_and_serves_local_only() {
     ] {
         let registrar = Arc::new(Registrar::default());
         let (prepared, charges) = start(&manager, registrar.clone(), budget);
-        wait(|| {
+        wait("startup", || {
             matches!(
                 prepared.client.as_ref().unwrap().status(),
                 PoolStatus::Disabled(_)
@@ -217,11 +217,11 @@ fn startup_wait_precedes_readiness_and_restart_never_registers_again() {
             .to_string()
             .contains("layouts disagree")
     );
-    wait(|| prepared.client.as_ref().unwrap().status() == PoolStatus::Ready);
+    wait("startup", || prepared.client.as_ref().unwrap().status() == PoolStatus::Ready);
     let topology = prepared.client.as_ref().unwrap().topology();
     manager.stop();
     manager.run();
-    wait(|| {
+    wait("startup", || {
         prepared.client.as_ref().unwrap().topology() != topology
             && prepared.client.as_ref().unwrap().status() == PoolStatus::Ready
     });
@@ -229,7 +229,7 @@ fn startup_wait_precedes_readiness_and_restart_never_registers_again() {
     manager.stop();
     manager.config.staging *= 2;
     manager.run();
-    wait(|| {
+    wait("startup", || {
         matches!(
             prepared.client.as_ref().unwrap().status(),
             PoolStatus::Disabled(_)

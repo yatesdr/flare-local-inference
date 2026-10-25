@@ -353,7 +353,7 @@ impl crate::HostRegistrar for IdentityRegistrar {
 
 #[derive(Default)]
 pub struct TrackingRegistrar {
-    pub calls: std::sync::Mutex<Vec<usize>>,
+    pub calls: std::sync::Mutex<Vec<(usize, usize)>>,
     pub drops: std::sync::Arc<std::sync::Mutex<usize>>,
 }
 struct Registration {
@@ -377,7 +377,7 @@ impl crate::HostRegistrar for TrackingRegistrar {
         address: usize,
         bytes: usize,
     ) -> crate::Result<Box<dyn crate::Registration>> {
-        self.calls.lock().unwrap().push(bytes);
+        self.calls.lock().unwrap().push((address, bytes));
         Ok(Box::new(Registration {
             address,
             drops: self.drops.clone(),
