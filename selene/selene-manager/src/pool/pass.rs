@@ -291,9 +291,9 @@ mod tests {
             let out = run(job).unwrap();
             let slices = out.slices.unwrap();
             assert!(out.whole.is_none());
-            for rank in 0..world {
+            for (rank, got) in slices.iter().enumerate() {
                 assert_eq!(
-                    slices[rank],
+                    *got,
                     f.layout.slice_sums(rank, &window, pages, row).unwrap(),
                     "world {world} pages {pages}"
                 );
@@ -400,11 +400,8 @@ mod tests {
             f.layout.whole_sums(&window, 64, true).unwrap()
         );
         let slices = out.slices.unwrap();
-        for rank in 0..2 {
-            assert_eq!(
-                slices[rank],
-                f.layout.slice_sums(rank, &window, 64, true).unwrap()
-            );
+        for (rank, got) in slices.iter().enumerate() {
+            assert_eq!(*got, f.layout.slice_sums(rank, &window, 64, true).unwrap());
         }
     }
 }

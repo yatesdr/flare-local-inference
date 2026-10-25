@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::{
-    CacheGeometry, History, PageCopier, PageId, PrefixKey, Result, StateSlotId,
+    CacheGeometry, History, PageId, PrefixKey, Result, StateSlotId,
     characterize::Ranking,
     geometry::fingerprint,
     plan::{self, Identity, Request},
