@@ -230,7 +230,6 @@ pub enum SessionKind {
 pub struct Local {
     instance: String,
     directory: PathBuf,
-    boot_nonce: String,
     _lock: File,
     arena: Arena,
     staging: Arena,
@@ -320,7 +319,6 @@ impl Local {
             eprintln!("selene: reclaimed stale instance '{instance}' ({reclaimed} files)");
         }
 
-        let boot_nonce = boot_nonce()?;
         let arena_size = region_size_of(ARENA_FILE, arena_bytes)?;
         let staging_size = region_size_of(STAGING_FILE, staging_bytes)?;
         let arena_path = directory.join(ARENA_FILE);
@@ -374,7 +372,6 @@ impl Local {
         let local = Self {
             instance: instance.to_owned(),
             directory,
-            boot_nonce,
             _lock: lock,
             arena,
             staging,
@@ -913,16 +910,6 @@ fn validate_instance(instance: &str) -> Result<()> {
     Ok(())
 }
 
-fn boot_nonce() -> Result<String> {
-    let mut bytes = [0u8; 8];
-    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    let mut nonce = String::with_capacity(16);
-    for byte in bytes {
-        use std::fmt::Write;
-        write!(nonce, "{byte:02x}").unwrap();
-    }
-    Ok(nonce)
-}
 
 /// Removes every stale entry a crashed owner left in the instance directory.
 ///
@@ -1302,20 +1289,12 @@ mod tests {
     }
 
     #[test]
-    fn stale_regions_are_unlinked_and_boot_nonce_is_fresh() {
+    fn stale_region_debris_is_removed() {
         let name = instance("stale");
         let directory;
-        let old_nonce;
         {
             let first = Local::open(&name, 64 * 1024, 64 * 1024, 4 * 1024 * 1024).unwrap();
             directory = first.directory().to_path_buf();
-            old_nonce = first.boot_nonce.to_owned();
-            assert_eq!(old_nonce.len(), 16);
-            assert!(
-                old_nonce
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            );
             assert!(first.arena_path().exists());
             assert!(first.staging_path().exists());
         }
@@ -1326,9 +1305,7 @@ mod tests {
         let _cleanup = Cleanup(directory.clone());
         assert!(!directory.join("arena-0123456789abcdef").exists());
         assert!(!directory.join("staging-0123456789abcdef").exists());
-        assert!(!directory.join(format!("arena-{old_nonce}")).exists());
         assert!(!directory.join("leftover.tmp").exists());
-        assert_ne!(second.boot_nonce, old_nonce);
         assert!(directory.join("lock").exists());
         assert!(second.arena_path().exists());
         assert_eq!(
@@ -1797,7 +1774,6 @@ mod tests {
             .grant_put(1, 1, 0, Region::Arena, shape(1, false))
             .unwrap();
         assert_ne!(left.arena_path(), right.arena_path());
-        assert_ne!(left.boot_nonce, right.boot_nonce);
 
         // SAFETY: these distinct fixture windows are exclusively owned by this test.
         unsafe {

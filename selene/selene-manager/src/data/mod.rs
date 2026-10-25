@@ -27,13 +27,6 @@ pub enum Region {
 }
 
 impl Region {
-    pub fn as_u8(self) -> u8 {
-        match self {
-            Self::Arena => 1,
-            Self::Staging => 2,
-        }
-    }
-
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             1 => Some(Self::Arena),
@@ -145,10 +138,10 @@ mod tests {
     }
 
     #[test]
-    fn region_round_trip() {
-        assert_eq!(Region::from_u8(Region::Arena.as_u8()), Some(Region::Arena));
+    fn region_numbers_are_checked() {
+        assert_eq!(Region::from_u8(1), Some(Region::Arena));
         assert_eq!(
-            Region::from_u8(Region::Staging.as_u8()),
+            Region::from_u8(2),
             Some(Region::Staging)
         );
         assert_eq!(Region::from_u8(0), None);

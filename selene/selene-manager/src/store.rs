@@ -718,7 +718,6 @@ impl Store {
     pub fn hello(
         &mut self,
         connection: u64,
-        replica: String,
         pid: u32,
         descriptor: Descriptor,
     ) -> Result<u64> {
@@ -726,12 +725,6 @@ impl Store {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "connection limit reached",
-            ));
-        }
-        if replica.is_empty() || replica.len() > 256 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "replica name must be 1..=256 bytes",
             ));
         }
         let id = self.register_namespace(descriptor)?;
@@ -755,10 +748,7 @@ impl Store {
 
     /// Register the store connection of an instance on another host. The namespace is bound by
     /// the first Subscribe or PutBegin, because `RemoteHello` carries no descriptor.
-    pub fn remote_hello(&mut self, connection: u64, node: &str) -> Result<u64> {
-        if node.is_empty() || node.len() > 256 {
-            return Err(invalid("remote node name must be 1..=256 bytes"));
-        }
+    pub fn remote_hello(&mut self, connection: u64) -> Result<u64> {
         if self.sessions.contains_key(&connection) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -5190,7 +5180,6 @@ pub enum GetAnswer {
 pub enum StoreCommand {
     Hello {
         connection: u64,
-        replica: String,
         pid: u32,
         descriptor: Descriptor,
         reply: Reply<Result<HelloReply>>,
@@ -5267,7 +5256,6 @@ pub enum StoreCommand {
     },
     RemoteHello {
         connection: u64,
-        node: String,
         reply: Reply<Result<u64>>,
     },
     /// Release the windows of one transfer once the party that held them has drained.
@@ -5391,7 +5379,6 @@ impl Store {
         match command {
             StoreCommand::Hello {
                 connection,
-                replica,
                 pid,
                 descriptor,
                 reply,
@@ -5400,7 +5387,7 @@ impl Store {
                     self.connection_closed(connection);
                 }
                 let result = self
-                    .hello(connection, replica, pid, descriptor)
+                    .hello(connection, pid, descriptor)
                     .map(|generation| HelloReply {
                         generation,
                         namespace: self.sessions[&connection].namespace.unwrap(),
@@ -5622,10 +5609,9 @@ impl Store {
             | StoreCommand::ProcessExited { connection } => self.connection_closed(connection),
             StoreCommand::RemoteHello {
                 connection,
-                node,
                 reply,
             } => {
-                let _ = reply.send(self.remote_hello(connection, &node));
+                let _ = reply.send(self.remote_hello(connection));
             }
             StoreCommand::ReleaseTransfer {
                 connection,
@@ -5828,7 +5814,7 @@ mod tests {
         let value = descriptor();
         let id = store.register_namespace(value.clone()).unwrap();
         store
-            .hello(1, "l0".into(), std::process::id(), value)
+            .hello(1, std::process::id(), value)
             .unwrap();
         let (events, _receiver) = tokio::sync::mpsc::channel(4);
         let get = Get {
@@ -5941,7 +5927,7 @@ mod tests {
         let value = descriptor();
         let id = store.register_namespace(value.clone()).unwrap();
         store
-            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .hello(1, std::process::id(), value.clone())
             .unwrap();
         let generation = store.sessions[&1].generation;
         let key = Key {
@@ -5983,7 +5969,7 @@ mod tests {
         let value = descriptor();
         let id = store.register_namespace(value.clone()).unwrap();
         store
-            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .hello(1, std::process::id(), value.clone())
             .unwrap();
         let generation = store.sessions[&1].generation;
         let first = Key {
@@ -6052,7 +6038,7 @@ mod tests {
         let value = descriptor();
         let id = store.register_namespace(value.clone()).unwrap();
         store
-            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .hello(1, std::process::id(), value.clone())
             .unwrap();
         let generation = store.sessions[&1].generation;
         let total = 70_000u64;
@@ -6155,7 +6141,7 @@ mod tests {
         let (mut store, directory) = store("parent");
         let value = descriptor();
         let id = store.register_namespace(value.clone()).unwrap();
-        store.remote_hello(1, "near").unwrap();
+        store.remote_hello(1).unwrap();
         let parent = Key {
             consumed_tokens: 64,
             digest: [1; 16],
@@ -6200,7 +6186,7 @@ mod tests {
         let value = descriptor();
         let id = store.register_namespace(value.clone()).unwrap();
         store
-            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .hello(1, std::process::id(), value.clone())
             .unwrap();
         let parent = Key {
             consumed_tokens: 64,
@@ -6410,7 +6396,7 @@ mod tests {
         let (mut store, directory) = store("fence");
         let value = descriptor();
         let id = store.register_namespace(value.clone()).unwrap();
-        store.remote_hello(1, "near").unwrap();
+        store.remote_hello(1).unwrap();
         let key = Key {
             consumed_tokens: 64,
             digest: [6; 16],
@@ -6475,7 +6461,7 @@ mod tests {
         let first = descriptor();
         let mut second = descriptor();
         second.pool_name = "tenant-b".to_string();
-        store.remote_hello(1, "near").unwrap();
+        store.remote_hello(1).unwrap();
         let generation = store.sessions[&1].generation;
         let (sender_a, mut receiver_a) = tokio::sync::mpsc::channel(8);
         store
@@ -6529,7 +6515,7 @@ mod tests {
         let (mut store, directory) = store("dup");
         let value = descriptor();
         let id = store.register_namespace(value.clone()).unwrap();
-        store.remote_hello(1, "near").unwrap();
+        store.remote_hello(1).unwrap();
         let key = Key {
             consumed_tokens: 64,
             digest: [4; 16],
@@ -6621,7 +6607,7 @@ mod tests {
         let (mut store, directory) = dram_store("chain", 64 * 1024);
         let value = descriptor();
         store
-            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .hello(1, std::process::id(), value.clone())
             .unwrap();
         let id = store.sessions[&1].namespace.unwrap();
         let root = store.memory.allocate(32 * 1024).unwrap();
@@ -6685,7 +6671,7 @@ mod tests {
         let value = descriptor();
         store.register_namespace(value.clone()).unwrap();
         store
-            .hello(1, "l0".into(), std::process::id(), value)
+            .hello(1, std::process::id(), value)
             .unwrap();
         let (put_events, _put_receiver) = tokio::sync::mpsc::channel(4);
         store.submit_put(
@@ -6734,7 +6720,7 @@ mod tests {
         let (mut store, base, directory) = store_with_root("detached-blocked", 4096);
         let value = descriptor();
         store
-            .hello(1, "l0".into(), std::process::id(), value)
+            .hello(1, std::process::id(), value)
             .unwrap();
         let id = store.sessions[&1].namespace.unwrap();
         let (events, _receiver) = tokio::sync::mpsc::channel(4);
@@ -6779,7 +6765,7 @@ mod tests {
         let value = descriptor();
         let id = store.register_namespace(value.clone()).unwrap();
         store
-            .hello(1, "l0".into(), std::process::id(), value)
+            .hello(1, std::process::id(), value)
             .unwrap();
         let (get_events, _get_receiver) = tokio::sync::mpsc::channel(4);
         let (put_events, _put_receiver) = tokio::sync::mpsc::channel(4);
@@ -6850,7 +6836,7 @@ mod tests {
         let (mut store, base, directory) = store_with_root("failed-chunks", 4096);
         let value = descriptor();
         store
-            .hello(1, "l0".into(), std::process::id(), value)
+            .hello(1, std::process::id(), value)
             .unwrap();
         let (events, _receiver) = tokio::sync::mpsc::channel(4);
         store.submit_put(
@@ -6906,7 +6892,7 @@ mod tests {
         let (mut store, base, directory) = store_with_root("fragmented", 64 * 1024);
         let value = descriptor();
         store
-            .hello(1, "l0".into(), std::process::id(), value.clone())
+            .hello(1, std::process::id(), value.clone())
             .unwrap();
         let id = store.sessions[&1].namespace.unwrap();
         let first = store.memory.allocate(16 * 1024).unwrap();
@@ -6988,7 +6974,7 @@ mod tests {
         let value = descriptor();
         store.register_namespace(value.clone()).unwrap();
         store
-            .hello(1, "l0".into(), std::process::id(), value)
+            .hello(1, std::process::id(), value)
             .unwrap();
         let (get_events, _get_receiver) = tokio::sync::mpsc::channel(4);
         let (put_events, _put_receiver) = tokio::sync::mpsc::channel(4);
@@ -7072,7 +7058,7 @@ mod tests {
         let mut store = Store::open(config).unwrap();
         let value = descriptor();
         store
-            .hello(1, "l0".into(), std::process::id(), value)
+            .hello(1, std::process::id(), value)
             .unwrap();
         let id = store.sessions[&1].namespace.unwrap();
         let (events, _receiver) = tokio::sync::mpsc::channel(4);
