@@ -5,7 +5,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -20,7 +20,7 @@ use crate::{
         PoolAddress, PoolClient, PoolConfig, PoolEvent, PoolFetch, PoolStatus, PutBytes, Scope,
         Tier,
         agent::{AgentConfig, RankAgent, RankRecords},
-        manager_tests::{Manager, OkRegistrar, PT, history_of, wait},
+        manager_tests::{Manager, OkRegistrar, PT, history_of, wait, network_manager, remote},
         rank::{RankLink, RankSet, memory_links},
     },
     record::checksum,
@@ -47,7 +47,7 @@ fn scope(world: usize) -> Scope {
 }
 
 fn config(manager: &Manager, name: &str, world: usize, gpus: Vec<[u8; 16]>) -> PoolConfig {
-    config_at(PoolAddress::Unix(manager.socket.clone()), name, world, gpus)
+    config_at(PoolAddress::Unix(manager.config.socket.clone()), name, world, gpus)
 }
 
 fn config_at(address: PoolAddress, name: &str, world: usize, gpus: Vec<[u8; 16]>) -> PoolConfig {
@@ -164,8 +164,8 @@ fn instance(manager: &Manager, world: usize) -> Instance {
 
 fn address_for(manager: &Manager, reach: Reach) -> PoolAddress {
     match reach {
-        Reach::Local => PoolAddress::Unix(manager.socket.clone()),
-        Reach::Network => manager.remote().expect("a network manager").0,
+        Reach::Local => PoolAddress::Unix(manager.config.socket.clone()),
+        Reach::Network => remote(&manager).expect("a network manager").0,
     }
 }
 
@@ -195,6 +195,7 @@ struct Faults {
 }
 
 struct Gate {
+    held: AtomicUsize,
     open: AtomicBool,
     fail: AtomicBool,
 }
@@ -202,6 +203,7 @@ struct Gate {
 impl Gate {
     fn shut() -> Arc<Self> {
         Arc::new(Self {
+            held: AtomicUsize::new(0),
             open: AtomicBool::new(false),
             fail: AtomicBool::new(false),
         })
@@ -224,6 +226,7 @@ impl crate::PageCopier for GatedGpu {
     }
     fn poll(&mut self, replies: &mut Vec<crate::Reply>) {
         self.inner.poll(&mut self.held);
+        self.gate.held.store(self.held.len(), Ordering::SeqCst);
         if self.gate.open.load(Ordering::SeqCst) {
             for mut reply in self.held.drain(..) {
                 if self.gate.fail.load(Ordering::SeqCst) {
@@ -384,10 +387,9 @@ impl Instance {
 
     fn close(mut self) {
         let _ = self.rank0.close();
-        for agent in &mut self.agents {
-            let _ = agent.close();
-        }
+        for agent in &mut self.agents { let _ = agent.close(); }
     }
+
 }
 
 fn identity(world: usize) -> Identity {
@@ -489,19 +491,19 @@ fn a_two_rank_instance_restores_a_single_process_record_slice_by_slice() {
 
 #[test]
 fn a_peer_on_its_own_data_channel_gets_its_slices_while_rank_zero_reads_shared_memory() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     restore_through(&manager, 2, &[Reach::Local, Reach::Network]);
 }
 
 #[test]
 fn every_rank_on_its_own_data_channel_restores_a_record() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     restore_through(&manager, 2, &[Reach::Network, Reach::Network]);
 }
 
 #[test]
 fn three_ranks_mix_shared_memory_and_channels() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     restore_through(&manager, 3, &[Reach::Local, Reach::Network, Reach::Local]);
 }
 
@@ -722,19 +724,19 @@ fn a_two_rank_instance_exports_a_gpu_checkpoint_to_a_single_process_instance() {
 
 #[test]
 fn a_peer_on_a_channel_writes_its_slice_of_an_export_to_the_manager() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     export_to_plain(&manager, 2, &[Reach::Local, Reach::Network], Reach::Local);
 }
 
 #[test]
 fn a_whole_instance_on_channels_exports_to_a_remote_single_process_instance() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     export_to_plain(&manager, 3, &[Reach::Network; 3], Reach::Network);
 }
 
 #[test]
 fn three_ranks_mixing_shared_memory_and_channels_export_to_a_multi_process_instance() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     let world = 3;
     let mut source = instance_reaching(
         &manager,
@@ -893,13 +895,13 @@ fn a_two_rank_instance_puts_a_record_a_single_process_instance_restores() {
 
 #[test]
 fn a_peer_on_a_channel_writes_its_slice_of_a_put() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     put_then_restore(&manager, 2, &[Reach::Local, Reach::Network], None);
 }
 
 #[test]
 fn three_ranks_on_channels_put_and_another_multi_process_instance_restores() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     put_then_restore(
         &manager,
         3,
@@ -972,7 +974,9 @@ impl Scenario {
 
     /// No further `Fetched` is ever reported for this restore.
     fn assert_no_more_events(&mut self) {
-        thread::sleep(Duration::from_millis(300));
+        let history = history_of(4000);
+        let ticket = self.requester.rank0.begin_lookup(&history, 0);
+        wait("an ordered lookup after the verdict", || !matches!(ticket.state(), LookupState::Pending));
         self.requester.poll();
         assert!(
             !self
@@ -1009,7 +1013,7 @@ fn a_restore_is_reported_only_after_every_rank_drained_and_no_rank_is_read_early
             .unwrap()
             .is_empty()
     });
-    thread::sleep(Duration::from_millis(400));
+    wait("rank 1 to hold its completions", || gate.held.load(Ordering::SeqCst) > 0);
     scenario.requester.poll();
     assert!(
         !scenario
@@ -1417,7 +1421,7 @@ fn a_two_rank_instance_exports_a_record_from_its_ranks_files() {
 
 #[test]
 fn a_peer_on_a_channel_exports_its_files_slices_to_the_manager() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     let (page, row) = whole(2);
     assert_eq!(
         host_export(&manager, 2, &[Reach::Local, Reach::Network], None),
@@ -1427,7 +1431,7 @@ fn a_peer_on_a_channel_exports_its_files_slices_to_the_manager() {
 
 #[test]
 fn three_ranks_mixing_shared_memory_and_channels_export_from_their_files() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     let (page, row) = whole(3);
     assert_eq!(
         host_export(
@@ -1443,7 +1447,7 @@ fn three_ranks_mixing_shared_memory_and_channels_export_from_their_files() {
 #[test]
 fn a_peers_wrong_persisted_checksum_fails_the_export_from_its_files() {
     for reach in [Reach::Local, Reach::Network] {
-        let manager = Manager::start_network(false);
+        let manager = network_manager(false);
         let result = host_export(&manager, 2, &[Reach::Local, reach], Some(1));
         assert!(result.is_err(), "a corrupted file reached the requester");
     }
@@ -1519,7 +1523,7 @@ fn a_two_rank_instance_spills_a_record_from_its_ranks_files() {
 
 #[test]
 fn a_peer_on_a_channel_spills_its_files_slices() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     host_put(&manager, 2, &[Reach::Local, Reach::Network]);
 }
 
@@ -1623,7 +1627,7 @@ fn when_rank_zero_turns_the_pool_off_its_agents_do_too() {
     .unwrap();
     let (copier, _gpu1) = SimulatedGpu::shared(&[local()]).unwrap();
     let agent = RankAgent::start(AgentConfig {
-        address: PoolAddress::Unix(manager.socket.clone()),
+        address: PoolAddress::Unix(manager.config.socket.clone()),
         ca: None,
         scope: scope(2),
         rank: 1,

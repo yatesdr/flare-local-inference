@@ -44,212 +44,88 @@ const ROW: usize = 4096;
 
 static SERIAL: AtomicU32 = AtomicU32::new(0);
 
-pub(super) struct OkRegistrar;
-struct Registered;
-impl Registration for Registered {
-    fn device_address(&self) -> u64 {
-        0
-    }
-}
-impl HostRegistrar for OkRegistrar {
-    fn register(&self, _: usize, _: usize, _: usize) -> Result<Box<dyn Registration>> {
-        Ok(Box::new(Registered))
-    }
-    fn map_split(&self, _: &[(usize, i32, usize)]) -> Result<Box<dyn SplitMapping>> {
-        Err("not used".into())
-    }
+pub(super) use crate::testing::IdentityRegistrar as OkRegistrar;
+pub(crate) use crate::testing::TrackingRegistrar as CountingRegistrar;
+use selene_manager::testing::free_address;
+pub(super) use selene_manager::testing::{Manager, wait};
+
+pub(super) fn network_manager(tls: bool) -> Manager {
+    network_manager_with(tls, false)
 }
 
-/// A manager that also listens for instances on other hosts, on loopback.
-struct Network {
-    /// The certificate to trust, when the manager serves TLS.
-    ca: Option<PathBuf>,
-}
-
-/// A loopback address nobody listens on. Taken from below the ephemeral range and handed out
-/// once, so concurrent tests never share one or meet a connection's own port.
-fn free_address() -> std::net::SocketAddr {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    loop {
-        let port = 20_000
-            + (std::process::id() % 2_000) * 4
-            + NEXT.fetch_add(1, Ordering::Relaxed) % 4_000;
-        let address = std::net::SocketAddr::from(([127, 0, 0, 1], port as u16));
-        if std::net::TcpListener::bind(address).is_ok() {
-            return address;
-        }
-    }
-}
-
-pub(super) struct Manager {
-    pub(super) socket: PathBuf,
-    base: PathBuf,
-    config: Config,
-    stop: Arc<AtomicBool>,
-    thread: Option<thread::JoinHandle<()>>,
-    network: Option<Network>,
-}
-
-impl Manager {
-    pub(super) fn start() -> Self {
-        Self::with_memory(16 << 20)
-    }
-
-    /// A manager whose store holds `memory` bytes.
-    fn with_memory(memory: usize) -> Self {
-        let id = SERIAL.fetch_add(1, Ordering::Relaxed);
-        let base =
-            std::env::temp_dir().join(format!("selene-client-it-{}-{id}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("run")).unwrap();
-        let socket = base.join("run/m.sock");
-        let mut config = Config::dram_only(socket.clone(), memory);
-        config.name = format!("selene-client-it-{}-{id}", std::process::id());
-        // Small and explicit: many managers run at once in a small /dev/shm.
-        config.staging = 16 << 20;
-        let mut manager = Self {
-            socket,
-            base,
-            config,
-            stop: Arc::new(AtomicBool::new(false)),
-            thread: None,
-            network: None,
-        };
-        manager.run();
-        manager
-    }
-
-    /// A manager reached over TCP, with TLS when `tls`.
-    pub(super) fn start_network(tls: bool) -> Self {
-        Self::start_network_with(tls, false)
-    }
-
-    /// As [`Manager::start_network`], also offering RDMA when `rdma`.
-    fn start_network_with(tls: bool, rdma: bool) -> Self {
-        let mut manager = Self::start();
-        manager.stop();
-        let _ = std::fs::remove_file(&manager.socket);
-        let free = free_address;
-        let net = &mut manager.config;
-        net.listen = Some(free());
-        net.listen_data = Some(free());
-        net.metrics = Some(free());
-        net.rdma = rdma;
-        let mut ca = None;
-        if tls {
-            let generated =
-                rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-            let (cert, key) = (
-                manager.base.join("server.pem"),
-                manager.base.join("server-key.pem"),
-            );
-            std::fs::write(&cert, generated.cert.pem()).unwrap();
-            std::fs::write(&key, generated.signing_key.serialize_pem()).unwrap();
-            net.tls_cert = Some(cert.clone());
-            net.tls_key = Some(key);
-            ca = Some(cert);
-        }
-        manager.network = Some(Network { ca });
-        manager.run();
-        manager
-    }
-
-    /// What the data channel has moved so far, as `(windows, bytes)` by carrier, read from the
-    /// manager's metrics.
-    fn moved(&self, carrier: &str) -> (u64, u64) {
-        use std::io::{Read, Write};
-        let address = self.config.metrics.unwrap();
-        let mut stream = std::net::TcpStream::connect(address).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        stream
-            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            .unwrap();
-        let mut text = String::new();
-        stream.read_to_string(&mut text).unwrap();
-        let value = |name: &str| {
-            text.lines()
-                .find_map(|line| {
-                    line.strip_prefix(&format!(
-                        "selene_pool_channel_{name}_total{{carrier=\"{carrier}\"}} "
-                    ))
-                })
-                .and_then(|value| value.trim().parse().ok())
-                .unwrap_or(0)
-        };
-        (value("windows"), value("bytes"))
-    }
-
-    /// Where an instance on another host reaches the manager, and the CA it trusts.
-    pub(super) fn remote(&self) -> Option<(PoolAddress, Option<PathBuf>)> {
-        let network = self.network.as_ref()?;
-        let port = self.config.listen.unwrap().port();
-        let host = if network.ca.is_some() {
-            "localhost"
-        } else {
-            "127.0.0.1"
-        };
-        let address = format!("{host}:{port}");
-        Some((
-            if network.ca.is_some() {
-                PoolAddress::Tcp(address)
-            } else {
-                PoolAddress::TcpPlaintext(address)
-            },
-            network.ca.clone(),
-        ))
-    }
-
-    fn run(&mut self) {
-        self.stop.store(false, Ordering::Release);
-        let (config, stop) = (self.config.clone(), self.stop.clone());
-        self.thread = Some(thread::spawn(move || {
-            let result = control::serve(config, stop);
-            if let Err(error) = result {
-                eprintln!("manager exited: {error}");
-            }
-        }));
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while !self.socket.exists() {
-            assert!(Instant::now() < deadline, "the manager did not start");
-            thread::sleep(Duration::from_millis(5));
-        }
-        if let Some((PoolAddress::Tcp(address) | PoolAddress::TcpPlaintext(address), _)) =
-            self.remote()
-        {
-            let port = address.rsplit_once(':').unwrap().1.to_string();
-            while std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_err() {
-                assert!(Instant::now() < deadline, "the manager did not listen");
-                thread::sleep(Duration::from_millis(5));
-            }
-        }
-    }
-
-    fn stop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-
-    /// Restart the manager on the same socket.
-    pub(super) fn restart(&mut self) {
-        self.stop();
-        let _ = std::fs::remove_file(&self.socket);
-        self.run();
-    }
-}
-
-impl Drop for Manager {
-    fn drop(&mut self) {
-        self.stop();
-        let _ = std::fs::remove_dir_all(&self.base);
-        // The manager keeps its region files across restarts; a test is done with them.
-        let _ = std::fs::remove_dir_all(
-            std::path::Path::new("/dev/shm/selene").join(&self.config.name),
+pub(super) fn network_manager_with(tls: bool, rdma: bool) -> Manager {
+    let mut manager = Manager::start();
+    manager.stop();
+    let _ = std::fs::remove_file(&manager.config.socket);
+    let free = free_address;
+    let net = &mut manager.config;
+    net.listen = Some(free());
+    net.listen_data = Some(free());
+    net.metrics = Some(free());
+    net.rdma = rdma;
+    if tls {
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let (cert, key) = (
+            manager.base.join("server.pem"),
+            manager.base.join("server-key.pem"),
         );
+        std::fs::write(&cert, generated.cert.pem()).unwrap();
+        std::fs::write(&key, generated.signing_key.serialize_pem()).unwrap();
+        net.tls_cert = Some(cert.clone());
+        net.tls_key = Some(key);
     }
+    manager.run();
+    manager
+}
+
+/// What the data channel has moved so far, as `(windows, bytes)` by carrier, read from the
+/// manager's metrics.
+fn metrics(manager: &Manager) -> String {
+    use std::io::{Read, Write};
+    let address = manager.config.metrics.unwrap();
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut text = String::new();
+    stream.read_to_string(&mut text).unwrap();
+    text
+}
+fn moved(manager: &Manager, carrier: &str) -> (u64, u64) {
+    let text = metrics(manager);
+    let value = |name: &str| {
+        text.lines()
+            .find_map(|line| {
+                line.strip_prefix(&format!(
+                    "selene_pool_channel_{name}_total{{carrier=\"{carrier}\"}} "
+                ))
+            })
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    (value("windows"), value("bytes"))
+}
+
+pub(super) fn remote(manager: &Manager) -> Option<(PoolAddress, Option<PathBuf>)> {
+    let port = manager.config.listen?.port();
+    let ca = manager.config.tls_cert.clone();
+    let host = if ca.is_some() {
+        "localhost"
+    } else {
+        "127.0.0.1"
+    };
+    let address = format!("{host}:{port}");
+    Some((
+        if ca.is_some() {
+            PoolAddress::Tcp(address)
+        } else {
+            PoolAddress::TcpPlaintext(address)
+        },
+        ca,
+    ))
 }
 
 fn geo() -> Vec<crate::CacheGeometry> {
@@ -264,10 +140,9 @@ fn config(manager: &Manager, name: &str, gpu: u8) -> PoolConfig {
 /// manager's own host does.
 fn config_on(manager: &Manager, name: &str, gpu: u8, local: bool) -> PoolConfig {
     let geometry = geo();
-    let (address, ca) = manager
-        .remote()
+    let (address, ca) = remote(manager)
         .filter(|_| !local)
-        .unwrap_or_else(|| (PoolAddress::Unix(manager.socket.clone()), None));
+        .unwrap_or_else(|| (PoolAddress::Unix(manager.config.socket.clone()), None));
     PoolConfig {
         address,
         ca,
@@ -303,14 +178,6 @@ fn instance_on(manager: &Manager, name: &str, gpu: u8, local: bool) -> Instance 
         client,
         gpu: memory,
         events: Vec::new(),
-    }
-}
-
-pub(super) fn wait(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !done() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -745,21 +612,6 @@ fn announcements_survive_a_manager_restart_and_the_instances_reconnect() {
     requester.client.close().unwrap();
 }
 
-/// Counts what is registered, and refuses nothing.
-#[derive(Default)]
-pub(crate) struct CountingRegistrar {
-    pub(crate) calls: std::sync::Mutex<Vec<(usize, usize)>>,
-}
-impl HostRegistrar for CountingRegistrar {
-    fn register(&self, _: usize, address: usize, bytes: usize) -> Result<Box<dyn Registration>> {
-        self.calls.lock().unwrap().push((address, bytes));
-        Ok(Box::new(Registered))
-    }
-    fn map_split(&self, _: &[(usize, i32, usize)]) -> Result<Box<dyn SplitMapping>> {
-        Err("not used".into())
-    }
-}
-
 fn counted(manager: &Manager, registrar: &Arc<CountingRegistrar>, wait: Duration) -> PoolClient {
     counted_approving(manager, registrar, wait, None)
 }
@@ -902,7 +754,6 @@ fn a_rejected_plan_registers_nothing_and_turns_the_pool_off() {
             && reason.contains("staging"),
         "{reason}"
     );
-    thread::sleep(Duration::from_millis(500));
     assert_eq!(seen.lock().unwrap().len(), 1);
     assert!(registrar.calls.lock().unwrap().is_empty());
     client.close().unwrap();
@@ -917,7 +768,7 @@ fn a_changed_staging_size_turns_the_pool_off_for_a_running_instance() {
 
     manager.stop();
     manager.config.staging *= 2;
-    let _ = std::fs::remove_file(&manager.socket);
+    let _ = std::fs::remove_file(&manager.config.socket);
     manager.run();
     wait("the instance to notice", || {
         matches!(client.status(), PoolStatus::Disabled(_))
@@ -929,7 +780,6 @@ fn a_changed_staging_size_turns_the_pool_off_for_a_running_instance() {
         reason.contains("recreated its shared memory") && reason.contains("restarted"),
         "{reason}"
     );
-    thread::sleep(Duration::from_millis(500));
     assert!(matches!(client.status(), PoolStatus::Disabled(_)));
     assert_eq!(
         registrar.calls.lock().unwrap().len(),
@@ -943,7 +793,7 @@ fn a_changed_staging_size_turns_the_pool_off_for_a_running_instance() {
 fn a_manager_that_is_not_there_at_startup_is_never_attached_to_later() {
     let mut manager = Manager::start();
     manager.stop();
-    let _ = std::fs::remove_file(&manager.socket);
+    let _ = std::fs::remove_file(&manager.config.socket);
     let registrar = Arc::new(CountingRegistrar::default());
     let started = Instant::now();
     let mut client = counted(&manager, &registrar, Duration::from_millis(400));
@@ -956,10 +806,9 @@ fn a_manager_that_is_not_there_at_startup_is_never_attached_to_later() {
 
     // The manager comes up after the instance gave up on it.
     manager.run();
-    thread::sleep(Duration::from_secs(1));
     assert!(matches!(client.status(), PoolStatus::Disabled(_)));
-    assert!(registrar.calls.lock().unwrap().is_empty());
     client.close().unwrap();
+    assert!(registrar.calls.lock().unwrap().is_empty());
 }
 
 // ---- the eviction cascade against the real manager ----
@@ -1423,7 +1272,7 @@ fn put_then_restore(manager: &Manager, carrier: &str) {
     writer.client.close().unwrap();
     requester.client.close().unwrap();
     // One put and two restores of five pages and a row went by this carrier and no other.
-    let (windows, bytes) = manager.moved(carrier);
+    let (windows, bytes) = moved(manager, carrier);
     assert!(windows >= 3, "{carrier}: {windows} windows");
     assert!(
         bytes >= 3 * (5 * PAGE + ROW) as u64,
@@ -1434,31 +1283,31 @@ fn put_then_restore(manager: &Manager, carrier: &str) {
     } else {
         "stream"
     };
-    assert_eq!(manager.moved(other), (0, 0), "nothing went by {other}");
+    assert_eq!(moved(&manager, other), (0, 0), "nothing went by {other}");
 }
 
 #[test]
 fn a_record_put_into_a_manager_on_another_host_is_restored_over_tcp() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     put_then_restore(&manager, "stream");
 }
 
 #[test]
 fn a_record_put_into_a_manager_on_another_host_is_restored_over_tls() {
-    let manager = Manager::start_network(true);
+    let manager = network_manager(true);
     put_then_restore(&manager, "stream");
 }
 
 #[cfg(feature = "rdma")]
 #[test]
 fn a_record_put_into_a_manager_on_another_host_is_restored_over_rdma() {
-    let manager = Manager::start_network_with(false, true);
+    let manager = network_manager_with(false, true);
     put_then_restore(&manager, "rdma");
 }
 
 #[test]
 fn instances_on_other_hosts_come_back_and_copy_after_the_manager_restarts() {
-    let mut manager = Manager::start_network(false);
+    let mut manager = network_manager(false);
     let mut writer = instance(&manager, "writer", 1);
     writer.ready();
     let history = history();
@@ -1511,7 +1360,7 @@ fn a_window_of_pages_with_the_row_alone(manager: &Manager) {
 
 #[test]
 fn a_row_in_a_window_of_its_own_is_put_and_restored_over_tcp() {
-    a_window_of_pages_with_the_row_alone(&Manager::start_network(false));
+    a_window_of_pages_with_the_row_alone(&network_manager(false));
 }
 
 #[test]
@@ -1520,11 +1369,14 @@ fn a_row_in_a_window_of_its_own_is_put_and_restored_through_shared_memory() {
 }
 
 /// The round trip of a lookup, from asking to a ready answer, against the real manager
-/// over a Unix socket with an index to scan: the figure the worker's admission hold is
-/// set from. Run with `-- --nocapture` to see the numbers.
+/// over a Unix socket with an index to scan. Run with `-- --nocapture` to see the numbers.
 #[test]
 fn a_lookup_is_answered_in_well_under_a_millisecond_over_a_unix_socket() {
-    let manager = Manager::start();
+    let mut manager = Manager::new();
+    manager.config.memory = 16 << 20;
+    manager.config.staging = 16 << 20;
+    manager.config.metrics = Some(free_address());
+    manager.run();
     let a = instance(&manager, "a", 1);
     a.ready();
     // Noise the scan must skip, and holdings the first lookups find.
@@ -1578,7 +1430,11 @@ fn a_lookup_is_answered_in_well_under_a_millisecond_over_a_unix_socket() {
     }
     let mut b = instance(&manager, "b", 2);
     b.ready();
-    thread::sleep(Duration::from_millis(300));
+    wait("all announcement batches", || {
+        metrics(&manager)
+            .lines()
+            .any(|line| line == "selene_pool_index_entries 5000")
+    });
     let mut times = Vec::new();
     for salt in 0..2000u32 {
         let history = salted(salt);
@@ -1720,10 +1576,10 @@ fn relay_host_record(manager: &Manager, source_local: bool, requester_local: boo
 
 #[test]
 fn a_host_record_is_relayed_between_two_instances_on_other_hosts_over_tcp() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     // Two windows of a 4 MiB manager window each way.
     relay_host_record(&manager, false, false, 700);
-    let (windows, bytes) = manager.moved("stream");
+    let (windows, bytes) = moved(&manager, "stream");
     assert!(windows >= 4, "{windows} windows crossed the manager twice");
     assert!(bytes >= 2 * (700 * PAGE + ROW) as u64, "{bytes} bytes");
 }
@@ -1731,13 +1587,13 @@ fn a_host_record_is_relayed_between_two_instances_on_other_hosts_over_tcp() {
 #[cfg(feature = "rdma")]
 #[test]
 fn a_host_record_is_relayed_between_two_instances_on_other_hosts_over_rdma() {
-    let manager = Manager::start_network_with(false, true);
+    let manager = network_manager_with(false, true);
     relay_host_record(&manager, false, false, 700);
-    let (windows, bytes) = manager.moved("rdma");
+    let (windows, bytes) = moved(&manager, "rdma");
     assert!(windows >= 4, "{windows} windows crossed the manager twice");
     assert!(bytes >= 2 * (700 * PAGE + ROW) as u64, "{bytes} bytes");
     assert_eq!(
-        manager.moved("stream"),
+        moved(&manager, "stream"),
         (0, 0),
         "nothing went by the stream"
     );
@@ -1745,29 +1601,29 @@ fn a_host_record_is_relayed_between_two_instances_on_other_hosts_over_rdma() {
 
 #[test]
 fn a_host_record_is_relayed_between_two_instances_on_other_hosts_over_tls() {
-    let manager = Manager::start_network(true);
+    let manager = network_manager(true);
     relay_host_record(&manager, false, false, 5);
 }
 
 #[test]
 fn a_remote_instance_serves_an_instance_on_the_managers_host() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     relay_host_record(&manager, false, true, 700);
-    let (windows, _) = manager.moved("stream");
+    let (windows, _) = moved(&manager, "stream");
     assert!(windows >= 2, "{windows} windows came in from the source");
 }
 
 #[test]
 fn an_instance_on_the_managers_host_serves_a_remote_instance() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     relay_host_record(&manager, true, false, 700);
-    let (windows, _) = manager.moved("stream");
+    let (windows, _) = moved(&manager, "stream");
     assert!(windows >= 2, "{windows} windows went out to the requester");
 }
 
 #[test]
 fn a_gpu_checkpoint_on_another_host_is_relayed_through_reserved_staging() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     let mut source = instance(&manager, "source", 1);
     let mut requester = instance(&manager, "requester", 2);
     source.ready();
@@ -1836,7 +1692,7 @@ fn a_gpu_checkpoint_on_another_host_is_relayed_through_reserved_staging() {
 
 #[test]
 fn a_stalled_source_fails_the_relay_and_the_same_record_relays_after() {
-    let manager = Manager::start_network(false);
+    let manager = network_manager(false);
     let pages = 700usize;
     let mut source = instance(&manager, "source", 1);
     let mut requester = instance(&manager, "requester", 2);
