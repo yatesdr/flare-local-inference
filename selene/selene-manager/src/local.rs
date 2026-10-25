@@ -25,9 +25,9 @@ use std::{
 
 pub const SHM_ROOT: &str = "/dev/shm/selene";
 pub const PAGE_BYTES: u64 = 4096;
-pub const MAX_WINDOW_PAGES: u32 = 64;
+pub const MAX_WINDOW_PAGES: u32 = flare_selene::slab::WINDOW_PAGES as u32;
 /// Granted windows per direction per connection.
-pub const WINDOW_CREDITS: u32 = 2;
+pub use flare_selene::pool::WINDOW_CREDITS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Region {

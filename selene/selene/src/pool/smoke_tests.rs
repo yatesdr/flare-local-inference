@@ -192,6 +192,7 @@ fn serve_with(name: &str, hello: wire::HelloReply, wrong_scope: bool) -> Fixture
 
 fn hello(protocol: u32, status: wire::HelloStatus) -> wire::HelloReply {
     wire::HelloReply {
+        limits: Some(super::limits::wire_defaults()),
         status: status as i32,
         protocol,
         manager_incarnation: 99,

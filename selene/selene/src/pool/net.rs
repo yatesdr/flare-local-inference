@@ -46,7 +46,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// A claim's frames and a window's payload may stall this long.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// The manager never plans a window of more pages than this.
-const MAX_PAGES: u32 = 64;
+const MAX_PAGES: u32 = crate::slab::WINDOW_PAGES as u32;
 const ALIGN: u64 = 4096;
 
 // ---------------------------------------------------------------- staging
@@ -703,7 +703,7 @@ async fn receive_stream(target: &Target, claim: u64, mut conn: Box<dyn Conn>) ->
 }
 
 /// How many slots a claim lends the manager at once.
-const CREDIT_DEPTH: usize = 2;
+const CREDIT_DEPTH: usize = super::limits::WINDOW_CREDITS as usize;
 
 /// The queue pair and the slots lent to the manager. The pair is declared first so it is
 /// destroyed first: no write for a lent slot can land after the slot is given back.

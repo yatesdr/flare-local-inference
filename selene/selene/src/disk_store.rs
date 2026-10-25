@@ -43,7 +43,7 @@ use super::{
 };
 
 /// Windows of one record the staged transport keeps in staging at a time.
-pub const WINDOWS_IN_FLIGHT: usize = 2;
+pub const WINDOWS_IN_FLIGHT: usize = crate::pool::WINDOW_CREDITS as usize;
 /// Records per direction a disk store keeps in flight. Further `store` calls
 /// are skipped and further `fetch` calls refused until one completes, so GPU
 /// pins and ticket ids held for the store stay bounded.

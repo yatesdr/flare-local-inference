@@ -22,7 +22,7 @@ pub struct PlannedWindow {
 }
 
 /// Pages per window never exceed this, whatever `max_window_bytes` allows.
-pub const MAX_WINDOW_PAGES: u64 = 64;
+pub const MAX_WINDOW_PAGES: u64 = flare_selene::slab::WINDOW_PAGES as u64;
 
 /// Cuts the records into windows: whole pages of one record, and the row after
 /// the pages of the last record when it fits `max_window_bytes`, else alone.

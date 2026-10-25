@@ -117,7 +117,7 @@ impl Pool for PoolService {
             encryption: shared.encryption as i32,
             readiness: Some(readiness),
             data_transports: shared.transports.iter().map(|t| *t as i32).collect(),
-            limits: Some(shared.limits.to_proto()),
+            limits: Some(super::limits::to_proto(&shared.limits)),
             shared_memory: same_host.then(|| shared.shm.clone()),
             host_id: shared.host_id.to_vec(),
         }))

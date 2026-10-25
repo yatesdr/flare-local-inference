@@ -49,8 +49,7 @@ impl Engine {
 
     /// Slots and bytes per slot of the data channel's staging.
     fn net_shape(&self, limits: &wire::Limits) -> (u32, u64) {
-        let slots = (self.st.claim_slots + limits.max_open_puts + self.st.export_slots).max(1)
-            * limits.window_credits.max(1);
+        let slots = super::super::limits::staging_slots(limits, self.st.claim_slots, self.st.export_slots);
         let slot_bytes = limits
             .max_window_bytes
             .max(self.st.page_record_bytes())

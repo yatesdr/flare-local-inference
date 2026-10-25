@@ -216,7 +216,7 @@ impl Rig {
                 staging: Region::heap(1 << 20),
             }),
             now: Instant::now(),
-            limits: super::super::conn::limits_or_default(None),
+            limits: super::super::limits::wire_defaults(),
         }
     }
 

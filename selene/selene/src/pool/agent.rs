@@ -31,6 +31,7 @@ use crate::{
     SharedCopier, StateSlotId, record::checksum, slab::WINDOW_PAGES,
 };
 
+use super::conn::{FIRST_BACKOFF, MAX_BACKOFF, BUSY_TICK, IDLE_TICK};
 use super::{
     Checksums,
     client::PoolAddress,
@@ -46,14 +47,7 @@ use super::{
     wire::{self, rank_client_message as rc, rank_server_message as rs},
 };
 
-const FIRST_BACKOFF: Duration = Duration::from_millis(100);
-const MAX_BACKOFF: Duration = Duration::from_secs(5);
-const BUSY_TICK: Duration = Duration::from_millis(1);
-const IDLE_TICK: Duration = Duration::from_millis(20);
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
-/// Slots of this agent's own staging when its slices travel on a channel.
-const STAGING_SLOTS: u32 = 16;
-
 /// This rank's record files, for the host-tier exports and puts of a multi-process instance
 /// whose local tier is sharded: every rank keeps the slices of every record in its own files,
 /// and rank 0's index holds them for all ranks.
@@ -703,7 +697,7 @@ impl Agent {
                     if !hello.data_transports.is_empty() {
                         plan.push(PlannedRegion {
                             name: "data-staging",
-                            bytes: Staging::planned_bytes(STAGING_SLOTS, self.slot_bytes(&hello)),
+                            bytes: Staging::planned_bytes(self.staging_slots(&hello), self.slot_bytes(&hello)),
                         });
                     }
                     if let Some(approve) = &self.approve
@@ -884,20 +878,26 @@ impl Agent {
         Ok(Arc::new(Staging::new(
             &*self.registrar,
             self.context,
-            STAGING_SLOTS,
+            self.staging_slots(hello),
             self.slot_bytes(hello),
         )?))
     }
 
+    /// Slots for claims, puts and exports, each with the stated window credits.
+    fn staging_slots(&self, hello: &wire::HelloReply) -> u32 {
+        let limits = conn::checked_limits(hello.limits);
+        super::limits::staging_slots(&limits, limits.max_claims_in_flight, limits.max_export_slots)
+    }
+
     /// The size of one slot of the data-channel staging.
     fn slot_bytes(&self, hello: &wire::HelloReply) -> u64 {
-        let limits = conn::limits_or_default(hello.limits);
+        let limits = conn::checked_limits(hello.limits);
         let mine = self.layout.rank(self.rank);
         limits.max_window_bytes.max(mine.page_len).max(mine.row_len)
     }
 
     fn make_dial(&mut self, link: &conn::Link, hello: &wire::HelloReply) -> Result<()> {
-        let limits = conn::limits_or_default(hello.limits);
+        let limits = conn::checked_limits(hello.limits);
         let (host, tls) = match &self.address {
             PoolAddress::Tcp(address) | PoolAddress::TcpPlaintext(address) => {
                 let host = address

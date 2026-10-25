@@ -44,11 +44,11 @@ fn entry_to_proto(entry: &EntryData) -> proto::CatalogEntry {
 
 /// Store connections: one per instance process, plus one catalog link per scope.
 pub const MAX_CONNECTIONS: usize = 1024;
-pub const OPEN_PUTS: usize = 4;
+pub const OPEN_PUTS: usize = flare_selene::pool::MAX_OPEN_PUTS as usize;
 pub const OPEN_GETS: usize = 4;
-pub const WINDOW_CREDITS: u32 = 2;
-pub const MAX_CHAIN: usize = 65_536;
-pub const NO_PROGRESS: Duration = Duration::from_secs(3);
+pub use flare_selene::pool::WINDOW_CREDITS;
+pub const MAX_CHAIN: usize = flare_selene::pool::MAX_CHAIN_NODES as usize;
+pub use flare_selene::pool::PROGRESS_TIMEOUT as NO_PROGRESS;
 
 /// Whether an operation that has been idle for `idle` has stalled. A put whose client has
 /// delivered everything (`delivered`) waits on this manager's own disk, whose jobs queue behind
@@ -57,7 +57,7 @@ pub const NO_PROGRESS: Duration = Duration::from_secs(3);
 fn stalled(idle: Duration, delivered: bool, disk_idle: Option<Duration>) -> bool {
     idle >= NO_PROGRESS && !(delivered && disk_idle.is_some_and(|disk| disk < NO_PROGRESS))
 }
-pub const DEFAULT_MAX_WINDOW: u64 = 4 * 1024 * 1024;
+pub use flare_selene::pool::MAX_WINDOW_BYTES as DEFAULT_MAX_WINDOW;
 
 /// The staging of a store built in code (an embedding or a test). The command line always sets it
 /// from `--staging`, whose default is larger.
