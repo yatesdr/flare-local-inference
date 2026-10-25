@@ -7,6 +7,7 @@
 mod agent;
 mod announce;
 mod cascade;
+mod budget;
 mod client;
 mod codec;
 mod conn;
@@ -23,6 +24,8 @@ mod manager_tests;
 pub(crate) mod net;
 pub(crate) mod pins;
 mod probe;
+mod options;
+mod records;
 pub mod rank;
 #[cfg(test)]
 mod rank_tests;
@@ -41,6 +44,9 @@ pub(crate) mod wire {
 }
 mod types;
 
+pub use budget::Budget;
+pub use options::{PoolOptions, DEFAULT_POOL_TENANT, parse_pool_address, parse_pool_tenant, pool_address, pool_scope};
+pub use records::DeferredRecords;
 pub use agent::{AgentConfig, RankAgent, RankRecords};
 pub use announce::{Announcer, IndexEntry, Notice, Snapshot};
 pub use client::{PoolAddress, PoolClient, PoolConfig, STARTUP_WAIT};

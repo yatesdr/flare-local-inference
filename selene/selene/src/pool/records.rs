@@ -1,36 +1,44 @@
-use super::*;
-use flare_selene::pool::{Checksums, RankRecords};
-use std::io::{Seek, SeekFrom};
+use super::{Checksums, RankRecords};
+use crate::{
+    CacheGeometry, Layout, PrefixKey, Result,
+    geometry::invalid,
+    record::{self, HEADER_BYTES, Header},
+};
+use std::{
+    io::{Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 /// Filled after cache allocation and scanning, before the peer can serve a pool command.
 #[derive(Clone, Default)]
-pub(crate) struct DeferredRecords(Arc<Mutex<Option<Records>>>);
+pub struct DeferredRecords(Arc<Mutex<Option<Records>>>);
 
 struct Records {
     directory: PathBuf,
     identity: [u8; 32],
     fingerprint: [u8; 16],
-    geometry: Vec<super::super::CacheGeometry>,
-    layout: flare_selene::Layout,
+    geometry: Vec<CacheGeometry>,
+    layout: Layout,
     _lock: record::DirectoryLock,
 }
 
 impl DeferredRecords {
-    pub(crate) fn bind(&self, prepared: &Prepared) -> crate::Result<()> {
+    pub fn bind(
+        &self,
+        directory: PathBuf,
+        identity: [u8; 32],
+        fingerprint: [u8; 16],
+        geometry: Vec<CacheGeometry>,
+        lock: record::DirectoryLock,
+    ) -> Result<()> {
         *self.0.lock().unwrap() = Some(Records {
-            directory: prepared
-                .resolved
-                .directory
-                .clone()
-                .ok_or("a rank's records need a disk directory")?,
-            identity: prepared.identity,
-            fingerprint: prepared.fingerprint,
-            geometry: prepared.geometry.clone(),
-            layout: prepared.layout.clone(),
-            _lock: prepared
-                .directory_lock
-                .clone()
-                .ok_or("a rank's records need a directory lock")?,
+            directory,
+            identity,
+            fingerprint,
+            layout: Layout::new(&geometry)?,
+            geometry,
+            _lock: lock,
         });
         Ok(())
     }
@@ -38,7 +46,7 @@ impl DeferredRecords {
 
 impl Records {
     fn header(&self, key: PrefixKey) -> Result<(std::fs::File, Header)> {
-        let path = file(&self.directory, &record::file_name(&key))?;
+        let path = self.directory.join(record::file_name(&key));
         let mut file =
             std::fs::File::open(path).map_err(|e| record::io_failure("open a rank record", e))?;
         let mut block = [0; HEADER_BYTES];
@@ -213,7 +221,7 @@ impl RankRecords for DeferredRecords {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flare_selene::{pool::RankRecords, testing::geometry};
+    use crate::{pool::RankRecords, testing::geometry};
     use std::time::SystemTime;
 
     fn key(tokens: u64) -> PrefixKey {
@@ -225,7 +233,7 @@ mod tests {
 
     fn write(
         directory: &Path,
-        geometry: &[super::super::super::CacheGeometry],
+        geometry: &[CacheGeometry],
         tokens: u64,
         parent: Option<PrefixKey>,
         values: &[u8],
@@ -258,7 +266,9 @@ mod tests {
 
     #[test]
     fn rank_records_read_slices_rows_and_chain_spills_with_persisted_sums() {
-        let directory = super::super::tests::directory("pool-records");
+        let directory =
+            std::env::temp_dir().join(format!("selene-pool-records-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
         let geometry = vec![geometry(64, &[("kv", 4096)], 4096)];
         let root = write(&directory, &geometry, 128, None, &[11, 22]);
         let tail = write(&directory, &geometry, 256, Some(root.key), &[33, 44]);
@@ -267,7 +277,7 @@ mod tests {
             directory: directory.clone(),
             identity: [1; 32],
             fingerprint: [2; 16],
-            layout: flare_selene::Layout::new(&geometry).unwrap(),
+            layout: Layout::new(&geometry).unwrap(),
             geometry,
 
             _lock: lock,
