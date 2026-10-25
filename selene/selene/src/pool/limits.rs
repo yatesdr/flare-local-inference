@@ -58,28 +58,31 @@ impl Limits {
     pub fn progress_timeout(&self) -> Duration {
         Duration::from_millis(u64::from(self.progress_timeout_ms))
     }
+
+    pub fn to_wire(&self) -> wire::Limits {
+        wire::Limits {
+            max_concurrent_lookups: self.max_concurrent_lookups,
+            max_candidates: self.max_candidates,
+            max_chain_nodes: self.max_chain_nodes,
+            max_boundaries: self.max_boundaries,
+            max_notices_per_batch: self.max_notices_per_batch,
+            max_resync_chunk_entries: self.max_resync_chunk_entries,
+            max_resync_entries: self.max_resync_entries,
+            max_claims_in_flight: self.max_claims_in_flight,
+            max_export_slots: self.max_export_slots,
+            window_credits: self.window_credits,
+            max_window_bytes: self.max_window_bytes,
+            max_claim_deadline_ms: self.max_claim_deadline_ms,
+            pin_deadline_ms: self.pin_deadline_ms,
+            progress_timeout_ms: self.progress_timeout_ms,
+            max_open_puts: self.max_open_puts,
+        }
+    }
 }
 
 #[cfg(test)]
 pub(crate) fn wire_defaults() -> wire::Limits {
-    let limits = Limits::default();
-    wire::Limits {
-        max_concurrent_lookups: limits.max_concurrent_lookups,
-        max_candidates: limits.max_candidates,
-        max_chain_nodes: limits.max_chain_nodes,
-        max_boundaries: limits.max_boundaries,
-        max_notices_per_batch: limits.max_notices_per_batch,
-        max_resync_chunk_entries: limits.max_resync_chunk_entries,
-        max_resync_entries: limits.max_resync_entries,
-        max_claims_in_flight: limits.max_claims_in_flight,
-        max_export_slots: limits.max_export_slots,
-        window_credits: limits.window_credits,
-        max_window_bytes: limits.max_window_bytes,
-        max_claim_deadline_ms: limits.max_claim_deadline_ms,
-        pin_deadline_ms: limits.pin_deadline_ms,
-        progress_timeout_ms: limits.progress_timeout_ms,
-        max_open_puts: limits.max_open_puts,
-    }
+    Limits::default().to_wire()
 }
 
 pub(crate) fn validate(stated: Option<wire::Limits>) -> std::result::Result<(), String> {
