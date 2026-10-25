@@ -27,11 +27,12 @@ use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    CLOSE_TIMEOUT, Direction, Error, HostRegistrar, Job, JobId, PageId, Result, SharedCopier,
-    StateSlotId, record::checksum, slab::WINDOW_PAGES,
+    CLOSE_TIMEOUT, Direction, Error, HostRegistrar, Job, JobId, PageId, PrefixKey, Result,
+    SharedCopier, StateSlotId, record::checksum, slab::WINDOW_PAGES,
 };
 
 use super::{
+    Checksums,
     client::PoolAddress,
     codec, conn,
     engine::{coverage::Coverage, requester::ExpectedRecord},
@@ -54,6 +55,139 @@ const TOMBSTONES: usize = 1024;
 /// Slots of this agent's own staging when its slices travel on a channel.
 const STAGING_SLOTS: u32 = 16;
 
+/// This rank's record files, for the host-tier exports and puts of a multi-process instance
+/// whose local tier is sharded: every rank keeps the slices of every record in its own files,
+/// and rank 0's index holds them for all ranks.
+pub trait RankRecords: Send + 'static {
+    /// This rank's slices of pages `first_page..first_page + pages` of the host record
+    /// `key` at `generation` (record-relative pages), then its slice of the row when `row`,
+    /// packed into `dst`, with the persisted slice checksums (never hashes of what was just
+    /// read). Blocks on the device: it runs on the agent's one reader thread, so at most one
+    /// read is in flight.
+    fn read(
+        &mut self,
+        key: PrefixKey,
+        generation: u64,
+        first_page: u32,
+        pages: u32,
+        row: bool,
+        dst: &mut [u8],
+    ) -> Result<Checksums>;
+
+    /// The same for a put: this rank's slices of pages `first_page..` of the chain being
+    /// published, `key` naming the record the put commits (`first_page` counts from the
+    /// chain's start, as a single process's `PutBytes::fill` does).
+    fn fill(
+        &mut self,
+        key: PrefixKey,
+        first_page: u32,
+        pages: u32,
+        row: bool,
+        dst: &mut [u8],
+    ) -> Result<Checksums>;
+}
+
+/// One read or fill for the reader thread.
+struct RecordJob {
+    xfer: u64,
+    index: u32,
+    key: PrefixKey,
+    generation: u64,
+    put: bool,
+    first_page: u32,
+    pages: u32,
+    row: bool,
+    target: Target,
+}
+
+/// Where a job's bytes go: scattered into this rank's slices of a shared window, or straight
+/// into a staging slot.
+enum Target {
+    Window {
+        base: usize,
+        length: usize,
+        layout: Arc<SliceLayout>,
+        rank: usize,
+    },
+    Slot {
+        base: usize,
+        length: usize,
+    },
+}
+
+struct RecordDone {
+    xfer: u64,
+    index: u32,
+    result: Result<Checksums>,
+}
+
+/// The thread that reads this rank's files, started with the first host-tier transfer.
+struct RecordWorker {
+    jobs: std::sync::mpsc::Sender<RecordJob>,
+    done: Arc<Mutex<VecDeque<RecordDone>>>,
+}
+
+impl RecordWorker {
+    fn start(records: Box<dyn RankRecords>, wake: Arc<Notify>) -> std::io::Result<Self> {
+        let (jobs, queue) = std::sync::mpsc::channel::<RecordJob>();
+        let done = Arc::new(Mutex::new(VecDeque::new()));
+        let finished = done.clone();
+        std::thread::Builder::new()
+            .name("selene-rank-records".into())
+            .spawn(move || {
+                let mut records = records;
+                while let Ok(job) = queue.recv() {
+                    let result = run_record_job(&mut *records, &job);
+                    finished.lock().unwrap().push_back(RecordDone {
+                        xfer: job.xfer,
+                        index: job.index,
+                        result,
+                    });
+                    wake.notify_one();
+                }
+            })?;
+        Ok(Self { jobs, done })
+    }
+}
+
+fn run_record_job(records: &mut dyn RankRecords, job: &RecordJob) -> Result<Checksums> {
+    let mut read = |dst: &mut [u8]| {
+        if job.put {
+            records.fill(job.key, job.first_page, job.pages, job.row, dst)
+        } else {
+            records.read(
+                job.key,
+                job.generation,
+                job.first_page,
+                job.pages,
+                job.row,
+                dst,
+            )
+        }
+    };
+    match &job.target {
+        Target::Slot { base, length } => {
+            // SAFETY: the transfer keeps its staging slot, and so the mapping, until its job
+            // has been reported.
+            let dst = unsafe { std::slice::from_raw_parts_mut(*base as *mut u8, *length) };
+            read(dst)
+        }
+        Target::Window {
+            base,
+            length,
+            layout,
+            rank,
+        } => {
+            let mut packed = vec![0u8; layout.slice_bytes(*rank, job.pages, job.row) as usize];
+            let sums = read(&mut packed)?;
+            // SAFETY: as above, for the window of the shared memory.
+            let window = unsafe { std::slice::from_raw_parts_mut(*base as *mut u8, *length) };
+            layout.scatter(*rank, window, job.pages, job.row, &packed)?;
+            Ok(sums)
+        }
+    }
+}
+
 /// What a peer rank's agent is built from. The pool address, CA and tenant are this
 /// process's own flags; `scope` is the instance's, identical to rank 0's.
 pub struct AgentConfig {
@@ -71,6 +205,8 @@ pub struct AgentConfig {
     /// The device context made current when registering memory.
     pub registration_context: usize,
     pub gpu_uuid: [u8; 16],
+    /// This rank's record files, when its local tier is sharded.
+    pub records: Option<Box<dyn RankRecords>>,
 }
 
 /// A running agent.
@@ -140,6 +276,8 @@ impl RankAgent {
             owed: Vec::new(),
             quarantined: false,
             closing: false,
+            records: config.records,
+            worker: None,
         };
         let thread = std::thread::Builder::new()
             .name("selene-rank-agent".into())
@@ -200,9 +338,17 @@ struct Win {
     spec: wire::WindowSpec,
     /// The staging slot a channel window lives in.
     slot: Option<u32>,
+    /// The persisted checksums of a host window's slices, once its read is in.
+    persisted: Option<Checksums>,
 }
 
 struct Xfer {
+    /// The bytes are this rank's record files', not GPU pages.
+    host: bool,
+    /// The records the transfer covers, for the reader.
+    records: Vec<wire::Record>,
+    /// A put's first page in its chain.
+    chain_first: u64,
     out: bool,
     kind: i32,
     fence_id: u64,
@@ -257,6 +403,9 @@ struct Agent {
     owed: Vec<(i32, u64, bool)>,
     quarantined: bool,
     closing: bool,
+    /// The record files, until the reader thread takes them.
+    records: Option<Box<dyn RankRecords>>,
+    worker: Option<RecordWorker>,
 }
 
 fn run(mut agent: Agent) -> Result<()> {
@@ -646,6 +795,7 @@ impl Agent {
             self.on_net(event);
         }
         self.poll_copier();
+        self.poll_records();
         self.submit_pending();
         let ids: Vec<u64> = self.xfers.keys().copied().collect();
         for xfer in ids {
@@ -710,7 +860,21 @@ impl Agent {
             });
         }
         let total: u64 = expected.iter().map(|r| u64::from(r.pages)).sum();
-        if expected.is_empty() || total != open.pages.len() as u64 {
+        if open.host {
+            if !out || (self.worker.is_none() && self.records.is_none()) {
+                return self.reject(xfer, "this agent has no record files to serve");
+            }
+            if self.worker.is_none() {
+                let records = self.records.take().expect("checked above");
+                match RecordWorker::start(records, self.wake.clone()) {
+                    Ok(worker) => self.worker = Some(worker),
+                    Err(error) => return self.reject(xfer, &error.to_string()),
+                }
+            }
+            if expected.is_empty() || !open.pages.is_empty() {
+                return self.reject(xfer, "a host transfer names records, not pages");
+            }
+        } else if expected.is_empty() || total != open.pages.len() as u64 {
             return self.reject(xfer, "the transfer's pages do not match its records");
         }
         if open.page_bytes != self.layout.page_record_bytes()
@@ -719,6 +883,9 @@ impl Agent {
             return self.reject(xfer, "the transfer's record sizes are not this instance's");
         }
         let mut run = Xfer {
+            host: open.host,
+            records: open.records.clone(),
+            chain_first: open.chain_first,
             out,
             kind: open.kind,
             fence_id: open.fence_id,
@@ -815,6 +982,16 @@ impl Agent {
                 return self.fail(xfer, "a page or row failed its checksum".into());
             }
         }
+        if run.host {
+            let (record, layout) = (spec.record as usize, self.layout.clone());
+            let target = Target::Window {
+                base,
+                length: spec.length as usize,
+                layout,
+                rank,
+            };
+            return self.read_window(xfer, spec, record, target, None);
+        }
         let layout = self.layout.clone();
         let pages = run.pages.clone();
         let slot = run.slot;
@@ -829,6 +1006,7 @@ impl Agent {
                 jobs_left: 0,
                 spec,
                 slot: None,
+                persisted: None,
             },
         );
         let jobs = jobs_of(
@@ -842,6 +1020,88 @@ impl Agent {
             base + layout.row_at(rank, count as u32) as usize,
         );
         self.queue(xfer, spec.index, jobs);
+    }
+
+    /// Hand one window of a host transfer to the reader thread.
+    fn read_window(
+        &mut self,
+        xfer: u64,
+        spec: wire::WindowSpec,
+        record: usize,
+        target: Target,
+        slot: Option<u32>,
+    ) {
+        let Some(run) = self.xfers.get_mut(&xfer) else {
+            return;
+        };
+        let Some(wanted) = run.records.get(record) else {
+            return self.fail(xfer, "a window names no record".into());
+        };
+        let Some(key) = wanted.key.as_ref().and_then(codec::key_from) else {
+            return self.fail(xfer, "a record names no key".into());
+        };
+        let put = run.kind == wire::rank_fence::Kind::Put as i32;
+        let job = RecordJob {
+            xfer,
+            index: spec.index,
+            key,
+            generation: wanted.generation,
+            put,
+            first_page: if put {
+                (run.chain_first + u64::from(spec.first_page)) as u32
+            } else {
+                spec.first_page
+            },
+            pages: spec.page_count,
+            row: spec.row,
+            target,
+        };
+        run.jobs_outstanding += 1;
+        run.windows.insert(
+            spec.index,
+            Win {
+                jobs_left: 1,
+                spec,
+                slot,
+                persisted: None,
+            },
+        );
+        let sent = self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.jobs.send(job).is_ok());
+        if !sent {
+            self.fail(xfer, "the record reader is gone".into());
+        }
+    }
+
+    /// Collect the reads the reader thread finished.
+    fn poll_records(&mut self) {
+        let done: Vec<RecordDone> = match &self.worker {
+            Some(worker) => worker.done.lock().unwrap().drain(..).collect(),
+            None => return,
+        };
+        for RecordDone {
+            xfer,
+            index,
+            result,
+        } in done
+        {
+            let owner = (xfer, index);
+            match result {
+                Ok(sums) => {
+                    if let Some(win) = self
+                        .xfers
+                        .get_mut(&xfer)
+                        .and_then(|run| run.windows.get_mut(&index))
+                    {
+                        win.persisted = Some(sums);
+                    }
+                    self.job_done(owner, Ok(()));
+                }
+                Err(error) => self.job_done(owner, Err(error.to_string())),
+            }
+        }
     }
 
     fn queue(&mut self, xfer: u64, window: u32, jobs: Vec<Job>) {
@@ -978,6 +1238,7 @@ impl Agent {
                 jobs_left: 0,
                 spec,
                 slot: Some(slot),
+                persisted: None,
             },
         );
         let jobs = jobs_of(
@@ -1027,6 +1288,14 @@ impl Agent {
             .region()
             .address(spec.offset, spec.length)
             .expect("a slot of the staging");
+        if run.host {
+            let record = spec.record as usize;
+            let target = Target::Slot {
+                base,
+                length: spec.length as usize,
+            };
+            return self.read_window(xfer, spec, record, target, Some(slot));
+        }
         let page_len = mine.page_len as usize;
         let pages = run.pages.clone();
         let rowslot = run.slot;
@@ -1036,6 +1305,7 @@ impl Agent {
                 jobs_left: 0,
                 spec,
                 slot: Some(slot),
+                persisted: None,
             },
         );
         let jobs = jobs_of(
@@ -1112,6 +1382,7 @@ impl Agent {
             return;
         };
         let (spec, slot) = (win.spec, win.slot);
+        let persisted = win.persisted.clone();
         let (count, row) = (spec.page_count as usize, spec.row);
         let over = run.failed.is_some() || run.cancelled;
         let (shared, out) = (run.shared, run.out);
@@ -1146,17 +1417,24 @@ impl Agent {
                 let Some(bytes) = region.and_then(|r| r.bytes(spec.offset, spec.length)) else {
                     return self.fail(xfer, "window outside its region".into());
                 };
-                let sums = SliceSums {
-                    pages: (0..count)
-                        .map(|i| {
-                            let at = self.layout.page_at(rank, i as u32) as usize;
-                            checksum(&bytes[at..at + mine.page_len as usize])
-                        })
-                        .collect(),
-                    row: row.then(|| {
-                        let at = self.layout.row_at(rank, count as u32) as usize;
-                        checksum(&bytes[at..at + mine.row_len as usize])
-                    }),
+                let sums = if let Some(persisted) = persisted {
+                    SliceSums {
+                        pages: persisted.pages,
+                        row: persisted.row,
+                    }
+                } else {
+                    SliceSums {
+                        pages: (0..count)
+                            .map(|i| {
+                                let at = self.layout.page_at(rank, i as u32) as usize;
+                                checksum(&bytes[at..at + mine.page_len as usize])
+                            })
+                            .collect(),
+                        row: row.then(|| {
+                            let at = self.layout.row_at(rank, count as u32) as usize;
+                            checksum(&bytes[at..at + mine.row_len as usize])
+                        }),
+                    }
                 };
                 self.end.send(Msg::WindowDone(link::WindowDone {
                     xfer,
@@ -1189,10 +1467,15 @@ impl Agent {
                     .bytes(spec.offset, spec.length)
                     .expect("a slot of the staging");
                 let page_len = mine.page_len as usize;
-                let page_xxh3: Vec<u64> = (0..count)
-                    .map(|i| checksum(&bytes[i * page_len..(i + 1) * page_len]))
-                    .collect();
-                let row_xxh3 = row.then(|| checksum(&bytes[count * page_len..]));
+                let (page_xxh3, row_xxh3) = match persisted {
+                    Some(sums) => (sums.pages, sums.row),
+                    None => (
+                        (0..count)
+                            .map(|i| checksum(&bytes[i * page_len..(i + 1) * page_len]))
+                            .collect(),
+                        row.then(|| checksum(&bytes[count * page_len..])),
+                    ),
+                };
                 let sent = run.channel.as_ref().is_some_and(|channel| {
                     channel.send(net::Filled {
                         index,

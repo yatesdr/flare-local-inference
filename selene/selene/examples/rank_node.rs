@@ -533,6 +533,7 @@ fn agent(args: &Args) {
         registrar: Arc::new(NoRegistration),
         registration_context: 0,
         gpu_uuid: gpus(args.world)[args.rank],
+        records: None,
     })
     .unwrap();
     wait_until(|| agent.status() == PoolStatus::Ready);
