@@ -8,7 +8,7 @@
 //! one result after every destination write has drained, whatever happened.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     time::Instant,
 };
 
@@ -76,11 +76,13 @@ pub(crate) struct State {
     next_claim: u64,
     restores: HashMap<u64, Restore>,
     claims: HashMap<u64, Claim>,
+    /// Restores that wait for one of the manager's claim slots, oldest first.
+    waiting: VecDeque<(PoolFetch, Instant)>,
 }
 
 impl State {
     pub(crate) fn is_empty(&self) -> bool {
-        self.restores.is_empty() && self.claims.is_empty()
+        self.restores.is_empty() && self.claims.is_empty() && self.waiting.is_empty()
     }
 }
 
@@ -140,6 +142,11 @@ impl Engine {
     pub(crate) fn start_fetch(&mut self, now: Instant, fetch: PoolFetch) {
         let id = fetch.id;
         match self.build_restore(now, &fetch) {
+            Ok(_) if !self.claim_room(fetch.parts.len()) => {
+                // The manager grants a requester only so many claims at once and refuses the
+                // rest; a restore waits for a slot instead of being refused.
+                self.requester.waiting.push_back((fetch, now));
+            }
             Ok(restore) => {
                 self.requester.restores.insert(id, restore);
                 self.claim_part(now, id, 0);
@@ -153,6 +160,54 @@ impl Engine {
                     no_headroom: false,
                 }),
             }),
+        }
+    }
+
+    /// Whether a restore of `parts` parts fits in the claim slots the manager grants this
+    /// session. Every part of a restore keeps its slot until the restore ends. A restore
+    /// larger than all the slots runs alone.
+    fn claim_room(&self, parts: usize) -> bool {
+        let granted = self.sess.as_ref().map_or(0, |s| s.limits.max_claims_in_flight);
+        let slots = match (self.st.claim_slots, granted) {
+            (0, _) => return true,
+            (own, 0) => own,
+            (own, granted) => own.min(granted),
+        } as usize;
+        let used: usize = self.requester.restores.values().map(|r| r.parts.len()).sum();
+        used == 0 || used + parts <= slots
+    }
+
+    /// Start the waiting restores that now fit, in order, and give up on those that waited
+    /// longer than a restore may take.
+    pub(crate) fn admit_waiting(&mut self, now: Instant) {
+        while let Some((fetch, since)) = self.requester.waiting.front() {
+            let (parts, since) = (fetch.parts.len(), *since);
+            let expired = now.duration_since(since) >= RESTORE_DEADLINE;
+            if !expired && !self.claim_room(parts) {
+                break;
+            }
+            let (fetch, _) = self.requester.waiting.pop_front().expect("front");
+            let id = fetch.id;
+            let built = if expired {
+                Err(Error::new("the restore waited too long for a claim slot"))
+            } else {
+                self.build_restore(now, &fetch)
+            };
+            match built {
+                Ok(restore) => {
+                    self.requester.restores.insert(id, restore);
+                    self.claim_part(now, id, 0);
+                }
+                Err(error) => self.event(PoolEvent::Fetched {
+                    id,
+                    result: Err(FetchFailure {
+                        error,
+                        part: None,
+                        source: None,
+                        no_headroom: false,
+                    }),
+                }),
+            }
         }
     }
 
@@ -1034,6 +1089,7 @@ impl Engine {
         };
         self.requester.restores.remove(&id);
         self.event(PoolEvent::Fetched { id, result });
+        self.admit_waiting(Instant::now());
     }
 
     /// The restore cannot succeed. Granted claims get a verdict once their
@@ -1139,6 +1195,7 @@ impl Engine {
     // ---- time, loss, close --------------------------------------------------------
 
     pub(crate) fn requester_tick(&mut self, now: Instant) {
+        self.admit_waiting(now);
         let late: Vec<u64> = self
             .requester
             .restores
@@ -1161,6 +1218,17 @@ impl Engine {
     /// the requester's loss, and each is fenced once its copies drain (the
     /// acknowledgment is owed to the next session).
     pub(crate) fn requester_lost(&mut self) {
+        for (fetch, _) in std::mem::take(&mut self.requester.waiting) {
+            self.event(PoolEvent::Fetched {
+                id: fetch.id,
+                result: Err(FetchFailure {
+                    error: Error::new("the pool session was lost"),
+                    part: None,
+                    source: None,
+                    no_headroom: false,
+                }),
+            });
+        }
         let ids: Vec<u64> = self.requester.restores.keys().copied().collect();
         let granted: Vec<u64> = self.requester.claims.keys().copied().collect();
         for id in granted {
