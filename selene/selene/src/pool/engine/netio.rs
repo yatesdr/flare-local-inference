@@ -36,12 +36,7 @@ impl Engine {
         if let Some(staging) = &self.net {
             return Ok(staging.clone());
         }
-        let slots = (self.st.claim_slots + limits.max_open_puts + self.st.export_slots).max(1)
-            * limits.window_credits.max(1);
-        let slot_bytes = limits
-            .max_window_bytes
-            .max(self.st.page_record_bytes())
-            .max(self.st.row_record_bytes());
+        let (slots, slot_bytes) = self.net_shape(limits);
         let staging = Arc::new(Staging::new(
             self.registrar(),
             self.st.context,
@@ -50,6 +45,23 @@ impl Engine {
         )?);
         self.net = Some(staging.clone());
         Ok(staging)
+    }
+
+    /// Slots and bytes per slot of the data channel's staging.
+    fn net_shape(&self, limits: &wire::Limits) -> (u32, u64) {
+        let slots = (self.st.claim_slots + limits.max_open_puts + self.st.export_slots).max(1)
+            * limits.window_credits.max(1);
+        let slot_bytes = limits
+            .max_window_bytes
+            .max(self.st.page_record_bytes())
+            .max(self.st.row_record_bytes());
+        (slots, slot_bytes)
+    }
+
+    /// The bytes [`Engine::net_staging`] would register.
+    pub(crate) fn net_staging_bytes(&self, limits: &wire::Limits) -> u64 {
+        let (slots, slot_bytes) = self.net_shape(limits);
+        Staging::planned_bytes(slots, slot_bytes)
     }
 
     /// The open session reaches the manager over the network: its windows pass

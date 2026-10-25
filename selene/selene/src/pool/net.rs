@@ -64,6 +64,11 @@ pub(crate) struct Staging {
 }
 
 impl Staging {
+    /// The bytes `Staging::new(.., slots, slot_bytes)` maps.
+    pub(crate) fn planned_bytes(slots: u32, slot_bytes: u64) -> u64 {
+        slot_bytes.div_ceil(ALIGN) * ALIGN * u64::from(slots)
+    }
+
     /// `slots` windows of up to `slot_bytes` each, mapped and registered with
     /// the devices that copy to and from them.
     pub(crate) fn new(

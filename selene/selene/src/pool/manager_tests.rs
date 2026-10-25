@@ -290,6 +290,7 @@ fn config_on(manager: &Manager, name: &str, gpu: u8, local: bool) -> PoolConfig 
         claim_slots: 2,
         level_order: None,
         registration_context: 0,
+        approve: None,
     }
 }
 
@@ -783,9 +784,20 @@ impl HostRegistrar for CountingRegistrar {
 }
 
 fn counted(manager: &Manager, registrar: &Arc<CountingRegistrar>, wait: Duration) -> PoolClient {
+    counted_approving(manager, registrar, wait, None)
+}
+
+fn counted_approving(
+    manager: &Manager,
+    registrar: &Arc<CountingRegistrar>,
+    wait: Duration,
+    approve: Option<super::Approve>,
+) -> PoolClient {
     let (copier, _gpu) = SimulatedGpu::shared(&geo()).unwrap();
+    let mut config = config(manager, "counted", 1);
+    config.approve = approve;
     PoolClient::start_waiting(
-        config(manager, "counted", 1),
+        config,
         copier,
         registrar.clone(),
         super::net::Roots::System,
@@ -838,6 +850,80 @@ fn a_manager_restart_reuses_the_regions_and_the_client_registers_nothing_again()
         "the reconnect registered nothing"
     );
     assert_eq!(client.registered_regions(), regions);
+}
+
+/// An approval that records each plan with the registrations made before it, and says `verdict`.
+fn recording(
+    registrar: &Arc<CountingRegistrar>,
+    verdict: std::result::Result<(), String>,
+) -> (
+    super::Approve,
+    Arc<std::sync::Mutex<Vec<(Vec<super::PlannedRegion>, usize)>>>,
+) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (log, registrar) = (seen.clone(), registrar.clone());
+    let approve: super::Approve = Arc::new(move |plan| {
+        let before = registrar.calls.lock().unwrap().len();
+        log.lock().unwrap().push((plan.to_vec(), before));
+        verdict.clone()
+    });
+    (approve, seen)
+}
+
+#[test]
+fn the_plan_arrives_whole_before_any_registration_and_a_reconnect_asks_nothing() {
+    let mut manager = Manager::start();
+    let registrar = Arc::new(CountingRegistrar::default());
+    let (approve, seen) = recording(&registrar, Ok(()));
+    let client = counted_approving(&manager, &registrar, STARTUP_WAIT, Some(approve));
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let (plan, registered_before) = &seen[0];
+        assert_eq!(*registered_before, 0, "approved before the first register");
+        assert_eq!(
+            plan.iter().map(|r| r.name).collect::<Vec<_>>(),
+            ["arena", "staging"]
+        );
+        let sizes: Vec<_> = client
+            .registered_regions()
+            .iter()
+            .map(|r| r.bytes as u64)
+            .collect();
+        assert_eq!(plan.iter().map(|r| r.bytes).collect::<Vec<_>>(), sizes);
+    }
+    wait("Ready", || client.status() == PoolStatus::Ready);
+    let before = client.topology();
+    manager.restart();
+    wait("a session with the restarted manager", || {
+        client.topology() != before && client.status() == PoolStatus::Ready
+    });
+    assert_eq!(seen.lock().unwrap().len(), 1, "the reconnect asked nothing");
+    assert_eq!(registrar.calls.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn a_rejected_plan_registers_nothing_and_turns_the_pool_off() {
+    let manager = Manager::start();
+    let registrar = Arc::new(CountingRegistrar::default());
+    let (approve, seen) = recording(&registrar, Err("over the host budget".into()));
+    let mut client = counted_approving(&manager, &registrar, STARTUP_WAIT, Some(approve));
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert!(registrar.calls.lock().unwrap().is_empty());
+    assert!(client.registered_regions().is_empty());
+    let PoolStatus::Disabled(reason) = client.status() else {
+        panic!("{:?}", client.status());
+    };
+    assert!(
+        reason.contains("over the host budget")
+            && reason.contains("arena")
+            && reason.contains("staging"),
+        "{reason}"
+    );
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert!(registrar.calls.lock().unwrap().is_empty());
+    client.close().unwrap();
 }
 
 #[test]

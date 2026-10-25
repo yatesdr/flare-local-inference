@@ -367,6 +367,7 @@ fn main() {
             claim_slots: 2,
             level_order: None,
             registration_context: 0,
+            approve: None,
         },
         copier,
         Arc::new(Registrar),
