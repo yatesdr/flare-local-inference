@@ -1296,12 +1296,6 @@ impl HostStore for MemoryStore {
         self.core.lookup(history, resident, before)
     }
 
-    /// A publication is only noted: the worker asks for the copy with
-    /// `write_back` when it expects to evict the checkpoint.
-    fn store(&mut self, _checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
-        Ok(StoreOutcome::Noted)
-    }
-
     fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
         if self.core.copying_out(&checkpoint.key) {
             self.core.stats.store_skipped += 1;

@@ -1028,7 +1028,7 @@ fn publication(gpu: &GpuMemory, salt: u32, pages: usize) -> (PublishedCheckpoint
 /// reported, and try again after a refusal or a deferral. The device cache
 /// then evicts the checkpoint, as it does under pressure.
 fn publish<S: HostStore>(store: &mut S, checkpoint: &PublishedCheckpoint) {
-    assert_eq!(store.store(checkpoint).unwrap(), StoreOutcome::Noted);
+    store.published(checkpoint).unwrap();
     store_and_wait(store, checkpoint);
     store.evicted(checkpoint.key, None);
 }

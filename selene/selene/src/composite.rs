@@ -972,12 +972,6 @@ impl HostStore for CompositeStore {
         Some(hit)
     }
 
-    /// A publication is only noted: the worker asks for the copy with
-    /// `write_back` when it expects to evict the checkpoint.
-    fn store(&mut self, _checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
-        Ok(StoreOutcome::Noted)
-    }
-
     fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
         if checkpoint.tail_pages > checkpoint.chain_pages.len() {
             self.stats.store_failed += 1;
@@ -2930,7 +2924,7 @@ mod tests {
         let full = history(2000);
         let mut ids = Ids::new();
         let root = checkpoint(&mut ids, &full, 700, None, pages(0..10), 10, StateSlotId(1));
-        assert_eq!(store.store(&root).unwrap(), StoreOutcome::Noted);
+        store.published(&root).unwrap();
         assert!(store.outbound.is_empty() && !store.memory.index().contains(&root.key));
         // Local mode keeps write-through: the copy lands in memory and a file
         // is reserved and written at once.

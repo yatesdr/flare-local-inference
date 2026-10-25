@@ -2026,10 +2026,7 @@ impl<'a> Worker<'a> {
         }
         for publication in self.scheduler.take_publications() {
             progress = true;
-            if let Ok(outcome) = store.store(&publication) {
-                self.metrics.host_store_outcome(outcome);
-                self.scheduler.store_outcome(publication.id, outcome)?;
-            }
+            store.published(&publication)?;
         }
         let next = next_admission(&self.scheduler, &self.parked, &self.pending);
         for id in self.scheduler.write_back_candidates(next) {
