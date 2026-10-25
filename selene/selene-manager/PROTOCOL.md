@@ -673,9 +673,11 @@ record can be allocated in them) until every such holder has either
    incarnation (stale messages are rejected by `manager_incarnation`), so after
    that nothing of the old epoch can write.
 
+While the hold lasts a claim is refused at once with `REGIONS_HELD`, not `NO_WINDOWS`. It ends as soon as the last recorded holder has reconnected or exited, not on a timer. A requester that gets it claims again after a short wait (250 ms), within the restore's own deadline, and recomputes only when that passes.
+
 A holder that is alive but never reconnects, or whose exit cannot be observed,
 keeps the regions held: the same outcome as a quarantined window in 7.4, at region
-size, and visible as `NO_WINDOWS`. A process that was not recorded cannot have a
+size, and visible as `REGIONS_HELD`. A process that was not recorded cannot have a
 window of the old epoch, so it needs no wait. Recreated files need no hold: they
 are different files that no old mapping can reach. When the hold ends the
 allocators are fresh, so every window of the old epoch is free by construction.
