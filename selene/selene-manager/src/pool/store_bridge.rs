@@ -241,7 +241,7 @@ impl Core {
                     state.index.remove(manager, key, Tier::Nvme, u64::MAX);
                 }
             }
-            Some(E::Room(_)) | None => {}
+            None => {}
         }
     }
 

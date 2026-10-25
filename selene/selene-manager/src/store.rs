@@ -436,9 +436,6 @@ enum LiveEvent {
         key: Key,
         entry: Option<EntryData>,
     },
-    Room {
-        bytes: u64,
-    },
 }
 
 struct Subscription {
@@ -529,10 +526,6 @@ pub enum StoreEvent {
         key: Key,
         entry: Option<EntryData>,
     },
-    Room {
-        connection: u64,
-        bytes: u64,
-    },
 }
 
 struct PutDrain {
@@ -545,16 +538,6 @@ struct PutDrain {
     reservation: u64,
     _temporary: Option<Arc<DiskExtent>>,
     _staging_hold: Option<Arc<Extent>>,
-}
-
-#[derive(Clone, Debug)]
-struct ArmedRoom {
-    requirement: PutRequirement,
-    /// Arena shape the same Put could take once space frees, when the refused
-    /// streaming shape cannot fit its hold.
-    alternative: Option<PutRequirement>,
-    /// Keys the refused shape needs to survive the retry.
-    protected: Vec<Key>,
 }
 
 struct GetDrain {
@@ -629,7 +612,6 @@ pub struct Store {
     next_transfer: u64,
     read_backlog: VecDeque<(NamespaceId, u64, Task)>,
     detached_puts: HashMap<(u64, u64), Put>,
-    armed: HashMap<u64, ArmedRoom>,
 }
 
 /// Names the startup step and path an error came from.
@@ -713,7 +695,6 @@ impl Store {
             next_transfer: 1,
             read_backlog: VecDeque::new(),
             detached_puts: HashMap::new(),
-            armed: HashMap::new(),
         };
         let mut recovered_age = Vec::new();
         for recovered in recovered {
@@ -1405,7 +1386,7 @@ impl Store {
         // The arena rounds every record extent up to a power of two. Without a
         // root there is no disk to stream to, so a record whose own extent
         // cannot fit the arena can never be stored. Whether it fits beside
-        // what else must stay resident is a Room question, not OVERSIZE.
+        // what else must stay resident is a capacity question.
         if rootless && child_header.length_with_row().max(4096).next_power_of_two() > arena_bytes {
             self.metrics.oversize += 1;
             self.reject_put(&events, proto::Reason::Oversize as u8);
@@ -1420,8 +1401,7 @@ impl Store {
         // arena keeps, and for a streamed record the envelope, the record and
         // its mandatory two-window staging hold. Only the record's own charge
         // can make it OVERSIZE; a shortage caused by what else must stay
-        // resident is a Budget, and without Room the record is simply not
-        // stored.
+        // resident is a Budget refusal.
         let extent = child_header.length_with_row().max(4096).next_power_of_two();
         let charge = if extent <= arena_bytes {
             disk::ENVELOPE_BYTES.saturating_add(extent)
@@ -1438,9 +1418,6 @@ impl Store {
         // the parent and store the root. `memory` holds the extent the shape
         // was admitted with.
         let selected = self.put_requirement(&child_header, arena_bytes);
-        // A streaming refusal still has the arena shape as a retry candidate
-        // whenever the record fits an arena extent.
-        let alternative = (!selected.streaming).then_some(selected);
         let mut memory: Option<Arc<Extent>> = None;
         let (header, parent, pins, requirement): (Header, Option<Key>, Vec<Key>, PutRequirement) =
             if !selected.streaming {
@@ -1471,9 +1448,8 @@ impl Store {
                                     replacement.then_some(request.key).into_iter().collect();
                                 (root_header, None, root_pins, requirement)
                             }
-                            RootChoice::Wait(requirement, protected) => {
+                            RootChoice::Wait(_, _) => {
                                 self.metrics.retry_budget += 1;
-                                self.arm(connection, requirement, protected, None);
                                 self.reject_put(&events, proto::Reason::Budget as u8);
                                 return;
                             }
@@ -1491,9 +1467,8 @@ impl Store {
         let length = header.length_with_row();
         // A streamed record reserves two windows in staging. When that hold
         // cannot fit the whole region it can never be admitted: if the record
-        // has no arena shape either, no Room can ever arrive, so refuse it as
-        // OVERSIZE instead of arming a wait. A record that still fits an arena
-        // extent waits for arena space.
+        // has no arena shape either, refuse it as OVERSIZE. A record that still
+        // fits an arena extent can be tried again after space is freed.
         if requirement.streaming && requirement.allocation > self.staging.capacity() as u64 {
             if selected.streaming {
                 self.metrics.oversize += 1;
@@ -1501,7 +1476,6 @@ impl Store {
                 return;
             }
             self.metrics.retry_budget += 1;
-            self.arm(connection, selected, pins.clone(), alternative);
             self.reject_put(&events, proto::Reason::Budget as u8);
             return;
         }
@@ -1520,7 +1494,6 @@ impl Store {
                 let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
             }
             self.metrics.retry_budget += 1;
-            self.arm(connection, requirement, pins.clone(), alternative);
             self.reject_put(&events, proto::Reason::Budget as u8);
             return;
         }
@@ -1533,7 +1506,6 @@ impl Store {
                         let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
                     }
                     self.metrics.retry_budget += 1;
-                    self.arm(connection, requirement, pins.clone(), alternative);
                     self.reject_put(&events, proto::Reason::Budget as u8);
                     return;
                 }
@@ -1548,7 +1520,6 @@ impl Store {
                 let _ = self.namespaces.get_mut(&id).unwrap().tree.unpin(key);
             }
             self.metrics.retry_budget += 1;
-            self.arm(connection, requirement, pins.clone(), alternative);
             self.reject_put(&events, proto::Reason::Budget as u8);
             return;
         }
@@ -1748,29 +1719,6 @@ impl Store {
             return true;
         }
         self.evict_accounted(id, key)
-    }
-
-    /// Arm Room with the requirement of the shape that was just refused, the
-    /// arena shape that may become possible later, and the keys the shape
-    /// needs to survive. The latest refusal replaces the previous one, so an
-    /// older, unserviceable requirement cannot keep Room tied to a charge this
-    /// operation no longer needs.
-    fn arm(
-        &mut self,
-        connection: u64,
-        requirement: PutRequirement,
-        protected: Vec<Key>,
-        alternative: Option<PutRequirement>,
-    ) {
-        self.local.arm_budget(connection, requirement.charge);
-        self.armed.insert(
-            connection,
-            ArmedRoom {
-                requirement,
-                alternative,
-                protected,
-            },
-        );
     }
 
     /// The physical requirement for this Put shape. A record whose
@@ -2013,8 +1961,6 @@ impl Store {
             } else {
                 put.hold_slots.iter().position(Option::is_none)
             };
-            let requirement = put.requirement;
-            let protected: Vec<Key> = put.pins.iter().copied().collect();
             (
                 index,
                 plan,
@@ -2023,11 +1969,9 @@ impl Store {
                 hold,
                 hold_unit,
                 slot,
-                requirement,
-                protected,
             )
         };
-        let (index, plan, header, memory, hold, hold_unit, slot, requirement, protected) = prepared;
+        let (index, plan, header, memory, hold, hold_unit, slot) = prepared;
         if memory.is_none() && slot.is_none() {
             // Both hold slots are still live; retry once one is released.
             return false;
@@ -2103,7 +2047,6 @@ impl Store {
             }
             Err(GrantError::Credits) => false,
             Err(GrantError::Budget) => {
-                self.arm(connection, requirement, protected, None);
                 self.fail_put(
                     connection,
                     transfer,
@@ -3924,7 +3867,6 @@ impl Store {
     }
 
     fn connection_closed(&mut self, connection: u64) {
-        self.armed.remove(&connection);
         self.local.close(connection);
         self.subscriptions.retain(|(id, _), _| *id != connection);
         self.pending_gets.remove(&connection);
@@ -4892,7 +4834,6 @@ impl Store {
             self.disk_progress = now;
         }
         self.timeouts();
-        self.room();
     }
 
     fn timeouts(&mut self) {
@@ -4927,68 +4868,6 @@ impl Store {
                     invalid("no progress"),
                 );
             }
-        }
-    }
-
-    fn room(&mut self) {
-        let connections: Vec<u64> = self.sessions.keys().copied().collect();
-        for connection in connections {
-            let Some(armed) = self.armed.get(&connection).cloned() else {
-                continue;
-            };
-            let namespace = self
-                .sessions
-                .get(&connection)
-                .and_then(|session| session.namespace);
-            let _ = self.make_room_with(namespace, armed.requirement.charge, &armed.protected);
-            let budget_ok = self
-                .sessions
-                .get(&connection)
-                .is_some_and(|session| session.budget.balance() >= 0);
-            let mut bytes = armed.requirement.charge;
-            let mut capacity = self.room_capacity(armed.requirement, &armed.protected);
-            if !capacity {
-                // The refused streaming shape may still be unserviceable
-                // while the arena shape becomes possible again.
-                if let Some(alternative) = armed.alternative.filter(|alt| *alt != armed.requirement)
-                {
-                    let _ = self.make_room_with(namespace, alternative.charge, &armed.protected);
-                    if self.room_capacity(alternative, &armed.protected) {
-                        capacity = true;
-                        bytes = alternative.charge;
-                    }
-                }
-            }
-            if budget_ok && capacity && self.local.take_armed(connection).is_some() {
-                self.armed.remove(&connection);
-                self.events.push(StoreEvent::Room { connection, bytes });
-            }
-        }
-    }
-
-    /// A retry can be admitted now when the same allocator path admission
-    /// uses succeeds: the fixed staging hold fits, or the arena allocation
-    /// succeeds with the shape's protected keys left in place.
-    fn room_capacity(&mut self, requirement: PutRequirement, protected: &[Key]) -> bool {
-        if requirement.streaming {
-            self.charge_total().saturating_add(requirement.charge) <= self.config.nvme
-                && requirement.allocation <= self.staging.capacity() as u64
-                && self
-                    .staging
-                    .allocate(requirement.allocation as usize)
-                    .is_some()
-        } else {
-            let arena_ok = requirement.allocation <= self.memory.capacity() as u64
-                && self
-                    .memory_room_excluding(
-                        requirement.allocation as usize,
-                        self.config.root.is_some(),
-                        protected,
-                    )
-                    .is_some();
-            arena_ok
-                && (self.config.root.is_none()
-                    || self.charge_total().saturating_add(requirement.charge) <= self.config.nvme)
         }
     }
 
@@ -5065,19 +4944,6 @@ impl Store {
                         }
                     }
                 }
-                StoreEvent::Room { connection, bytes } => {
-                    let keys: Vec<(u64, NamespaceId)> = self
-                        .subscriptions
-                        .keys()
-                        .filter(|(id, _)| *id == connection)
-                        .copied()
-                        .collect();
-                    for key in keys {
-                        if self.buffer_or_send(key, LiveEvent::Room { bytes }) {
-                            self.restart_snapshot(key);
-                        }
-                    }
-                }
             }
         }
     }
@@ -5087,7 +4953,6 @@ impl Store {
     fn buffer_or_send(&mut self, connection: (u64, NamespaceId), live: LiveEvent) -> bool {
         let seq = match &live {
             LiveEvent::Catalog { seq, .. } => Some(*seq),
-            LiveEvent::Room { .. } => None,
         };
         let action = {
             let Some(subscription) = self.subscriptions.get_mut(&connection) else {
@@ -5619,12 +5484,6 @@ fn live_event(live: &LiveEvent, sequence: u64) -> Option<proto::CatalogEvent> {
                 event: Some(event),
             })
         }
-        LiveEvent::Room { bytes } => Some(proto::CatalogEvent {
-            sequence,
-            event: Some(proto::catalog_event::Event::Room(proto::Room {
-                bytes: *bytes,
-            })),
-        }),
     }
 }
 
@@ -6215,24 +6074,6 @@ mod tests {
         // already transferred count.
         store.connection_closed(1);
         assert!(store.retired_gets.is_empty());
-        drop(store);
-        let _ = fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn arm_replaces_the_requirement_with_the_latest_refusal() {
-        let (mut store, directory) = store("arm-latest");
-        let value = descriptor();
-        store
-            .hello(1, "l0".into(), std::process::id(), value)
-            .unwrap();
-        let large = PutRequirement::streaming(1024, 4096);
-        let small = PutRequirement::arena(8192);
-        store.arm(1, large, Vec::new(), None);
-        store.arm(1, small, Vec::new(), None);
-        assert_eq!(store.armed[&1].requirement, small);
-        assert_eq!(store.local.armed_budget(1), Some(small.charge));
-        assert_eq!(store.local.take_armed(1), Some(small.charge));
         drop(store);
         let _ = fs::remove_dir_all(directory);
     }
@@ -7396,90 +7237,6 @@ mod tests {
     }
 
     #[test]
-    fn room_admits_an_arena_sized_reservation() {
-        let (mut store, directory) = store("room-size");
-        let value = descriptor();
-        store
-            .hello(1, "l0".into(), std::process::id(), value)
-            .unwrap();
-        let capacity = store.memory.capacity() as u64;
-        store.arm(
-            1,
-            PutRequirement {
-                streaming: false,
-                charge: crate::disk::ENVELOPE_BYTES + capacity,
-                reservation: crate::disk::ENVELOPE_BYTES + capacity,
-                allocation: capacity,
-                unit: capacity,
-            },
-            Vec::new(),
-            None,
-        );
-        store.room();
-        assert!(
-            store
-                .events
-                .iter()
-                .any(|event| matches!(event, StoreEvent::Room { connection: 1, .. }))
-        );
-        drop(store);
-        let _ = fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn room_does_not_offer_an_oversized_unit_it_cannot_fit() {
-        let (mut store, base, directory) = store_with_root("room-unit", 4096);
-        let value = descriptor();
-        store
-            .hello(1, "l0".into(), std::process::id(), value)
-            .unwrap();
-        store.arm(
-            1,
-            PutRequirement {
-                streaming: true,
-                charge: crate::disk::ENVELOPE_BYTES + 16 * 1024 * 1024,
-                reservation: crate::disk::ENVELOPE_BYTES,
-                allocation: 16 * 1024 * 1024,
-                unit: 16 * 1024 * 1024,
-            },
-            Vec::new(),
-            None,
-        );
-        store.room();
-        assert!(
-            !store
-                .events
-                .iter()
-                .any(|event| matches!(event, StoreEvent::Room { .. })),
-            "a 16 MiB unit cannot fit the 8 MiB staging region"
-        );
-        store.local.take_armed(1);
-        store.armed.remove(&1);
-        store.arm(
-            1,
-            PutRequirement {
-                streaming: true,
-                charge: crate::disk::ENVELOPE_BYTES + 4 * 1024 * 1024,
-                reservation: crate::disk::ENVELOPE_BYTES,
-                allocation: 4 * 1024 * 1024,
-                unit: 4 * 1024 * 1024,
-            },
-            Vec::new(),
-            None,
-        );
-        store.room();
-        assert!(
-            store
-                .events
-                .iter()
-                .any(|event| matches!(event, StoreEvent::Room { .. }))
-        );
-        drop(store);
-        let _ = fs::remove_dir_all(base);
-        let _ = fs::remove_dir_all(directory);
-    }
-
-    #[test]
     fn the_nvme_measure_counts_put_holds_and_reservations_not_windows_leased_for_claims() {
         let (mut store, base, directory) = store_with_root("nvme-measure", 4096);
         assert_eq!(store.charge_total(), 0);
@@ -7572,87 +7329,4 @@ mod tests {
         let _ = fs::remove_dir_all(PathBuf::from("/dev/shm/selene").join(name));
     }
 
-    #[test]
-    fn streaming_room_only_needs_a_window() {
-        let (mut store, base, directory) = store_with_root("room-window-stream", 4096);
-        let value = descriptor();
-        store
-            .hello(1, "l0".into(), std::process::id(), value.clone())
-            .unwrap();
-        // A record larger than staging still streams: the requirement
-        // charges the disk record plus a fixed hold of two of its largest
-        // windows, and Room only needs that hold to fit the staging region.
-        let key = |tokens| Key {
-            consumed_tokens: tokens,
-            digest: [0; 16],
-        };
-        let header = Header::new(&value, key(4096 * 64), None, [0; 16], 4096).unwrap();
-        let requirement = store.put_requirement(&header, 0);
-        assert!(requirement.streaming);
-        assert!(requirement.reservation > 8 * 1024 * 1024);
-        assert!(requirement.unit <= 4 * 1024 * 1024);
-        store.arm(1, requirement, Vec::new(), None);
-        store.room();
-        assert!(
-            store
-                .events
-                .iter()
-                .any(|event| matches!(event, StoreEvent::Room { connection: 1, .. }))
-        );
-        drop(store);
-        let _ = fs::remove_dir_all(base);
-        let _ = fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn window_budget_arms_room() {
-        let (mut store, base, directory) = store_with_root("room-window", 4096);
-        let value = descriptor();
-        store
-            .hello(1, "l0".into(), std::process::id(), value)
-            .unwrap();
-        // Hold all of staging so the fixed hold cannot be reserved.
-        let hold = store.staging.allocate(8 * 1024 * 1024).unwrap();
-        let (events, mut receiver) = tokio::sync::mpsc::channel(4);
-        store.submit_put(
-            1,
-            1,
-            PutRequest {
-                namespace: store.namespace_id().unwrap(),
-                key: Key {
-                    consumed_tokens: 128,
-                    digest: [6; 16],
-                },
-                published_parent: None,
-                bucket: [0; 16],
-                chain_pages: 2,
-                published_tail_pages: 2,
-                row: true,
-            },
-            events,
-        );
-        store.dispatch_trace();
-        assert!(!store.sessions[&1].ops.contains_key(&1));
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(Ok(PutAnswer::Refused(refused)))
-                if refused.reason == proto::Reason::Budget as u8
-        ));
-        let requirement = store.armed.get(&1).unwrap().requirement;
-        assert!(requirement.streaming);
-        assert_eq!(store.local.armed_budget(1), Some(requirement.charge));
-        drop(hold);
-        store.events.clear();
-        store.room();
-        assert!(
-            store
-                .events
-                .iter()
-                .any(|event| matches!(event, StoreEvent::Room { connection: 1, .. }))
-        );
-        assert!(!store.armed.contains_key(&1));
-        drop(store);
-        let _ = fs::remove_dir_all(base);
-        let _ = fs::remove_dir_all(directory);
-    }
 }

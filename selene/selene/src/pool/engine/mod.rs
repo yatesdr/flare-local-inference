@@ -423,8 +423,6 @@ impl Engine {
             In::PutGrant(grant) => self.on_put_grant(grant),
             In::Stored(stored) => self.on_stored(stored),
             In::PutRefused(refused) => self.on_put_refused(refused),
-            // Room is only a hint for later eviction attempts.
-            In::Room(_) => {}
         }
         self.pump(now);
         Ok(())
