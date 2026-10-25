@@ -96,6 +96,38 @@ pub fn base(label: &str) -> PathBuf {
     ))
 }
 
+/// Staging for a test manager: small, since many run at once in a small `/dev/shm`.
+pub const TEST_STAGING: usize = 16 * 1024 * 1024;
+
+/// Removes an instance's shared-memory directory when dropped. The manager keeps its region files
+/// across restarts, so a test that runs the binary must clean up after it.
+pub struct ShmCleanup(String);
+
+impl ShmCleanup {
+    pub fn new(name: &str) -> Self {
+        Self(name.to_owned())
+    }
+}
+
+impl Drop for ShmCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(std::path::Path::new("/dev/shm/selene").join(&self.0));
+    }
+}
+
+/// Removes the shared-memory directories of a test child that was killed, which cannot clean up
+/// after itself. They are named by the child's pid, which is gone.
+pub fn remove_children_shm(pid: u32) {
+    let prefix = format!("selene-{pid}-");
+    if let Ok(entries) = std::fs::read_dir("/dev/shm/selene") {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+}
+
 pub fn instance_name(label: &str) -> String {
     format!(
         "selene-{}-{label}-{}",
@@ -135,6 +167,7 @@ impl Host {
         let name = instance_name("host");
         let mut config = Config::new(base.join("records"), base.join("run/m.sock"), memory, nvme);
         config.name = name;
+        config.staging = TEST_STAGING;
         config.metrics = Some(free_metrics_address());
         Self {
             base,
@@ -150,6 +183,7 @@ impl Host {
         let name = instance_name("host");
         let mut config = Config::dram_only(base.join("run/m.sock"), memory);
         config.name = name;
+        config.staging = TEST_STAGING;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         config.metrics = Some(listener.local_addr().unwrap().to_string());
         drop(listener);
