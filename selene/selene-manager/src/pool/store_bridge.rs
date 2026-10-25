@@ -334,6 +334,15 @@ impl Core {
             );
             return Ok(());
         }
+        if !self.ranks_ready(sid) {
+            self.put_refusal(
+                sid,
+                put_id,
+                v2::Reason::PutNotReady,
+                "a peer rank of this instance is not attached",
+            );
+            return Ok(());
+        }
         let open = self.puts.keys().filter(|k| (k.0, k.1) == process).count();
         if open >= self.cfg.limits.max_open_puts as usize {
             self.put_refusal(sid, put_id, v2::Reason::Queue, "too many open puts");
