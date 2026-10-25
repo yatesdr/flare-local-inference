@@ -771,6 +771,7 @@ impl Store {
                 arena_bytes: self.local.arena_size(),
                 staging_path: self.local.staging_path().display().to_string(),
                 staging_bytes: self.local.staging_size(),
+                regions_generation: self.local.regions_generation(),
             },
             self.local.staging(),
             records,

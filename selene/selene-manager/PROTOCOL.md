@@ -632,13 +632,17 @@ Detected by stream error, EOF, a `SessionClosing`, or a different
 2. fails every claim it has outstanding locally (all-or-nothing plans fail);
 3. drains its own CUDA and transport accesses (it cannot ask the manager; the
    `PageCopier` completions tell it);
-4. then releases its export pins (`unpin_checkpoint`), drops host-tier references
-   and unmaps or unregisters the staging regions, quarantining whatever it could
-   not drain;
+4. then releases its export pins (`unpin_checkpoint`) and drops host-tier
+   references, quarantining whatever it could not drain. It keeps the shared
+   regions mapped and registered: they are mapped and registered once, at
+   startup, and for the life of the process (section 8.6);
 5. continues on its local tiers. Evictions that targeted the manager's NVMe pass
    the record one tier further down (design: unavailable destination);
-6. reconnects with backoff (Hello, open, resync). The old regions' file names
-   embed the old incarnation, so a stale mapping can never alias a new window.
+6. reconnects with backoff (Hello, open, resync). The regions are the same
+   files at the same offsets when the restarted manager reports the same
+   `SharedMemory.regions_generation`; a different generation disables the pool
+   until the process restarts (section 8.6). Opening the new session is the
+   instance's statement that step 3 is done.
 
 ### 8.2 Manager restart
 
@@ -652,7 +656,9 @@ process picks a new incarnation, starts `RECOVERING` (its NVMe records), moves t
   admits with its local match (no wait).
 - A `ClaimRelease`, `FenceAck` or `ExportEnd` that mentions a vanished claim or
   export is answered (`UNKNOWN_CLAIM`) or ignored. Old windows were never
-  reusable by the new manager: new region files.
+  reusable by the new manager: it reuses the same region files and holds them
+  until each process that had a session has reconnected or exited
+  (section 8.6).
 - Records the dead manager held in DRAM are lost; NVMe records are recovered.
   A writer dropped its source copy only at `Stored`, so there is nothing to
   resend; the record is simply gone and will be recomputed on demand.
@@ -709,7 +715,62 @@ dying: "a hold protects against eviction only".
 | stream ends, process alive | `REQUESTER_LOST` | `SOURCE_LOST` | removed | quarantined until fence acks arrive on a new session or the process exits |
 | superseded by a reconnect (same process) | `REQUESTER_LOST` | `SOURCE_LOST` | hidden, replaced at the new snapshot | as above; the old stream's fence acks are accepted on the new session |
 | superseded by another process (same `instance_id`) | `REQUESTER_LOST` | `SOURCE_LOST` | hidden, replaced at the new snapshot | quarantined until the old process's exit is confirmed; the new process attests nothing for it |
-| manager restart | all dead | all dead | gone | new region files; old ones unreachable |
+| manager restart | all dead | all dead | gone | the same region files, held until the previous run's processes have reconnected (drained) or exited (8.6) |
+
+### 8.6 Persistent shared regions
+
+An instance may register host memory with CUDA only at startup (registration
+consumes device memory, and serving allocates none). So the manager's arena and
+staging are not per-incarnation: they are fixed-size files, `arena` and
+`staging`, in the instance's directory, and an instance maps and registers them
+once, when it first connects, for the life of its process.
+
+**Reuse.** At start the manager takes the instance lock, then reuses the existing
+files when both are regular files of its user with exactly the configured sizes,
+and a readable generation. Their paths, inodes and offsets are then unchanged,
+and `SharedMemory.regions_generation` (Hello) is unchanged. Windows name a region
+(`ARENA` or `STAGING`) and an offset, both stable across the restart. Otherwise
+(first start, `--memory` or `--staging` changed, a file truncated or replaced) it
+recreates both files, chooses a new random nonzero generation and logs that
+running instances must restart to use the pool. The lock decides ownership, so a
+live manager's files are never reclaimed and another instance's directory is never
+read: startup removes only what is not one of the lock, the two region files, the
+generation and the holders list.
+
+**Client.** A client uses the pool only with the regions it registered:
+
+- same generation, paths and sizes after a reconnect: it continues with its
+  existing mappings and registrations;
+- a different generation, path or size: its mappings are of files that no longer
+  back the pool. It disables the pool for the process (local tiers only, one
+  warning) and never registers late. Restarting the instance picks up the new
+  regions;
+- manager unreachable at the first connect: it waits a bounded time, then runs
+  local-only for the life of the process and never attaches later.
+
+**Why reuse is safe.** Reusing the files gives up what new files used to
+guarantee: that no access under the dead manager can alias a window of the new
+one. Physical fencing (7.1) is restored by the following rule instead. The
+manager records the pid and start time of every process with a local session, in
+a file that survives a crash. When it starts on reused regions, each recorded
+process that is still the same live process is a previous-run holder, and the
+manager takes the whole of both regions out of service (no window, put extent or
+record can be allocated in them) until every such holder has either
+
+1. exited, as its pidfd reports (the 7.4 quarantine rule: memory returns when
+   the owning process is confirmed gone), or
+2. opened a new session. A client opens one only after step 3 of 8.1: it has
+   failed its claims and every copy it submitted under the old incarnation has
+   completed on every rank. Old-epoch windows are not referred to by the new
+   incarnation (stale messages are rejected by `manager_incarnation`), so after
+   that nothing of the old epoch can write.
+
+A holder that is alive but never reconnects, or whose exit cannot be observed,
+keeps the regions held: the same outcome as a quarantined window in 7.4, at region
+size, and visible as `NO_WINDOWS`. A process that was not recorded cannot have a
+window of the old epoch, so it needs no wait. Recreated files need no hold: they
+are different files that no old mapping can reach. When the hold ends the
+allocators are fresh, so every window of the old epoch is free by construction.
 
 ## 9. The two-source restore plan
 
