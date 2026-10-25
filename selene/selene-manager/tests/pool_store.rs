@@ -163,9 +163,7 @@ async fn u2_u8_and_a9_present_queue_and_invalid_metadata() {
                 digest: vec![4; 16],
             }],
             before_tokens: 5000,
-            held: vec![],
-
-            max_candidates: 0,
+            resident_tokens: 0,
         })
         .await;
     let keys: Vec<u64> = reply

@@ -69,4 +69,4 @@ pub use slice::{RankSlice, SliceLayout, SliceSums};
 pub use startup::{Approve, PlannedRegion, RegisteredRegion};
 pub use store::{PoolPort, PooledStore};
 pub use tiers::{Releases, TierView};
-pub use types::{HeldRange, PoolCandidate, SourceRef, Tier};
+pub use types::{PoolCandidate, SourceRef, Tier};

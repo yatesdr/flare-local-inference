@@ -12,14 +12,12 @@ use std::{
 
 use tokio::sync::Notify;
 
-use crate::{
-    Error, ExportChain, ExportId, ExportRefusal, PageId, PrefixKey, Result, StateSlotId,
-};
+use crate::{Error, ExportChain, ExportId, ExportRefusal, PageId, PrefixKey, Result, StateSlotId};
 
 use super::{
     exporter::{HostPin, PutBytes},
     lookup::{Answer, LookupState, LookupTicket, TicketInner},
-    types::{HeldRange, PoolCandidate, SourceRef, Tier},
+    types::{PoolCandidate, SourceRef, Tier},
 };
 
 /// Commands the worker may queue before new lookups and fetches are refused.
@@ -179,7 +177,7 @@ pub(crate) struct LookupSend {
     pub id: u64,
     pub boundaries: Vec<PrefixKey>,
     pub before: u64,
-    pub held: Vec<HeldRange>,
+    pub resident: u64,
 }
 
 pub(crate) enum Command {
@@ -209,12 +207,11 @@ pub(crate) enum Command {
 struct CoalesceKey {
     last: PrefixKey,
     before: u64,
-    held: Vec<(usize, PrefixKey)>,
+    resident: u64,
 }
 
 struct Entry {
     key: CoalesceKey,
-    held: Vec<HeldRange>,
     waiters: Vec<(u64, Arc<TicketInner>)>,
 }
 
@@ -339,7 +336,7 @@ impl Shared {
         now: Instant,
         boundaries: Vec<PrefixKey>,
         before: u64,
-        held: Vec<HeldRange>,
+        resident: u64,
     ) -> LookupTicket {
         let Some(last) = boundaries.last().copied() else {
             return LookupTicket::none();
@@ -353,15 +350,10 @@ impl Shared {
         {
             return LookupTicket::none();
         }
-        let mut held_key: Vec<(usize, PrefixKey)> = held
-            .iter()
-            .map(|range| (range.level as usize, range.end))
-            .collect();
-        held_key.sort_by_key(|(level, end)| (*level, end.consumed_tokens));
         let key = CoalesceKey {
             last,
             before,
-            held: held_key,
+            resident,
         };
         let inner = TicketInner::new(LookupState::Pending);
         let mut registry = self.registry.lock().unwrap();
@@ -390,7 +382,7 @@ impl Shared {
                         id: wire,
                         boundaries,
                         before,
-                        held: held.clone(),
+                        resident,
                     }),
                     false,
                 );
@@ -402,7 +394,6 @@ impl Shared {
                     wire,
                     Entry {
                         key,
-                        held,
                         waiters: vec![(waiter, inner.clone())],
                     },
                 );
@@ -440,10 +431,7 @@ impl Shared {
         registry.by_key.remove(&entry.key);
         drop(registry);
         let state = match candidates {
-            Some(candidates) => LookupState::Ready(Arc::new(Answer {
-                held: entry.held,
-                candidates,
-            })),
+            Some(candidates) => LookupState::Ready(Arc::new(Answer { candidates })),
             None => LookupState::None,
         };
         for (_, ticket) in entry.waiters {
@@ -514,7 +502,7 @@ mod tests {
             Instant::now(),
             vec![key(0), key(n)],
             key(n).consumed_tokens + 64,
-            Vec::new(),
+            0,
         )
     }
 

@@ -409,7 +409,7 @@ fn fetch_for(
     pages: usize,
     scratch: &[u32],
 ) -> PoolFetch {
-    let ticket = client.begin_lookup(history, Vec::new());
+    let ticket = client.begin_lookup(history, 0);
     wait("the lookup", || {
         !matches!(ticket.state(), LookupState::Pending)
     });
@@ -521,7 +521,7 @@ fn restore_through(manager: &Manager, world: usize, reach: &[Reach]) {
     let key = offer(&source, &history, world, pages);
     let scratch = [100, 101, 102, 103];
     wait("the offer to be indexed", || {
-        let ticket = requester.rank0.begin_lookup(&history, Vec::new());
+        let ticket = requester.rank0.begin_lookup(&history, 0);
         let deadline = Instant::now() + Duration::from_secs(2);
         while matches!(ticket.state(), LookupState::Pending) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(2));
@@ -599,7 +599,7 @@ fn publish(source: &Instance, history: &TestHistory, world: usize, pages: usize)
 
 fn wait_offered(client: &PoolClient, history: &TestHistory) {
     wait("the offer to be indexed", || {
-        let ticket = client.begin_lookup(history, Vec::new());
+        let ticket = client.begin_lookup(history, 0);
         let deadline = Instant::now() + Duration::from_secs(2);
         while matches!(ticket.state(), LookupState::Pending) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(2));

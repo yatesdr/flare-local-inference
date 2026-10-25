@@ -151,25 +151,13 @@ impl Core {
             }
             boundaries.push(key);
         }
-        let order = [v2::Level::NeighbourGpu, v2::Level::HostDram, v2::Level::HostNvme, v2::Level::RemoteNvme];
-        let mut held: Vec<(v2::Level, Key)> = Vec::new();
-        for range in &request.held {
-            let (Ok(level), Ok(end)) = (
-                v2::Level::try_from(range.level),
-                key_from(range.end.as_ref()),
-            ) else {
-                return (S::LookupInvalid, vec![]);
-            };
-            if level == v2::Level::Unspecified {
-                return (S::LookupInvalid, vec![]);
-            }
-            held.push((level, end));
-        }
-        let max = if request.max_candidates == 0 {
-            limits.max_candidates
-        } else {
-            request.max_candidates.min(limits.max_candidates)
-        } as usize;
+        let order = [
+            v2::Level::NeighbourGpu,
+            v2::Level::HostDram,
+            v2::Level::HostNvme,
+            v2::Level::RemoteNvme,
+        ];
+        let max = limits.max_candidates as usize;
 
         // Records shorter than one page all live in the root bucket, whatever they are
         // records of, so for a history that has a block of its own they would fill the
@@ -209,12 +197,7 @@ impl Core {
                     continue;
                 };
                 let closer = rank(&order, level);
-                let begin = held
-                    .iter()
-                    .filter(|(held_level, _)| rank(&order, *held_level) < closer)
-                    .map(|(_, end)| end.consumed_tokens)
-                    .max()
-                    .unwrap_or(0);
+                let begin = request.resident_tokens;
                 if begin >= entry.key.consumed_tokens {
                     continue;
                 }
@@ -238,7 +221,7 @@ impl Core {
                 ));
             }
         }
-        found.sort_by(|a, b| (a.0, a.1, a.2, a.3).cmp(&(b.0, b.1, b.2, b.3)));
+        found.sort_by(|a, b| (a.1, a.0, a.2, a.3).cmp(&(b.1, b.0, b.2, b.3)));
         found.truncate(max);
         (S::LookupOk, found.into_iter().map(|item| item.4).collect())
     }
@@ -328,17 +311,10 @@ fn candidate(
             })
             .collect(),
         skip_pages: walk.skip_pages,
-
     }
 }
 
 /// A candidate ordered by level, match length, source and tier.
-type Ranked = (
-    i32,
-    std::cmp::Reverse<u64>,
-    SourceId,
-    Tier,
-    v2::Candidate,
-);
+type Ranked = (i32, std::cmp::Reverse<u64>, SourceId, Tier, v2::Candidate);
 
 pub(super) type LookupQueue = VecDeque<Queued>;

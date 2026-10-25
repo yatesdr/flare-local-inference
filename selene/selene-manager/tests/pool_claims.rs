@@ -71,7 +71,7 @@ async fn world_with(tier: v2::Tier, tokens: &[u64], tweak: impl FnOnce(&mut Host
 
 impl World {
     async fn candidate(&mut self, id: u64, upto: u64) -> v2::Candidate {
-        let reply = self.requester.lookup(id, upto, vec![]).await;
+        let reply = self.requester.lookup(id, upto, 0).await;
         reply
             .candidates
             .into_iter()
@@ -583,7 +583,7 @@ async fn x1_claims_in_flight_and_export_slots_are_limited() {
     // A second requester is limited by the source's export slots instead.
     let mut other = w.pool.open(&Ident::new("req2")).await;
     other.snapshot(vec![]).await;
-    let reply = other.lookup(1, 3072, vec![]).await;
+    let reply = other.lookup(1, 3072, 0).await;
     let candidate = reply
         .candidates
         .iter()
@@ -1063,7 +1063,7 @@ async fn s4_and_s7_a_new_process_attests_nothing_for_its_predecessor() {
     );
     // S7: its own counters start afresh and are accepted.
     let candidate = {
-        let reply = fresh.lookup(1, 1024, vec![]).await;
+        let reply = fresh.lookup(1, 1024, 0).await;
         reply.candidates[0].clone()
     };
     let claim = fresh.claim_for(1, &candidate, 0, true);
@@ -1079,12 +1079,12 @@ async fn s5_and_s6_the_predecessors_entries_are_hidden_until_the_new_snapshot() 
     let src_ident = w.source_ident.clone();
     let mut third = w.pool.open(&Ident::new("third")).await;
     third.snapshot(vec![]).await;
-    assert_eq!(third.lookup(1, 2048, vec![]).await.candidates.len(), 2);
+    assert_eq!(third.lookup(1, 2048, 0).await.candidates.len(), 2);
     let candidate = w.candidate(2, 2048).await;
     // A newer session of the source opens; the old entries are not offered at once.
     let mut newer = w.pool.open(&src_ident.restarted()).await;
     let _ = w.source.closed().await;
-    assert!(third.lookup(3, 2048, vec![]).await.candidates.is_empty());
+    assert!(third.lookup(3, 2048, 0).await.candidates.is_empty());
     // A claim naming the predecessor's session is stale.
     w.requester
         .claim(w.requester.claim_for(1, &candidate, 0, true))
@@ -1094,11 +1094,11 @@ async fn s5_and_s6_the_predecessors_entries_are_hidden_until_the_new_snapshot() 
     // S6: the new session never finishes its snapshot and ends: nothing stale is offered.
     drop(newer);
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(third.lookup(4, 2048, vec![]).await.candidates.is_empty());
+    assert!(third.lookup(4, 2048, 0).await.candidates.is_empty());
     // A later successor installs and its set alone is visible.
     newer = w.pool.open(&src_ident.restarted()).await;
     newer.snapshot(chain(&[4096], v2::Tier::Dram, 1)).await;
-    let reply = third.lookup(5, 4096, vec![]).await;
+    let reply = third.lookup(5, 4096, 0).await;
     assert_eq!(reply.candidates.len(), 1);
 }
 
@@ -1121,7 +1121,7 @@ fn child_peer() {
                 "requester" => {
                     let mut session = pool.open(&Ident::new("req")).await;
                     session.snapshot(vec![]).await;
-                    let reply = session.lookup(1, 1024, vec![]).await;
+                    let reply = session.lookup(1, 1024, 0).await;
                     let candidate = reply.candidates[0].clone();
                     session
                         .claim(session.claim_for(1, &candidate, 0, true))
@@ -1262,7 +1262,7 @@ async fn r10_a_killed_source_fails_its_claims_and_frees_its_windows() {
     requester.snapshot(vec![]).await;
     let mut candidate = None;
     for id in 1..400 {
-        let reply = requester.lookup(id, 1024, vec![]).await;
+        let reply = requester.lookup(id, 1024, 0).await;
         if let Some(found) = reply.candidates.first() {
             candidate = Some(found.clone());
             break;
@@ -1293,7 +1293,7 @@ async fn r10_a_killed_source_fails_its_claims_and_frees_its_windows() {
         "its write windows are reclaimed after exit"
     );
     // Its entries are gone too.
-    let reply = requester.lookup(500, 1024, vec![]).await;
+    let reply = requester.lookup(500, 1024, 0).await;
     assert!(reply.candidates.is_empty());
 }
 

@@ -143,7 +143,7 @@ enum Tier {
 // order.
 enum Level {
   LEVEL_UNSPECIFIED = 0;
-  THIS_GPU = 1;        // never offered as a candidate; appears only in HeldRange.
+  THIS_GPU = 1;        // never offered as a candidate.
   NEIGHBOUR_GPU = 2;   // Tier GPU in another instance on the same host.
   HOST_DRAM = 3;       // Tier DRAM: own, a neighbour's, or a same-host manager's (its DRAM is level 3).
   HOST_NVME = 4;       // Tier NVME: own, a neighbour's, or a same-host manager's.
@@ -631,15 +631,6 @@ message ResyncInstalled {
 // Lookup
 // ---------------------------------------------------------------------------
 
-// What the requester already holds closer. `end` is the deepest committed,
-// validated record the requester holds at `level` for this history; coverage is
-// the whole prefix from token 0 to end.consumed_tokens. "Committed" means a
-// complete, checksummed copy; an index entry pointing elsewhere does not count.
-message HeldRange {
-  Level level = 1;
-  PrefixKey end = 2;
-}
-
 message LookupRequest {
   // Unique per session among live lookups; chosen by the client.
   uint64 lookup_id = 1;
@@ -651,10 +642,9 @@ message LookupRequest {
   // Candidates must end strictly below this many tokens (the same meaning as
   // `before` in Flare's lookup, capped at the history length).
   uint64 before_tokens = 3;
-  repeated HeldRange held = 4;
-  reserved 5;
-  // At most Limits.max_candidates; 0 means the limit.
-  uint32 max_candidates = 6;
+  reserved 4, 5, 6;
+  // The exact end of the GPU-resident prefix.
+  uint64 resident_tokens = 7;
 }
 
 message LookupCancel { uint64 lookup_id = 1; }

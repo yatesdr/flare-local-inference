@@ -26,7 +26,7 @@ use super::{
     rank::RankSet,
     shared::{Command, PoolEvent, PoolFetch, PoolStatus, PutRequest, Shared},
     startup::{Approve, RegisteredRegion, Startup},
-    types::{HeldRange, Tier},
+    types::Tier,
 };
 
 /// How long [`PoolClient::start`] waits for the manager at startup. A manager that has not
@@ -322,14 +322,14 @@ impl PoolClient {
 
     /// Start a lookup for a queued request. Identical prefixes share one wire
     /// lookup. The ticket has no answer when the pool is not ready.
-    pub fn begin_lookup(&self, history: &dyn History, held: Vec<HeldRange>) -> LookupTicket {
+    pub fn begin_lookup(&self, history: &dyn History, resident: u64) -> LookupTicket {
         let mut boundaries: Vec<_> = history.key_at(0).into_iter().collect();
         boundaries.extend_from_slice(history.aligned_boundaries());
         self.shared.begin_lookup(
             std::time::Instant::now(),
             boundaries,
             history.token_count(),
-            held,
+            resident,
         )
     }
 

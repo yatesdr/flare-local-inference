@@ -83,7 +83,7 @@ async fn l4_and_a22_remote_sessions_see_the_managers_records_as_level_five_and_i
     let remote = far.manager_candidate(2, 1024).await;
     assert_eq!(remote.level, v2::Level::RemoteNvme as i32);
     assert!(remote.source.as_ref().unwrap().instance_id.is_empty());
-    let reply = far.lookup(3, 1024, vec![]).await;
+    let reply = far.lookup(3, 1024, 0).await;
     assert!(
         reply.candidates.iter().any(|candidate| candidate
             .source

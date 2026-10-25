@@ -4,14 +4,11 @@ use std::sync::{Arc, Mutex};
 
 use crate::plan;
 
-use super::types::{HeldRange, PoolCandidate};
+use super::types::PoolCandidate;
 
 /// What a lookup produced for one request.
 #[derive(Debug)]
 pub struct Answer {
-    /// What the request held closer when the lookup started. A candidate is
-    /// usable against this context, not against the history's final key.
-    pub held: Vec<HeldRange>,
     pub candidates: Vec<PoolCandidate>,
 }
 

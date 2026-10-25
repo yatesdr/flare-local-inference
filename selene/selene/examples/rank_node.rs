@@ -27,7 +27,6 @@ use std::{
 use flare_selene::{
     CacheGeometry, History, HostRegistrar, Job, Layout, PageCopier, PageId, Registration, Reply,
     Result, SplitMapping, StateSlotId,
-    levels::Ranking,
     geometry::fingerprint,
     plan::{self, Identity, Request},
     pool::{
@@ -442,7 +441,7 @@ fn rank0(args: &Args) {
 }
 
 fn restore(client: &mut PoolClient, world: usize, history: &TestHistory) {
-    let ticket = client.begin_lookup(history, Vec::new());
+    let ticket = client.begin_lookup(history, 0);
     wait_until(|| !matches!(ticket.state(), LookupState::Pending));
     let LookupState::Ready(answer) = ticket.state() else {
         return say("fetched err no lookup answer");
@@ -450,7 +449,6 @@ fn restore(client: &mut PoolClient, world: usize, history: &TestHistory) {
     if answer.candidates.is_empty() {
         return say("fetched err no candidate");
     }
-    let ranking = Ranking::default();
     let g = ranks(world);
     let identity = Identity {
         tenant: "t".into(),
@@ -463,13 +461,11 @@ fn restore(client: &mut PoolClient, world: usize, history: &TestHistory) {
         page_tokens: PT,
         resident: 0,
         before: u64::MAX,
-        ranking: &ranking,
-        prefill_tokens_per_second: 8000.0,
     };
     let Some(plan) = plan::plan(&request, &answer.plan_candidates()) else {
         return say("fetched err no plan");
     };
-    let part = plan.a.clone();
+    let part = plan.part.clone();
     let candidate = answer
         .candidates
         .iter()

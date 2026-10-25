@@ -491,15 +491,7 @@ impl Engine {
             lookup_id: lookup.id,
             boundaries: boundaries.into_iter().map(codec::key_to).collect(),
             before_tokens: lookup.before,
-            held: lookup
-                .held
-                .iter()
-                .map(|range| wire::HeldRange {
-                    level: codec::level_to(range.level) as i32,
-                    end: Some(codec::key_to(range.end)),
-                })
-                .collect(),
-            max_candidates: 0,
+            resident_tokens: lookup.resident,
         };
         self.lookups.insert(lookup.id, now + LOOKUP_TIMEOUT);
         self.emit(Out::Lookup(request));

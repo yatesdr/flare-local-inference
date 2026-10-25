@@ -265,7 +265,7 @@ client                                        manager
 
 ## 4. Lookup
 
-Request: the history's aligned boundaries, `before_tokens`, `held`, `level_order`.
+Request: the history's aligned boundaries, `before_tokens`, `resident_tokens`.
 The manager answers from its index only; it never contacts a source.
 
 Manager algorithm for each candidate source entry (endpoint `E` with a row):
@@ -273,21 +273,19 @@ Manager algorithm for each candidate source entry (endpoint `E` with a row):
 1. Skip the requester's own instance and sources the requester cannot reach
    (decision 4).
 2. Compute the level from the tier and the relation to the requester.
-3. `begin` = the largest exact `consumed_tokens` among held ranges at levels
-   closer than this one in `level_order` (decision 12: exact, not page-aligned);
-   the physical start is `floor(begin / page_tokens)` pages. Walk parents from `E`
-   to the node containing that page; require the chain to be contiguous. A hole
-   gives no candidate.
+3. `begin` = `resident_tokens` (exact, not page-aligned); the physical start
+   is `floor(begin / page_tokens)`. Walk parents from `E` to the node containing
+   that page and require a contiguous chain. A hole gives no candidate.
 4. Drop it if it supplies no page and no row beyond `begin` (zero pages with the
    row is kept: a row-only tail).
-5. Order by level, `est_us_per_page`, longest match; return at most
+5. Order by longest match, then fixed copy level and stable source identity; return at most
    `max_candidates`, each with at most `max_chain_nodes` nodes.
 
 Answers: `NOT_READY` (with `retry_after_ms`), `OVERLOADED` (the bound on
 concurrent lookups or the work queue, answered at once, never queued), `INVALID`.
 The requester treats every non-OK answer, a timeout, and a lost session as "no
 pool candidates for this request" and admits with its local match. Identical
-prefixes are coalesced on the client by (last boundary key, held ends).
+prefixes are coalesced on the client by (last boundary key, resident tokens).
 
 A candidate is a hint. After the reply the client verifies each node against its
 history; any mismatch drops the candidate.

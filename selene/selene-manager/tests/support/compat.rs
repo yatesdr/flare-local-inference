@@ -283,9 +283,7 @@ impl Client {
                     digest: BUCKET.to_vec(),
                 }],
                 before_tokens,
-                held: vec![],
-
-                max_candidates: 0,
+                resident_tokens: 0,
             })
             .await;
         reply.candidates

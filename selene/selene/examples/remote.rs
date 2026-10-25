@@ -23,7 +23,6 @@ use std::{
 use flare_selene::{
     CacheGeometry, History, HostRegistrar, Job, Layout, PageCopier, PageId, Registration, Reply,
     Result, SplitMapping, StateSlotId,
-    levels::Ranking,
     geometry::fingerprint,
     plan::{self, Identity, Request},
     pool::{
@@ -268,7 +267,7 @@ impl Pool {
     ) -> (f64, f64) {
         let history = history_for(record, o.pages);
         let began = Instant::now();
-        let ticket = self.client.begin_lookup(&history, Vec::new());
+        let ticket = self.client.begin_lookup(&history, 0);
         let answer = wait("a lookup", Duration::from_secs(10), || {
             match ticket.state() {
                 LookupState::Pending => None,
@@ -277,18 +276,15 @@ impl Pool {
             }
         });
         let lookup = began.elapsed().as_secs_f64();
-        let ranking = Ranking::default();
         let request = Request {
             history: &history,
             identity,
             page_tokens: PT,
             resident: 0,
             before: u64::MAX,
-            ranking: &ranking,
-            prefill_tokens_per_second: 8000.0,
         };
         let plan = plan::plan(&request, &answer.plan_candidates()).expect("a plan");
-        let part = plan.a.clone();
+        let part = plan.part.clone();
         let candidate = answer
             .candidates
             .iter()
@@ -488,7 +484,7 @@ fn main() {
             // Wait for the manager to offer what the other instance exports.
             let probe = history_for(0, o.pages);
             wait("a candidate", Duration::from_secs(60), || {
-                let ticket = pool.client.begin_lookup(&probe, Vec::new());
+                let ticket = pool.client.begin_lookup(&probe, 0);
                 let answer = wait("a lookup", Duration::from_secs(10), || {
                     match ticket.state() {
                         LookupState::Pending => None,
