@@ -165,6 +165,9 @@ enum Stage {
     Local { local_key: PrefixKey },
     /// A pool restore is running under this id.
     Pool { id: u64 },
+    /// The pool could not restore it and this host's own copy of the same endpoint is
+    /// copying into the same pages.
+    Fallback { local_key: PrefixKey },
 }
 
 struct Restore {
@@ -598,6 +601,20 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
                 }
             }
         }
+        // The pool has no source left: this host's own copy of the same endpoint restores
+        // into the same pages, and only a restore with no source left is a recompute.
+        let own = self.restores.get(&key).and_then(|restore| {
+            let pool_only = restore.planned.plan.a.source != LOCAL;
+            restore.planned.local.clone().filter(|hit| pool_only && hit.key == key)
+        });
+        if let Some(hit) = own {
+            let ticket = self.restores[&key].ticket.clone();
+            if self.inner.fetch(hit, ticket).is_ok() {
+                self.restores.get_mut(&key).expect("found").stage = Stage::Fallback { local_key: key };
+                self.pool_fetch_failed += 1;
+                return;
+            }
+        }
         self.restores.remove(&key);
         self.pool_fetch_failed += 1;
         self.fail(key, failure.error, events);
@@ -784,6 +801,14 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
                             }
                         }
                     }
+                }
+                StoreEvent::Fetched { key, result }
+                    if self.restores.get(&key).is_some_and(
+                        |r| matches!(r.stage, Stage::Fallback { local_key } if local_key == key),
+                    ) =>
+                {
+                    self.restores.remove(&key);
+                    events.push(StoreEvent::Fetched { key, result });
                 }
                 other => events.push(other),
             }
@@ -1430,6 +1455,31 @@ mod tests {
             });
         assert_eq!(fetched(&rig.poll()), [(rig.key(1600), false)]);
         assert!(rig.pool.lock().unwrap().fetches.is_empty());
+    }
+
+    #[test]
+    fn a_failed_pool_restore_falls_back_to_the_local_copy_of_the_same_endpoint() {
+        let mut rig = rig();
+        rig.local_hit(1600, Local::Disk);
+        let candidate = rig.candidate(Level::HostDram, 1, 0, 0, &[1600], 0);
+        let refused = (candidate.source.clone(), candidate.tier);
+        rig.answer(vec![candidate]);
+        let hit = rig.lookup().unwrap();
+        assert_eq!(hit.key, rig.key(1600));
+        let ticket = rig.ticket(&hit);
+        rig.store.fetch(hit, ticket).unwrap();
+        assert!(rig.local.0.lock().unwrap().fetches.is_empty());
+        rig.pool.lock().unwrap().events.push(PoolEvent::Fetched {
+            id: 1,
+            result: Err(failure(0, refused, false)),
+        });
+        assert!(fetched(&rig.poll()).is_empty(), "the failure is not reported");
+        assert_eq!(rig.local.0.lock().unwrap().fetches.len(), 1, "the local copy is fetched");
+        rig.local.0.lock().unwrap().events.push(StoreEvent::Fetched {
+            key: rig.key(1600),
+            result: Ok(1),
+        });
+        assert_eq!(fetched(&rig.poll()), [(rig.key(1600), true)]);
     }
 
     #[test]
