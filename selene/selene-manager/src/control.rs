@@ -250,6 +250,7 @@ pub fn serve(
         transports: pool_transports(&config),
         channel,
         regions: Some(regions.clone()),
+        held: store.held_flag(),
     };
     if let Some(hub) = &pool_config.channel {
         hub.set_packed(staging_arena.clone());

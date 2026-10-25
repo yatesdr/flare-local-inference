@@ -838,6 +838,9 @@ enum ClaimReason {
   UNKNOWN_CLAIM = 23;         // the manager has no such claim (after a manager restart, or a late release).
   RANKS_DETACHED = 24;        // a peer rank of a multi-process instance is not attached (refused at once).
   RANK_LOST = 25;             // an attached peer rank's stream ended during the transfer.
+  REGIONS_HELD = 26;          // the manager restarted and still holds its shared regions for the previous run's
+                              // processes (PROTOCOL.md 8.6); refused at once. Retry shortly: it ends as soon
+                              // as they have reconnected.
 }
 
 // Hold granted. Sent only after the source's PinAck (for a manager-store source,

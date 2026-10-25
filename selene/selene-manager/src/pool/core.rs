@@ -84,6 +84,9 @@ pub struct PoolConfig {
     pub channel: Option<Hub>,
     /// The manager's shared regions, for the window assembly pass of multi-process instances.
     pub regions: Option<Arc<dyn crate::data::RegionAccess>>,
+    /// True while the shared regions are held for the previous run's processes; claims are then
+    /// refused `REGIONS_HELD`.
+    pub held: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for PoolConfig {
@@ -98,6 +101,7 @@ impl Default for PoolConfig {
             transports: vec![v2::DataTransport::Tcp],
             channel: None,
             regions: None,
+            held: Arc::default(),
         }
     }
 }

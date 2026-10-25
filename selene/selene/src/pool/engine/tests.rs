@@ -1294,7 +1294,10 @@ fn restores_beyond_the_claim_slots_wait_for_a_slot_instead_of_being_refused() {
     }
     assert_eq!(started[0].1.len(), 1);
     assert_eq!(started[1].1.len(), 1);
-    assert!(started[2].1.is_empty(), "two slots are taken: the third waits");
+    assert!(
+        started[2].1.is_empty(),
+        "two slots are taken: the third waits"
+    );
     assert!(fetched(&rig.events()).is_empty(), "waiting is not failing");
     // The first restore ends and the third takes its slot.
     let claim = started[0].1[0].claim_id;
@@ -1307,7 +1310,50 @@ fn restores_beyond_the_claim_slots_wait_for_a_slot_instead_of_being_refused() {
         wire::ClaimReason::ReasonNone,
         true,
     ));
-    assert_eq!(pick!(out, Claim).len(), 1, "the waiting restore claims the freed slot");
+    assert_eq!(
+        pick!(out, Claim).len(),
+        1,
+        "the waiting restore claims the freed slot"
+    );
+}
+
+#[test]
+fn a_claim_refused_because_the_regions_are_held_is_retried_not_failed() {
+    let mut rig = Rig::new();
+    rig.open();
+    let fetch = single_part();
+    let out = rig.command(Command::Fetch(fetch.clone()));
+    let first = pick!(out, Claim)[0].claim_id;
+    let out = rig.send(terminal(
+        first,
+        wire::ClaimState::Failed,
+        wire::ClaimReason::RegionsHeld,
+        false,
+    ));
+    assert!(pick!(out, Claim).is_empty(), "not at once");
+    assert!(
+        fetched(&rig.events()).is_empty(),
+        "a held refusal does not fail the restore"
+    );
+    // The first tick starts the wait; the claim is made again when it is over.
+    assert!(pick!(rig.tick(Duration::from_millis(1)), Claim).is_empty());
+    assert!(pick!(rig.tick(Duration::from_millis(100)), Claim).is_empty());
+    let again = pick!(rig.tick(Duration::from_millis(300)), Claim);
+    assert_eq!(again.len(), 1, "it claims again inside its deadline");
+    assert_ne!(again[0].claim_id, first);
+    // Refused again and again, it gives up when the restore's own deadline passes.
+    let second = again[0].claim_id;
+    rig.send(terminal(
+        second,
+        wire::ClaimState::Failed,
+        wire::ClaimReason::RegionsHeld,
+        false,
+    ));
+    rig.tick(super::RESTORE_DEADLINE + Duration::from_secs(1));
+    let events = rig.events();
+    let results = fetched(&events);
+    assert_eq!(results.len(), 1);
+    assert!(results[0].1.is_err());
 }
 
 // ---- exports ----------------------------------------------------------------

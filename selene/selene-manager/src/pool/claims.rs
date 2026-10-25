@@ -400,6 +400,9 @@ impl Core {
         if !self.ready() {
             return refuse(self, v2::ClaimReason::NotReady);
         }
+        if self.cfg.held.load(std::sync::atomic::Ordering::Acquire) {
+            return refuse(self, v2::ClaimReason::RegionsHeld);
+        }
         if !self.ranks_ready(sid) {
             return refuse(self, v2::ClaimReason::RanksDetached);
         }

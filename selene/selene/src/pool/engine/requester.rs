@@ -9,7 +9,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -86,6 +86,9 @@ impl State {
     }
 }
 
+/// How long a restore waits before it claims again after the manager said `REGIONS_HELD`.
+const HELD_RETRY: Duration = Duration::from_millis(250);
+
 struct PartRun {
     fetch: FetchPart,
     expected: Vec<ExpectedRecord>,
@@ -98,6 +101,9 @@ struct Restore {
     deadline: Instant,
     failure: Option<FetchFailure>,
     bytes: u64,
+    /// A part whose claim the manager refused `REGIONS_HELD`, and when to claim it again (set
+    /// by the next tick, which knows the time).
+    retry: Option<(usize, Option<Instant>)>,
 }
 
 struct Window {
@@ -250,6 +256,7 @@ impl Engine {
             deadline: now + RESTORE_DEADLINE,
             failure: None,
             bytes,
+            retry: None,
         })
     }
 
@@ -971,7 +978,13 @@ impl Engine {
             channel.stop();
         }
         let (restore, part, verdict_ok) = (claim.restore, claim.part, claim.verdict_ok);
-        if state == wire::ClaimState::Copied as i32 && verdict_ok {
+        let held = !claim.granted && terminal.reason == wire::ClaimReason::RegionsHeld as i32;
+        if held && let Some(run) = self.requester.restores.get_mut(&restore) {
+            // The manager restarted and is waiting for this instance's neighbours to
+            // reconnect: claim again shortly, within the restore's own deadline.
+            run.parts[part].claim = None;
+            run.retry = Some((part, None));
+        } else if state == wire::ClaimState::Copied as i32 && verdict_ok {
             if let Some(run) = self.requester.restores.get_mut(&restore) {
                 run.parts[part].copied = true;
             }
@@ -1196,6 +1209,20 @@ impl Engine {
 
     pub(crate) fn requester_tick(&mut self, now: Instant) {
         self.admit_waiting(now);
+        let mut due = Vec::new();
+        for (id, run) in &mut self.requester.restores {
+            match run.retry {
+                Some((part, None)) => run.retry = Some((part, Some(now + HELD_RETRY))),
+                Some((part, Some(at))) if run.failure.is_none() && now >= at => {
+                    run.retry = None;
+                    due.push((*id, part));
+                }
+                _ => {}
+            }
+        }
+        for (id, part) in due {
+            self.claim_part(now, id, part);
+        }
         let late: Vec<u64> = self
             .requester
             .restores

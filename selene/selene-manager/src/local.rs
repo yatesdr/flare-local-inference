@@ -262,6 +262,8 @@ pub struct Local {
     regions_generation: u64,
     /// Processes of the previous run that may still access the reused regions.
     prior: Option<Prior>,
+    /// True while `prior` holds the regions; the pool reads it to refuse claims distinctly.
+    held: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The reused regions' previous run: nothing in them is granted until every process that held
@@ -402,6 +404,7 @@ impl Local {
             max_window_bytes,
             connections: HashMap::new(),
             regions_generation,
+            held: Arc::new(std::sync::atomic::AtomicBool::new(prior.is_some())),
             prior,
         };
         local.persist_holders();
@@ -412,6 +415,11 @@ impl Local {
     /// process that mapped and registered them can keep using them.
     pub fn regions_generation(&self) -> u64 {
         self.regions_generation
+    }
+
+    /// The flag that is true while the regions are held for the previous run.
+    pub fn held_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.held.clone()
     }
 
     /// Whether the regions are still held for processes of the previous run.
@@ -450,6 +458,7 @@ impl Local {
             .is_some_and(|prior| prior.holders.is_empty())
         {
             self.prior = None;
+            self.held.store(false, std::sync::atomic::Ordering::Release);
             eprintln!(
                 "selene: instance '{}' released the shared regions held for the previous run",
                 self.instance
@@ -1685,6 +1694,8 @@ mod tests {
 
         let mut second = reopen(&name);
         assert!(second.held_for_previous_run());
+        let flag = second.held_flag();
+        assert!(flag.load(std::sync::atomic::Ordering::Acquire));
         second.accept(9, std::process::id()).unwrap();
         for region in [Region::Staging, Region::Arena] {
             assert_eq!(
@@ -1706,6 +1717,7 @@ mod tests {
             assert!(Instant::now() < deadline, "the exit was never seen");
             thread::sleep(Duration::from_millis(2));
         }
+        assert!(!flag.load(std::sync::atomic::Ordering::Acquire));
         second
             .grant_put(9, 1, 0, Region::Staging, shape(1, false))
             .unwrap();

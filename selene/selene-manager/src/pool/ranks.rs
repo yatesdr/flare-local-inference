@@ -533,6 +533,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_claim_while_the_regions_are_held_is_refused_distinctly_and_then_served() {
+        let mut core = core();
+        let me = unix(&core);
+        let (sid, mut rx) = open_rank0_with(&mut core, 2, RANK0, me);
+        core.state = v2::ReadinessState::Ready;
+        core.cfg
+            .held
+            .store(true, std::sync::atomic::Ordering::Release);
+        while rx.try_recv().is_ok() {}
+        let claim = |id| v2::Claim {
+            claim_id: id,
+            level: v2::Level::HostNvme as i32,
+            tier: v2::Tier::Nvme as i32,
+            key: Some(v2::PrefixKey {
+                consumed_tokens: 64,
+                digest: vec![1; 16],
+            }),
+            mode: v2::CopyMode::SharedWindows as i32,
+            ..Default::default()
+        };
+        core.claim(sid, claim(1)).unwrap();
+        let Some(v2::server_message::M::ClaimTerminal(t)) = rx.try_recv().unwrap().m else {
+            panic!("no terminal");
+        };
+        assert_eq!(t.reason, v2::ClaimReason::RegionsHeld as i32);
+        assert!(!t.fence_required);
+        // Once the hold ends the same claim gets past the gate (and is refused for what it names).
+        core.cfg
+            .held
+            .store(false, std::sync::atomic::Ordering::Release);
+        core.claim(sid, claim(2)).unwrap();
+        let Some(v2::server_message::M::ClaimTerminal(t)) = rx.try_recv().unwrap().m else {
+            panic!("no terminal");
+        };
+        assert_ne!(t.reason, v2::ClaimReason::RegionsHeld as i32);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_claim_or_put_of_an_instance_with_a_rank_missing_is_refused_at_once() {
         let mut core = core();
         let me = unix(&core);
