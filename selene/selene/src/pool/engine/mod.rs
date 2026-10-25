@@ -57,8 +57,6 @@ pub(crate) struct Settings {
     pub claim_slots: u32,
     /// The context made current when registering the shared regions.
     pub context: usize,
-    /// Where each rank's slice lies in a record.
-    pub slices: Arc<super::slice::SliceLayout>,
     /// Set for rank 0 of a multi-process instance: the secret its peers attach with.
     pub rank_secret: Option<[u8; 32]>,
 }
@@ -768,7 +766,7 @@ impl Engine {
                         None => {}
                     }
                 }
-                RankEvent::Attached { .. } | RankEvent::Detached { .. } => {}
+                RankEvent::Attached | RankEvent::Detached => {}
                 RankEvent::Lost { rank, reason } => self.rank_lost(rank, &reason),
             }
         }

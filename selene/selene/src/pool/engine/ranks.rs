@@ -36,10 +36,10 @@ pub(crate) enum RankEvent {
         quarantined: bool,
     },
     /// The rank attached to the manager.
-    Attached { rank: usize },
+    Attached,
     /// The attachment of a rank changed or ended; its open transfers are cancelled by the
     /// agent and their `Done` follow.
-    Detached { rank: usize },
+    Detached,
     /// The link failed: nothing more will come from this rank, drained or not.
     Lost { rank: usize, reason: String },
 }
@@ -88,16 +88,25 @@ enum State {
 struct Peer {
     end: LinkEnd,
     state: State,
-    agent_nonce: Vec<u8>,
-    gpu_uuid: Vec<u8>,
+}
+
+/// What rank 0 tells its peers about the instance.
+pub(crate) struct Identity {
+    pub secret: [u8; 32],
+    pub nonce: [u8; 16],
+    pub instance_id: [u8; 16],
+    pub fingerprint: [u8; 16],
+    /// The GPUs of the instance; an agent's must be one of them.
+    pub gpus: Vec<[u8; 16]>,
 }
 
 pub(crate) struct Ranks {
     pub layout: Arc<SliceLayout>,
     secret: [u8; 32],
-    nonce: [u8; 16],
     instance_id: [u8; 16],
     fingerprint: [u8; 16],
+    /// The GPUs of the instance; an agent's must be one of them.
+    gpus: Vec<[u8; 16]>,
     peers: Vec<Peer>,
     next_xfer: u64,
     /// Open transfers: owner and rank.
@@ -109,12 +118,16 @@ impl Ranks {
     pub(crate) fn new(
         set: RankSet,
         layout: Arc<SliceLayout>,
-        secret: [u8; 32],
-        nonce: [u8; 16],
-        instance_id: [u8; 16],
-        fingerprint: [u8; 16],
+        who: Identity,
         wake: Arc<Notify>,
     ) -> Result<Self> {
+        let Identity {
+            secret,
+            nonce,
+            instance_id,
+            fingerprint,
+            gpus,
+        } = who;
         let world = set.links.len() + 1;
         if layout.world() != world {
             return Err(Error::new(
@@ -134,16 +147,14 @@ impl Ranks {
             peers.push(Peer {
                 end,
                 state: State::Greeting,
-                agent_nonce: Vec::new(),
-                gpu_uuid: Vec::new(),
             });
         }
         Ok(Self {
             layout,
             secret,
-            nonce,
             instance_id,
             fingerprint,
+            gpus,
             peers,
             next_xfer: 0,
             xfers: HashMap::new(),
@@ -159,11 +170,6 @@ impl Ranks {
         self.peers.iter().all(
             |peer| matches!(peer.state, State::Attached { incarnation: i, .. } if i == incarnation),
         )
-    }
-
-    /// Whether a link failed for good.
-    pub(crate) fn any_lost(&self) -> bool {
-        self.peers.iter().any(|p| matches!(p.state, State::Lost))
     }
 
     /// The mode the manager gave `rank`'s agent, once attached.
@@ -240,18 +246,6 @@ impl Ranks {
         self.xfers.is_empty()
     }
 
-    /// GPU uuids of the peers, in rank order, as they reported them.
-    pub(crate) fn gpu_uuids(&self) -> Vec<Vec<u8>> {
-        self.peers.iter().map(|p| p.gpu_uuid.clone()).collect()
-    }
-
-    /// Tell every agent the instance is closing.
-    pub(crate) fn close_all(&self) {
-        for peer in &self.peers {
-            peer.end.send(Msg::Close(link::Close {}));
-        }
-    }
-
     /// Collect what the links delivered since the last call.
     pub(crate) fn poll(&mut self) -> Vec<RankEvent> {
         let mut events = Vec::new();
@@ -290,7 +284,11 @@ impl Ranks {
                     && hello.rank as usize == rank
                     && hello.world as usize == self.world()
                     && hello.layout == self.fingerprint
-                    && hello.agent_nonce.len() == 16;
+                    && hello.agent_nonce.len() == 16
+                    && self
+                        .gpus
+                        .iter()
+                        .any(|gpu| gpu.as_slice() == hello.gpu_uuid.as_slice());
                 if !fine {
                     return self.lose(
                         index,
@@ -298,8 +296,6 @@ impl Ranks {
                         events,
                     );
                 }
-                self.peers[index].agent_nonce = hello.agent_nonce;
-                self.peers[index].gpu_uuid = hello.gpu_uuid;
                 self.peers[index].state = State::Bound;
                 self.peers[index].end.send(Msg::Bind(link::Bind {
                     rank_secret: self.secret.to_vec(),
@@ -321,12 +317,12 @@ impl Ranks {
                     generation: attached.generation,
                     mode,
                 };
-                events.push(RankEvent::Attached { rank });
+                events.push(RankEvent::Attached);
             }
             Msg::Detached(_) => {
                 if !matches!(self.peers[index].state, State::Lost) {
                     self.peers[index].state = State::Detached;
-                    events.push(RankEvent::Detached { rank });
+                    events.push(RankEvent::Detached);
                 }
             }
             Msg::WindowDone(done) => {
@@ -357,10 +353,6 @@ impl Ranks {
                 events,
             ),
         }
-    }
-
-    pub(crate) fn nonce(&self) -> [u8; 16] {
-        self.nonce
     }
 }
 

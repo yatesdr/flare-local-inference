@@ -2497,7 +2497,7 @@ impl Core {
             .claims
             .iter()
             .filter(|(_, claim)| !claim.is_terminal())
-            .filter(|(_, claim)| claim.mp.peer_procs().any(|proc| proc == agent) || false)
+            .filter(|(_, claim)| claim.mp.peer_procs().any(|proc| proc == agent))
             .map(|(key, _)| *key)
             .collect();
         for key in keys {

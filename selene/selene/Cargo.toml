@@ -52,3 +52,11 @@ tonic = { version = "0.14", default-features = false, features = ["transport", "
 [[example]]
 name = "remote"
 required-features = ["test-support"]
+
+[[example]]
+name = "rank_node"
+required-features = ["test-support"]
+
+[[test]]
+name = "rank_processes"
+required-features = ["test-support"]
