@@ -11,6 +11,7 @@ pub mod core;
 pub mod index;
 pub mod limits;
 mod lookup;
+mod mp;
 mod notices;
 pub mod pass;
 mod ranks;
@@ -217,6 +218,8 @@ pub struct ValidScope {
     pub id: [u8; 32],
     pub descriptor: Descriptor,
     pub geometry: ScopeGeometry,
+    /// Where each rank's slice lies in a record, for multi-process instances.
+    pub slices: std::sync::Arc<flare_selene::pool::SliceLayout>,
 }
 
 pub fn validate_scope(scope: Option<&v2::Scope>) -> Option<ValidScope> {
@@ -271,8 +274,10 @@ pub fn validate_scope(scope: Option<&v2::Scope>) -> Option<ValidScope> {
     };
     let id =
         flare_selene::pool::scope_id(&scope.tenant, &identity, &fingerprint, &canonical).ok()?;
+    let slices = std::sync::Arc::new(flare_selene::pool::SliceLayout::new(&canonical).ok()?);
     Some(ValidScope {
         id,
+        slices,
         geometry: ScopeGeometry {
             page_tokens: geometry.page_tokens,
             page_bytes: geometry.page_record_bytes,

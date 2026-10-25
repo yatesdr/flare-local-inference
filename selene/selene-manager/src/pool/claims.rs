@@ -10,6 +10,7 @@ use super::{
     core::{ChanOwner, Core, Nonce, ProcKey, Session},
     index::{InstanceId, SourceId, Tier, walk_chain},
     key_from, key_to,
+    mp::{MpState, Stated},
     store_bridge::persisted_checksums,
     tier_from, tier_to,
     windows::{self, PlannedWindow, RecordShape},
@@ -21,7 +22,7 @@ use crate::{
     proto::v2::{self, server_message::M},
     store::GetAnswer,
 };
-use flare_selene::pool::frame::Shape;
+use flare_selene::pool::{SliceSums, frame::Shape};
 use std::time::{Duration, Instant};
 
 pub type ClaimKey = (InstanceId, Nonce, u64);
@@ -57,6 +58,11 @@ pub struct Win {
     pub extent: Option<Extent>,
     pub page_xxh3: Vec<u64>,
     pub row_xxh3: u64,
+    /// Readers that must finish with the window before it is free, one bit per accessor:
+    /// bit 0 is the requester's session (or its own leg), bit `r` the leg of rank `r`.
+    pub readers: u64,
+    /// The window's contents have been handed to the pass (or delivered): a repeat is ignored.
+    pub arrived: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +110,8 @@ pub struct Claim {
     /// Set when the source has no shared memory: it writes the windows to the manager on the
     /// data channel and the manager relays them on.
     pub source_channel: Option<Channel>,
+    /// What multi-process instances add: peer participants, their legs, the assembly pass.
+    pub mp: MpState,
 }
 
 /// A claim's data-channel transfer. The manager's handler is the only party that
@@ -118,6 +126,15 @@ pub struct Channel {
     pub stopped_at: Option<Instant>,
     /// The handler did not exit in time: its windows are never reused.
     pub quarantined: bool,
+}
+
+/// Which of a claim's legs did not exit.
+#[derive(Clone, Copy)]
+enum Which {
+    /// The requester's (false) or the source's (true).
+    Edge(bool),
+    /// A peer rank's, by index into the claim's `mp.legs`.
+    Rank(usize),
 }
 
 /// How long a stopped handler may take to exit before its windows are quarantined.
@@ -162,13 +179,20 @@ impl Claim {
             .count()
     }
 
+    /// Some peer rank's leg has not finished reading a window the requester has.
+    pub(super) fn legs_pending(&self) -> bool {
+        self.windows
+            .iter()
+            .any(|w| w.phase == Phase::RequesterRead && w.readers & !1 != 0)
+    }
+
     fn all_windows_done(&self) -> bool {
         self.windows
             .iter()
             .all(|window| window.phase == Phase::Free)
     }
 
-    fn spec(&self, index: usize) -> v2::WindowSpec {
+    pub(super) fn spec(&self, index: usize) -> v2::WindowSpec {
         let window = &self.windows[index];
         v2::WindowSpec {
             index: window.plan.index,
@@ -248,8 +272,19 @@ impl Core {
                 .source_channel
                 .as_ref()
                 .is_some_and(|open| open.quarantined);
+            let stuck_rank = claim.mp.legs.iter().any(|leg| leg.ch.quarantined);
+            // A shared-memory peer that cannot show it stopped, or that is gone unseen.
+            let stuck_peer = claim.mp.req.as_ref().is_some_and(|side| {
+                side.peers.iter().any(|peer| {
+                    peer.shared
+                        && (peer.fence == Party::Quarantined
+                            || (peer.fence == Party::Pending
+                                && !self.agents.values().any(|a| a.proc() == peer.proc)
+                                && !self.proc_exited_flag(&peer.proc)))
+                })
+            });
             for window in &claim.windows {
-                if stuck && window.phase == Phase::RequesterRead
+                if (stuck || stuck_rank || stuck_peer) && window.phase == Phase::RequesterRead
                     || stuck_source && window.phase == Phase::SourceWrite
                 {
                     total += window.plan.length;
@@ -477,8 +512,12 @@ impl Core {
 
         // The legs that cross the network: to a requester without shared windows, and
         // from a source without shared memory.
+        let requester_slices = self.requester_slices(sid);
         let requester_leg = if mode == v2::CopyMode::DataChannel {
-            match self.open_leg(channel::Kind::Get) {
+            match self.open_leg(
+                channel::Kind::Get,
+                requester_slices.map(|layout| (layout, 0)),
+            ) {
                 Some(leg) => Some(leg),
                 None => return refuse(self, v2::ClaimReason::NoWindows),
             }
@@ -488,7 +527,7 @@ impl Core {
         let source_leg = if self.sessions[&source_sid].shm {
             None
         } else {
-            match self.open_leg(channel::Kind::Put) {
+            match self.open_leg(channel::Kind::Put, None) {
                 Some(leg) => Some(leg),
                 None => {
                     self.discard_leg(requester_leg);
@@ -502,6 +541,19 @@ impl Core {
         if let Some(leg) = &source_leg {
             self.channels.insert(leg.transfer, ChanOwner::Source(key));
         }
+        // The requester's peer ranks, when it is a multi-process instance.
+        let mut mp_legs = Vec::new();
+        let req_mp = match self.mp_side(sid, key, channel::Kind::Get, &mut mp_legs) {
+            Ok(side) => side,
+            Err(reason) => {
+                for leg in [&requester_leg, &source_leg].into_iter().flatten() {
+                    self.channels.remove(&leg.transfer);
+                }
+                self.discard_leg(requester_leg);
+                self.discard_leg(source_leg);
+                return refuse(self, reason);
+            }
+        };
         let source_channel_ref = source_leg
             .as_ref()
             .zip(self.cfg.channel.as_ref())
@@ -546,6 +598,11 @@ impl Core {
             manager: None,
             channel: requester_leg,
             source_channel: source_leg,
+            mp: MpState {
+                req: req_mp,
+                legs: mp_legs,
+                ..Default::default()
+            },
         };
         let reserved = claim.reserved_bytes;
         self.claims.insert(key, claim);
@@ -572,9 +629,17 @@ impl Core {
     }
 
     /// Begin a data-channel transfer for one leg of a claim.
-    fn open_leg(&mut self, kind: channel::Kind) -> Option<Channel> {
+    fn open_leg(
+        &mut self,
+        kind: channel::Kind,
+        rank: Option<(std::sync::Arc<flare_selene::pool::SliceLayout>, usize)>,
+    ) -> Option<Channel> {
         let hub = self.cfg.channel.as_ref()?;
-        match hub.open(kind) {
+        let opened = match rank {
+            Some((layout, rank)) => hub.open_rank(kind, layout, rank),
+            None => hub.open(kind),
+        };
+        match opened {
             Ok((transfer, token)) => Some(Channel {
                 transfer,
                 token,
@@ -587,6 +652,16 @@ impl Core {
                 None
             }
         }
+    }
+
+    /// The slice layout of the requester's instance when it is a multi-process one.
+    fn requester_slices(
+        &self,
+        sid: u64,
+    ) -> Option<std::sync::Arc<flare_selene::pool::SliceLayout>> {
+        let session = self.sessions.get(&sid)?;
+        session.ranks.as_ref()?;
+        Some(self.scopes.get(&session.scope)?.valid.slices.clone())
     }
 
     /// Drop a leg that no one has connected to.
@@ -625,9 +700,14 @@ impl Core {
         if self.link_for((key.0, key.1), scope, pid).is_none() {
             return refuse(self, v2::ClaimReason::SourceBusy);
         }
+        let slices = self.requester_slices(sid);
         let channel = if mode == v2::CopyMode::DataChannel {
             let hub = self.cfg.channel.as_ref().expect("checked by the caller");
-            match hub.open(channel::Kind::Get) {
+            let opened = match &slices {
+                Some(layout) => hub.open_rank(channel::Kind::Get, layout.clone(), 0),
+                None => hub.open(channel::Kind::Get),
+            };
+            match opened {
                 Ok((transfer, token)) => Some((transfer, token)),
                 Err(error) => {
                     eprintln!(
@@ -639,6 +719,17 @@ impl Core {
             }
         } else {
             None
+        };
+        let mut mp_legs = Vec::new();
+        let req_mp = match self.mp_side(sid, key, channel::Kind::Get, &mut mp_legs) {
+            Ok(side) => side,
+            Err(reason) => {
+                if let (Some((transfer, _)), Some(hub)) = (&channel, self.cfg.channel.as_ref()) {
+                    hub.stop(*transfer);
+                    hub.forget(*transfer);
+                }
+                return refuse(self, reason);
+            }
         };
         let last = walk.nodes.len() - 1;
         let records: Vec<v2::Record> = walk
@@ -713,6 +804,11 @@ impl Core {
                 quarantined: false,
             }),
             source_channel: None,
+            mp: MpState {
+                req: req_mp,
+                legs: mp_legs,
+                ..Default::default()
+            },
         };
         if let Some(open) = &claim.channel {
             self.channels.insert(open.transfer, ChanOwner::Claim(key));
@@ -749,7 +845,12 @@ impl Core {
                     .as_ref()
                     .zip(self.cfg.channel.as_ref())
                     .map(|(open, hub)| super::channel_ref(hub, &open.token));
-                let granted = v2::ClaimGranted {
+                if let Some(side) = claim.mp.req.as_mut() {
+                    for peer in &mut side.peers {
+                        peer.fence = Party::Pending;
+                    }
+                }
+                let mut granted = v2::ClaimGranted {
                     claim_id: key.2,
                     records: claim.records.clone(),
                     total_pages: claim.total_pages,
@@ -760,6 +861,7 @@ impl Core {
                     rank_channels: Vec::new(),
                 };
                 let sid = claim.requester_sid;
+                granted.rank_channels = self.rank_channels(key);
                 self.send(sid, M::ClaimGranted(granted));
             }
             Ok(GetAnswer::Meta {
@@ -822,6 +924,8 @@ impl Core {
                     extent: None,
                     page_xxh3: page_xxh3.clone(),
                     row_xxh3,
+                    readers: 1,
+                    arrived: true,
                 };
                 let index = grant.index as usize;
                 while claim.windows.len() <= index {
@@ -834,11 +938,30 @@ impl Core {
                         extent: None,
                         page_xxh3: Vec::new(),
                         row_xxh3: 0,
+                        readers: 0,
+                        arrived: true,
                     };
                     filler.plan.index = claim.windows.len() as u32;
                     claim.windows.push(filler);
                 }
                 claim.windows[index] = window;
+                if claim.mp.req.is_some() {
+                    // A multi-process requester gets its ranks' slices with their own
+                    // checksums: the stored sums are verified and those computed in one pass.
+                    let window = &mut claim.windows[index];
+                    window.phase = Phase::SourceWrite;
+                    window.arrived = true;
+                    window.readers = 0;
+                    self.window_arrived(
+                        key,
+                        index,
+                        Stated::Whole(SliceSums {
+                            pages: page_xxh3,
+                            row: grant.row.then_some(row_xxh3),
+                        }),
+                    );
+                    return;
+                }
                 claim.state = v2::ClaimState::Copying;
                 claim.last_progress = Instant::now();
                 let spec = claim.spec(index);
@@ -894,8 +1017,17 @@ impl Core {
                 if let Some((open, hub)) = claim.channel.as_ref().zip(self.cfg.channel.as_ref()) {
                     hub.finish(open.transfer);
                 }
+                if let Some(hub) = self.cfg.channel.as_ref() {
+                    for leg in claim.mp.legs.iter().filter(|leg| !leg.source) {
+                        hub.finish(leg.ch.transfer);
+                    }
+                }
                 if copied && !terminal {
-                    self.finish(key, v2::ClaimState::Copied, v2::ClaimReason::ReasonNone);
+                    if claim.legs_pending() {
+                        claim.mp.copy_ok = true;
+                    } else {
+                        self.finish(key, v2::ClaimState::Copied, v2::ClaimReason::ReasonNone);
+                    }
                 }
             }
             Ok(GetAnswer::Refused(refused)) => {
@@ -951,6 +1083,7 @@ impl Core {
             manager: None,
             channel: None,
             source_channel: None,
+            mp: MpState::default(),
         };
         let message = self.terminal_message(&claim);
         self.claims.insert(key, claim);
@@ -1072,6 +1205,8 @@ impl Core {
                     extent: None,
                     page_xxh3: Vec::new(),
                     row_xxh3: 0,
+                    readers: 0,
+                    arrived: false,
                 }
             })
             .collect();
@@ -1089,7 +1224,7 @@ impl Core {
             .as_ref()
             .zip(self.cfg.channel.as_ref())
             .map(|(open, hub)| super::channel_ref(hub, &open.token));
-        let granted = v2::ClaimGranted {
+        let mut granted = v2::ClaimGranted {
             claim_id: key.2,
             records: ack.records,
             total_pages: ack.total_pages,
@@ -1100,6 +1235,12 @@ impl Core {
             rank_channels: Vec::new(),
         };
         claim.state = v2::ClaimState::Granted;
+        if let Some(side) = claim.mp.req.as_mut() {
+            for peer in &mut side.peers {
+                peer.fence = Party::Pending;
+            }
+        }
+        granted.rank_channels = self.rank_channels(key);
         self.send(requester_sid, M::ClaimGranted(granted));
         self.issue_windows(key);
     }
@@ -1228,7 +1369,18 @@ impl Core {
             self.reclaim(key);
             return Ok(());
         }
-        self.deliver_window(key, index, m.page_xxh3, m.row_xxh3);
+        if window.arrived {
+            return Ok(());
+        }
+        window.arrived = true;
+        self.window_arrived(
+            key,
+            index,
+            Stated::Whole(SliceSums {
+                pages: m.page_xxh3,
+                row: m.has_row.then_some(m.row_xxh3),
+            }),
+        );
         Ok(())
     }
 
@@ -1262,17 +1414,36 @@ impl Core {
             self.reclaim(key);
             return;
         }
-        self.deliver_window(key, index as usize, page_xxh3, row_xxh3.unwrap_or(0));
+        if window.arrived {
+            return;
+        }
+        window.arrived = true;
+        self.window_arrived(
+            key,
+            index as usize,
+            Stated::Whole(SliceSums {
+                pages: page_xxh3,
+                row: row_xxh3,
+            }),
+        );
     }
 
     /// A window is filled and checked against its plan: hand it to the requester, through
     /// shared memory or on its data channel.
-    fn deliver_window(&mut self, key: ClaimKey, index: usize, page_xxh3: Vec<u64>, row_xxh3: u64) {
+    pub(super) fn deliver_window(
+        &mut self,
+        key: ClaimKey,
+        index: usize,
+        page_xxh3: Vec<u64>,
+        row_xxh3: u64,
+    ) {
         let Some(claim) = self.claims.get_mut(&key) else {
             return;
         };
         let window = &mut claim.windows[index];
         window.phase = Phase::RequesterRead;
+        window.readers = 1;
+        window.arrived = true;
         window.page_xxh3 = page_xxh3.clone();
         window.row_xxh3 = row_xxh3;
         let has_row = window.plan.row;
@@ -1334,10 +1505,7 @@ impl Core {
             ));
         };
         match window.phase {
-            Phase::RequesterRead => {
-                window.phase = Phase::Free;
-                window.extent = None;
-            }
+            Phase::RequesterRead => {}
             Phase::Free => return Ok(()),
             Phase::SourceWrite | Phase::Unissued => {
                 return Err(Violation::new(
@@ -1345,17 +1513,7 @@ impl Core {
                 ));
             }
         }
-        claim.last_progress = Instant::now();
-        let from_store = claim.manager.is_some();
-        let terminal = claim.is_terminal();
-        if from_store {
-            self.store_release_window(key, m.index);
-        }
-        if terminal {
-            self.reclaim(key);
-        } else if !from_store {
-            self.issue_windows(key);
-        }
+        self.reader_done(key, m.index, 0);
         Ok(())
     }
 
@@ -1386,7 +1544,7 @@ impl Core {
                 // On the data channel the claim's windows are freed as the handler reports
                 // them sent, on another path than this message. The requester's verdict
                 // proves it read them all, so windows still marked sent-or-sending count.
-                let windows_done = if claim.channel.is_some() {
+                let windows_done = if claim.channel.is_some() || !claim.mp.legs.is_empty() {
                     claim
                         .windows
                         .iter()
@@ -1396,7 +1554,14 @@ impl Core {
                 };
                 let complete = covered && exact && windows_done && !claim.windows.is_empty();
                 let store_done = claim.manager.as_ref().is_none_or(|manager| manager.done);
-                if complete && store_done {
+                let legs_pending = claim.legs_pending();
+                if complete && store_done && legs_pending {
+                    // Every peer rank's leg must have delivered its slices too: the claim
+                    // completes when the last of them reports.
+                    if let Some(claim) = self.claims.get_mut(&key) {
+                        claim.mp.copy_ok = true;
+                    }
+                } else if complete && store_done {
                     self.finish(key, v2::ClaimState::Copied, v2::ClaimReason::ReasonNone);
                 } else if complete {
                     // The copy is exact; the store has not yet reported that its own reads
@@ -1591,6 +1756,7 @@ impl Core {
             claim.export = ExportState::Ended(Party::Drained);
             claim.source_fence = Party::Drained;
         }
+        self.settle_peers(key);
         let message = self.terminal_message(self.claims.get(&key).expect("claim exists"));
         let requester_sid = self.claims[&key].requester_sid;
         self.send(requester_sid, M::ClaimTerminal(message));
@@ -1611,6 +1777,7 @@ impl Core {
                 for leg in [claim.channel.as_mut(), claim.source_channel.as_mut()]
                     .into_iter()
                     .flatten()
+                    .chain(claim.mp.legs.iter_mut().map(|leg| &mut leg.ch))
                 {
                     leg.exited = true;
                 }
@@ -1624,6 +1791,7 @@ impl Core {
         for leg in [claim.channel.as_mut(), claim.source_channel.as_mut()]
             .into_iter()
             .flatten()
+            .chain(claim.mp.legs.iter_mut().map(|leg| &mut leg.ch))
         {
             if leg.exited {
                 continue;
@@ -1645,11 +1813,20 @@ impl Core {
     pub(super) fn channel_event(&mut self, event: channel::Event) {
         use channel::Event as E;
         match event {
-            E::Sent { transfer, index } => {
-                if let Some(ChanOwner::Claim(key)) = self.channels.get(&transfer).copied() {
-                    self.claim_window_sent(key, index);
+            E::Sent { transfer, index } => match self.channels.get(&transfer).copied() {
+                Some(ChanOwner::Claim(key)) => self.reader_done(key, index, 0),
+                Some(ChanOwner::ClaimRank(key, leg)) => {
+                    let rank = self
+                        .claims
+                        .get(&key)
+                        .and_then(|claim| claim.mp.legs.get(leg))
+                        .map(|leg| leg.rank);
+                    if let Some(rank) = rank {
+                        self.reader_done(key, index, rank);
+                    }
                 }
-            }
+                _ => {}
+            },
             E::Filled {
                 transfer,
                 index,
@@ -1665,6 +1842,13 @@ impl Core {
                 _ => {}
             },
             E::Failed { transfer, reason } => match self.channels.get(&transfer).copied() {
+                Some(ChanOwner::ClaimRank(key, _)) => {
+                    eprintln!(
+                        "selene: claim {}: a peer rank's data channel failed: {reason}",
+                        key.2
+                    );
+                    self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
+                }
                 Some(ChanOwner::Claim(key)) => {
                     eprintln!(
                         "selene: claim {} on the data channel failed: {reason}",
@@ -1687,6 +1871,31 @@ impl Core {
                     hub.forget(transfer);
                 }
                 match self.channels.remove(&transfer) {
+                    Some(ChanOwner::ClaimRank(key, leg)) => {
+                        if let Some(open) = self
+                            .claims
+                            .get_mut(&key)
+                            .and_then(|claim| claim.mp.legs.get_mut(leg))
+                        {
+                            open.ch.exited = true;
+                            open.ch.quarantined = false;
+                        }
+                        // A leg that ends before the claim is over, with windows it never
+                        // read, fails the claim; one that read them all is simply done.
+                        let owed = self.claims.get(&key).is_some_and(|claim| {
+                            !claim.is_terminal()
+                                && claim.mp.legs.get(leg).is_some_and(|open| {
+                                    claim.windows.iter().any(|w| {
+                                        w.phase == Phase::RequesterRead
+                                            && w.readers & (1 << open.rank) != 0
+                                    })
+                                })
+                        });
+                        if owed {
+                            self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
+                        }
+                        self.reclaim(key);
+                    }
                     Some(ChanOwner::Claim(key)) => {
                         if let Some(open) = self
                             .claims
@@ -1727,16 +1936,22 @@ impl Core {
         }
     }
 
-    /// A window is in the socket: the handler will not read it again.
-    fn claim_window_sent(&mut self, key: ClaimKey, index: u32) {
+    /// One accessor of a window is done reading it: slot 0 is the requester's session (or its
+    /// own leg), slot `r` the leg of peer rank `r`. The window is free when every accessor
+    /// has finished; an acknowledgment counts once per accessor, whatever its repeats.
+    pub(super) fn reader_done(&mut self, key: ClaimKey, index: u32, slot: u32) {
         let Some(claim) = self.claims.get_mut(&key) else {
             return;
         };
         let Some(window) = claim.windows.get_mut(index as usize) else {
             return;
         };
-        if window.phase != Phase::RequesterRead {
+        if window.phase != Phase::RequesterRead || window.readers & (1 << slot) == 0 {
             return;
+        }
+        window.readers &= !(1 << slot);
+        if window.readers != 0 {
+            return self.complete_if_latched(key);
         }
         window.phase = Phase::Free;
         window.extent = None;
@@ -1752,6 +1967,22 @@ impl Core {
             // A relayed claim's next window can take the freed room.
             self.issue_windows(key);
         }
+        self.complete_if_latched(key);
+    }
+
+    /// The requester's COPY_OK was exact but waited for a leg or the store; finish the claim
+    /// now if nothing is outstanding.
+    fn complete_if_latched(&mut self, key: ClaimKey) {
+        let Some(claim) = self.claims.get(&key) else {
+            return;
+        };
+        if claim.is_terminal() || !claim.mp.copy_ok || claim.legs_pending() {
+            return;
+        }
+        if claim.manager.as_ref().is_some_and(|manager| !manager.done) {
+            return;
+        }
+        self.finish(key, v2::ClaimState::Copied, v2::ClaimReason::ReasonNone);
     }
 
     /// Tells the source to stop and release, if its export is still open.
@@ -1815,6 +2046,23 @@ impl Core {
             Some(open) => open.exited,
             None => matches!(claim.requester_fence, Party::Drained | Party::Idle) || requester_gone,
         };
+        // A multi-process requester's peers: a shared-memory one answers for itself (its own
+        // attestation, or its process's exit); one on a leg is fenced by the handler's exit.
+        let peers_ok = claim.mp.req.as_ref().is_none_or(|side| {
+            side.peers.iter().all(|peer| {
+                !peer.shared
+                    || matches!(peer.fence, Party::Drained | Party::Idle)
+                    || self.proc_exited_flag(&peer.proc)
+            })
+        }) && claim
+            .mp
+            .legs
+            .iter()
+            .filter(|leg| !leg.source)
+            .all(|leg| leg.ch.exited);
+        // The assembly pass reads manager memory too.
+        let quiet = claim.mp.passes == 0;
+        let (source_ok, requester_ok) = (source_ok && quiet, requester_ok && peers_ok && quiet);
         let claim = self.claims.get_mut(&key).expect("claim exists");
         for window in &mut claim.windows {
             match window.phase {
@@ -1855,7 +2103,7 @@ impl Core {
         let retention = self.cfg.reply_retention;
         let mut expire = Vec::new();
         let mut forget = Vec::new();
-        let mut quarantine: Vec<(ClaimKey, bool)> = Vec::new();
+        let mut quarantine: Vec<(ClaimKey, Which)> = Vec::new();
         for (key, claim) in &self.claims {
             if claim.is_terminal() {
                 for (leg, source) in [(&claim.channel, false), (&claim.source_channel, true)] {
@@ -1866,11 +2114,33 @@ impl Core {
                                 .stopped_at
                                 .is_some_and(|at| now.duration_since(at) >= DRAIN_GRACE)
                         {
-                            quarantine.push((*key, source));
+                            quarantine.push((*key, Which::Edge(source)));
                         }
                     }
                 }
+                for (index, leg) in claim.mp.legs.iter().enumerate() {
+                    if !leg.ch.exited
+                        && !leg.ch.quarantined
+                        && leg
+                            .ch
+                            .stopped_at
+                            .is_some_and(|at| now.duration_since(at) >= DRAIN_GRACE)
+                    {
+                        quarantine.push((*key, Which::Rank(index)));
+                    }
+                }
+                let peers_settled = claim.mp.passes == 0
+                    && claim.mp.legs.iter().all(|leg| leg.ch.exited)
+                    && [&claim.mp.req, &claim.mp.src]
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|side| side.peers.iter())
+                        .all(|peer| {
+                            !matches!(peer.fence, Party::Pending | Party::Quarantined)
+                                || self.proc_exited_flag(&peer.proc)
+                        });
                 let settled = claim.block.is_none()
+                    && peers_settled
                     && claim
                         .windows
                         .iter()
@@ -1907,15 +2177,13 @@ impl Core {
                 expire.push((*key, v2::ClaimReason::NoProgress));
             }
         }
-        for (key, source) in quarantine {
+        for (key, which) in quarantine {
             // The handler did not exit: it may still touch the claim's windows, so they
             // stay out of service until the manager exits.
-            if let Some(open) = self.claims.get_mut(&key).and_then(|claim| {
-                if source {
-                    claim.source_channel.as_mut()
-                } else {
-                    claim.channel.as_mut()
-                }
+            if let Some(open) = self.claims.get_mut(&key).and_then(|claim| match which {
+                Which::Edge(true) => claim.source_channel.as_mut(),
+                Which::Edge(false) => claim.channel.as_mut(),
+                Which::Rank(index) => claim.mp.legs.get_mut(index).map(|leg| &mut leg.ch),
             }) {
                 open.quarantined = true;
                 eprintln!(
@@ -1943,10 +2211,58 @@ impl Core {
     // ------------------------------------------------------------------ rank agents
 
     /// An agent attested that it drained one transfer.
-    pub(super) fn agent_fence(&mut self, _agent: ProcKey, _kind: i32, _id: u64, _party: Party) {}
+    pub(super) fn agent_fence(&mut self, agent: ProcKey, kind: i32, id: u64, party: Party) {
+        use v2::rank_fence::Kind;
+        let key = match Kind::try_from(kind) {
+            Ok(Kind::Claim) => {
+                // The claim is named by rank 0's id; the agent's instance is its rank 0's.
+                let rank0 = self
+                    .agents
+                    .values()
+                    .find(|a| a.proc() == agent)
+                    .map(|a| a.rank0);
+                rank0.map(|nonce| (agent.0, nonce, id))
+            }
+            Ok(Kind::Export) => self.exports.get(&id).copied(),
+            _ => None,
+        };
+        let Some(key) = key else { return };
+        let Some(claim) = self.claims.get_mut(&key) else {
+            return;
+        };
+        let mut touched = false;
+        for side in [claim.mp.req.as_mut(), claim.mp.src.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            for peer in side.peers.iter_mut().filter(|p| p.proc == agent) {
+                if peer.fence == Party::Pending
+                    || peer.fence == Party::Quarantined && party == Party::Drained
+                {
+                    peer.fence = party;
+                    touched = true;
+                }
+            }
+        }
+        if touched {
+            self.reclaim(key);
+        }
+    }
 
-    /// An attached agent is gone or replaced: transfers it takes part in fail.
-    pub(super) fn agent_gone(&mut self, _agent: ProcKey) {}
+    /// An attached agent is gone or replaced: the transfers it takes part in fail. What it
+    /// may still be touching stays its own obligation.
+    pub(super) fn agent_gone(&mut self, agent: ProcKey) {
+        let keys: Vec<ClaimKey> = self
+            .claims
+            .iter()
+            .filter(|(_, claim)| !claim.is_terminal())
+            .filter(|(_, claim)| claim.mp.peer_procs().any(|proc| proc == agent) || false)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in keys {
+            self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::RankLost);
+        }
+    }
 
     // ------------------------------------------------------------------ processes
 
@@ -1974,6 +2290,17 @@ impl Core {
                 }
                 touched = true;
             }
+            for side in [claim.mp.req.as_mut(), claim.mp.src.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                for peer in side.peers.iter_mut().filter(|p| p.proc == process) {
+                    if matches!(peer.fence, Party::Pending | Party::Quarantined) {
+                        peer.fence = Party::Drained;
+                    }
+                    touched = true;
+                }
+            }
             if touched {
                 self.reclaim(key);
             }
@@ -1999,6 +2326,17 @@ impl Core {
                 if matches!(claim.export, ExportState::Requested | ExportState::Pinned) {
                     claim.export = ExportState::Ended(Party::Drained);
                     touched = true;
+                }
+            }
+            for side in [claim.mp.req.as_mut(), claim.mp.src.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                for peer in side.peers.iter_mut().filter(|p| p.proc == process) {
+                    if peer.fence == Party::Pending {
+                        peer.fence = Party::Drained;
+                        touched = true;
+                    }
                 }
             }
             if touched {
@@ -2179,6 +2517,8 @@ mod tests {
                     extent: None,
                     page_xxh3: Vec::new(),
                     row_xxh3: 0,
+                    readers: 0,
+                    arrived: false,
                 }],
                 requester_fence: Party::Pending,
                 source_fence: Party::Idle,
@@ -2196,6 +2536,7 @@ mod tests {
                 }),
                 channel: None,
                 source_channel: None,
+                mp: MpState::default(),
             },
         );
         key
@@ -2405,5 +2746,175 @@ mod tests {
         assert_eq!(core.quarantined_bytes(), 0);
         assert_eq!(core.claims[&key].windows[0].phase, Phase::Free);
         assert!(core.channels.is_empty());
+    }
+
+    // ---- multi-process requesters -------------------------------------------------
+
+    use super::super::mp::{MpPeer, MpSide, RankLeg};
+
+    fn three_ranks() -> std::sync::Arc<flare_selene::pool::SliceLayout> {
+        use flare_selene::pool::{Geometry, RankPlanes};
+        let rank = RankPlanes {
+            plane_bytes: vec![4096],
+            row_bytes: 4096,
+        };
+        std::sync::Arc::new(
+            flare_selene::pool::SliceLayout::new(&Geometry {
+                page_tokens: 64,
+                ranks: vec![rank; 3],
+                page_record_bytes: 3 * 4096,
+                row_record_bytes: 3 * 4096,
+            })
+            .unwrap(),
+        )
+    }
+
+    const AGENT_1: ProcKey = ([1; 16], [11; 16]);
+    const AGENT_2: ProcKey = ([1; 16], [12; 16]);
+
+    /// A claim from a three-rank requester with one window read by rank 0's session, the
+    /// shared peer rank 1 (a participant) and the leg of rank 2.
+    fn ranked(core: &mut Core, window_phase: Phase) -> ClaimKey {
+        let key = delivered(core);
+        for agent in [AGENT_1, AGENT_2] {
+            core.procs.insert(
+                agent,
+                crate::pool::core::Proc {
+                    pid: None,
+                    pidfd: None,
+                    exited: false,
+                    claim_hw: 0,
+                    put_hw: 0,
+                    idle_since: None,
+                    link: None,
+                },
+            );
+        }
+        let claim = core.claims.get_mut(&key).unwrap();
+        claim.windows[0].phase = window_phase;
+        claim.windows[0].readers = 0b101;
+        claim.mp.req = Some(MpSide {
+            layout: three_ranks(),
+            peers: vec![
+                MpPeer {
+                    rank: 1,
+                    proc: AGENT_1,
+                    shared: true,
+                    fence: Party::Pending,
+                },
+                MpPeer {
+                    rank: 2,
+                    proc: AGENT_2,
+                    shared: false,
+                    fence: Party::Idle,
+                },
+            ],
+        });
+        claim.mp.legs = vec![RankLeg {
+            rank: 2,
+            source: false,
+            ch: Channel {
+                transfer: 99,
+                token: [0; flare_selene::pool::frame::TOKEN_BYTES],
+                exited: false,
+                stopped_at: None,
+                quarantined: false,
+            },
+        }];
+        claim.manager.as_mut().unwrap().done = true;
+        key
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_window_is_free_only_when_every_accessor_finished_and_repeats_are_not_votes() {
+        let (mut core, _out) = core();
+        let key = ranked(&mut core, Phase::RequesterRead);
+        core.reader_done(key, 0, 0);
+        core.reader_done(key, 0, 0);
+        core.reader_done(key, 0, 0);
+        assert_eq!(core.claims[&key].windows[0].phase, Phase::RequesterRead);
+        assert_eq!(core.claims[&key].windows[0].readers, 0b100);
+        // A slot that was never required is no vote either.
+        core.reader_done(key, 0, 1);
+        core.reader_done(key, 0, 5);
+        assert_eq!(core.claims[&key].windows[0].phase, Phase::RequesterRead);
+        core.reader_done(key, 0, 2);
+        assert_eq!(core.claims[&key].windows[0].phase, Phase::Free);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exact_copy_ok_waits_for_the_legs_and_completes_when_the_last_one_reports() {
+        let (mut core, _out) = core();
+        let key = ranked(&mut core, Phase::RequesterRead);
+        core.reader_done(key, 0, 0);
+        core.copy_result(1, copy_ok()).unwrap();
+        assert!(
+            !core.claims[&key].is_terminal(),
+            "rank 2's leg has not finished reading"
+        );
+        assert!(core.claims[&key].mp.copy_ok);
+        core.reader_done(key, 0, 2);
+        assert_eq!(core.claims[&key].state, v2::ClaimState::Copied);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shared_peers_window_is_released_by_its_own_fence_and_not_by_anyone_elses() {
+        let (mut core, _out) = core();
+        let key = ranked(&mut core, Phase::RequesterRead);
+        core.claims.get_mut(&key).unwrap().windows[0].readers = 0;
+        core.finish(key, v2::ClaimState::Failed, v2::ClaimReason::Cancelled);
+        // The requester's session fenced itself (the fixture's party is Pending).
+        core.claims.get_mut(&key).unwrap().requester_fence = Party::Drained;
+        core.claims.get_mut(&key).unwrap().mp.legs[0].ch.exited = true;
+        core.reclaim(key);
+        assert_eq!(
+            core.claims[&key].windows[0].phase,
+            Phase::RequesterRead,
+            "peer 1 may still be reading"
+        );
+        // A different agent (a replacement) attesting does nothing for peer 1.
+        core.agent_fence(
+            AGENT_2,
+            v2::rank_fence::Kind::Claim as i32,
+            1,
+            Party::Drained,
+        );
+        core.reclaim(key);
+        assert_eq!(core.claims[&key].windows[0].phase, Phase::RequesterRead);
+        // Peer 1's own process exiting is its proof.
+        core.proc_exited(AGENT_1);
+        assert_eq!(core.claims[&key].windows[0].phase, Phase::Free);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_that_attests_quarantined_keeps_the_window_until_its_process_exits() {
+        let (mut core, _out) = core();
+        let key = ranked(&mut core, Phase::RequesterRead);
+        core.claims.get_mut(&key).unwrap().windows[0].readers = 0;
+        core.finish(key, v2::ClaimState::Failed, v2::ClaimReason::Cancelled);
+        let claim = core.claims.get_mut(&key).unwrap();
+        claim.requester_fence = Party::Drained;
+        claim.mp.legs[0].ch.exited = true;
+        claim.mp.req.as_mut().unwrap().peers[0].fence = Party::Quarantined;
+        core.reclaim(key);
+        assert_eq!(core.claims[&key].windows[0].phase, Phase::RequesterRead);
+        assert_eq!(core.quarantined_bytes(), 6 * 4096);
+        core.proc_exited(AGENT_1);
+        assert_eq!(core.claims[&key].windows[0].phase, Phase::Free);
+        assert_eq!(core.quarantined_bytes(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn losing_an_attached_peer_fails_the_claims_it_takes_part_in() {
+        let (mut core, _out) = core();
+        let key = ranked(&mut core, Phase::RequesterRead);
+        core.agent_gone(AGENT_2);
+        assert!(
+            !core.claims[&key].is_terminal(),
+            "rank 2 is on a leg, not a participant"
+        );
+        core.agent_gone(AGENT_1);
+        assert_eq!(core.claims[&key].state, v2::ClaimState::Failed);
+        assert_eq!(core.claims[&key].reason, v2::ClaimReason::RankLost);
     }
 }
