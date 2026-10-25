@@ -29,7 +29,7 @@ use super::{
     Engine, Owner,
     coverage::Coverage,
     hostfill::{FillDone, FillJob, FillOwner},
-    ranks::{PeerPart, XferOwner},
+    ranks::{PeerPart, PeerWindow, XferOwner},
     requester::ExpectedRecord,
 };
 
@@ -76,11 +76,6 @@ struct Export {
     /// Shared-memory peers that have not yet drained their slice of a window, and the
     /// slice checksums those that have reported.
     peer_windows: HashMap<u32, PeerWindow>,
-}
-
-struct PeerWindow {
-    left: BTreeSet<usize>,
-    sums: Vec<(usize, crate::pool::SliceSums)>,
 }
 
 #[derive(Default)]

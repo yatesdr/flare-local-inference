@@ -12,6 +12,7 @@ use super::{
     core::{ChanOwner, Core, Event, Nonce, ProcKey, ScopeId},
     index::{Entry, InstanceId, SourceId, Tier},
     key_from, key_to,
+    mp::{PutMp, PutWin},
 };
 use crate::{
     Key,
@@ -55,6 +56,8 @@ pub(super) struct PutRec {
     pub refused: bool,
     pub key: Key,
     pub chain_pages: u64,
+    /// The record carries the state row.
+    pub row: bool,
     /// What the store accepted: the parent it will link to and the first page it needs.
     pub accepted: Option<(Option<Key>, u32)>,
     /// Set when the writer's bytes arrive on the data channel.
@@ -62,6 +65,10 @@ pub(super) struct PutRec {
     /// A commit that arrived before the data channel delivered every window: the
     /// channel and the session are separate streams, so it waits for the last fill.
     pub deferred_commit: Option<(u64, v2::PutCommit)>,
+    /// What a multi-process writer adds: its peers, their legs, the windows being assembled.
+    pub mp: Option<PutMp>,
+    /// The writer's fence arrived; the put waits for its peers before releasing its windows.
+    pub fenced: bool,
 }
 
 /// A put's data-channel transfer. Its windows are written only by the manager's
@@ -433,8 +440,12 @@ impl Core {
             return Ok(());
         }
         let hub = self.cfg.channel.clone();
+        let slices = self.requester_slices(sid);
         let channel = match (mode, hub) {
-            (v2::CopyMode::DataChannel, Some(hub)) => match hub.open(channel::Kind::Put) {
+            (v2::CopyMode::DataChannel, Some(hub)) => match match &slices {
+                Some(layout) => hub.open_rank(channel::Kind::Put, layout.clone(), 0),
+                None => hub.open(channel::Kind::Put),
+            } {
                 Ok((transfer, token)) => Some(PutChannel {
                     transfer,
                     token,
@@ -454,6 +465,42 @@ impl Core {
             },
             _ => None,
         };
+        // The peer ranks of a multi-process writer.
+        let mut legs = Vec::new();
+        let mp = match self.mp_side(
+            sid,
+            &|i| ChanOwner::PutRank(key, i),
+            channel::Kind::Put,
+            &mut legs,
+        ) {
+            Ok(side) => side.map(|side| PutMp {
+                layout: side.layout,
+                peers: side.peers,
+                legs,
+                windows: Default::default(),
+                passes: 0,
+                whole: Vec::new(),
+                row: None,
+            }),
+            Err(_) => {
+                if let (Some(open), Some(hub)) = (&channel, self.cfg.channel.as_ref()) {
+                    hub.stop(open.transfer);
+                    hub.forget(open.transfer);
+                }
+                self.store_send(StoreCommand::Cancel {
+                    connection: link.connection,
+                    generation: link.generation,
+                    transfer: put_id,
+                });
+                self.put_refusal(
+                    sid,
+                    put_id,
+                    v2::Reason::PutNotReady,
+                    "a peer rank of this instance is not attached",
+                );
+                return Ok(());
+            }
+        };
         if let Some(open) = &channel {
             self.channels.insert(open.transfer, ChanOwner::Put(key));
         }
@@ -467,9 +514,12 @@ impl Core {
                 refused: false,
                 key: record_key,
                 chain_pages: m.chain_pages,
+                row: m.row,
                 accepted: None,
                 channel,
                 deferred_commit: None,
+                mp,
+                fenced: false,
             },
         );
         let tx = self.self_tx.clone();
@@ -516,6 +566,17 @@ impl Core {
                     .as_ref()
                     .zip(self.cfg.channel.as_ref())
                     .map(|(open, hub)| super::channel_ref(hub, &open.token));
+                let rank_channels = match (rec.mp.as_ref(), self.cfg.channel.as_ref()) {
+                    (Some(mp), Some(hub)) => mp
+                        .legs
+                        .iter()
+                        .map(|leg| v2::RankChannel {
+                            rank: leg.rank,
+                            channel: Some(super::channel_ref(hub, &leg.ch.token)),
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
                 self.send(
                     sid,
                     M::PutAccept(v2::PutAccept {
@@ -525,18 +586,63 @@ impl Core {
                         parent: accept.parent.map(key_to),
                         record_bytes: accept.record_bytes,
                         channel,
-                        rank_channels: Vec::new(),
+                        rank_channels,
                     }),
                 );
             }
             Ok(PutAnswer::Grant(grant)) => {
                 rec.unfilled += 1;
+                let region = u8::try_from(grant.region)
+                    .ok()
+                    .and_then(crate::data::Region::from_u8);
+                let layout = rec.mp.as_ref().map(|mp| mp.layout.clone());
+                let shape_for = |rank: usize| Shape {
+                    index: grant.index,
+                    record: grant.record,
+                    first_page: grant.page_first as u32,
+                    page_count: grant.page_count,
+                    row: grant.row,
+                    length: match &layout {
+                        Some(layout) => layout.slice_bytes(rank, grant.page_count, grant.row),
+                        None => grant.length,
+                    },
+                };
+                // A multi-process writer's window is written by every rank: record who
+                // must report, and grant each peer on a leg its own slice.
+                let mut peer_grants: Vec<(u64, u32)> = Vec::new();
+                if let Some(mp) = rec.mp.as_mut() {
+                    let Some(region) = region else {
+                        self.put_fail_by_key(key, v2::Reason::Io, "a window in an unknown region");
+                        return;
+                    };
+                    let writers = mp.legs.iter().fold(1u64, |mask, leg| mask | 1 << leg.rank);
+                    mp.windows.insert(
+                        grant.index,
+                        PutWin {
+                            region,
+                            first_page: grant.page_first as u32,
+                            offset: grant.offset,
+                            pages: grant.page_count,
+                            row: grant.row,
+                            writers,
+                            stated: vec![None; mp.layout.world()],
+                            arrived: false,
+                        },
+                    );
+                    for peer in &mut mp.peers {
+                        if peer.shared && peer.fence == Party::Idle {
+                            peer.fence = Party::Pending;
+                        }
+                    }
+                    peer_grants = mp
+                        .legs
+                        .iter()
+                        .map(|leg| (leg.ch.transfer, leg.rank))
+                        .collect();
+                }
                 if let Some((open, hub)) = rec.channel.as_ref().zip(self.cfg.channel.as_ref()) {
                     // The window is filled by the manager's handler from what the
                     // instance writes; no one else holds it.
-                    let region = u8::try_from(grant.region)
-                        .ok()
-                        .and_then(crate::data::Region::from_u8);
                     let Some(region) = region else {
                         self.put_fail_by_key(key, v2::Reason::Io, "a window in an unknown region");
                         return;
@@ -544,38 +650,43 @@ impl Core {
                     hub.push_grant(
                         open.transfer,
                         channel::GrantOut {
-                            shape: Shape {
-                                index: grant.index,
-                                record: grant.record,
-                                first_page: grant.page_first as u32,
-                                page_count: grant.page_count,
-                                row: grant.row,
-                                length: grant.length,
-                            },
+                            shape: shape_for(0),
                             region,
                             offset: grant.offset,
                         },
                     );
-                    return;
+                } else {
+                    rec.fence = Party::Pending;
+                    let window = v2::WindowSpec {
+                        index: grant.index,
+                        region: grant.region,
+                        offset: grant.offset,
+                        length: grant.length,
+                        record: grant.record,
+                        first_page: grant.page_first as u32,
+                        page_count: grant.page_count,
+                        row: grant.row,
+                    };
+                    self.send(
+                        sid,
+                        M::PutGrant(v2::PutGrant {
+                            put_id,
+                            window: Some(window),
+                        }),
+                    );
                 }
-                rec.fence = Party::Pending;
-                let window = v2::WindowSpec {
-                    index: grant.index,
-                    region: grant.region,
-                    offset: grant.offset,
-                    length: grant.length,
-                    record: grant.record,
-                    first_page: grant.page_first as u32,
-                    page_count: grant.page_count,
-                    row: grant.row,
-                };
-                self.send(
-                    sid,
-                    M::PutGrant(v2::PutGrant {
-                        put_id,
-                        window: Some(window),
-                    }),
-                );
+                if let (Some(hub), Some(region)) = (self.cfg.channel.as_ref(), region) {
+                    for (transfer, rank) in peer_grants {
+                        hub.push_grant(
+                            transfer,
+                            channel::GrantOut {
+                                shape: shape_for(rank as usize),
+                                region,
+                                offset: grant.offset,
+                            },
+                        );
+                    }
+                }
             }
             Ok(PutAnswer::Stored { bytes }) => {
                 rec.phase = PutPhase::Finished;
@@ -614,10 +725,16 @@ impl Core {
         if rec.phase != PutPhase::Finished {
             return;
         }
+        if rec.mp.is_some() {
+            self.put_stop_legs(key);
+        }
+        let Some(rec) = self.puts.get(&key) else {
+            return;
+        };
         if rec.channel.is_some() {
             return self.put_channel_end(key);
         }
-        if rec.unfilled == 0 {
+        if rec.unfilled == 0 && self.put_peers_quiet(rec) {
             self.puts.remove(&key);
         }
     }
@@ -646,6 +763,13 @@ impl Core {
             self.channels.remove(&open.transfer);
         }
         let link = rec.link;
+        if self
+            .puts
+            .get(&key)
+            .is_some_and(|rec| !self.put_peers_quiet(rec))
+        {
+            return;
+        }
         self.puts.remove(&key);
         self.store_send(StoreCommand::ReleaseTransfer {
             connection: link.connection,
@@ -707,8 +831,267 @@ impl Core {
         if self.puts.get(&key).is_some_and(|rec| rec.channel.is_some()) {
             return Err(Violation::new("PutFilled for a put on the data channel"));
         }
+        if self.puts.get(&key).is_some_and(|rec| rec.mp.is_some()) {
+            // A multi-process writer states its ranks' slice checksums, not whole ones.
+            if !m.page_xxh3.is_empty() || m.rank_sums.is_empty() {
+                return Err(Violation::new(
+                    "a multi-process writer states slice checksums",
+                ));
+            }
+            let parts = m
+                .rank_sums
+                .into_iter()
+                .map(|sums| {
+                    (
+                        sums.rank as usize,
+                        flare_selene::pool::SliceSums {
+                            pages: sums.page_xxh3,
+                            row: sums.has_row.then_some(sums.row_xxh3),
+                        },
+                    )
+                })
+                .collect();
+            self.put_stated_part(key, m.index, parts, 0);
+            return Ok(());
+        }
         self.put_window_filled(key, m.index, m.page_xxh3, m.has_row.then_some(m.row_xxh3));
         Ok(())
+    }
+
+    /// Some of a multi-process writer's ranks stated their slice checksums for a window; the
+    /// window goes to the assembly pass when every accessor has.
+    pub(super) fn put_stated_part(
+        &mut self,
+        key: PutKey,
+        index: u32,
+        parts: Vec<(usize, flare_selene::pool::SliceSums)>,
+        slot: u32,
+    ) {
+        let Some(rec) = self.puts.get_mut(&key) else {
+            return;
+        };
+        if rec.phase != PutPhase::Open {
+            return;
+        }
+        let Some(mp) = rec.mp.as_mut() else { return };
+        let Some(window) = mp.windows.get_mut(&index) else {
+            return;
+        };
+        if window.arrived || window.writers & (1 << slot) == 0 {
+            return;
+        }
+        let shaped = parts.iter().all(|(rank, sums)| {
+            *rank < window.stated.len()
+                && sums.pages.len() == window.pages as usize
+                && sums.row.is_some() == window.row
+        });
+        let fresh = parts.iter().all(|(rank, _)| {
+            window
+                .stated
+                .get(*rank)
+                .is_some_and(|stated| stated.is_none())
+        });
+        if !shaped || !fresh {
+            return self.put_fail_by_key(
+                key,
+                v2::Reason::Invalid,
+                "a rank's slice checksums do not fit its window",
+            );
+        }
+        for (rank, sums) in parts {
+            window.stated[rank] = Some(sums);
+        }
+        window.writers &= !(1 << slot);
+        if window.writers != 0 {
+            return;
+        }
+        let stated: Option<Vec<flare_selene::pool::SliceSums>> = window.stated.drain(..).collect();
+        let Some(stated) = stated else {
+            return self.put_fail_by_key(key, v2::Reason::Invalid, "a rank stated nothing");
+        };
+        window.arrived = true;
+        let Some(regions) = self.cfg.regions.clone() else {
+            return self.put_fail_by_key(key, v2::Reason::Io, "the manager has no regions");
+        };
+        let job = super::pass::PassJob {
+            regions,
+            region: window.region,
+            offset: window.offset,
+            pages: window.pages,
+            row: window.row,
+            layout: mp.layout.clone(),
+            stated_slices: Some(stated),
+            stated_whole: None,
+            want_whole: true,
+            want_slices: false,
+        };
+        mp.passes += 1;
+        let events = self.self_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = super::pass::run(job);
+            let _ = events.blocking_send(Event::PutPass { key, index, result });
+        });
+    }
+
+    /// A put's assembly pass finished: the verified whole checksums go to the store.
+    pub(super) fn put_pass_done(
+        &mut self,
+        key: PutKey,
+        index: u32,
+        result: Result<super::pass::PassOut, super::pass::PassError>,
+    ) {
+        let Some(rec) = self.puts.get_mut(&key) else {
+            return;
+        };
+        if let Some(mp) = rec.mp.as_mut() {
+            mp.passes = mp.passes.saturating_sub(1);
+        }
+        if rec.phase != PutPhase::Open {
+            return self.puts_settle(key);
+        }
+        match result {
+            Ok(out) => {
+                let whole = out.whole.unwrap_or_default();
+                if let Some(mp) = self.puts.get_mut(&key).and_then(|rec| rec.mp.as_mut()) {
+                    let first = mp.windows.get(&index).map_or(0, |w| w.first_page as usize);
+                    if mp.whole.len() < first + whole.pages.len() {
+                        mp.whole.resize(first + whole.pages.len(), None);
+                    }
+                    for (i, sum) in whole.pages.iter().enumerate() {
+                        mp.whole[first + i] = Some(*sum);
+                    }
+                    if whole.row.is_some() {
+                        mp.row = whole.row;
+                    }
+                }
+                self.put_window_filled(key, index, whole.pages, whole.row);
+            }
+            Err(super::pass::PassError::Mismatch(why)) => {
+                self.put_fail_by_key(key, v2::Reason::Invalid, &why);
+            }
+            Err(super::pass::PassError::Io(why)) => {
+                self.put_fail_by_key(key, v2::Reason::Io, &why);
+            }
+        }
+    }
+
+    /// Whether nothing of a multi-process writer's peers can still touch the put's windows:
+    /// no pass runs, every leg has exited and every shared peer has drained or is gone.
+    fn put_peers_quiet(&self, rec: &PutRec) -> bool {
+        let Some(mp) = rec.mp.as_ref() else {
+            return true;
+        };
+        mp.passes == 0
+            && mp.legs.iter().all(|leg| leg.ch.exited)
+            && mp.peers.iter().all(|peer| {
+                !peer.shared
+                    || matches!(peer.fence, Party::Drained | Party::Idle)
+                    || self.procs.get(&peer.proc).is_none_or(|p| p.exited)
+            })
+    }
+
+    /// Stop the peers' legs of a put that is over.
+    fn put_stop_legs(&mut self, key: PutKey) {
+        let Some(hub) = self.cfg.channel.clone() else {
+            if let Some(mp) = self.puts.get_mut(&key).and_then(|rec| rec.mp.as_mut()) {
+                for leg in &mut mp.legs {
+                    leg.ch.exited = true;
+                }
+            }
+            return;
+        };
+        let Some(mp) = self.puts.get_mut(&key).and_then(|rec| rec.mp.as_mut()) else {
+            return;
+        };
+        let mut quiet = Vec::new();
+        for leg in &mut mp.legs {
+            if leg.ch.exited {
+                continue;
+            }
+            leg.ch.stopped_at.get_or_insert_with(Instant::now);
+            if hub.stop(leg.ch.transfer) {
+                leg.ch.exited = true;
+                quiet.push(leg.ch.transfer);
+            }
+        }
+        for transfer in quiet {
+            self.channels.remove(&transfer);
+        }
+    }
+
+    /// An agent attested what it was doing for a put.
+    pub(super) fn put_agent_fence(&mut self, key: PutKey, agent: ProcKey, party: Party) {
+        let Some(mp) = self.puts.get_mut(&key).and_then(|rec| rec.mp.as_mut()) else {
+            return;
+        };
+        for peer in mp.peers.iter_mut().filter(|p| p.proc == agent) {
+            if peer.fence == Party::Pending
+                || peer.fence == Party::Quarantined && party == Party::Drained
+            {
+                peer.fence = party;
+            }
+        }
+        self.puts_resettle(key);
+    }
+
+    /// A process that may be a peer rank of some puts exited, or said it is quiet.
+    pub(super) fn puts_peer_changed(&mut self, process: ProcKey, gone: bool) {
+        let keys: Vec<PutKey> = self
+            .puts
+            .iter()
+            .filter(|(_, rec)| {
+                rec.mp
+                    .as_ref()
+                    .is_some_and(|mp| mp.peers.iter().any(|p| p.proc == process))
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        for key in keys {
+            if let Some(mp) = self.puts.get_mut(&key).and_then(|rec| rec.mp.as_mut()) {
+                for peer in mp.peers.iter_mut().filter(|p| p.proc == process) {
+                    if matches!(peer.fence, Party::Pending | Party::Quarantined) || gone {
+                        peer.fence = Party::Drained;
+                    }
+                }
+            }
+            self.puts_resettle(key);
+        }
+    }
+
+    /// A peer rank of some puts is gone: those puts cannot continue.
+    pub(super) fn puts_peer_gone(&mut self, process: ProcKey) {
+        let keys: Vec<PutKey> =
+            self.puts
+                .iter()
+                .filter(|(_, rec)| {
+                    rec.phase == PutPhase::Open
+                        && rec.mp.as_ref().is_some_and(|mp| {
+                            mp.peers.iter().any(|p| p.shared && p.proc == process)
+                        })
+                })
+                .map(|(key, _)| *key)
+                .collect();
+        for key in keys {
+            self.put_fail_by_key(key, v2::Reason::Io, "a peer rank of the writer was lost");
+        }
+    }
+
+    /// Re-examine a put whose peers have changed state.
+    pub(super) fn puts_resettle(&mut self, key: PutKey) {
+        let Some(rec) = self.puts.get(&key) else {
+            return;
+        };
+        if rec.fenced && self.put_peers_quiet(rec) && rec.channel.is_none() {
+            let link = rec.link;
+            self.puts.remove(&key);
+            self.store_send(StoreCommand::ReleaseTransfer {
+                connection: link.connection,
+                generation: link.generation,
+                transfer: key.2,
+            });
+            return;
+        }
+        self.puts_settle(key);
     }
 
     /// The writer filled window `index`: the store checks and consumes it.
@@ -790,7 +1173,7 @@ impl Core {
         if rec.phase != PutPhase::Open {
             return Ok(());
         }
-        if rec.channel.is_some() && rec.unfilled > 0 {
+        if (rec.channel.is_some() || rec.mp.is_some()) && rec.unfilled > 0 {
             rec.deferred_commit = Some((sid, m));
             return Ok(());
         }
@@ -816,6 +1199,31 @@ impl Core {
             );
             return Ok(());
         }
+        // A multi-process writer's ranks cannot state whole-page checksums; the record keeps
+        // the ones the manager computed over the assembled windows.
+        let mut metadata = m.metadata.clone();
+        if let Some(mp) = rec.mp.as_ref() {
+            let header = Header::decode(&metadata).expect("validated above");
+            let pages: Option<Vec<u64>> = (0..header.tail_pages as usize)
+                .map(|page| mp.whole.get(page).copied().flatten())
+                .collect();
+            let row = mp.row.filter(|_| rec.row);
+            match pages {
+                Some(pages) if set_checksums(&mut metadata, &header, &pages, row) => {}
+                _ => {
+                    self.put_fail(
+                        sid,
+                        key,
+                        v2::Reason::Invalid,
+                        "the record's pages were not all written by every rank",
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        let Some(rec) = self.puts.get_mut(&key) else {
+            return Ok(());
+        };
         rec.phase = PutPhase::Committed;
         let link = rec.link;
         let result = self.store_call(|reply| StoreCommand::PutCommit {
@@ -823,7 +1231,7 @@ impl Core {
             generation: link.generation,
             transfer: m.put_id,
             metadata_offset: m.metadata_offset,
-            metadata: m.metadata.clone(),
+            metadata,
             reply,
         });
         if let Err(error) = result {
@@ -873,13 +1281,8 @@ impl Core {
             return;
         }
         if party == Party::Drained {
-            let link = rec.link;
-            self.puts.remove(&key);
-            self.store_send(StoreCommand::ReleaseTransfer {
-                connection: link.connection,
-                generation: link.generation,
-                transfer: put_id,
-            });
+            rec.fenced = true;
+            self.puts_resettle(key);
         } else {
             rec.fence = party;
         }
@@ -1063,6 +1466,26 @@ fn key_of(key: &proto::Key) -> Option<Key> {
     })
 }
 
+/// Where a record header keeps its row checksum: after the magic, version, flags, identity,
+/// fingerprint, key, parent, bucket, page tokens, tail pages and the two segment offsets.
+const ROW_CHECKSUM_OFFSET: usize = 8 + 4 + 4 + 32 + 16 + 24 + 1 + 24 + 16 + 8 + 4 + 8 + 8;
+
+/// Replace the checksums of a record's metadata (its header block and checksum table) with
+/// `pages` and, when the record has a row, `row`.
+fn set_checksums(metadata: &mut [u8], header: &Header, pages: &[u64], row: Option<u64>) -> bool {
+    let table = HEADER_BYTES..HEADER_BYTES + pages.len() * 8;
+    if pages.len() != header.tail_pages as usize || metadata.len() < table.end {
+        return false;
+    }
+    for (chunk, sum) in metadata[table].chunks_exact_mut(8).zip(pages) {
+        chunk.copy_from_slice(&sum.to_le_bytes());
+    }
+    if let Some(row) = row {
+        metadata[ROW_CHECKSUM_OFFSET..ROW_CHECKSUM_OFFSET + 8].copy_from_slice(&row.to_le_bytes());
+    }
+    true
+}
+
 /// The checksums persisted with a record: one per page, and the row's.
 pub(super) fn persisted_checksums(metadata: &[u8]) -> Option<(Vec<u64>, u64)> {
     let header = Header::decode(metadata).ok()?;
@@ -1077,4 +1500,81 @@ pub(super) fn persisted_checksums(metadata: &[u8]) -> Option<(Vec<u64>, u64)> {
         .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
         .collect();
     Some((sums, header.row_checksum))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_row_checksum_sits_where_the_header_keeps_it_and_set_checksums_rewrites_the_table() {
+        // A header the client encodes, read by the manager's decoder: patching the offset
+        // this module assumes changes exactly the row checksum it reports.
+        use flare_selene::{CacheGeometry, Plane};
+        use flare_selene::{PrefixKey, geometry::fingerprint, record::Header as Client};
+        let rank = CacheGeometry {
+            page_tokens: 64,
+            page_capacity: 16,
+            row_capacity: 4,
+            row: Plane {
+                name: "state".into(),
+                address: 0x1000_0000,
+                unit_bytes: 4096,
+            },
+            planes: ["k", "v"]
+                .iter()
+                .enumerate()
+                .map(|(i, name)| Plane {
+                    name: (*name).into(),
+                    address: 0x2000_0000 + i as u64 * 0x100_0000,
+                    unit_bytes: 4096,
+                })
+                .collect(),
+            snapshot_pages: Vec::new(),
+        };
+        let geometry = vec![rank; 2];
+        let key = PrefixKey {
+            consumed_tokens: 192,
+            digest: [3; 16],
+        };
+        let mut header = Client::new(
+            &geometry,
+            [1; 32],
+            fingerprint(&geometry),
+            key,
+            None,
+            [4; 16],
+            3,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        header.row_checksum = 0x1111;
+        let mut metadata = header.encode().unwrap().to_vec();
+        metadata.extend(vec![0u8; header.checksum_bytes() as usize]);
+        let decoded = Header::decode(&metadata).unwrap();
+        assert_eq!(decoded.row_checksum, 0x1111);
+        assert!(set_checksums(
+            &mut metadata,
+            &decoded,
+            &[7, 8, 9],
+            Some(0x2222)
+        ));
+        let patched = Header::decode(&metadata).unwrap();
+        assert_eq!(patched.row_checksum, 0x2222);
+        assert_eq!(
+            persisted_checksums(&metadata),
+            Some((vec![7, 8, 9], 0x2222))
+        );
+        // Without a row the row checksum is left as it was.
+        assert!(set_checksums(&mut metadata, &patched, &[1, 2, 3], None));
+        assert_eq!(Header::decode(&metadata).unwrap().row_checksum, 0x2222);
+        // The wrong number of pages, or a short block, is refused.
+        assert!(!set_checksums(&mut metadata, &patched, &[1, 2], None));
+        assert!(!set_checksums(
+            &mut metadata[..HEADER_BYTES],
+            &patched,
+            &[1, 2, 3],
+            None
+        ));
+    }
 }

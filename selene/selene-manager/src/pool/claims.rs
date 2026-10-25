@@ -569,10 +569,20 @@ impl Core {
         // The requester's peer ranks, when it is a multi-process instance.
         let mut mp_legs = Vec::new();
         let sides = self
-            .mp_side(sid, key, channel::Kind::Get, &mut mp_legs)
+            .mp_side(
+                sid,
+                &|i| ChanOwner::ClaimRank(key, i),
+                channel::Kind::Get,
+                &mut mp_legs,
+            )
             .and_then(|req| {
-                self.mp_side(source_sid, key, channel::Kind::Put, &mut mp_legs)
-                    .map(|src| (req, src))
+                self.mp_side(
+                    source_sid,
+                    &|i| ChanOwner::ClaimRank(key, i),
+                    channel::Kind::Put,
+                    &mut mp_legs,
+                )
+                .map(|src| (req, src))
             });
         let (req_mp, src_mp) = match sides {
             Ok(sides) => sides,
@@ -689,7 +699,7 @@ impl Core {
     }
 
     /// The slice layout of the requester's instance when it is a multi-process one.
-    fn requester_slices(
+    pub(super) fn requester_slices(
         &self,
         sid: u64,
     ) -> Option<std::sync::Arc<flare_selene::pool::SliceLayout>> {
@@ -755,7 +765,12 @@ impl Core {
             None
         };
         let mut mp_legs = Vec::new();
-        let req_mp = match self.mp_side(sid, key, channel::Kind::Get, &mut mp_legs) {
+        let req_mp = match self.mp_side(
+            sid,
+            &|i| ChanOwner::ClaimRank(key, i),
+            channel::Kind::Get,
+            &mut mp_legs,
+        ) {
             Ok(side) => side,
             Err(reason) => {
                 if let (Some((transfer, _)), Some(hub)) = (&channel, self.cfg.channel.as_ref()) {
@@ -1982,7 +1997,37 @@ impl Core {
                     }
                 }
                 Some(ChanOwner::Put(key)) => {
-                    self.put_window_filled(key, index, page_xxh3, row_xxh3)
+                    if self.puts.get(&key).is_some_and(|rec| rec.mp.is_some()) {
+                        // Rank 0's leg of a multi-process writer states rank 0's slice.
+                        let parts = vec![(
+                            0,
+                            SliceSums {
+                                pages: page_xxh3,
+                                row: row_xxh3,
+                            },
+                        )];
+                        self.put_stated_part(key, index, parts, 0);
+                    } else {
+                        self.put_window_filled(key, index, page_xxh3, row_xxh3)
+                    }
+                }
+                Some(ChanOwner::PutRank(key, leg)) => {
+                    let rank = self
+                        .puts
+                        .get(&key)
+                        .and_then(|rec| rec.mp.as_ref())
+                        .and_then(|mp| mp.legs.get(leg))
+                        .map(|leg| leg.rank);
+                    if let Some(rank) = rank {
+                        let parts = vec![(
+                            rank as usize,
+                            SliceSums {
+                                pages: page_xxh3,
+                                row: row_xxh3,
+                            },
+                        )];
+                        self.put_stated_part(key, index, parts, rank);
+                    }
                 }
                 Some(ChanOwner::Source(key)) => {
                     self.source_window_filled(key, index, page_xxh3, row_xxh3)
@@ -2012,6 +2057,7 @@ impl Core {
                     self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::SourceLost);
                 }
                 Some(ChanOwner::Put(key)) => self.put_channel_failed(key, &reason),
+                Some(ChanOwner::PutRank(key, _)) => self.put_channel_failed(key, &reason),
                 None => {}
             },
             E::Closed { transfer } => {
@@ -2085,6 +2131,18 @@ impl Core {
                         self.reclaim(key);
                     }
                     Some(ChanOwner::Put(key)) => self.put_channel_closed(key),
+                    Some(ChanOwner::PutRank(key, leg)) => {
+                        if let Some(open) = self
+                            .puts
+                            .get_mut(&key)
+                            .and_then(|rec| rec.mp.as_mut())
+                            .and_then(|mp| mp.legs.get_mut(leg))
+                        {
+                            open.ch.exited = true;
+                            open.ch.quarantined = false;
+                        }
+                        self.puts_resettle(key);
+                    }
                     None => {}
                 }
             }
@@ -2395,6 +2453,17 @@ impl Core {
                 rank0.map(|nonce| (agent.0, nonce, id))
             }
             Ok(Kind::Export) => self.exports.get(&id).copied(),
+            Ok(Kind::Put) => {
+                let rank0 = self
+                    .agents
+                    .values()
+                    .find(|a| a.proc() == agent)
+                    .map(|a| a.rank0);
+                if let Some(nonce) = rank0 {
+                    self.put_agent_fence((agent.0, nonce, id), agent, party);
+                }
+                return;
+            }
             _ => None,
         };
         let Some(key) = key else { return };
@@ -2423,6 +2492,7 @@ impl Core {
     /// An attached agent is gone or replaced: the transfers it takes part in fail. What it
     /// may still be touching stays its own obligation.
     pub(super) fn agent_gone(&mut self, agent: ProcKey) {
+        self.puts_peer_gone(agent);
         let keys: Vec<ClaimKey> = self
             .claims
             .iter()
@@ -2439,6 +2509,7 @@ impl Core {
 
     /// A process is confirmed gone: nothing it did can touch memory any more.
     pub(super) fn proc_exited(&mut self, process: ProcKey) {
+        self.puts_peer_changed(process, true);
         let keys: Vec<ClaimKey> = self.claims.keys().copied().collect();
         for key in keys {
             let claim = self.claims.get_mut(&key).expect("claim exists");
@@ -2481,6 +2552,7 @@ impl Core {
 
     /// `Goodbye{quiesced}`: the process cleared its own obligations.
     pub(super) fn party_quiesced(&mut self, process: ProcKey) {
+        self.puts_peer_changed(process, false);
         let keys: Vec<ClaimKey> = self.claims.keys().copied().collect();
         for key in keys {
             let claim = self.claims.get_mut(&key).expect("claim exists");
