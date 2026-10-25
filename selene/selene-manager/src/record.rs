@@ -110,3 +110,54 @@ pub fn verify_record(bytes: &[u8], header: &Header, row: bool) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn key(tokens: u64) -> Key {
+        Key {
+            consumed_tokens: tokens,
+            digest: (tokens as u128 * 7919).to_le_bytes(),
+        }
+    }
+    fn descriptor() -> Descriptor {
+        Descriptor {
+            identity: [7; 32],
+            fingerprint: [3; 16],
+            page_tokens: 64,
+            ranks: vec![RankSizes {
+                planes: vec![4000],
+                row_bytes: 1000,
+            }],
+            tenant: "tenant".into(),
+        }
+    }
+    #[test]
+    fn persisted_header_matches_the_descriptor_layout() {
+        let fixture = include_bytes!("../tests/fixtures/flare-header-v1.bin");
+        let decoded = Header::decode(fixture).unwrap();
+        let mut planned = new_header(&descriptor(), key(130), Some(key(65)), [4; 16], 1).unwrap();
+        planned.created = 1_700_000_000;
+        planned.row_checksum = 0x0123456789abcdef;
+        assert_eq!(decoded, planned);
+        assert_eq!(&planned.encode().unwrap(), fixture);
+        for (offset, value) in [(129, 0u64), (173, 0), (181, u64::MAX)] {
+            let mut invalid = *fixture;
+            invalid[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            assert!(Header::decode(&invalid).is_err());
+        }
+    }
+    #[test]
+    fn namespace_id_vectors() {
+        let id = namespace_id(&[0x63; 32], &[0x1b; 16], "test");
+        assert_eq!(
+            hex(&id),
+            "83bbb4befe798c5d717456d55695acc1d166d45c214e54e253f249cd025d4040"
+        );
+        let id = namespace_id(&[0x63; 32], &[0x1b; 16], "");
+        assert_eq!(
+            hex(&id),
+            "6fbf3a101213ca13f48c6ab6ae91e7e1e35fd409de023b30696e32b18c97ed74"
+        );
+    }
+}
