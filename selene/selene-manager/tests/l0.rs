@@ -1908,6 +1908,13 @@ fn l0_57_sigkill_never_blocks_a_restart_on_the_same_instance() {
         socket.exists(),
         "the killed manager leaves its socket behind"
     );
+    let directory = std::path::Path::new("/dev/shm/selene").join(&name);
+    let before = |file: &str| {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(directory.join(file)).unwrap().ino()
+    };
+    let (arena, staging) = (before("arena"), before("staging"));
+    fs::write(directory.join("leftover"), b"debris").unwrap();
     let mut restarted = spawn("second.err");
     wait(|| std::os::unix::net::UnixStream::connect(&socket).is_ok());
     assert!(
@@ -1922,9 +1929,13 @@ fn l0_57_sigkill_never_blocks_a_restart_on_the_same_instance() {
     assert!(!socket.exists());
     let log = fs::read_to_string(base.join("second.err")).unwrap();
     assert!(
-        log.contains("reclaimed stale instance"),
+        log.contains("reclaimed stale instance") && log.contains("(1 files)"),
         "missing reclaim log: {log}"
     );
+    // The reclaim took the debris only: the killed manager's regions were reused as they were.
+    assert!(log.contains("reused its shared regions"), "{log}");
+    assert!(!directory.join("leftover").exists());
+    assert_eq!((before("arena"), before("staging")), (arena, staging));
     let _ = fs::remove_dir_all(base);
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

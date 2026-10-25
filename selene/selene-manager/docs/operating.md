@@ -67,8 +67,17 @@ DRAM eviction needs durability, so a full NVMe budget stops DRAM from making roo
 
 The arena and staging are preallocated files in `/dev/shm/selene/<name>`, so the shared-memory mount
 must provide at least `--memory + --staging` for each manager. A container's default 64 MiB
-`/dev/shm` is far too small; use `--shm-size` or the host IPC namespace. New region files are
-created at every start and stale ones are reclaimed, so a killed manager never blocks a restart.
+`/dev/shm` is far too small; use `--shm-size` or the host IPC namespace.
+
+The files are fixed (`arena`, `staging`, and a `generation` and `holders` file beside them) and
+persist across restarts. A restarted manager with the same `--memory` and `--staging` reopens the
+same files at the same offsets, so instances that registered them with CUDA at startup keep
+working; a killed manager never blocks a restart, and debris from a crash is reclaimed. If a size
+changed or a file is unusable, the manager recreates them under a new generation and logs that
+running instances must restart to use the pool: until they do, they run on local tiers only. After
+a crash the manager keeps the regions out of service until each process that had a session has
+reconnected or exited (PROTOCOL.md 8.6). The files outlive a stopped manager and keep their
+memory: remove `/dev/shm/selene/<name>` to give it back.
 
 Tenancy separates keys, not memory: every instance with shared memory maps the same arena and
 staging files, so any of them can read another tenant's mapped bytes. Tenants are not a security
