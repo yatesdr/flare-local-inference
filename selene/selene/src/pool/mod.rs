@@ -65,6 +65,7 @@ pub use shared::{
 };
 pub use slice::{RankSlice, SliceLayout, SliceSums};
 pub use startup::{Approve, PlannedRegion, RegisteredRegion};
-pub use store::{PoolPort, PooledStore};
+pub use store::PoolPort;
+pub(crate) use store::PooledStore;
 pub use tiers::{Releases, TierView};
 pub use types::{PoolCandidate, SourceRef, Tier};

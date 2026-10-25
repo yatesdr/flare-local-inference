@@ -14,6 +14,7 @@
 //! enqueue, and `poll` advances every pipeline as far as free slabs and queue
 //! space allow before reporting completions.
 
+use crate::store::TierStore;
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
@@ -32,9 +33,9 @@ use crate::{
 };
 
 use super::{
-    CacheGeometry, HostHit, HostStore, INITIAL_STAGED_DISK_RATE,
-    InboundTicket, JobId, Layout, PublishedCheckpoint, Retirement, Retiring, StoreEvent,
-    StoreOutcome, StoreReason, StoreStats, Tier,
+    CacheGeometry, HostHit, HostStore, INITIAL_STAGED_DISK_RATE, InboundTicket, JobId, Layout,
+    PublishedCheckpoint, Retirement, Retiring, StoreEvent, StoreOutcome, StoreReason, StoreStats,
+    Tier,
     copier::{self, Direction, PageCopier, SharedCopier},
     disk::{self, DiskThread, Operation},
     geometry::invalid,
@@ -2418,41 +2419,6 @@ impl HostStore for DiskStore {
         polled
     }
 
-    fn closest_tier(&self) -> Option<Tier> {
-        Some(Tier::Disk)
-    }
-
-    fn announce_to(&mut self, announcer: Announcer) {
-        self.announce_records(announcer);
-    }
-
-    fn set_spill(&mut self, enabled: bool) {
-        self.spill = enabled && self.announce.is_some();
-    }
-
-    fn take_retiring(&mut self) -> Vec<Retiring> {
-        std::mem::take(&mut self.retiring)
-    }
-
-    fn retired(&mut self, key: PrefixKey, tier: PoolTier, how: Retirement) {
-        if tier == PoolTier::Nvme {
-            let _ = DiskStore::retired(self, &key, how);
-        }
-    }
-
-    fn pin_export(
-        &mut self,
-        tier: PoolTier,
-        key: PrefixKey,
-        begin_tokens: u64,
-        want_row: bool,
-    ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
-        if tier != PoolTier::Nvme {
-            return Err(ExportRefusal::NotFound);
-        }
-        self.pin_export_files(key, begin_tokens, want_row)
-    }
-
     fn stats(&self) -> StoreStats {
         StoreStats {
             outbound_in_flight: self.outbound.len(),
@@ -2476,6 +2442,38 @@ impl HostStore for DiskStore {
             self.apply(event, &mut events);
         }
         closed
+    }
+}
+
+impl crate::store::TierStore for DiskStore {
+    fn announce_to(&mut self, announcer: Announcer) {
+        self.announce_records(announcer);
+    }
+    fn pin_export(
+        &mut self,
+        tier: PoolTier,
+        key: PrefixKey,
+        begin_tokens: u64,
+        want_row: bool,
+    ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
+        if tier != PoolTier::Nvme {
+            return Err(ExportRefusal::NotFound);
+        }
+        self.pin_export_files(key, begin_tokens, want_row)
+    }
+    fn closest_tier(&self) -> Option<Tier> {
+        Some(Tier::Disk)
+    }
+    fn set_spill(&mut self, enabled: bool) {
+        self.spill = enabled && self.announce.is_some();
+    }
+    fn take_retiring(&mut self) -> Vec<Retiring> {
+        std::mem::take(&mut self.retiring)
+    }
+    fn retired(&mut self, key: PrefixKey, tier: PoolTier, how: Retirement) {
+        if tier == PoolTier::Nvme {
+            let _ = DiskStore::retired(self, &key, how);
+        }
     }
 }
 
@@ -4992,14 +4990,14 @@ mod tests {
         assert!(store.take_retiring().is_empty());
 
         // A failed move keeps the file, which is offered again.
-        HostStore::retired(&mut store, cold.key, PoolTier::Nvme, Retirement::Failed);
+        crate::store::TierStore::retired(&mut store, cold.key, PoolTier::Nvme, Retirement::Failed);
         assert!(unlinked(&log).is_empty());
         assert!(!store.index.node(&cold.key).unwrap().pinned());
         assert!(!store.make_room(PAGE_RECORD).unwrap());
         assert_eq!(store.take_retiring()[0].key, cold.key);
 
         // Once moved, the file is unlinked and its bytes are free.
-        HostStore::retired(&mut store, cold.key, PoolTier::Nvme, Retirement::Moved);
+        crate::store::TierStore::retired(&mut store, cold.key, PoolTier::Nvme, Retirement::Moved);
         assert_eq!(unlinked(&log).len(), 1);
         assert!(!store.index.contains(&cold.key));
         assert_eq!(store.take_evicted(), [cold.key]);
@@ -5047,7 +5045,7 @@ mod tests {
         let retiring = store.take_retiring().remove(0);
         let pin = store.pin_export(PoolTier::Nvme, leaf.key, 0, true).unwrap();
 
-        HostStore::retired(&mut store, leaf.key, PoolTier::Nvme, Retirement::Moved);
+        crate::store::TierStore::retired(&mut store, leaf.key, PoolTier::Nvme, Retirement::Moved);
         assert!(unlinked(&log).is_empty(), "a pin still reads the file");
         drop(pin);
         store.flush_announcements();

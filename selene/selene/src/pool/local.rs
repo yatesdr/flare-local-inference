@@ -1,3 +1,4 @@
+use crate::store::TierStore;
 use crate::{
     ExportRefusal, HostHit, HostStore, InboundTicket, PrefixKey, PublishedCheckpoint, StoreOutcome,
     StoreStats, Tier,
@@ -5,10 +6,10 @@ use crate::{
 
 /// The local tiers beneath a pooled store. Without any, nothing is retained
 /// locally and every restore comes from the pool.
-pub struct Tiers(Option<Box<dyn HostStore>>);
+pub(crate) struct Tiers(Option<Box<dyn TierStore>>);
 
 impl Tiers {
-    pub fn new(tiers: Option<Box<dyn HostStore>>) -> Self {
+    pub(crate) fn new(tiers: Option<Box<dyn TierStore>>) -> Self {
         Self(tiers)
     }
 }
@@ -49,10 +50,6 @@ impl HostStore for Tiers {
         }
     }
 
-    fn closest_tier(&self) -> Option<Tier> {
-        self.0.as_ref().and_then(|tiers| tiers.closest_tier())
-    }
-
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> crate::Result<()> {
         match &mut self.0 {
             Some(tiers) => tiers.fetch(hit, ticket),
@@ -83,13 +80,14 @@ impl HostStore for Tiers {
 
     // The hooks a pooled store drives on its tiers. Each must reach them: a default here
     // would leave the tiers announcing nothing, never exporting and never spilling.
+}
 
+impl crate::store::TierStore for Tiers {
     fn announce_to(&mut self, announcer: crate::pool::Announcer) {
         if let Some(tiers) = &mut self.0 {
             tiers.announce_to(announcer);
         }
     }
-
     fn pin_export(
         &mut self,
         tier: crate::pool::Tier,
@@ -102,26 +100,25 @@ impl HostStore for Tiers {
             None => Err(ExportRefusal::NotFound),
         }
     }
-
+    fn closest_tier(&self) -> Option<Tier> {
+        self.0.as_ref().and_then(|tiers| tiers.closest_tier())
+    }
     fn cascade(&mut self) {
         if let Some(tiers) = &mut self.0 {
             tiers.cascade();
         }
     }
-
     fn set_spill(&mut self, enabled: bool) {
         if let Some(tiers) = &mut self.0 {
             tiers.set_spill(enabled);
         }
     }
-
     fn take_retiring(&mut self) -> Vec<crate::Retiring> {
         self.0
             .as_mut()
             .map(|tiers| tiers.take_retiring())
             .unwrap_or_default()
     }
-
     fn retired(&mut self, key: PrefixKey, tier: crate::pool::Tier, how: crate::Retirement) {
         if let Some(tiers) = &mut self.0 {
             tiers.retired(key, tier, how);
