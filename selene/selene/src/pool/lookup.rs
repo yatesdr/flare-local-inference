@@ -55,8 +55,7 @@ impl TicketInner {
 }
 
 /// The handle one request holds for its lookup. Dropping it withdraws the
-/// request: when it was the last holder of a lookup still on the wire, the
-/// lookup is cancelled and a late reply is discarded.
+/// lookup still on the wire; a late reply is discarded.
 pub struct LookupTicket {
     inner: Arc<TicketInner>,
     withdraw: Option<Box<dyn FnOnce() + Send>>,
