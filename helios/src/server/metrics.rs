@@ -6,7 +6,7 @@ use std::{
 pub(super) mod scheduler;
 
 pub(super) fn input_metrics(
-    stats: crate::offload::input::InputStats,
+    stats: flare_selene::input::InputStats,
     preparation: crate::frontend::images::ImagePreparationCounts,
 ) -> Vec<(&'static str, &'static str, &'static str, u64)> {
     vec![
@@ -37,10 +37,10 @@ pub(super) fn input_metrics(
 }
 
 use serde::{Deserialize, Serialize};
+use flare_selene::StoreStats;
 
 use crate::{
     execution::{CompletionRecord, GraphKind},
-    offload::StoreStats,
     scheduler::SchedulerStats,
 };
 
@@ -460,8 +460,8 @@ impl Metrics {
         self.host_lookup_outcomes[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(super) fn host_store_outcome(&self, outcome: crate::offload::StoreOutcome) {
-        use crate::offload::{StoreOutcome, StoreReason};
+    pub(super) fn host_store_outcome(&self, outcome: flare_selene::StoreOutcome) {
+        use flare_selene::{StoreOutcome, StoreReason};
         let reason = match outcome {
             StoreOutcome::Queued => return,
             StoreOutcome::Present => 0,
@@ -474,7 +474,7 @@ impl Metrics {
         self.host_store_reasons[reason].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(super) fn host_lookup_cost(&self, hit: &crate::offload::HostHit, rate: f64) {
+    pub(super) fn host_lookup_cost(&self, hit: &flare_selene::HostHit, rate: f64) {
         let missing = hit.consumed_tokens - hit.resident_tokens;
         for (index, (buckets, value, limits)) in [
             (&self.host_missing_tokens, missing, HOST_TOKEN_BUCKETS),
@@ -1062,7 +1062,8 @@ mod tests {
 
     #[test]
     fn host_outcomes_and_capacity_have_bounded_labels_and_cost_histograms() {
-        use crate::offload::{HostHit, LookupOutcome, StoreOutcome, StoreReason, Tier};
+        use flare_selene::{HostHit, StoreOutcome, StoreReason, Tier};
+        use crate::offload::LookupOutcome;
         let metrics = Metrics::default();
         for outcome in [
             LookupOutcome::NoMatch,
@@ -1087,7 +1088,7 @@ mod tests {
             consumed_tokens: 1024,
             digest: [0; 16],
         };
-        let chain = crate::offload::index::Match {
+        let chain = flare_selene::index::Match {
             key,
             consumed_tokens: 1024,
             resident_tokens: 0,

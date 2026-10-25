@@ -59,7 +59,8 @@ mod memory {
     #[test]
     #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
     fn memory_store_round_trips_a_multi_window_checkpoint() {
-        use crate::{cuda::Stream, offload::CacheGeometry};
+        use crate::cuda::Stream;
+        use flare_selene::CacheGeometry;
 
         let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
             eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
@@ -196,7 +197,8 @@ mod memory {
     #[test]
     #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
     fn memory_store_round_trips_a_checkpoint_through_a_loaded_package() {
-        use crate::{cuda::Stream, offload::CacheGeometry};
+        use crate::cuda::Stream;
+        use flare_selene::CacheGeometry;
 
         let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
             eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
@@ -553,7 +555,8 @@ mod composite {
     #[test]
     #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
     fn composite_writes_a_child_published_while_its_parent_is_in_flight() {
-        use crate::{cuda::Stream, offload::geometry::fingerprint};
+        use crate::cuda::Stream;
+        use flare_selene::geometry::fingerprint;
         let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
             eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
             return;
@@ -789,7 +792,7 @@ mod composite {
         // Restart: a fresh composite over the scanned directory and an empty memory pool.
         let directory_lock = record::DirectoryLock::acquire(&directory).unwrap();
         let scanned =
-            crate::offload::record::scan(&directory_lock, &IDENTITY, &fingerprint, &geometry)
+            flare_selene::record::scan(&directory_lock, &IDENTITY, &fingerprint, &geometry)
                 .unwrap();
         assert_eq!(scanned.len(), 7);
         let mut pool = SlabPool::new(
@@ -873,7 +876,8 @@ mod composite {
     #[test]
     #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
     fn composite_round_trips_through_memory_and_disk_on_a_loaded_package() {
-        use crate::{cuda::Stream, offload::geometry::fingerprint};
+        use crate::cuda::Stream;
+        use flare_selene::geometry::fingerprint;
         let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
             eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
             return;
@@ -1402,7 +1406,8 @@ mod disk_store {
     #[test]
     #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
     fn staged_store_round_trips_records_through_files_and_a_restart() {
-        use crate::{cuda::Stream, offload::geometry::fingerprint};
+        use crate::cuda::Stream;
+        use flare_selene::geometry::fingerprint;
         let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
             eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
             return;

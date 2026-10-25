@@ -8,13 +8,6 @@
 //! worker, the scheduler, and the recipes see no difference between a checkpoint
 //! produced by prefill and one restored from the host.
 //!
-//! Three stores implement [`PrefixStore`]: [`memory::MemoryStore`] retains records
-//! in registered host memory, [`disk_store::DiskStore`] retains record files, and
-//! [`composite::CompositeStore`] composes the two with write-through and
-//! read-through. Every store is driven from the model worker thread and never
-//! blocks it: `store` notes publications, `write_back` and `fetch` enqueue work,
-//! and `poll` drains completions.
-
 #[cfg(all(test, feature = "runtime-package"))]
 mod gpu_tests;
 pub(crate) mod pool;
@@ -23,13 +16,7 @@ pub mod shard;
 pub mod transfer;
 
 pub use flare_selene::pool::{PoolOptions, parse_pool_address};
-pub use flare_selene::{
-    CacheGeometry, ExportChain, ExportId, ExportNode, ExportRefusal, HostHit, INITIAL_MEMORY_RATE,
-    INITIAL_PREFILL_RATE, INITIAL_STAGED_DISK_RATE, InboundTicket, JobId, Layout, Plane,
-    PublishedCheckpoint, StoreOutcome, StoreReason, StoreStats, Tier, disk, disk_store, geometry,
-    index, input, pool::LookupTicket, record, slab, worth_fetching,
-};
-pub use flare_selene::{HostStore as PrefixStore, StoreEvent};
+use flare_selene::{CacheGeometry, HostStore};
 
 use crate::Result;
 
@@ -69,7 +56,7 @@ pub fn prepare_with_inputs(
     )?)
 }
 
-pub fn open(prepared: Prepared) -> Result<Box<dyn PrefixStore>> {
+pub fn open(prepared: Prepared) -> Result<Box<dyn HostStore>> {
     Ok(flare_selene::offload::open(prepared, &transfer::Copiers)?)
 }
 
