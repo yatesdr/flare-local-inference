@@ -681,49 +681,26 @@ impl Engine {
             return Ok(());
         };
         let (page_bytes, row_bytes) = (self.st.page_record_bytes(), self.st.row_record_bytes());
-        for rank in 1..ranks.world() {
-            let channel = granted
-                .rank_channels
-                .iter()
-                .find(|c| c.rank as usize == rank)
-                .and_then(|c| c.channel.clone());
-            let shared = channel.is_none();
-            let expected = if shared {
-                wire::RankMode::RankShared
-            } else {
-                wire::RankMode::RankChannel
-            };
-            if ranks.mode(rank) != Some(expected) {
-                return Err(Error::new(format!(
-                    "rank {rank}'s attachment does not match the grant's mode for it"
-                )));
-            }
-            let open = link::Open {
-                dir: link::Dir::In as i32,
-                kind: wire::rank_fence::Kind::Claim as i32,
-                fence_id: id,
-                records: granted.records.clone(),
-                pages: claim.pages.iter().map(|page| page.0).collect(),
-                has_slot: claim.slot.is_some(),
-                slot: claim.slot.map_or(0, |slot| slot.0),
-                channel,
-                page_bytes,
-                row_bytes,
-                ..Default::default()
-            };
-            let xfer = ranks
-                .open(rank, XferOwner::Claim(id), open)
-                .ok_or_else(|| Error::new(format!("rank {rank} is not attached")))?;
-            claim.peers.push(PeerPart {
-                rank,
-                xfer,
-                shared,
-                done: None,
-                quarantined: false,
-                cancelled: false,
-            });
-        }
-        Ok(())
+        let open = link::Open {
+            dir: link::Dir::In as i32,
+            kind: wire::rank_fence::Kind::Claim as i32,
+            fence_id: id,
+            records: granted.records.clone(),
+            pages: claim.pages.iter().map(|page| page.0).collect(),
+            has_slot: claim.slot.is_some(),
+            slot: claim.slot.map_or(0, |slot| slot.0),
+            page_bytes,
+            row_bytes,
+            ..Default::default()
+        };
+        ranks
+            .open_peers(
+                XferOwner::Claim(id),
+                &granted.rank_channels,
+                open,
+                &mut claim.peers,
+            )
+            .map_err(Error::new)
     }
 
     /// A shared-memory peer drained its copy of one window.
