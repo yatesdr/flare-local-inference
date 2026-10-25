@@ -7,7 +7,7 @@ use blake2::{
     Blake2bVar,
     digest::{Update, VariableOutput},
 };
-use std::fmt::Write as _;
+pub use flare_selene::record::{checksum, hex};
 
 pub type NamespaceId = [u8; 32];
 
@@ -250,13 +250,6 @@ impl Header {
     }
 }
 
-pub fn hex(bytes: &[u8]) -> String {
-    let mut text = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(text, "{byte:02x}").unwrap();
-    }
-    text
-}
 pub fn namespace_id(identity: &[u8; 32], fingerprint: &[u8; 16], tenant: &str) -> NamespaceId {
     let mut hasher = Blake2bVar::new(32).unwrap();
     hasher.update(b"selene-ns-v1");
@@ -284,10 +277,6 @@ pub fn parse_file_name(name: &str) -> Option<Key> {
     }
     (file_name(&key) == name).then_some(key)
 }
-pub fn checksum(bytes: &[u8]) -> u64 {
-    twox_hash::XxHash3_64::oneshot(bytes)
-}
-
 pub fn verify_record(bytes: &[u8], header: &Header, row: bool) -> Result<()> {
     let length = header.length(row);
     if Header::decode(bytes)? != *header || bytes.len() as u64 != length {

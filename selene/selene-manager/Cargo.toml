@@ -31,7 +31,6 @@ tokio-stream = { version = "0.1", features = ["net", "sync"] }
 toml = "0.8"
 tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "tls-ring", "router"] }
 tonic-prost = "0.14"
-twox-hash = { version = "2.1", default-features = false, features = ["std", "xxhash3_64"] }
 tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]

@@ -146,9 +146,7 @@ pub fn default_order() -> Vec<i32> {
     ]
 }
 
-pub fn xxh3(bytes: &[u8]) -> u64 {
-    twox_hash::XxHash3_64::oneshot(bytes)
-}
+pub use selene_manager::record::checksum as xxh3;
 
 /// A client's identity for one process.
 #[derive(Clone)]
