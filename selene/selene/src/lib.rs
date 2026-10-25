@@ -26,6 +26,7 @@ pub mod pool;
 pub mod record;
 pub mod registrar;
 pub mod slab;
+pub mod shard;
 pub mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
