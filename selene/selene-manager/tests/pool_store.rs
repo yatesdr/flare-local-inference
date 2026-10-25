@@ -529,3 +529,39 @@ async fn u4_a_cancelled_put_keeps_its_unfilled_windows_until_the_writers_fence()
     }
     assert!(settled, "the fence releases the window");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_nvme_limit_bounds_the_reservations_it_reports_however_many_puts_pass_it() {
+    // A limit of 1 MiB, and records of about 70 KiB: fifteen fill it, and forty are offered.
+    let limit: u64 = 1 << 20;
+    let mut host = Host::new(256 * 1024, limit);
+    host.start();
+    let mut pool = Pool::connect(&host.config.socket).await;
+    let mut writer = open(&mut pool, "writer").await;
+    let (mut stored, mut refused) = (0, 0);
+    for index in 0..40u64 {
+        match writer
+            .put_record(index + 1, key(1024 + 64 * index), None, Damage::default())
+            .await
+        {
+            PutResult::Stored(_) => stored += 1,
+            PutResult::Refused(_) => refused += 1,
+        }
+        // The gauge follows the store's clock; the peak is kept at every admission.
+        assert!(
+            host.gauge("nvme_reserved_bytes") <= limit,
+            "reserved {} after put {index}",
+            host.gauge("nvme_reserved_bytes")
+        );
+    }
+    assert!(stored >= 10, "{stored} stored, {refused} refused");
+    // Let the store settle, then read the high-water mark of the same measure.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let peak = host.gauge("nvme_reserved_peak_bytes");
+    assert!(
+        peak > limit / 2 && peak <= limit,
+        "the reservations peaked at {peak} bytes against a limit of {limit}"
+    );
+    assert!(host.gauge("nvme_reserved_bytes") <= peak);
+    assert_eq!(writer.readiness().await.quarantined_bytes, 0);
+}
