@@ -410,7 +410,6 @@ fn pin_for(key: PrefixKey, generation: u64, pages: usize) -> Box<dyn HostPin> {
         chain: HostChain {
             records: vec![HostRecord {
                 key,
-                generation,
                 first_page: 0,
                 pages: pages as u32,
                 row: true,
@@ -461,7 +460,7 @@ fn fetch_for(
     let candidate = answer
         .candidates
         .iter()
-        .find(|c| c.plan.source == part.source && c.plan.generation == part.generation)
+        .find(|c| c.plan.source == part.source)
         .unwrap()
         .clone();
     PoolFetch {
@@ -493,7 +492,6 @@ fn an_instance_restores_a_neighbours_host_record_through_the_real_manager() {
         tail_pages: pages as u32,
         row: true,
         tier: Tier::Dram,
-        generation: 11,
         bytes: (pages * PAGE + ROW) as u64,
     });
     // The manager learns of it; the requester's lookup then finds it.
@@ -513,10 +511,10 @@ fn an_instance_restores_a_neighbours_host_record_through_the_real_manager() {
     requester.client.fetch(fetch).unwrap();
     // The source is asked to export; its store (here, the test) pins the chain.
     let export = source.event("an export request", |e| match e {
-        PoolEvent::Export(request) => Some((request.export, request.tier, request.generation)),
+        PoolEvent::Export(request) => Some((request.export, request.tier)),
         _ => None,
     });
-    assert_eq!((export.1, export.2), (Tier::Dram, 11));
+    assert_eq!(export.1, Tier::Dram);
     source.client.host_pinned(export.0, pin);
     let result = requester.event("the restore", |e| match e {
         PoolEvent::Fetched { result, .. } => {
@@ -587,7 +585,6 @@ fn put_request(history: &TestHistory, pages: usize) -> (PutRequest, PrefixKey) {
             chain_pages: pages as u64,
             tail_pages: pages as u64,
             row: true,
-            generation: 1,
             source: PutSource::Host(Box::new(Bytes { data, sums, row })),
         },
         key,
@@ -666,7 +663,6 @@ fn a_gpu_checkpoint_is_exported_by_device_copies_and_its_pin_released() {
         tail_pages: pages as u32,
         row: true,
         tier: Tier::Gpu,
-        generation: 5,
         bytes: (pages * PAGE + ROW) as u64,
     });
     wait("the manager to offer it", || {
@@ -686,10 +682,7 @@ fn a_gpu_checkpoint_is_exported_by_device_copies_and_its_pin_released() {
     // The worker's side: pin the chain and answer, then release at the end.
     let (export, reserved) = source.event("an export request", |e| match e {
         PoolEvent::Export(request) => {
-            assert_eq!(
-                (request.tier, request.generation, request.key),
-                (Tier::Gpu, 5, key)
-            );
+            assert_eq!((request.tier, request.key), (Tier::Gpu, key));
             Some((request.export, request.reserved_bytes))
         }
         _ => None,
@@ -700,7 +693,6 @@ fn a_gpu_checkpoint_is_exported_by_device_copies_and_its_pin_released() {
         crate::ExportChain {
             nodes: vec![crate::ExportNode {
                 key,
-                generation: 5,
                 pages: (20..20 + pages as u32).map(PageId).collect(),
             }],
             skip_pages: 0,
@@ -743,7 +735,6 @@ fn announcements_survive_a_manager_restart_and_the_instances_reconnect() {
         tail_pages: 4,
         row: true,
         tier: Tier::Dram,
-        generation: 3,
         bytes: (4 * PAGE + ROW) as u64,
     });
     let offered = |requester: &Instance| {
@@ -1039,7 +1030,7 @@ fn publication(gpu: &GpuMemory, salt: u32, pages: usize) -> (PublishedCheckpoint
 fn publish<S: HostStore>(store: &mut S, checkpoint: &PublishedCheckpoint) {
     assert_eq!(store.store(checkpoint).unwrap(), StoreOutcome::Noted);
     store_and_wait(store, checkpoint);
-    store.evicted(checkpoint.key, checkpoint.id.value(), None);
+    store.evicted(checkpoint.key, None);
 }
 
 fn store_and_wait<S: HostStore>(store: &mut S, checkpoint: &PublishedCheckpoint) {
@@ -1216,7 +1207,6 @@ fn a_record_the_manager_already_holds_is_released_without_waiting_for_a_copy() {
             chain_pages: 4,
             tail_pages: 4,
             row: true,
-            generation: 1,
             source: PutSource::Host(Box::new(Bytes { data, sums, row })),
         })
         .unwrap();
@@ -1596,7 +1586,6 @@ fn a_lookup_is_answered_in_well_under_a_millisecond_over_a_unix_socket() {
             tail_pages: 1,
             row: true,
             tier: Tier::Gpu,
-            generation: u64::from(n) + 1,
             bytes: 1,
         });
     }
@@ -1679,7 +1668,6 @@ fn offer_host_record(
         tail_pages: pages as u32,
         row: true,
         tier: Tier::Dram,
-        generation,
         bytes: (pages * PAGE + ROW) as u64,
     });
     wait("the manager to offer the record", || {
@@ -1819,7 +1807,6 @@ fn a_gpu_checkpoint_on_another_host_is_relayed_through_reserved_staging() {
         tail_pages: pages as u32,
         row: true,
         tier: Tier::Gpu,
-        generation: 5,
         bytes: (pages * PAGE + ROW) as u64,
     });
     wait("the manager to offer it", || {
@@ -1843,7 +1830,6 @@ fn a_gpu_checkpoint_on_another_host_is_relayed_through_reserved_staging() {
         crate::ExportChain {
             nodes: vec![crate::ExportNode {
                 key,
-                generation: 5,
                 pages: (20..20 + pages as u32).map(PageId).collect(),
             }],
             skip_pages: 0,
@@ -1930,7 +1916,6 @@ impl TestPinParts {
             chain: HostChain {
                 records: vec![HostRecord {
                     key,
-                    generation,
                     first_page: 0,
                     pages: pages as u32,
                     row: true,

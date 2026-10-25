@@ -50,18 +50,6 @@
 //                        nothing for its predecessor.
 //   export_id            assigned by the manager, unique within one manager
 //                        incarnation. One export request per claim.
-//   generation           64-bit, assigned by the source for each (key, tier)
-//                        holding when that holding is created. Strictly
-//                        increasing per (instance, process, tier): the GPU cache and
-//                        each host tier allocate independently, so values are
-//                        compared only between entries of the same instance and
-//                        tier. For the GPU tier it is `CheckpointId::value()`. A
-//                        key that is evicted and later saved again in the same
-//                        tier has a larger generation. Never reused within an
-//                        (instance_id, process_nonce, tier). A restarted process
-//                        starts over; generations of different processes are
-//                        never compared because a new session's snapshot replaces
-//                        its predecessor's entries wholesale.
 
 syntax = "proto3";
 package selene.v2;
@@ -487,10 +475,7 @@ message IndexEntry {
   // The record carries the state row, so it can end a restore.
   bool row = 6;
   Tier tier = 7;
-  // See the header. For the same (key, tier) in one session, a larger generation
-  // replaces a smaller one; an equal generation replaces the entry (used for a
-  // compaction heir); a smaller generation is ignored.
-  uint64 generation = 8;
+  reserved 8;
   // Payload bytes of this record, excluding any envelope.
   uint64 bytes = 9;
 }
@@ -504,17 +489,17 @@ message Notice {
 }
 
 // A holding appeared (publication to the GPU cache, a host write completing).
-// Idempotent upsert by (key, tier, generation). A record whose write has not
+// Upsert by immutable content key and tier. A record whose write has not
 // completed must not be announced.
 message Saved { IndexEntry entry = 1; }
 
 // A holding moved down the eviction cascade atomically: `to` is added and the
-// holding at `from_tier` with `from_generation` is removed, so the manager never
+// holding at `from_tier` is removed, so the manager never
 // sees a moment with neither. `to.tier` must be a tier below `from_tier`.
 message Spilled {
   IndexEntry to = 1;
   Tier from_tier = 2;
-  uint64 from_generation = 3;
+  reserved 3;
 }
 
 enum EvictKind {
@@ -523,17 +508,16 @@ enum EvictKind {
   // separate Evicted notices, one per node; the manager never cascades.
   REMOVED = 1;
   // The node stopped being an endpoint but its pages live on in its single
-  // child. `heir` is the child's updated entry (same key and generation, new
+  // child. `heir` is the child's updated entry (same key, new
   // parent and tail_pages).
   COMPACTED = 2;
 }
 
-// Logical removal. Removes the (key, tier) entry only if its generation is <=
-// `generation`: an eviction of an old holding never removes a newer one.
+// Remove the content key and tier hint. A late eviction may cause a miss.
 message Evicted {
   PrefixKey key = 1;
   Tier tier = 2;
-  uint64 generation = 3;
+  reserved 3;
   EvictKind kind = 4;
   IndexEntry heir = 5;   // present iff kind == COMPACTED.
 }
@@ -586,18 +570,16 @@ enum LookupStatus {
 message ChainNode {
   PrefixKey key = 1;
   uint32 tail_pages = 2;
-  uint64 generation = 3;
+  reserved 3;
   bool row = 4;
 }
 
 // One place the requester could restore from. Rules the manager applies
 // (design "Rules" 1, 3 and 5):
 //  * the requester's own instance is never a source;
-//  * a candidate at level L is trimmed to begin at the largest end among `held`
-//    ranges at levels closer than L (in the fixed copy order), rounded down to a page
-//    boundary, and dropped if it then supplies no page and no row beyond that;
-//  * replies are ordered by level, then lower est_us_per_page,
-//    then longer match (larger key.consumed_tokens).
+//  * candidates begin at resident_tokens; physical pages use its floor to a
+//    page boundary. Endpoints must extend the resident prefix.
+//  * replies are ordered by longest match, then fixed copy level.
 // Everything here is a hint. The client re-checks every node against its own
 // history (`key == history.key_at(key.consumed_tokens)`) and drops a candidate
 // that fails.
@@ -605,14 +587,10 @@ message Candidate {
   Level level = 1;
   Tier tier = 2;
   SourceRef source = 3;
-  // The endpoint (the deepest record) and its generation.
+  // The endpoint (the deepest record).
   PrefixKey key = 4;
-  uint64 generation = 5;
-  // First token this candidate supplies after trimming: the exact consumed_tokens
-  // of the largest held end that trimmed it (not necessarily a page boundary),
-  // or 0. The physical start is its floor to a page: page_tokens * (begin_tokens
-  // / page_tokens), the same flooring Flare's Match uses (pages = endpoint
-  // pages - resident pages).
+  reserved 5;
+  // Exact resident token count. Its floor to a page is the physical start.
   uint64 begin_tokens = 6;
   // Pages and bytes the candidate supplies from begin_tokens to the endpoint,
   // and whether it supplies the endpoint row.
@@ -666,12 +644,11 @@ message Claim {
   Level level = 2;
   SourceRef source = 3;
   Tier tier = 4;
-  // Endpoint key and generation, as in the Candidate.
+  // Endpoint key, as in the Candidate.
   PrefixKey key = 5;
-  uint64 generation = 6;
+  reserved 6;
   // The logical split: the exact consumed_tokens up to which the requester
-  // already holds (its resident prefix, or for part B exactly the end of part A,
-  // A.key.consumed_tokens). Not required to be page-aligned and >= the
+  // already holds (its resident prefix). Not required to be page-aligned and >= the
   // candidate's begin_tokens. The source supplies the pages from
   // floor(begin_tokens / page_tokens) to floor(key.consumed_tokens /
   // page_tokens) and, if want_row, the endpoint row. When both floors are equal
@@ -694,7 +671,7 @@ message Claim {
 // copy this is also the order bytes arrive.
 message Record {
   PrefixKey key = 1;
-  uint64 generation = 2;
+  reserved 2;
   // Record-relative page index where this claim's pages start in the record's
   // tail (non-zero only for the first record: Match.skip_pages /
   // FetchSegment.first_page).
@@ -732,7 +709,7 @@ enum ClaimReason {
   NO_WINDOWS = 8;             // staging exhausted or quarantined; not "no headroom at the source".
   // Refusals at the source, relayed immediately:
   NOT_FOUND = 9;              // the source no longer holds the key at that tier.
-  GENERATION_CHANGED = 10;    // it holds the key at another generation.
+  reserved 10;
   CHAIN_GAP = 11;             // the chain is not contiguous from begin_tokens to the endpoint.
   NO_HEADROOM = 12;           // GPU headroom check failed (immediate; never waits).
   SOURCE_BUSY = 13;           // the source's own export limit or pin failure.
@@ -918,7 +895,7 @@ message ExportRequest {
   bytes requester_instance_id = 3;
   Tier tier = 4;
   PrefixKey key = 5;
-  uint64 generation = 6;
+  reserved 6;
   uint64 begin_tokens = 7;
   bool want_row = 8;
   // The manager gives up (SOURCE_TIMEOUT) after this many ms and then sends
@@ -1060,8 +1037,7 @@ message PutBegin {
   bytes bucket = 7;
   uint64 published_tail_pages = 8;
   CopyMode mode = 9;
-  // The writer's generation of the holding being spilled (informational).
-  uint64 generation = 10;
+  reserved 10;
 }
 
 message PutAccept {

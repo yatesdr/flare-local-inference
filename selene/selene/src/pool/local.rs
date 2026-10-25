@@ -1,6 +1,6 @@
 use crate::{
-    ExportRefusal, HostHit, HostStore, InboundTicket, PrefixKey, PublishedCheckpoint,
-    StoreOutcome, StoreStats, Tier,
+    ExportRefusal, HostHit, HostStore, InboundTicket, PrefixKey, PublishedCheckpoint, StoreOutcome,
+    StoreStats, Tier,
 };
 
 /// The local tiers beneath a pooled store. Without any, nothing is retained
@@ -82,12 +82,11 @@ impl HostStore for Tiers {
         &mut self,
         tier: crate::pool::Tier,
         key: PrefixKey,
-        generation: u64,
         begin_tokens: u64,
         want_row: bool,
     ) -> std::result::Result<Box<dyn crate::pool::HostPin>, ExportRefusal> {
         match &mut self.0 {
-            Some(tiers) => tiers.pin_export(tier, key, generation, begin_tokens, want_row),
+            Some(tiers) => tiers.pin_export(tier, key, begin_tokens, want_row),
             None => Err(ExportRefusal::NotFound),
         }
     }

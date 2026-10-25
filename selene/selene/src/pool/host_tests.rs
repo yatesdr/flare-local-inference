@@ -97,17 +97,15 @@ impl Rig {
     }
 
     fn notices(&self) -> Vec<Notice> {
-        self.announcer
-            .take_batch(1000)
-            .unwrap_or_default()
+        self.announcer.take_batch(1000).unwrap_or_default()
     }
 }
 
-fn saved(notices: &[Notice]) -> Vec<(u64, u64, bool, Tier)> {
+fn saved(notices: &[Notice]) -> Vec<(u64, bool, Tier)> {
     notices
         .iter()
         .filter_map(|n| match n {
-            Notice::Saved(e) => Some((e.key.consumed_tokens, e.generation, e.row, e.tier)),
+            Notice::Saved(e) => Some((e.key.consumed_tokens, e.row, e.tier)),
             _ => None,
         })
         .collect()
@@ -128,33 +126,20 @@ fn a_stored_record_is_announced_once_hashed_and_served_with_those_checksums() {
     });
     let entries = saved(&announced);
     assert_eq!(entries.len(), 1, "announced once");
-    let (consumed, generation, row, tier) = entries[0];
+    let (consumed, row, tier) = entries[0];
     assert_eq!((consumed, row, tier), (3 * PT, true, Tier::Dram));
     let key = checkpoint.key;
-    // The wrong generation or an unknown key is refused.
-    assert_eq!(
-        rig.store
-            .pin_export(Tier::Dram, key, generation + 1, 0, true)
-            .err(),
-        Some(ExportRefusal::GenerationChanged)
-    );
+    // An unknown key or wrong tier is refused.
     let other = rig.history.key_at(5 * PT).unwrap();
     assert_eq!(
-        rig.store
-            .pin_export(Tier::Dram, other, generation, 0, true)
-            .err(),
+        rig.store.pin_export(Tier::Dram, other, 0, true).err(),
         Some(ExportRefusal::NotFound)
     );
     assert_eq!(
-        rig.store
-            .pin_export(Tier::Nvme, key, generation, 0, true)
-            .err(),
+        rig.store.pin_export(Tier::Nvme, key, 0, true).err(),
         Some(ExportRefusal::NotFound)
     );
-    let mut pin = rig
-        .store
-        .pin_export(Tier::Dram, key, generation, 0, true)
-        .unwrap();
+    let mut pin = rig.store.pin_export(Tier::Dram, key, 0, true).unwrap();
     let chain = pin.chain().clone();
     assert_eq!(
         (chain.total_pages, chain.row, chain.records.len()),
@@ -177,10 +162,7 @@ fn a_stored_record_is_announced_once_hashed_and_served_with_those_checksums() {
     assert_eq!(dst[3 * PAGE..], row_bytes[..]);
     assert_eq!(sums.row, Some(checksum(&row_bytes)));
     // Starting inside the record serves a suffix and its checksums.
-    let mut suffix = rig
-        .store
-        .pin_export(Tier::Dram, key, generation, PT, false)
-        .unwrap();
+    let mut suffix = rig.store.pin_export(Tier::Dram, key, PT, false).unwrap();
     assert_eq!(suffix.chain().records[0].first_page, 1);
     let mut dst = vec![0u8; 2 * PAGE];
     let part = suffix
@@ -208,10 +190,9 @@ fn a_pinned_record_survives_pressure_until_the_pin_is_dropped_and_its_eviction_i
         announced.extend(rig.notices());
         !announced.is_empty()
     });
-    let generation = saved(&announced)[0].1;
     let pin = rig
         .store
-        .pin_export(Tier::Dram, first.key, generation, 0, true)
+        .pin_export(Tier::Dram, first.key, 0, true)
         .unwrap();
     // The pool is full, and the only record is pinned: nothing can be stored.
     let second = rig.publish(2, 200);
@@ -229,19 +210,14 @@ fn a_pinned_record_survives_pressure_until_the_pin_is_dropped_and_its_eviction_i
     let evicted: Vec<_> = after
         .iter()
         .filter_map(|n| match n {
-            Notice::Evicted {
-                key,
-                tier,
-                generation,
-                ..
-            } => Some((*key, *tier, *generation)),
+            Notice::Evicted { key, tier, .. } => Some((*key, *tier)),
             _ => None,
         })
         .collect();
-    assert_eq!(evicted, [(first.key, Tier::Dram, generation)]);
+    assert_eq!(evicted, [(first.key, Tier::Dram)]);
     assert!(
         rig.store
-            .pin_export(Tier::Dram, first.key, generation, 0, true)
+            .pin_export(Tier::Dram, first.key, 0, true)
             .is_err()
     );
 }
@@ -259,7 +235,7 @@ fn a_store_that_was_never_attached_announces_nothing_and_exports_nothing() {
         digest: [1; 16],
     };
     assert_eq!(
-        store.pin_export(Tier::Dram, key, 1, 0, true).err(),
+        store.pin_export(Tier::Dram, key, 0, true).err(),
         Some(ExportRefusal::NotFound)
     );
 }

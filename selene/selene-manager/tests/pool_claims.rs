@@ -229,7 +229,6 @@ async fn c1_a_gpu_chain_is_copied_through_retained_windows() {
     let request = w.source.export_request().await;
     assert_eq!(request.claim_id, 1);
     assert_eq!(request.tier, v2::Tier::Gpu as i32);
-    assert_eq!(request.generation, GENERATION);
     assert_eq!(
         request.reserved_bytes,
         32 * PAGE_BYTES + ROW_BYTES,
@@ -395,7 +394,6 @@ async fn c5_source_refusals_fail_the_claim_and_free_the_slot() {
     let mut w = world(v2::Tier::Gpu, &[1024]).await;
     let reasons = [
         v2::ClaimReason::NotFound,
-        v2::ClaimReason::GenerationChanged,
         v2::ClaimReason::ChainGap,
         v2::ClaimReason::NoHeadroom,
         v2::ClaimReason::SourceBusy,
@@ -1329,7 +1327,6 @@ async fn a21_a_pin_larger_than_the_reservation_fails_no_windows() {
     // The chain grew: the source reports more pages than were reserved.
     let records = vec![v2::Record {
         key: Some(pool::pkey(1024)),
-        generation: GENERATION,
         first_page: 0,
         pages: 40,
         row: true,

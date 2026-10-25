@@ -45,7 +45,6 @@ pub struct ExportRequest {
     /// a host tier's by the store.
     pub tier: Tier,
     pub key: PrefixKey,
-    pub generation: u64,
     pub begin_tokens: u64,
     pub want_row: bool,
     /// When the manager stops waiting for the answer.
@@ -113,7 +112,6 @@ pub struct PutRequest {
     /// Pages the record owns, counted from its published parent.
     pub tail_pages: u64,
     pub row: bool,
-    pub generation: u64,
     pub source: PutSource,
 }
 

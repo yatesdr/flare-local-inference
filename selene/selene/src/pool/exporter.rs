@@ -6,7 +6,6 @@ use crate::{PrefixKey, Result};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostRecord {
     pub key: PrefixKey,
-    pub generation: u64,
     /// Record-relative page where this export's pages start.
     pub first_page: u32,
     pub pages: u32,

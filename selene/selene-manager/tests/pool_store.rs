@@ -215,7 +215,6 @@ async fn u2_u8_and_a9_present_queue_and_invalid_metadata() {
             bucket: vec![4; 16],
             published_tail_pages: 64,
             mode: v2::CopyMode::SharedWindows as i32,
-            generation: 1,
         }))
         .await;
     writer
@@ -229,7 +228,6 @@ async fn u2_u8_and_a9_present_queue_and_invalid_metadata() {
             bucket: vec![4; 16],
             published_tail_pages: 80,
             mode: v2::CopyMode::SharedWindows as i32,
-            generation: 1,
         }))
         .await;
     let refused = writer
@@ -480,7 +478,6 @@ async fn u4_a_cancelled_put_keeps_its_unfilled_windows_until_the_writers_fence()
             bucket: vec![4; 16],
             published_tail_pages: 16,
             mode: v2::CopyMode::SharedWindows as i32,
-            generation: 1,
         }))
         .await;
     writer

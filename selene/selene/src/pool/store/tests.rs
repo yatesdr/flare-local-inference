@@ -117,7 +117,6 @@ impl HostStore for FakeLocal {
         tier: Tier,
         key: PrefixKey,
         _: u64,
-        _: u64,
         _: bool,
     ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
         let mut state = self.0.lock().unwrap();
@@ -137,7 +136,6 @@ impl HostPin for NoPin {
         CHAIN.get_or_init(|| crate::pool::HostChain {
             records: vec![crate::pool::HostRecord {
                 key: self.0,
-                generation: 1,
                 first_page: 0,
                 pages: 10,
                 row: true,
@@ -165,7 +163,7 @@ struct PoolState {
     reject: bool,
     events: Vec<PoolEvent>,
     saved: Vec<IndexEntry>,
-    evicted: Vec<(PrefixKey, Tier, u64, Option<IndexEntry>)>,
+    evicted: Vec<(PrefixKey, Tier, Option<IndexEntry>)>,
     lost: usize,
     ready: bool,
     /// Puts accepted, by id; the test ends them with a [`PoolEvent::Put`].
@@ -201,12 +199,8 @@ impl PoolPort for FakePool {
     fn saved(&self, entry: IndexEntry) {
         self.0.lock().unwrap().saved.push(entry);
     }
-    fn evicted(&self, key: PrefixKey, tier: Tier, generation: u64, heir: Option<IndexEntry>) {
-        self.0
-            .lock()
-            .unwrap()
-            .evicted
-            .push((key, tier, generation, heir));
+    fn evicted(&self, key: PrefixKey, tier: Tier, heir: Option<IndexEntry>) {
+        self.0.lock().unwrap().evicted.push((key, tier, heir));
     }
     fn evictions_lost(&self) {
         self.0.lock().unwrap().lost += 1;
@@ -314,7 +308,6 @@ impl Rig {
             plan: plan::Candidate {
                 level,
                 source: SourceId(u64::from(source)),
-                generation: 1,
                 key: nodes.last().unwrap().key,
                 begin_tokens: begin,
                 skip_pages: (begin / PT - first_start) as usize,
@@ -610,19 +603,16 @@ fn gpu_publications_are_announced_and_their_evictions_reported() {
     assert!(rig.copies().is_empty());
     let saved = rig.pool.lock().unwrap().saved.clone();
     assert_eq!(saved.len(), 1);
-    assert_eq!(
-        (saved[0].generation, saved[0].tier, saved[0].tail_pages),
-        (42, Tier::Gpu, 2)
-    );
+    assert_eq!((saved[0].tier, saved[0].tail_pages), (Tier::Gpu, 2));
     assert_eq!(saved[0].parent, Some(rig.key(64)));
     let mut heir = checkpoint.clone();
     heir.id = CheckpointId::new(43);
-    rig.store.evicted(key, 42, Some(&heir));
-    rig.store.evicted(key, 41, None);
+    rig.store.evicted(key, Some(&heir));
+    rig.store.evicted(key, None);
     rig.store.evictions_lost();
     let state = rig.pool.lock().unwrap();
     assert_eq!(state.evicted.len(), 2);
-    assert_eq!(state.evicted[0].3.as_ref().map(|h| h.generation), Some(43));
+    assert_eq!(state.evicted[0].2.as_ref().map(|h| h.key), Some(heir.key));
     assert_eq!(state.lost, 1);
 }
 
@@ -642,7 +632,6 @@ fn queued_lookups_do_not_trim_local_prefixes_and_export_events_reach_the_worker(
         .push(PoolEvent::Export(super::super::shared::ExportRequest {
             export,
             key: rig.key(800),
-            generation: 3,
             begin_tokens: 0,
             want_row: true,
             deadline: Instant::now(),
@@ -655,9 +644,7 @@ fn queued_lookups_do_not_trim_local_prefixes_and_export_events_reach_the_worker(
         .events
         .push(PoolEvent::ExportEnded { export });
     let events = rig.poll();
-    assert!(
-        matches!(events[0], StoreEvent::ExportRequested { export: e, generation: 3, .. } if e == export)
-    );
+    assert!(matches!(events[0], StoreEvent::ExportRequested { export: e, .. } if e == export));
     assert!(matches!(events[1], StoreEvent::ExportEnded { export: e } if e == export));
 }
 
@@ -674,7 +661,6 @@ fn host_tier_exports_are_pinned_by_the_store_and_never_reach_the_worker() {
             export: ExportId(export),
             tier,
             key,
-            generation: 3,
             begin_tokens: 0,
             want_row: true,
             deadline: Instant::now(),
@@ -730,7 +716,6 @@ impl Rig {
         Retiring {
             tier: Tier::Nvme,
             key: self.key(page * PT),
-            generation: page,
             parent: (page > 1).then(|| self.key((page - 1) * PT)),
             bucket: [page as u8; 16],
             tail_pages: 1,
@@ -798,7 +783,6 @@ fn a_retiring_record_is_put_and_released_only_when_the_manager_commits_it() {
             (request.chain_pages, request.tail_pages, request.row),
             (10, 1, true)
         );
-        assert_eq!(request.generation, 5);
         assert!(matches!(request.source, PutSource::Host(_)));
     }
     assert_eq!(

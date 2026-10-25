@@ -165,8 +165,8 @@ struct Core {
     held: HashMap<PrefixKey, (usize, bool)>,
     /// Records whose moves ended and that leave once nothing reads them.
     finishing: Vec<PrefixKey>,
-    /// The generation announced for each announced record.
-    generations: HashMap<PrefixKey, u64>,
+    /// Checksum-backed holdings announced to the pool.
+    announced: std::collections::HashSet<PrefixKey>,
 }
 
 impl Core {
@@ -188,7 +188,7 @@ impl Core {
             retiring: Vec::new(),
             held: HashMap::new(),
             finishing: Vec::new(),
-            generations: HashMap::new(),
+            announced: Default::default(),
         }
     }
 
@@ -428,9 +428,9 @@ impl Core {
         let mut pages: usize = self.held.values().map(|(pages, _)| pages).sum();
         let mut rows = self.held.values().any(|(_, row)| *row);
         while pages < want_pages || (want_row && !rows) {
-            let generations = &self.generations;
+            let announced = &self.announced;
             let Some(key) = self.index.candidate(false, |node| {
-                node.location.durable && generations.contains_key(&node.key)
+                node.location.durable && announced.contains(&node.key)
             }) else {
                 break;
             };
@@ -441,7 +441,6 @@ impl Core {
             let retiring = Retiring {
                 tier: PoolTier::Dram,
                 key,
-                generation: self.generations[&key],
                 parent: node.parent,
                 bucket: node.bucket,
                 tail_pages: node.tail_pages,
@@ -1126,9 +1125,7 @@ impl MemoryStore {
                 a.sums.insert(done.key, Arc::new(done.sums));
                 a.view
                     .announce(&notice, parent_of(&notice.key, notice.parent));
-                if let Some(generation) = a.view.generation(&done.key) {
-                    self.core.generations.insert(done.key, generation);
-                }
+                self.core.announced.insert(done.key);
             }
         }
         for notice in a.view.drain() {
@@ -1165,7 +1162,7 @@ impl MemoryStore {
                 NodeEvent::Gone => {
                     a.hashing.remove(&key);
                     a.sums.remove(&key);
-                    self.core.generations.remove(&key);
+                    self.core.announced.remove(&key);
                     match spilled_to(&key) {
                         Some(to) => a.view.spill(&key, to),
                         None => a.view.retire(&key),
@@ -1186,17 +1183,14 @@ impl MemoryStore {
     pub fn pin_export_chain(
         &mut self,
         keys: &[PrefixKey],
-        generation: u64,
         begin_tokens: u64,
         want_row: bool,
     ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
         let (Some(a), Some(endpoint)) = (self.announce.as_ref(), keys.last()) else {
             return Err(ExportRefusal::NotFound);
         };
-        match a.view.generation(endpoint) {
-            Some(held) if held == generation => {}
-            Some(_) => return Err(ExportRefusal::GenerationChanged),
-            None => return Err(ExportRefusal::NotFound),
+        if !a.view.contains(endpoint) {
+            return Err(ExportRefusal::NotFound);
         }
         let pool = &self.core.pool;
         let mut nodes = Vec::with_capacity(keys.len());
@@ -1208,13 +1202,13 @@ impl MemoryStore {
                 .node(key)
                 .filter(|node| node.ready)
                 .ok_or(ExportRefusal::ChainGap)?;
-            let (Some(sums), Some(held)) = (a.sums.get(key), a.view.generation(key)) else {
+            let Some(sums) = a.sums.get(key).filter(|_| a.view.contains(key)) else {
                 return Err(ExportRefusal::ChainGap);
             };
             if want_row && position + 1 == keys.len() && node.location.row.is_none() {
                 return Err(ExportRefusal::ChainGap);
             }
-            nodes.push((*key, held, node.location.pages.len()));
+            nodes.push((*key, node.location.pages.len()));
             spans.push(MemorySpan {
                 pages: node
                     .location
@@ -1389,7 +1383,6 @@ impl HostStore for MemoryStore {
         &mut self,
         tier: PoolTier,
         key: PrefixKey,
-        generation: u64,
         begin_tokens: u64,
         want_row: bool,
     ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
@@ -1397,7 +1390,7 @@ impl HostStore for MemoryStore {
             return Err(ExportRefusal::NotFound);
         }
         let chain = self.export_chain(&key, begin_tokens)?;
-        self.pin_export_chain(&chain, generation, begin_tokens, want_row)
+        self.pin_export_chain(&chain, begin_tokens, want_row)
     }
 
     fn stats(&self) -> StoreStats {
@@ -2307,8 +2300,8 @@ mod tests {
     /// Marks every resident record as announced, as the hasher would have.
     fn announce_all(core: &mut Core) {
         let keys: Vec<_> = core.index.nodes().map(|node| node.key).collect();
-        for (generation, key) in keys.into_iter().enumerate() {
-            core.generations.insert(key, generation as u64 + 1);
+        for key in keys {
+            core.announced.insert(key);
         }
     }
 
@@ -2335,7 +2328,6 @@ mod tests {
             (retiring[0].key, retiring[0].tier, retiring[0].tail_pages),
             (cold.key, PoolTier::Dram, 2)
         );
-        assert_eq!(retiring[0].generation, core.generations[&cold.key]);
         assert!(core.index.contains(&cold.key));
 
         // A second attempt finds the held leaf covers it: nothing more is chosen.

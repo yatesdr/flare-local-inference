@@ -2,7 +2,7 @@
 //! thread an export from that tier needs.
 
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     sync::{Arc, Mutex, mpsc},
     thread,
 };
@@ -45,7 +45,7 @@ pub struct TierView {
     announcer: Announcer,
     tier: Tier,
     sink: NodeNotices,
-    generations: HashMap<PrefixKey, u64>,
+    announced: HashSet<PrefixKey>,
     page_record_bytes: u64,
     row_record_bytes: u64,
 }
@@ -56,7 +56,7 @@ impl TierView {
             announcer,
             tier,
             sink: Default::default(),
-            generations: HashMap::new(),
+            announced: HashSet::new(),
             page_record_bytes: layout.page_record_bytes,
             row_record_bytes: layout.row_record_bytes,
         }
@@ -72,25 +72,20 @@ impl TierView {
         std::mem::take(&mut *self.sink.lock().unwrap())
     }
 
-    /// The generation announced for the key in this tier.
-    pub fn generation(&self, key: &PrefixKey) -> Option<u64> {
-        self.generations.get(key).copied()
+    pub fn contains(&self, key: &PrefixKey) -> bool {
+        self.announced.contains(key)
     }
 
     /// Announce a node that became ready, or whose row was dropped, with the
     /// parent the manager should chain it under.
     pub fn announce(&mut self, notice: &NodeNotice, parent: Option<PrefixKey>) {
-        let generation = match notice.event {
-            NodeEvent::Ready => *self
-                .generations
-                .entry(notice.key)
-                .or_insert_with(|| self.announcer.next_generation(self.tier)),
-            NodeEvent::RowDropped => match self.generations.get(&notice.key) {
-                Some(generation) => *generation,
-                None => return,
-            },
-            NodeEvent::Gone => return,
-        };
+        match notice.event {
+            NodeEvent::Ready => {
+                self.announced.insert(notice.key);
+            }
+            NodeEvent::RowDropped if self.announced.contains(&notice.key) => {}
+            _ => return,
+        }
         self.announcer.saved(IndexEntry {
             key: notice.key,
             parent,
@@ -98,7 +93,6 @@ impl TierView {
             tail_pages: notice.tail_pages as u32,
             row: notice.row,
             tier: self.tier,
-            generation,
             bytes: notice.tail_pages as u64 * self.page_record_bytes
                 + if notice.row { self.row_record_bytes } else { 0 },
         });
@@ -107,15 +101,15 @@ impl TierView {
     /// The node left the tier because the next tier holds it, which `to` describes:
     /// one notice, so a lookup never sees neither.
     pub fn spill(&mut self, key: &PrefixKey, to: IndexEntry) {
-        if let Some(generation) = self.generations.remove(key) {
-            self.announcer.spilled(to, (self.tier, generation));
+        if self.announced.remove(key) {
+            self.announcer.spilled(to, self.tier);
         }
     }
 
     /// The node left the tier.
     pub fn retire(&mut self, key: &PrefixKey) {
-        if let Some(generation) = self.generations.remove(key) {
-            self.announcer.evicted(*key, self.tier, generation, None);
+        if self.announced.remove(key) {
+            self.announcer.evicted(*key, self.tier, None);
         }
     }
 }
@@ -224,21 +218,20 @@ mod tests {
     }
 
     #[test]
-    fn a_tier_view_announces_ready_nodes_with_stable_generations_and_retires_them() {
+    fn a_tier_view_announces_ready_nodes_updates_rows_and_retires_once() {
         let announcer = Announcer::new(Arc::new(Notify::new()));
         announcer.begin_session();
         let layout = Layout::new(&[geometry(64, &[("k", 4096)], 4096)]).unwrap();
         let mut view = TierView::new(announcer.clone(), Tier::Dram, &layout);
         view.announce(&notice(NodeEvent::Ready, 1, true), Some(key(0)));
         view.announce(&notice(NodeEvent::Ready, 2, true), None);
-        let first = view.generation(&key(1)).unwrap();
-        assert_ne!(first, view.generation(&key(2)).unwrap());
-        // Ready again keeps the generation; a dropped row updates the entry.
+        assert!(view.contains(&key(1)) && view.contains(&key(2)));
+        // A dropped row updates the same content entry.
         view.announce(&notice(NodeEvent::RowDropped, 1, false), Some(key(0)));
-        assert_eq!(view.generation(&key(1)), Some(first));
+        assert!(view.contains(&key(1)));
         view.retire(&key(1));
         view.retire(&key(1));
-        assert_eq!(view.generation(&key(1)), None);
+        assert!(!view.contains(&key(1)));
         // A node never announced is not retired.
         view.retire(&key(9));
         let notices = announcer.take_batch(100).unwrap();
@@ -246,13 +239,13 @@ mod tests {
             .iter()
             .map(|n| match n {
                 Notice::Saved(e) => ("saved", e.row, e.bytes),
-                Notice::Evicted { generation, .. } => ("evicted", false, *generation),
+                Notice::Evicted { .. } => ("evicted", false, 0),
                 Notice::Spilled { .. } => ("spilled", false, 0),
             })
             .collect();
         assert_eq!(kinds[0], ("saved", true, 2 * 4096 + 4096));
         assert_eq!(kinds[2], ("saved", false, 2 * 4096));
-        assert_eq!(kinds[3], ("evicted", false, first));
+        assert_eq!(kinds[3], ("evicted", false, 0));
         assert_eq!(kinds.len(), 4);
     }
 

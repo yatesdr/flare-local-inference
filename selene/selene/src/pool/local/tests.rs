@@ -47,15 +47,11 @@ impl HostStore for Hooks {
         &mut self,
         tier: crate::pool::Tier,
         _: PrefixKey,
-        generation: u64,
         _: u64,
         _: bool,
     ) -> std::result::Result<Box<dyn crate::pool::HostPin>, ExportRefusal> {
-        self.0
-            .lock()
-            .unwrap()
-            .push(format!("pin {tier:?} {generation}"));
-        Err(ExportRefusal::GenerationChanged)
+        self.0.lock().unwrap().push(format!("pin {tier:?}"));
+        Err(ExportRefusal::ChainGap)
     }
 }
 
@@ -73,8 +69,8 @@ fn the_tiers_beneath_a_pooled_store_receive_every_pool_hook() {
     assert!(tiers.take_retiring().is_empty());
     tiers.retired(key, crate::pool::Tier::Dram, crate::Retirement::Moved);
     assert!(matches!(
-        tiers.pin_export(crate::pool::Tier::Dram, key, 9, 0, true),
-        Err(ExportRefusal::GenerationChanged)
+        tiers.pin_export(crate::pool::Tier::Dram, key, 0, true),
+        Err(ExportRefusal::ChainGap)
     ));
     assert_eq!(
         *hooks.0.lock().unwrap(),
@@ -83,7 +79,7 @@ fn the_tiers_beneath_a_pooled_store_receive_every_pool_hook() {
             "spill true",
             "take_retiring",
             "retired Dram Moved",
-            "pin Dram 9"
+            "pin Dram"
         ]
     );
     // With no tiers there is nothing to reach.
@@ -92,7 +88,7 @@ fn the_tiers_beneath_a_pooled_store_receive_every_pool_hook() {
     none.cascade();
     assert!(none.take_retiring().is_empty());
     assert!(matches!(
-        none.pin_export(crate::pool::Tier::Dram, key, 9, 0, true),
+        none.pin_export(crate::pool::Tier::Dram, key, 0, true),
         Err(ExportRefusal::NotFound)
     ));
 }

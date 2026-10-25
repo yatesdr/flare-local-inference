@@ -64,7 +64,7 @@ fn rank_records_read_slices_rows_and_chain_spills_with_persisted_sums() {
     let offset = storage.as_ptr().align_offset(4096);
     let dst = &mut storage[offset..offset + 3 * 4096];
     let sums = records
-        .read(root.key, 7, 1, 1, true, &mut dst[..8192])
+        .read(root.key, 1, 1, true, &mut dst[..8192])
         .unwrap();
     assert_eq!(&dst[..4096], vec![22; 4096]);
     assert_eq!(&dst[4096..8192], vec![128; 4096]);
@@ -78,12 +78,12 @@ fn rank_records_read_slices_rows_and_chain_spills_with_persisted_sums() {
     assert_eq!(sums.row, Some(tail.row_checksum));
     assert!(
         records
-            .read(root.key, 7, 2, 1, false, &mut dst[..4096])
+            .read(root.key, 2, 1, false, &mut dst[..4096])
             .is_err()
     );
     assert!(
         records
-            .read(root.key, 7, 0, 1, false, &mut dst[..12])
+            .read(root.key, 0, 1, false, &mut dst[..12])
             .is_err()
     );
     // A damaged slice still serves the persisted checksum for the manager to verify.
@@ -92,7 +92,7 @@ fn rank_records_read_slices_rows_and_chain_spills_with_persisted_sums() {
     bytes[root.page_segment as usize] ^= 1;
     std::fs::write(path, bytes).unwrap();
     let sums = records
-        .read(root.key, 7, 0, 1, false, &mut dst[..4096])
+        .read(root.key, 0, 1, false, &mut dst[..4096])
         .unwrap();
     assert_eq!(sums.pages, vec![record::checksum(&vec![11; 4096])]);
     assert_ne!(sums.pages[0], record::checksum(&dst[..4096]));

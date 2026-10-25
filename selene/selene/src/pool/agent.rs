@@ -31,7 +31,7 @@ use crate::{
     SharedCopier, StateSlotId, record::checksum, slab::WINDOW_PAGES,
 };
 
-use super::conn::{FIRST_BACKOFF, MAX_BACKOFF, BUSY_TICK, IDLE_TICK};
+use super::conn::{BUSY_TICK, FIRST_BACKOFF, IDLE_TICK, MAX_BACKOFF};
 use super::{
     Checksums,
     client::PoolAddress,
@@ -53,14 +53,13 @@ const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 /// and rank 0's index holds them for all ranks.
 pub trait RankRecords: Send + 'static {
     /// This rank's slices of pages `first_page..first_page + pages` of the host record
-    /// `key` at `generation` (record-relative pages), then its slice of the row when `row`,
+    /// `key` (record-relative pages), then its slice of the row when `row`,
     /// packed into `dst`, with the persisted slice checksums (never hashes of what was just
     /// read). Blocks on the device: it runs on the agent's one reader thread, so at most one
     /// read is in flight.
     fn read(
         &mut self,
         key: PrefixKey,
-        generation: u64,
         first_page: u32,
         pages: u32,
         row: bool,
@@ -85,7 +84,6 @@ struct RecordJob {
     xfer: u64,
     index: u32,
     key: PrefixKey,
-    generation: u64,
     put: bool,
     first_page: u32,
     pages: u32,
@@ -148,14 +146,7 @@ fn run_record_job(records: &mut dyn RankRecords, job: &RecordJob) -> Result<Chec
         if job.put {
             records.fill(job.key, job.first_page, job.pages, job.row, dst)
         } else {
-            records.read(
-                job.key,
-                job.generation,
-                job.first_page,
-                job.pages,
-                job.row,
-                dst,
-            )
+            records.read(job.key, job.first_page, job.pages, job.row, dst)
         }
     };
     match &job.target {
@@ -697,7 +688,10 @@ impl Agent {
                     if !hello.data_transports.is_empty() {
                         plan.push(PlannedRegion {
                             name: "data-staging",
-                            bytes: Staging::planned_bytes(self.staging_slots(&hello), self.slot_bytes(&hello)),
+                            bytes: Staging::planned_bytes(
+                                self.staging_slots(&hello),
+                                self.slot_bytes(&hello),
+                            ),
                         });
                     }
                     if let Some(approve) = &self.approve
@@ -886,7 +880,11 @@ impl Agent {
     /// Slots for claims, puts and exports, each with the stated window credits.
     fn staging_slots(&self, hello: &wire::HelloReply) -> u32 {
         let limits = conn::checked_limits(hello.limits);
-        super::limits::staging_slots(&limits, limits.max_claims_in_flight, limits.max_export_slots)
+        super::limits::staging_slots(
+            &limits,
+            limits.max_claims_in_flight,
+            limits.max_export_slots,
+        )
     }
 
     /// The size of one slot of the data-channel staging.
@@ -1239,7 +1237,6 @@ impl Agent {
             xfer,
             index: spec.index,
             key,
-            generation: wanted.generation,
             put,
             first_page: if put {
                 (run.chain_first + u64::from(spec.first_page)) as u32

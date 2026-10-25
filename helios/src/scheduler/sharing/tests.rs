@@ -64,7 +64,6 @@ fn compaction_and_leaf_eviction_are_reported_with_the_heir() {
         s.take_evictions(),
         [EvictedCheckpoint {
             key: keys[0],
-            generation: a.value(),
             heir: Some(heir),
         }]
     );
@@ -77,15 +76,9 @@ fn compaction_and_leaf_eviction_are_reported_with_the_heir() {
     }
     let notices = s.take_evictions();
     assert_eq!(notices.len(), 2);
-    assert_eq!(
-        (notices[0].key, notices[0].generation),
-        (keys[1], b.value())
-    );
+    assert_eq!(notices[0].key, keys[1]);
     assert_eq!(notices[0].heir.as_ref().unwrap().key, keys[2]);
-    assert_eq!(
-        (notices[1].key, notices[1].generation),
-        (keys[2], c.value())
-    );
+    assert_eq!(notices[1].key, keys[2]);
     assert_eq!(notices[1].heir, None);
 }
 
@@ -102,8 +95,11 @@ fn an_heir_evicted_by_the_same_call_is_not_named() {
     });
     let notices = s.take_evictions();
     assert_eq!(
-        notices.iter().map(|n| n.generation).collect::<Vec<_>>(),
-        [a.value(), b.value()]
+        notices
+            .iter()
+            .map(|n| n.key.consumed_tokens)
+            .collect::<Vec<_>>(),
+        [64, 128]
     );
     assert!(notices.iter().all(|n| n.heir.is_none()));
 }
@@ -120,7 +116,7 @@ fn an_unready_heir_is_not_announced_and_untracked_evictions_are_silent() {
         snapshots: 1,
     });
     let notices = s.take_evictions();
-    assert_eq!(notices[0].generation, a.value());
+    assert_eq!(notices[0].key, h.key_at(64).unwrap());
     assert_eq!(notices[0].heir, None);
     assert!(s.cache.checkpoint(b).is_ok());
 
@@ -138,11 +134,12 @@ fn an_unready_heir_is_not_announced_and_untracked_evictions_are_silent() {
 fn queued_evictions_are_bounded_and_drop_the_oldest() {
     let mut s = scheduler(2, 16, 2);
     s.enable_evictions();
-    let h = history(1);
-    let mut generations = Vec::new();
-    for _ in 0..6 {
+    let mut keys = Vec::new();
+    for n in 0..6 {
+        let mut h = PrefixHistory::new([9; 32]);
+        h.append(&vec![n; 64], &[]).unwrap();
         let a = publish(&mut s, &h, None, 64, &[0], 0);
-        generations.push(a.value());
+        keys.push(s.cache.checkpoint(a).unwrap().prefix());
         s.evict(EvictionTarget {
             pages: 0,
             snapshots: 1,
@@ -150,27 +147,23 @@ fn queued_evictions_are_bounded_and_drop_the_oldest() {
         let update = s.cache.advance_completed(Fence(0)).unwrap();
         s.apply_completion(update);
     }
-    let kept: Vec<_> = s.take_evictions().iter().map(|e| e.generation).collect();
-    assert_eq!(kept, generations[2..]);
+    let kept: Vec<_> = s.take_evictions().iter().map(|e| e.key).collect();
+    assert_eq!(kept, keys[2..]);
     assert!(s.take_evictions_lost());
     assert!(!s.take_evictions_lost());
 }
 
 #[test]
-fn lookups_by_generation_distinguish_missing_from_replaced() {
+fn lookups_by_key_only_return_ready_content() {
     let mut s = scheduler(2, 16, 4);
     let h = history(2);
     let a = publish(&mut s, &h, None, 64, &[0], 0);
     let pending = publish(&mut s, &h, Some(a), 128, &[1], 9);
     let key = s.cache.checkpoint(a).unwrap().prefix();
     let pending_key = s.cache.checkpoint(pending).unwrap().prefix();
-    assert_eq!(s.checkpoint_by_generation(&key, a.value()), Ok(a));
+    assert_eq!(s.checkpoint_by_key(&key), Ok(a));
     assert_eq!(
-        s.checkpoint_by_generation(&key, a.value() + 1),
-        Err(ExportRefusal::GenerationChanged)
-    );
-    assert_eq!(
-        s.checkpoint_by_generation(&pending_key, pending.value()),
+        s.checkpoint_by_key(&pending_key),
         Err(ExportRefusal::NotFound)
     );
 }
@@ -188,23 +181,23 @@ fn the_export_chain_is_trimmed_to_the_physical_start() {
         .collect();
     let shape = |chain: &ExportChain| {
         (
-            chain.nodes.iter().map(|n| n.generation).collect::<Vec<_>>(),
+            chain.nodes.iter().map(|n| n.key).collect::<Vec<_>>(),
             chain.skip_pages,
         )
     };
     let all = s.export_chain(c, 0, true).unwrap();
-    assert_eq!(shape(&all), ([a, b, c].map(|id| id.value()).to_vec(), 0));
+    assert_eq!(shape(&all), (keys.clone(), 0));
     assert_eq!(all.nodes[1].key, keys[1]);
     assert_eq!(all.nodes[1].pages, [PageId(1), PageId(2)]);
     let slot = s.snapshot_slot(s.cache.checkpoint(c).unwrap().snapshot());
     assert_eq!(all.row, Some(slot));
     // Page 2 starts in the middle of b's record, and the row is optional.
     let middle = s.export_chain(c, 130, false).unwrap();
-    assert_eq!(shape(&middle), ([b, c].map(|id| id.value()).to_vec(), 1));
+    assert_eq!(shape(&middle), (keys[1..].to_vec(), 1));
     assert_eq!(middle.row, None);
     assert_eq!(
         shape(&s.export_chain(c, 192, true).unwrap()),
-        ([c.value()].to_vec(), 0)
+        (keys[2..].to_vec(), 0)
     );
     // Starting at the endpoint leaves only its row, which must then be wanted.
     let row_only = s.export_chain(c, 256, true).unwrap();
@@ -225,13 +218,13 @@ fn a_checkpoint_that_holds_no_page_is_left_out_of_the_export_chain() {
     let c = publish(&mut s, &h, Some(hollow), 192, &[1, 2], 0);
     let chain = s.export_chain(c, 0, true).unwrap();
     assert_eq!(
-        chain.nodes.iter().map(|n| n.generation).collect::<Vec<_>>(),
-        [a.value(), c.value()]
+        chain.nodes.iter().map(|n| n.key).collect::<Vec<_>>(),
+        [h.key_at(64).unwrap(), h.key_at(192).unwrap()]
     );
     // The endpoint is kept even with no page of its own: its row is the claim.
     let row_only = s.export_chain(hollow, 64, true).unwrap();
     assert_eq!(row_only.nodes.len(), 1);
-    assert_eq!(row_only.nodes[0].generation, hollow.value());
+    assert_eq!(row_only.nodes[0].key, inside.key_at(70).unwrap());
 }
 
 /// Builds the scarce-page tree used by the headroom tests: a chain `a` -> `b`
@@ -423,4 +416,24 @@ fn pressure_counts_snapshot_backing_and_retirement_once() {
         snapshots: 2,
     });
     assert!(s.write_back_candidates(None).is_empty());
+}
+
+#[test]
+fn a_key_republished_under_a_new_checkpoint_id_can_be_pinned() {
+    let mut s = scheduler(2, 16, 4);
+    let h = history(1);
+    let old = publish(&mut s, &h, None, 64, &[0], 0);
+    let key = s.cache.checkpoint(old).unwrap().prefix();
+    s.evict(EvictionTarget {
+        pages: 1,
+        snapshots: 1,
+    });
+    let update = s.cache.advance_completed(Fence(0)).unwrap();
+    s.apply_completion(update);
+    let current = publish(&mut s, &h, None, 64, &[0], 0);
+    assert_ne!(old, current);
+    assert_eq!(s.checkpoint_by_key(&key), Ok(current));
+    s.pin_checkpoint(current).unwrap();
+    assert!(s.export_chain(current, 0, true).is_some());
+    s.unpin_checkpoint(current).unwrap();
 }

@@ -279,7 +279,6 @@ impl Engine {
             }),
             tier: codec::tier_to(fetch.candidate.tier) as i32,
             key: Some(codec::key_to(p.end)),
-            generation: p.generation,
             begin_tokens: p.begin_tokens,
             want_row: p.row,
             mode: if self.dial.is_some() {

@@ -216,7 +216,6 @@ fn refusal_reason(value: i32) -> v2::ClaimReason {
     match R::try_from(value) {
         Ok(
             reason @ (R::NotFound
-            | R::GenerationChanged
             | R::ChainGap
             | R::NoHeadroom
             | R::SourceBusy
@@ -515,7 +514,7 @@ impl Core {
         let total = windows::total_bytes(&plan);
         if source == SourceId::Manager {
             let _ = &plan;
-            return self.manager_claim(sid, key, &m, endpoint, &entry, walk, &geometry, mode);
+            return self.manager_claim(sid, key, &m, endpoint, walk, &geometry, mode);
         }
 
         // Retained staging: required for a GPU export, preferred for host tiers.
@@ -658,7 +657,6 @@ impl Core {
                 requester_instance_id: instance.to_vec(),
                 tier: tier_to(tier) as i32,
                 key: Some(key_to(endpoint)),
-                generation: m.generation,
                 begin_tokens: m.begin_tokens,
                 want_row: m.want_row,
                 pin_deadline_ms: self.cfg.limits.pin_deadline_ms,
@@ -724,7 +722,6 @@ impl Core {
         key: ClaimKey,
         m: &v2::Claim,
         endpoint: Key,
-        entry: &super::index::Entry,
         walk: super::index::ChainWalk,
         geometry: &super::ScopeGeometry,
         mode: v2::CopyMode,
@@ -733,9 +730,6 @@ impl Core {
             core.refused_claim(sid, key, m, reason);
             Ok(())
         };
-        if entry.generation != m.generation {
-            return refuse(self, v2::ClaimReason::GenerationChanged);
-        }
         let (scope, pid) = {
             let session = &self.sessions[&sid];
             (session.scope, session.pid)
@@ -788,7 +782,6 @@ impl Core {
                 let first_page = if index == 0 { walk.skip_pages } else { 0 };
                 v2::Record {
                     key: Some(key_to(node.key)),
-                    generation: node.generation,
                     first_page,
                     pages: node.tail_pages - first_page,
                     row: index == last && m.want_row,

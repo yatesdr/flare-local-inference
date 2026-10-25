@@ -37,12 +37,9 @@ the instance side (`flare-selene`, `selene::pool`) implements the other.
    to every session: a same-host manager's DRAM is level 3 and its NVMe level 4; a
    remote manager's records (DRAM or NVMe) are level 5. The manager computes the
    level from the requester's perspective.
-5. **Generation.** Strictly increasing per (instance_id, tier). The GPU
-   cache and each host tier have independent allocators (GPU: `CheckpointId::value()`),
-   so generations are compared only between entries of the same instance and
-   tier. Evict and spill notices name the tier and the generation they remove; the
-   manager removes an entry only if its generation is less than or equal to the
-   notice's.
+5. **Content keys.** A source pins ready content by its scoped prefix key and
+   validates the chain shape. Index entries are hints: late evictions can remove
+   a fresh hint and cause a miss, but cannot grant ownership or change bytes.
 6. **COPIED is the requester's word,** and only after exact coverage (section 5).
    Everything else terminal is `FAILED` or `EXPIRED`.
 7. **Window ownership and reclaim.** A window passes manager, source, requester,
@@ -369,8 +366,7 @@ owner:
 
 - **GPU tier:** delivered through `poll` to the model worker as
   `StoreEvent::ExportRequested`. On the worker, atomically (one scheduler step):
-  1. find the published checkpoint by (key, generation); refuse `NOT_FOUND` or
-     `GENERATION_CHANGED`;
+  1. resolve the ready checkpoint by its scoped key; otherwise refuse `NOT_FOUND`;
   2. verify the chain from the physical start (`floor(begin_tokens / page_tokens)`)
      is contiguous and has the row if wanted (`CHAIN_GAP`), and that its size fits
      `reserved_bytes` (`NO_WINDOWS`);
@@ -789,8 +785,7 @@ What the manager serves, and where it is narrower than the contract above.
   burst beyond `max_concurrent_lookups` is refused `LOOKUP_OVERLOADED` at once. Candidates
   come from the index only; the manager never contacts a source to answer one.
 - **Manager-store entries.** The manager's own store appears in each scope's index as the
-  manager's entries (tier DRAM or NVMe; records recovered after a restart start on NVMe). Their
-  generation is the store's catalog sequence at the last change.
+  manager's entries (tier DRAM or NVMe; records recovered after a restart start on NVMe).
 - **Windows.** An instance-to-instance claim reserves one staging block for the whole export
   (its size rounds up to the allocator's size class), cut into windows by the pinned records.
   A host-tier source whose export does not fit streams with `window_credits`. Windows for the

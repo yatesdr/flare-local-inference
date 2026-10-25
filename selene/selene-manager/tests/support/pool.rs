@@ -88,7 +88,6 @@ pub fn entry(
         tail_pages: (tokens / PAGE_TOKENS - parent_pages) as u32,
         row: true,
         tier: tier as i32,
-        generation,
         bytes: 1000,
     }
 }
@@ -115,12 +114,11 @@ pub fn saved(entry: v2::IndexEntry) -> v2::Notice {
     }
 }
 
-pub fn evicted(tokens: u64, tier: v2::Tier, generation: u64) -> v2::Notice {
+pub fn evicted(tokens: u64, tier: v2::Tier) -> v2::Notice {
     v2::Notice {
         kind: Some(v2::notice::Kind::Evicted(v2::Evicted {
             key: Some(pkey(tokens)),
             tier: tier as i32,
-            generation,
             kind: v2::EvictKind::Removed as i32,
             heir: None,
         })),
@@ -132,7 +130,6 @@ pub fn spilled(to: v2::IndexEntry, from_tier: v2::Tier, from_generation: u64) ->
         kind: Some(v2::notice::Kind::Spilled(v2::Spilled {
             to: Some(to),
             from_tier: from_tier as i32,
-            from_generation,
         })),
     }
 }
@@ -541,7 +538,6 @@ impl Session {
             source: candidate.source.clone(),
             tier: candidate.tier,
             key: candidate.key.clone(),
-            generation: candidate.generation,
             begin_tokens,
             want_row,
             mode: v2::CopyMode::SharedWindows as i32,
@@ -737,7 +733,6 @@ pub fn records_for(
         if end > start_page || last {
             records.push(v2::Record {
                 key: Some(pkey(*token)),
-                generation,
                 first_page: first as u32,
                 pages: pages as u32,
                 row: last && want_row,
@@ -793,7 +788,6 @@ impl Session {
             published_tail_pages: key.consumed_tokens / PAGE_TOKENS
                 - parent.map_or(0, |parent| parent.consumed_tokens / PAGE_TOKENS),
             mode: v2::CopyMode::SharedWindows as i32,
-            generation: 1,
         }))
         .await;
         enum First {

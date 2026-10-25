@@ -104,7 +104,6 @@ async fn a_remote_session_cannot_use_shared_windows() {
         source: Some(v2::SourceRef::default()),
         tier: v2::Tier::Dram as i32,
         key: Some(pool::pkey(1024)),
-        generation: 1,
         begin_tokens: 0,
         want_row: true,
         mode: v2::CopyMode::SharedWindows as i32,
@@ -128,7 +127,6 @@ async fn a_remote_session_cannot_use_shared_windows() {
         bucket: vec![4; 16],
         published_tail_pages: 16,
         mode: v2::CopyMode::SharedWindows as i32,
-        generation: 1,
     }))
     .await;
     let refused = far

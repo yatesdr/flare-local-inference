@@ -31,7 +31,6 @@ pub struct ChainNode {
 pub struct Candidate {
     pub level: Level,
     pub source: SourceId,
-    pub generation: u64,
     pub key: PrefixKey,
     /// The first token this candidate supplies, exact, not necessarily page aligned.
     pub begin_tokens: u64,
@@ -57,7 +56,6 @@ pub struct Request<'a> {
 pub struct Part {
     pub level: Level,
     pub source: SourceId,
-    pub generation: u64,
     /// The first token this part supplies.
     pub begin_tokens: u64,
     /// The last record's key; the part supplies the tokens before it.
@@ -184,7 +182,6 @@ fn part(request: &Request, c: &Candidate, begin: u64, dest_page: usize, row: boo
     Part {
         level: c.level,
         source: c.source,
-        generation: c.generation,
         begin_tokens: begin,
         end: c.key,
         first_page: start - starts[first],
@@ -234,7 +231,6 @@ mod tests {
             Candidate {
                 level,
                 source: SourceId(source),
-                generation: 1,
                 key: self.history.key_at(*ends.last().unwrap()).unwrap(),
                 begin_tokens: 0,
                 skip_pages: 0,

@@ -84,8 +84,6 @@ pub struct ExportId(pub u64);
 pub enum ExportRefusal {
     /// The checkpoint is gone or was never ready.
     NotFound,
-    /// The key was published again under another checkpoint id.
-    GenerationChanged,
     /// The chain is not contiguous from the physical start, or lacks the wanted row.
     ChainGap,
     /// Pinning would leave too little room for running or queued requests.
@@ -100,8 +98,6 @@ pub enum ExportRefusal {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExportNode {
     pub key: PrefixKey,
-    /// The checkpoint id of the record, as the index announced it.
-    pub generation: u64,
     /// The record's own pages in ascending order.
     pub pages: Vec<PageId>,
 }
@@ -134,7 +130,6 @@ pub enum StoreEvent {
     ExportRequested {
         export: ExportId,
         key: PrefixKey,
-        generation: u64,
         begin_tokens: u64,
         want_row: bool,
         /// Bytes of staging the manager reserved for the whole export.
@@ -199,8 +194,6 @@ pub enum StoreReason {
 pub struct Retiring {
     pub tier: PoolTier,
     pub key: PrefixKey,
-    /// The generation the tier announced for the record.
-    pub generation: u64,
     pub parent: Option<PrefixKey>,
     pub bucket: [u8; 16],
     /// Pages the record owns, counted from its parent.
@@ -268,7 +261,7 @@ pub trait HostStore {
     /// A published GPU checkpoint left the cache, including when compaction
     /// removed it as an endpoint; `heir` is the single child that took over its
     /// pages, with its updated publication.
-    fn evicted(&mut self, _key: PrefixKey, _generation: u64, _heir: Option<&PublishedCheckpoint>) {}
+    fn evicted(&mut self, _key: PrefixKey, _heir: Option<&PublishedCheckpoint>) {}
     /// Some eviction notices were dropped because they queued faster than the
     /// worker delivered them, so the announced holdings may be stale and must be
     /// announced again in full.
@@ -283,7 +276,6 @@ pub trait HostStore {
         &mut self,
         _tier: PoolTier,
         _key: PrefixKey,
-        _generation: u64,
         _begin_tokens: u64,
         _want_row: bool,
     ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
