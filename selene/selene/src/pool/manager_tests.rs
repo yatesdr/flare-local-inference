@@ -280,9 +280,8 @@ fn config_on(manager: &Manager, name: &str, gpu: u8, local: bool) -> PoolConfig 
         .unwrap_or_else(|| (PoolAddress::Unix(manager.socket.clone()), None));
     PoolConfig {
         address,
-        tenant: "t".into(),
         ca,
-        scope: Scope::new("t", [7; 32], fingerprint(&geometry), &geometry).unwrap(),
+        scope: Scope::new([7; 32], fingerprint(&geometry), &geometry).unwrap(),
         gpu_uuids: vec![[gpu; 16]],
         export_slots: 2,
         claim_slots: 2,
@@ -365,7 +364,6 @@ pub(super) fn history_of(tokens: u32) -> TestHistory {
 
 fn identity() -> Identity {
     Identity {
-        tenant: "t".into(),
         model: [7; 32],
         layout: fingerprint(&geo()),
     }

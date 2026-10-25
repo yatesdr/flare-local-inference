@@ -207,11 +207,8 @@ pub struct ValidScope {
     pub slices: std::sync::Arc<flare_selene::pool::SliceLayout>,
 }
 
-pub fn validate_scope(scope: Option<&v2::Scope>) -> Option<ValidScope> {
+pub fn validate_scope(scope: Option<&v2::Scope>, pool_name: &str) -> Option<ValidScope> {
     let scope = scope?;
-    if scope.tenant.is_empty() || scope.tenant.len() > 255 {
-        return None;
-    }
     let identity: [u8; 32] = scope.model_identity.as_slice().try_into().ok()?;
     let fingerprint: [u8; 16] = scope.layout_fingerprint.as_slice().try_into().ok()?;
     let geometry = scope.geometry.as_ref()?;
@@ -236,7 +233,7 @@ pub fn validate_scope(scope: Option<&v2::Scope>) -> Option<ValidScope> {
                 row_bytes: rank.row_bytes,
             })
             .collect(),
-        tenant: scope.tenant.clone(),
+        pool_name: pool_name.into(),
     };
     descriptor.validate().ok()?;
     if descriptor.page_bytes() != geometry.page_record_bytes
@@ -257,8 +254,7 @@ pub fn validate_scope(scope: Option<&v2::Scope>) -> Option<ValidScope> {
         page_record_bytes: geometry.page_record_bytes,
         row_record_bytes: geometry.row_record_bytes,
     };
-    let id =
-        flare_selene::pool::scope_id(&scope.tenant, &identity, &fingerprint, &canonical).ok()?;
+    let id = flare_selene::pool::scope_id(pool_name, &identity, &fingerprint, &canonical).ok()?;
     let slices = std::sync::Arc::new(flare_selene::pool::SliceLayout::new(&canonical).ok()?);
     Some(ValidScope {
         id,

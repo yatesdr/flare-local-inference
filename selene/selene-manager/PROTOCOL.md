@@ -14,7 +14,7 @@ the instance side (`flare-selene`, `selene::pool`) implements the other.
    at manager start. `session_incarnation` is assigned by the manager at
    `SessionOpened` from a counter, so a client cannot forge or reuse one.
    `instance_id` is **stable across restarts**: BLAKE2b-128 over the
-   tenant, model identity, layout fingerprint and the sorted UUIDs of the
+   pool name, model identity, layout fingerprint and the sorted UUIDs of the
    instance's GPUs. Instances on one host use disjoint GPUs, so it is unique per
    host. A process is told apart by a random `process_nonce` (fresh per process,
    unchanged across a reconnect) and by the session incarnation. A new session
@@ -127,8 +127,9 @@ up, claims, copies) and a WRITER (puts) on one session. The manager is the index
 the broker of claims and windows, the owner of the shared-memory regions and of
 its own DRAM/NVMe store.
 
-Scope is `(tenant, model_identity, layout_fingerprint, geometry)`, fixed at
-`OpenSession`. The manager keeps one index and one set of claims per `scope_id`;
+Scope is `(pool_name, model_identity, layout_fingerprint, geometry)`. The manager
+supplies its configured name in Hello; OpenSession supplies the model and
+geometry. The manager keeps one index and one set of claims per `scope_id`;
 no message can name another. A claim whose source belongs to another scope is
 `UNKNOWN_SOURCE`, which is what an unknown name answers too. Rank geometry is part
 of the scope, so TP widths never share records.

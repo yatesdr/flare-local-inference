@@ -157,7 +157,6 @@ impl<S: HostStore> PooledStore<S, PoolClient> {
     ) -> Result<Self> {
         let layout = copier.lock().unwrap().layout().clone();
         let identity = Identity {
-            tenant: config.scope.tenant.clone(),
             model: config.scope.model_identity,
             layout: config.scope.layout_fingerprint,
         };

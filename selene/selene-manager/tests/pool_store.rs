@@ -261,8 +261,7 @@ fn rooted(label: &str) -> (std::path::PathBuf, selene_manager::store::Config) {
 
 /// A first manager life that stores `tokens` durably and stops without deleting its store.
 async fn first_life(config: &selene_manager::store::Config, tokens: &[u64]) {
-    let mut first = config.clone();
-    first.name = support::instance_name("first");
+    let first = config.clone();
     let mut host = Host::open_config(first);
     host.start();
     let mut pool = Pool::connect(&host.config.socket).await;
@@ -301,8 +300,7 @@ async fn c4_a_recovered_record_is_served_from_nvme_with_its_persisted_checksums(
     let (base, config) = rooted("c4");
     let tokens = [1024u64, 2048];
     first_life(&config, &tokens).await;
-    let mut second = config.clone();
-    second.name = support::instance_name("second");
+    let second = config.clone();
     let mut host = Host::open_config(second);
     host.start();
     let mut pool = Pool::connect(&host.config.socket).await;
@@ -339,8 +337,7 @@ async fn a_requesters_stream_that_blips_keeps_the_manager_windows_until_it_repor
     let (base, config) = rooted("blip");
     let tokens = [1024u64];
     first_life(&config, &tokens).await;
-    let mut second = config.clone();
-    second.name = support::instance_name("second");
+    let second = config.clone();
     let mut host = Host::open_config(second);
     host.start();
     let mut pool = Pool::connect(&host.config.socket).await;
@@ -389,8 +386,7 @@ async fn a_requesters_stream_that_blips_keeps_the_manager_windows_until_it_repor
 async fn a8_damage_at_rest_never_reaches_a_restore() {
     let (base, config) = rooted("a8");
     first_life(&config, &[1024]).await;
-    let mut second = config.clone();
-    second.name = support::instance_name("second");
+    let second = config.clone();
     let mut host = Host::open_config(second);
     host.start();
     let mut pool = Pool::connect(&host.config.socket).await;
@@ -399,7 +395,7 @@ async fn a8_damage_at_rest_never_reaches_a_restore() {
     // A bit flips at rest after recovery and before the record is first read. The
     // manager serves the checksums it persisted, so the requester can tell.
     let mut scoped = descriptor();
-    scoped.tenant = "tenant".into();
+    scoped.pool_name = config.name.clone();
     let file = config
         .root
         .as_ref()

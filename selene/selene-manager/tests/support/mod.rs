@@ -82,7 +82,7 @@ pub fn descriptor() -> Descriptor {
             planes: vec![4000],
             row_bytes: 1000,
         }],
-        tenant: "tenant".into(),
+        pool_name: "tenant".into(),
     }
 }
 

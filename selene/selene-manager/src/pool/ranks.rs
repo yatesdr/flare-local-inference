@@ -326,7 +326,6 @@ mod tests {
 
     fn scope(world: usize) -> v2::Scope {
         v2::Scope {
-            tenant: "t".into(),
             model_identity: vec![1; 32],
             layout_fingerprint: vec![2; 16],
             geometry: Some(v2::Geometry {

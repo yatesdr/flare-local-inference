@@ -664,11 +664,7 @@ impl NativeModel {
         };
         let peers = if let Some(cluster) = self.cluster() {
             agree.pool(crate::offload::shard::PoolOffer {
-                tenant: options
-                    .prefix_cache
-                    .pool
-                    .as_ref()
-                    .map(|pool| pool.tenant.clone()),
+                enabled: options.prefix_cache.pool.is_some(),
                 identity: if options.prefix_cache.pool.is_some() {
                     super::model::offload_identity(&self.server_config)?
                 } else {

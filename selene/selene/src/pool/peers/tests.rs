@@ -3,7 +3,7 @@ use std::io::Write;
 
 fn offer(rank: usize, enabled: bool) -> PoolOffer {
     PoolOffer {
-        tenant: enabled.then(|| "tenant".into()),
+        enabled,
         identity: [3; 32],
         layout: [4; 16],
         rank,
@@ -13,7 +13,7 @@ fn offer(rank: usize, enabled: bool) -> PoolOffer {
 }
 
 #[test]
-fn pool_agreement_checks_identity_layout_tenant_world_and_rank_bindings() {
+fn pool_agreement_checks_identity_layout_world_and_rank_bindings() {
     let zero = offer(0, true);
     let peer = offer(1, true);
     let good = vec![zero.encode(), peer.encode()];
@@ -23,11 +23,7 @@ fn pool_agreement_checks_identity_layout_tenant_world_and_rank_bindings() {
     );
     for bad in [
         PoolOffer {
-            tenant: None,
-            ..peer.clone()
-        },
-        PoolOffer {
-            tenant: Some("other".into()),
+            enabled: false,
             ..peer.clone()
         },
         PoolOffer {

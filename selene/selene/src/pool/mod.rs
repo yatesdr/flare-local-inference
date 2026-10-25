@@ -47,7 +47,7 @@ mod types;
 
 pub use budget::Budget;
 pub use builder::{PoolBuilder, PreparedPool};
-pub use options::{PoolOptions, DEFAULT_POOL_TENANT, parse_pool_address, parse_pool_tenant};
+pub use options::{PoolOptions, parse_pool_address};
 use options::{pool_address, pool_scope};
 pub use records::DeferredRecords;
 pub use agent::{AgentConfig, RankAgent, RankRecords};

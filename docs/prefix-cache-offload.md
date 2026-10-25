@@ -604,8 +604,8 @@ Offload limits interference through bounded work and explicit ownership:
   the GPU has already lost; the derived default's lower clamp exists for the
   staging minimum, and the sizing guidance for operators is a pool whose row
   slabs exceed the GPU's state rows.
-- Pool: `--prefix-cache-pool ADDRESS`, `--prefix-cache-pool-tenant NAME` and
-  `--prefix-cache-pool-ca FILE`, the tenant and the CA only with the pool; see
+- Pool: `--prefix-cache-pool ADDRESS` and `--prefix-cache-pool-ca FILE`,
+  the CA only with the pool; see
   [section 2.15](#215-sharing-through-a-pool). Unset, the instance uses its
   local tiers only.
 - `LoadOptions` gains `prefix_cache: PrefixCacheOffload` with the resolved
@@ -783,13 +783,13 @@ memory its transfers may still use.
 
 ### 2.15 Sharing through a pool
 
-`--prefix-cache-pool ADDRESS` and `--prefix-cache-pool-tenant NAME` attach the
-instance to a pool manager, at `unix:PATH` on this host, TLS `HOST:PORT`, or
+`--prefix-cache-pool ADDRESS` attaches the instance to a pool manager, at
+`unix:PATH` on this host, TLS `HOST:PORT`, or
 explicit plaintext `plain:HOST:PORT`. Network ports must be from 1 through
-65535; IPv6 hosts use brackets (`[::1]:7000`, `plain:[::1]:7000`). The
-tenant requires the pool and defaults to `default`; it scopes
-what the manager shares, so nothing crosses tenants. Without the pool flag none
-of the sharing code below runs: the worker builds no pool lookup history and
+65535; IPv6 hosts use brackets (`[::1]:7000`, `plain:[::1]:7000`). The manager's
+`--name` salts scope and instance identities; clients learn it from Hello. A
+renamed pool has a distinct namespace, so its cache starts cold. Without the
+pool flag none of the sharing code below runs: the worker builds no pool lookup history and
 sees no export requests. Local and pooled instances use the same GPU write-back
 and eviction policy from section 2.10. A pooled instance still reads
 its own memory and disk tiers first; the pool supplies what they lack.
@@ -900,10 +900,9 @@ Loading attaches the pool to the local tiers, if any, as a `PooledStore`; with
 no memory or disk tier every restore comes from the pool. The pool has its own
 copier, a third set of rank threads that names the manager's shared-memory
 windows by host address, so the registrar for those regions refuses any
-registration whose device address differs from its host address. The tenant
-defaults to `default`, because the protocol requires a nonempty one. The
-scope is the tenant, the model identity, the layout fingerprint and the
-per-rank plane sizes, so instances share only identical record layouts, and
+registration whose device address differs from its host address. The manager's
+pool name, model identity, layout fingerprint and per-rank plane sizes define
+the scope, so instances share only identical record layouts, and
 the instance id comes from the GPUs' UUIDs and is stable across restarts.
 
 The instance holds no pool staging of its own: the manager's regions are its

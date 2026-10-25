@@ -5757,7 +5757,7 @@ mod tests {
                 planes: vec![4000],
                 row_bytes: 1000,
             }],
-            tenant: String::new(),
+            pool_name: String::new(),
         }
     }
 
@@ -6519,7 +6519,7 @@ mod tests {
         let (mut store, directory) = store("multi-sub");
         let first = descriptor();
         let mut second = descriptor();
-        second.tenant = "tenant-b".to_string();
+        second.pool_name = "tenant-b".to_string();
         store.remote_hello(1, "near").unwrap();
         let generation = store.sessions[&1].generation;
         let (sender_a, mut receiver_a) = tokio::sync::mpsc::channel(8);

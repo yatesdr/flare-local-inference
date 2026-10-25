@@ -12,7 +12,6 @@ fn test_directory() -> PathBuf {
 fn pool(address: &str) -> PoolOptions {
     PoolOptions {
         address: address.into(),
-        tenant: DEFAULT_POOL_TENANT.into(),
         ca: None,
     }
 }

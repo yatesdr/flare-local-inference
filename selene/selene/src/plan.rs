@@ -9,7 +9,6 @@ use crate::{Error, History, PrefixKey, Result};
 /// it so every part is validated against the same identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Identity {
-    pub tenant: String,
     pub model: [u8; 32],
     pub layout: [u8; 16],
 }
@@ -209,7 +208,6 @@ mod tests {
             Self {
                 history,
                 identity: Identity {
-                    tenant: "t".into(),
                     model: [7; 32],
                     layout: [1; 16],
                 },

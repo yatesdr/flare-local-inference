@@ -638,7 +638,7 @@ fn proto_descriptor(value: &Descriptor) -> proto::Descriptor {
             .collect(),
         page_record_bytes: value.page_bytes(),
         row_record_bytes: value.row_bytes(),
-        tenant: value.tenant.clone(),
+        pool_name: value.pool_name.clone(),
     }
 }
 
@@ -665,7 +665,7 @@ fn record_descriptor(value: proto::Descriptor) -> Result<Descriptor> {
                 row_bytes: rank.row_bytes,
             })
             .collect(),
-        tenant: value.tenant,
+        pool_name: value.pool_name,
     };
     descriptor.validate()?;
     if value.page_record_bytes != descriptor.page_bytes()
@@ -840,6 +840,33 @@ mod tests {
     fn base(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("selene-disk-{}-{label}", std::process::id()))
     }
+    #[test]
+    fn older_descriptors_keep_their_explicit_or_absent_salt() {
+        let value = Descriptor {
+            identity: [7; 32],
+            fingerprint: [3; 16],
+            page_tokens: 64,
+            ranks: vec![record::RankSizes {
+                planes: vec![4000],
+                row_bytes: 1000,
+            }],
+            pool_name: String::new(),
+        };
+        let mut legacy = proto_descriptor(&value).encode_to_vec();
+        let absent =
+            record_descriptor(proto::Descriptor::decode(legacy.as_slice()).unwrap()).unwrap();
+        assert_eq!(absent, value);
+        // Former tenant string at field 7, unchanged in persisted descriptors.
+        legacy.extend_from_slice(b"\x3a\x06legacy");
+        let restored =
+            record_descriptor(proto::Descriptor::decode(legacy.as_slice()).unwrap()).unwrap();
+        assert_eq!(restored.pool_name, "legacy");
+        assert_eq!(
+            restored.namespace_id(),
+            record::namespace_id(&value.identity, &value.fingerprint, "legacy")
+        );
+    }
+
     #[test]
     fn disk_queue_read_write_interleave() {
         let base = base("disk");

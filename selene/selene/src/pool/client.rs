@@ -50,7 +50,6 @@ pub enum PoolAddress {
 /// Built from the flags for the startup connection.
 pub struct PoolConfig {
     pub address: PoolAddress,
-    pub tenant: String,
     /// A CA certificate file. When set the connection must be TLS.
     pub ca: Option<PathBuf>,
     /// Model identity, layout fingerprint and record geometry.
@@ -176,28 +175,11 @@ impl PoolClient {
                 "the number of rank links does not match the scope's rank count",
             ));
         }
-        if config.tenant.is_empty() || config.tenant != config.scope.tenant {
-            return Err(Error::new(
-                "the pool tenant must be set and equal the scope's",
-            ));
-        }
         if config.ca.is_some() && !matches!(config.address, PoolAddress::Tcp(_)) {
             return Err(Error::new(
                 "a CA certificate applies to an encrypted network address",
             ));
         }
-        let scope_id = identity::scope_id(
-            &config.scope.tenant,
-            &config.scope.model_identity,
-            &config.scope.layout_fingerprint,
-            &config.scope.geometry,
-        )?;
-        let instance_id = identity::instance_id(
-            &config.scope.tenant,
-            &config.scope.model_identity,
-            &config.scope.layout_fingerprint,
-            &config.gpu_uuids,
-        );
         let wake = Arc::new(Notify::new());
         let shared = Shared::new(wake.clone());
         shared.set_status(PoolStatus::Connecting);
@@ -209,10 +191,12 @@ impl PoolClient {
         };
         let fingerprint = config.scope.layout_fingerprint;
         let settings = Arc::new(Settings {
-            instance_id,
+            instance_id: [0; 16],
             nonce: identity::process_nonce()?,
             scope: config.scope,
-            scope_id,
+            scope_id: [0; 32],
+            pool_name: None,
+            gpu_uuids: config.gpu_uuids,
             export_slots: config.export_slots,
             claim_slots: config.claim_slots,
             context: config.registration_context,
@@ -232,7 +216,6 @@ impl PoolClient {
                 super::engine::ranks::Identity {
                     secret,
                     nonce: settings.nonce,
-                    instance_id: settings.instance_id,
                     fingerprint,
                     gpus: gpu_uuids,
                 },

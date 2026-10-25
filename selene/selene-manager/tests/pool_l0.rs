@@ -96,7 +96,7 @@ async fn h7_malformed_scopes_are_refused() {
     host.start();
     let mut pool = Pool::connect(&host.config.socket).await;
     for mutate in [
-        (|scope: &mut v2::Scope| scope.tenant.clear()) as fn(&mut v2::Scope),
+        (|scope: &mut v2::Scope| scope.layout_fingerprint.clear()) as fn(&mut v2::Scope),
         |scope| scope.geometry.as_mut().unwrap().page_record_bytes = 4000,
         |scope| scope.geometry.as_mut().unwrap().row_record_bytes = 0,
         |scope| scope.geometry.as_mut().unwrap().ranks.clear(),
@@ -124,7 +124,7 @@ async fn h8_scopes_never_see_each_other() {
     let mut pool_b = Pool::connect(&host.config.socket).await;
     let a = Ident::new("a");
     let mut b = Ident::new("b");
-    b.scope = pool::scope_for("other-tenant", 7);
+    b.scope = pool::scope_for(8);
     let mut sa = source(&mut pool_a, &a).await;
     let mut sb = source(&mut pool_b, &b).await;
     assert_ne!(sa.opened.scope_id, sb.opened.scope_id);

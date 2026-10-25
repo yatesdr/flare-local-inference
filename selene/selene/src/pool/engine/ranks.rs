@@ -153,7 +153,6 @@ struct Peer {
 pub(crate) struct Identity {
     pub secret: [u8; 32],
     pub nonce: [u8; 16],
-    pub instance_id: [u8; 16],
     pub fingerprint: [u8; 16],
     /// The GPUs of the instance; an agent's must be one of them.
     pub gpus: Vec<[u8; 16]>,
@@ -162,7 +161,7 @@ pub(crate) struct Identity {
 pub(crate) struct Ranks {
     pub layout: Arc<SliceLayout>,
     secret: [u8; 32],
-    instance_id: [u8; 16],
+    instance_id: Option<[u8; 16]>,
     fingerprint: [u8; 16],
     /// The GPUs of the instance; an agent's must be one of them.
     gpus: Vec<[u8; 16]>,
@@ -225,7 +224,6 @@ impl Ranks {
         let Identity {
             secret,
             nonce,
-            instance_id,
             fingerprint,
             gpus,
         } = who;
@@ -253,13 +251,26 @@ impl Ranks {
         Ok(Self {
             layout,
             secret,
-            instance_id,
+            instance_id: None,
             fingerprint,
             gpus,
             peers,
             next_xfer: 0,
             xfers: HashMap::new(),
         })
+    }
+
+    pub(crate) fn bind(&mut self, instance_id: [u8; 16]) {
+        if self.instance_id.replace(instance_id).is_none() {
+            for peer in &self.peers {
+                if matches!(peer.state, State::Bound) {
+                    peer.end.send(Msg::Bind(link::Bind {
+                        rank_secret: self.secret.to_vec(),
+                        instance_id: instance_id.to_vec(),
+                    }));
+                }
+            }
+        }
     }
 
     pub(crate) fn world(&self) -> usize {
@@ -405,13 +416,17 @@ impl Ranks {
                     );
                 }
                 self.peers[index].state = State::Bound;
-                self.peers[index].end.send(Msg::Bind(link::Bind {
-                    rank_secret: self.secret.to_vec(),
-                    instance_id: self.instance_id.to_vec(),
-                }));
+                if let Some(instance_id) = self.instance_id {
+                    self.peers[index].end.send(Msg::Bind(link::Bind {
+                        rank_secret: self.secret.to_vec(),
+                        instance_id: instance_id.to_vec(),
+                    }));
+                }
             }
             Msg::Attached(attached) => {
-                if matches!(self.peers[index].state, State::Greeting | State::Lost) {
+                if self.instance_id.is_none()
+                    || matches!(self.peers[index].state, State::Greeting | State::Lost)
+                {
                     return self.lose(
                         index,
                         format!("rank {rank} attached before its hello"),
@@ -642,5 +657,71 @@ impl super::Engine {
             return self.quarantine();
         }
         self.put_drive_now(put);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pool::{Geometry, RankPlanes, rank::memory_links};
+    use std::time::Duration;
+
+    #[test]
+    fn an_agent_is_bound_only_after_hello_names_the_pool() {
+        let (zero, mut agent) = memory_links();
+        let layout = Arc::new(
+            SliceLayout::new(&Geometry {
+                page_tokens: 64,
+                ranks: vec![
+                    RankPlanes {
+                        plane_bytes: vec![4096],
+                        row_bytes: 4096
+                    };
+                    2
+                ],
+                page_record_bytes: 8192,
+                row_record_bytes: 8192,
+            })
+            .unwrap(),
+        );
+        let mut ranks = Ranks::new(
+            RankSet { links: vec![zero] },
+            layout,
+            Identity {
+                secret: [1; 32],
+                nonce: [2; 16],
+                fingerprint: [3; 16],
+                gpus: vec![[4; 16]],
+            },
+            Arc::new(Notify::new()),
+        )
+        .unwrap();
+        agent
+            .receiver
+            .recv(Duration::from_secs(2))
+            .unwrap()
+            .unwrap(); // Rank-zero Hello.
+        let mut events = Vec::new();
+        ranks.message(
+            0,
+            Msg::AgentHello(link::AgentHello {
+                rank: 1,
+                world: 2,
+                layout: vec![3; 16],
+                gpu_uuid: vec![4; 16],
+                agent_nonce: vec![5; 16],
+            }),
+            &mut events,
+        );
+        assert!(events.is_empty());
+        assert!(agent.receiver.recv(Duration::ZERO).unwrap().is_none());
+        ranks.bind([6; 16]);
+        let frame = agent
+            .receiver
+            .recv(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let bound = crate::pool::rank::decode(&frame).unwrap();
+        assert!(matches!(bound, Msg::Bind(bind) if bind.instance_id == vec![6; 16]));
     }
 }

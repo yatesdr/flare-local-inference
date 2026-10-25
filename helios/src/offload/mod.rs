@@ -22,9 +22,7 @@ mod registrar;
 pub mod shard;
 pub mod transfer;
 
-pub use flare_selene::pool::{
-    DEFAULT_POOL_TENANT, PoolOptions, parse_pool_address, parse_pool_tenant,
-};
+pub use flare_selene::pool::{PoolOptions, parse_pool_address};
 pub use flare_selene::{
     CacheGeometry, ExportChain, ExportId, ExportNode, ExportRefusal, HostHit,
     INITIAL_MEMORY_RATE, INITIAL_PREFILL_RATE, INITIAL_STAGED_DISK_RATE,

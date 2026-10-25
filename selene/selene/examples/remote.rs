@@ -343,7 +343,6 @@ fn main() {
         (copier, None)
     };
     let identity = Identity {
-        tenant: "remote".into(),
         model: [7; 32],
         layout: fingerprint(&geo),
     };
@@ -354,9 +353,8 @@ fn main() {
             } else {
                 PoolAddress::TcpPlaintext(o.address.clone())
             },
-            tenant: "remote".into(),
             ca: o.ca.clone(),
-            scope: Scope::new("remote", [7; 32], fingerprint(&geo), &geo).unwrap(),
+            scope: Scope::new([7; 32], fingerprint(&geo), &geo).unwrap(),
             gpu_uuids: vec![[o.gpu; 16]],
             export_slots: 2,
             claim_slots: 2,
