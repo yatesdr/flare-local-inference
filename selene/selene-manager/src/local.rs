@@ -232,7 +232,6 @@ struct Connection {
     reported: bool,
     closed: bool,
     windows: HashMap<(u64, u32), Window>,
-    armed: u64,
 }
 
 /// Who owns a session's windows. Sessions of instances on other hosts have no local pidfd and
@@ -547,7 +546,6 @@ impl Local {
                 reported: false,
                 closed: false,
                 windows: HashMap::new(),
-                armed: 0,
             },
         );
         // A process of the previous run that reconnects has drained what it did under the
@@ -957,46 +955,6 @@ impl Local {
             Region::Arena => self.arena.can_allocate(bytes),
             Region::Staging => self.staging.can_allocate(bytes),
         }
-    }
-
-    /// Remembers the largest reservation refused `BUDGET` on this connection.
-    /// Replaces the armed reservation. The store arms the most recent refusal
-    /// for the connection, so a smaller later requirement must replace an
-    /// older, unserviceable one rather than being ignored.
-    pub fn arm_budget(&mut self, connection: u64, bytes: u64) {
-        if let Some(record) = self.connections.get_mut(&connection) {
-            record.armed = bytes;
-        }
-    }
-
-    pub fn armed_budget(&self, connection: u64) -> Option<u64> {
-        self.connections
-            .get(&connection)
-            .map(|record| record.armed)
-            .filter(|bytes| *bytes != 0)
-    }
-
-    /// Clears and returns the armed reservation without checking capacity. The
-    /// store uses this when it has already accounted for eviction and region
-    /// requirements itself.
-    pub fn take_armed(&mut self, connection: u64) -> Option<u64> {
-        let record = self.connections.get_mut(&connection)?;
-        let bytes = record.armed;
-        record.armed = 0;
-        (bytes != 0).then_some(bytes)
-    }
-
-    /// Returns the armed reservation once capacity can admit it, clearing the arming.
-    /// The caller emits `Room`; this never allocates.
-    pub fn take_room(&mut self, connection: u64) -> Option<u64> {
-        let bytes = self.armed_budget(connection)?;
-        if !self.can_admit(bytes) {
-            return None;
-        }
-        if let Some(record) = self.connections.get_mut(&connection) {
-            record.armed = 0;
-        }
-        Some(bytes)
     }
 
     fn pid(&self, connection: u64) -> std::result::Result<Option<u32>, GrantError> {
@@ -1973,25 +1931,4 @@ mod tests {
         assert_eq!(&local.window_bytes(1, 1, 0).unwrap()[..4], b"map!");
     }
 
-    #[test]
-    fn armed_budget_turns_into_room_once_capacity_frees() {
-        let name = instance("room");
-        let (mut local, _cleanup) = local(&name, 8192, 4096);
-        local.accept(1, std::process::id()).unwrap();
-        local
-            .grant_put(1, 1, 0, Region::Arena, shape(1, false))
-            .unwrap();
-        local
-            .grant_put(1, 1, 1, Region::Arena, shape(1, false))
-            .unwrap();
-        // Fill staging too so no region can admit the armed reservation.
-        local.grant_get_staging(1, 2, 0, shape(1, false)).unwrap();
-        assert_eq!(local.armed_budget(1), None);
-        local.arm_budget(1, 4096);
-        assert_eq!(local.armed_budget(1), Some(4096));
-        assert_eq!(local.take_room(1), None);
-        local.release(1, 1, 0).unwrap();
-        assert_eq!(local.take_room(1), Some(4096));
-        assert_eq!(local.armed_budget(1), None);
-    }
 }

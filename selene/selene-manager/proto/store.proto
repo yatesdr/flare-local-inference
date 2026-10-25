@@ -34,9 +34,9 @@ message CatalogEntry {
 
 message SnapshotBegin { uint64 seq0 = 1; }
 message SnapshotEnd {}
-message Room { uint64 bytes = 1; }
 
 message CatalogEvent {
+  reserved 8;
   uint64 sequence = 1;              // +1 per emitted event in this stream
   oneof event {
     SnapshotBegin snapshot_begin = 2;
@@ -45,6 +45,5 @@ message CatalogEvent {
     CatalogEntry added = 5;
     CatalogEntry changed = 6;       // tier/durable/row/unreadable; never geometry
     Key removed = 7;                // exactly one node, never cascaded
-    Room room = 8;                  // this connection's armed reservation fits
   }
 }

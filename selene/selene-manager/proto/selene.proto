@@ -354,6 +354,7 @@ message ClientMessage {
 }
 
 message ServerMessage {
+  reserved 44;
   Header header = 1;
   oneof m {
     SessionOpened opened = 2;
@@ -381,7 +382,6 @@ message ServerMessage {
     PutGrant put_grant = 41;
     Stored stored = 42;
     PutRefused put_refused = 43;
-    Room room = 44;
   }
 }
 
@@ -1214,11 +1214,6 @@ message PutRefused {
   Reason reason = 2;
   string detail = 3;
 }
-
-// The manager has room again after a put was refused BUDGET. Informational for
-// later eviction attempts only: a refused put is not retried on Room; the record
-// has already moved to the next tier. Pushed once, never periodically.
-message Room { uint64 bytes = 1; }
 
 // ---------------------------------------------------------------------------
 // Rank agents: instances whose tensor-parallel ranks are separate processes
