@@ -1840,9 +1840,13 @@ impl Core {
             let status =
                 v2::ExportEndStatus::try_from(m.status).unwrap_or(v2::ExportEndStatus::Unspecified);
             // A relayed source's last windows may still be on the channel when its
-            // ExportEnd arrives; the channel reports any that never come.
+            // ExportEnd arrives; the channel reports any that never come. So may the last
+            // windows of a multi-process source's channel ranks: rank 0 ends the export once
+            // every rank has finished, and a leg's bytes can still be in the manager's
+            // handler. The leg's close fails the claim if any window never arrived.
             let finished = status == v2::ExportEndStatus::ExportComplete
                 && (claim.source_channel.is_some()
+                    || claim.mp.legs.iter().any(|leg| leg.source && !leg.ch.exited)
                     || claim.windows.iter().all(|window| {
                         // A window in the assembly pass has been filled, too.
                         window.arrived || matches!(window.phase, Phase::RequesterRead | Phase::Free)
@@ -3175,5 +3179,49 @@ mod tests {
         core.agent_gone(AGENT_1);
         assert_eq!(core.claims[&key].state, v2::ClaimState::Failed);
         assert_eq!(core.claims[&key].reason, v2::ClaimReason::RankLost);
+    }
+
+    fn ending_source(core: &mut Core, leg_exited: bool) -> ClaimKey {
+        let key = ranked(core, Phase::SourceWrite);
+        let claim = core.claims.get_mut(&key).unwrap();
+        claim.source_proc = Some((INSTANCE, NONCE));
+        claim.export_id = 7;
+        claim.export = ExportState::Pinned;
+        claim.windows[0].readers = 0;
+        // Rank 2's slices are still to come from its data channel.
+        claim.windows[0].writers = 0b100;
+        claim.mp.legs[0].source = true;
+        claim.mp.legs[0].ch.exited = leg_exited;
+        core.exports.insert(7, key);
+        key
+    }
+
+    fn complete_export() -> v2::ExportEnd {
+        v2::ExportEnd {
+            export_id: 7,
+            status: v2::ExportEndStatus::ExportComplete as i32,
+            fence: v2::FenceOutcome::Drained as i32,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_export_that_ends_before_a_rank_legs_last_bytes_are_handled_does_not_fail_the_claim()
+    {
+        let (mut core, _out) = core();
+        let key = ending_source(&mut core, false);
+        core.export_end(1, complete_export()).unwrap();
+        assert!(
+            !core.claims[&key].is_terminal(),
+            "the leg's channel reports any window that never comes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_export_that_ends_with_a_window_missing_and_no_leg_left_to_deliver_it_fails_the_claim()
+     {
+        let (mut core, _out) = core();
+        let key = ending_source(&mut core, true);
+        core.export_end(1, complete_export()).unwrap();
+        assert_eq!(core.claims[&key].reason, v2::ClaimReason::CopyError);
     }
 }
