@@ -39,9 +39,6 @@ impl crate::store::TierStore for Hooks {
         self.0.lock().unwrap().push(format!("pin {tier:?}"));
         Err(ExportRefusal::ChainGap)
     }
-    fn closest_tier(&self) -> Option<Tier> {
-        Some(Tier::Memory)
-    }
     fn cascade(&mut self) {
         self.0.lock().unwrap().push("cascade".into());
     }
@@ -68,7 +65,6 @@ fn the_tiers_beneath_a_pooled_store_receive_every_pool_hook() {
         consumed_tokens: 64,
         digest: [1; 16],
     };
-    assert_eq!(tiers.closest_tier(), Some(Tier::Memory));
     tiers.cascade();
     tiers.set_spill(true);
     assert!(tiers.take_retiring().is_empty());
@@ -89,7 +85,6 @@ fn the_tiers_beneath_a_pooled_store_receive_every_pool_hook() {
     );
     // With no tiers there is nothing to reach.
     let mut none = Tiers::new(None);
-    assert_eq!(none.closest_tier(), None);
     none.cascade();
     assert!(none.take_retiring().is_empty());
     assert!(matches!(

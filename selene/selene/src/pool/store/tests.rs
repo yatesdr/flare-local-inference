@@ -115,9 +115,6 @@ impl crate::store::TierStore for FakeLocal {
             None => Ok(Box::new(NoPin(key))),
         }
     }
-    fn closest_tier(&self) -> Option<Local> {
-        Some(Local::Memory)
-    }
     fn cascade(&mut self) {
         self.0.lock().unwrap().cascaded = true;
     }

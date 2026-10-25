@@ -33,7 +33,9 @@
 //! have landed; when the parent's own write fails, those children fail too,
 //! because their memory copies hold only their tail pages.
 
+#[cfg(test)]
 use crate::store::TierStore;
+
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -1352,9 +1354,6 @@ impl crate::store::TierStore for CompositeStore {
         }
         chain.reverse();
         self.memory.pin_export_chain(&chain, begin_tokens, want_row)
-    }
-    fn closest_tier(&self) -> Option<Tier> {
-        Some(Tier::Memory)
     }
     fn cascade(&mut self) {
         self.pooled = true;

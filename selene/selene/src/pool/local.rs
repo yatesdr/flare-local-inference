@@ -102,9 +102,6 @@ impl crate::store::TierStore for Tiers {
             None => Err(ExportRefusal::NotFound),
         }
     }
-    fn closest_tier(&self) -> Option<Tier> {
-        self.0.as_ref().and_then(|tiers| tiers.closest_tier())
-    }
     fn cascade(&mut self) {
         if let Some(tiers) = &mut self.0 {
             tiers.cascade();

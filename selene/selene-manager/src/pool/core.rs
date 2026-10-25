@@ -26,13 +26,13 @@ use tokio::sync::{mpsc, oneshot};
 /// What a data-channel transfer belongs to.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ChanOwner {
-    /// A peer rank's leg of a claim; the index is into the claim's `mp.legs`.
+    /// A peer rank's leg of a claim; the index is into the claim's `legs`.
     ClaimRank(ClaimKey, usize),
     Claim(ClaimKey),
     /// The source leg of a claim relayed through the manager.
     Source(ClaimKey),
     Put(PutKey),
-    /// A peer rank's leg of a put; the index is into the put's `mp.legs`.
+    /// A peer rank's leg of a put; the index is into the put's `legs`.
     PutRank(PutKey, usize),
 }
 

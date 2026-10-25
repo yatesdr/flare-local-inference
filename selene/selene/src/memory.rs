@@ -27,7 +27,9 @@
 //! supplies chains, and `fetch_chain` reads page counts from the slabs. Such a
 //! store answers no lookups of its own.
 
+#[cfg(test)]
 use crate::store::TierStore;
+
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, PoisonError},
@@ -1406,9 +1408,6 @@ impl crate::store::TierStore for MemoryStore {
         }
         let chain = self.export_chain(&key, begin_tokens)?;
         self.pin_export_chain(&chain, begin_tokens, want_row)
-    }
-    fn closest_tier(&self) -> Option<Tier> {
-        Some(Tier::Memory)
     }
     fn set_spill(&mut self, enabled: bool) {
         self.core.spill = enabled && !self.core.flat && self.announce.is_some();
