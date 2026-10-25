@@ -180,27 +180,7 @@ impl Core {
             }
             boundaries.push(key);
         }
-        let mut order: Vec<v2::Level> = Vec::new();
-        for value in &request.level_order {
-            match v2::Level::try_from(*value) {
-                Ok(v2::Level::ThisGpu) => {}
-                Ok(
-                    level @ (v2::Level::NeighbourGpu
-                    | v2::Level::HostDram
-                    | v2::Level::HostNvme
-                    | v2::Level::RemoteNvme),
-                ) => {
-                    if order.contains(&level) {
-                        return (S::LookupInvalid, vec![]);
-                    }
-                    order.push(level);
-                }
-                _ => return (S::LookupInvalid, vec![]),
-            }
-        }
-        if order.len() != 4 {
-            return (S::LookupInvalid, vec![]);
-        }
+        let order = [v2::Level::NeighbourGpu, v2::Level::HostDram, v2::Level::HostNvme, v2::Level::RemoteNvme];
         let mut held: Vec<(v2::Level, Key)> = Vec::new();
         for range in &request.held {
             let (Ok(level), Ok(end)) = (

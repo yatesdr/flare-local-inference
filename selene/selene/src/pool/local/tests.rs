@@ -57,19 +57,6 @@ impl HostStore for Hooks {
             .push(format!("pin {tier:?} {generation}"));
         Err(ExportRefusal::GenerationChanged)
     }
-    fn probe(
-        &mut self,
-        tier: Tier,
-        _: &Scratch,
-        pages: usize,
-        _: bool,
-    ) -> crate::Result<Option<std::time::Duration>> {
-        self.0
-            .lock()
-            .unwrap()
-            .push(format!("probe {tier:?} {pages}"));
-        Ok(Some(std::time::Duration::from_micros(7)))
-    }
 }
 
 #[test]
@@ -89,14 +76,6 @@ fn the_tiers_beneath_a_pooled_store_receive_every_pool_hook() {
         tiers.pin_export(crate::pool::Tier::Dram, key, 9, 0, true),
         Err(ExportRefusal::GenerationChanged)
     ));
-    let scratch = Scratch {
-        pages: Vec::new(),
-        slot: crate::StateSlotId(1),
-    };
-    assert_eq!(
-        tiers.probe(Tier::Memory, &scratch, 4, false).unwrap(),
-        Some(std::time::Duration::from_micros(7))
-    );
     assert_eq!(
         *hooks.0.lock().unwrap(),
         [
@@ -104,8 +83,7 @@ fn the_tiers_beneath_a_pooled_store_receive_every_pool_hook() {
             "spill true",
             "take_retiring",
             "retired Dram Moved",
-            "pin Dram 9",
-            "probe Memory 4"
+            "pin Dram 9"
         ]
     );
     // With no tiers there is nothing to reach.
@@ -117,5 +95,4 @@ fn the_tiers_beneath_a_pooled_store_receive_every_pool_hook() {
         none.pin_export(crate::pool::Tier::Dram, key, 9, 0, true),
         Err(ExportRefusal::NotFound)
     ));
-    assert_eq!(none.probe(Tier::Memory, &scratch, 4, false).unwrap(), None);
 }

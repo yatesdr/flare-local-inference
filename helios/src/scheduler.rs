@@ -159,8 +159,6 @@ pub struct SchedulerStats {
     pub inbound_waiting: usize,
     /// Growable requests finished early to free KV pages and requeued by the runtime.
     pub preemptions: u64,
-    /// Page ids withheld for good because a copy into them could not be shown to have stopped.
-    pub quarantined_pages: usize,
 }
 
 #[derive(Clone)]
@@ -674,7 +672,6 @@ pub struct RequestScheduler {
     track_evictions: bool,
     evictions: Vec<EvictedCheckpoint>,
     evictions_lost: bool,
-    quarantined_pages: usize,
     admissions: u64,
 }
 
@@ -751,7 +748,6 @@ impl RequestScheduler {
             track_evictions: false,
             evictions: Vec::new(),
             evictions_lost: false,
-            quarantined_pages: 0,
             admissions: 0,
         })
     }
@@ -1059,7 +1055,6 @@ impl RequestScheduler {
     pub fn stats(&self) -> SchedulerStats {
         let cache = self.cache.stats();
         SchedulerStats {
-            quarantined_pages: self.quarantined_pages,
             active_requests: self
                 .slots
                 .iter()

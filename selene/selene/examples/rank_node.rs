@@ -27,7 +27,7 @@ use std::{
 use flare_selene::{
     CacheGeometry, History, HostRegistrar, Job, Layout, PageCopier, PageId, Registration, Reply,
     Result, SplitMapping, StateSlotId,
-    characterize::Ranking,
+    levels::Ranking,
     geometry::fingerprint,
     plan::{self, Identity, Request},
     pool::{
@@ -320,7 +320,7 @@ fn config(args: &Args, name: &str, gpus: Vec<[u8; 16]>) -> PoolConfig {
         gpu_uuids: gpus,
         export_slots: 2,
         claim_slots: 2,
-        level_order: None,
+
         registration_context: 0,
         approve: None,
     }

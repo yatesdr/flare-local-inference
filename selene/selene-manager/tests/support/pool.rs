@@ -561,7 +561,7 @@ impl Session {
             boundaries: boundaries(history_tokens),
             before_tokens: history_tokens + 1,
             held,
-            level_order: default_order(),
+
             max_candidates: 0,
         })
         .await
@@ -967,7 +967,7 @@ impl Session {
                     }],
                     before_tokens: tokens + 1,
                     held: vec![],
-                    level_order: default_order(),
+
                     max_candidates: 0,
                 })
                 .await;

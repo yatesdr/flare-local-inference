@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::{PrefixKey, characterize::Level, plan};
+use crate::{PrefixKey, levels::Level, plan};
 
 use super::{
     announce::{IndexEntry, Notice},

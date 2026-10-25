@@ -22,7 +22,7 @@ use std::{
 };
 
 use crate::{
-    CheckpointId, Error, ExportRefusal, History, PageId, PrefixKey, Result, Scratch, StateSlotId,
+    CheckpointId, Error, ExportRefusal, History, PageId, PrefixKey, Result, StateSlotId,
     index::NodeEvent,
     pool::{
         Announcer, FilePin, HostPin, IndexEntry, Releases, Tier as PoolTier, TierView,
@@ -1559,175 +1559,6 @@ impl DiskStore {
         });
     }
 
-    /// Time a write of `pages` synthetic pages through this store's own path
-    /// and the restore of them into the scratch ids (read, checksum, upload),
-    /// then unlink the record. The restore reads cold where the platform lets
-    /// the cache be dropped. Nothing is evicted to make room: without room the
-    /// measurement is refused. The record is never announced.
-    fn probe_restore(&mut self, scratch: &Scratch, pages: usize, cold: bool) -> Result<Duration> {
-        if pages == 0 || pages > scratch.pages.len() {
-            return Err(invalid(
-                "the probe needs between one page and the scratch pages",
-            ));
-        }
-        if !self.outbound.is_empty() || !self.inbound.is_empty() || !self.maintenance.is_empty() {
-            return Err(invalid("a disk probe needs the store idle"));
-        }
-        let page_tokens = self.layout.page_tokens;
-        let digest = {
-            use blake2::{Blake2b, Digest, digest::consts::U16};
-            let mut hash = Blake2b::<U16>::new();
-            hash.update(b"selene-probe-disk");
-            hash.update(self.identity);
-            hash.update((pages as u64).to_le_bytes());
-            let digest: [u8; 16] = hash.finalize().into();
-            digest
-        };
-        let key = PrefixKey {
-            consumed_tokens: pages as u64 * page_tokens,
-            digest,
-        };
-        let bytes = self.layout.record_bytes(pages as u64) + record::HEADER_BYTES as u64;
-        let limit = self
-            .budget
-            .as_ref()
-            .map_or(self.limit, |b| b.checkpoint_limit())
-            .min(self.limit);
-        if self.index.contains(&key) || self.used.saturating_add(bytes) > limit {
-            return Err(invalid("no room to measure the disk without evicting"));
-        }
-        let checkpoint = PublishedCheckpoint {
-            id: CheckpointId::new(u64::MAX),
-            key,
-            parent: None,
-            bucket: digest,
-            chain_pages: scratch.pages[..pages].to_vec(),
-            tail_pages: pages,
-            slot: scratch.slot,
-        };
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let result = self.probe_cycle(&checkpoint, deadline, cold);
-        // Whatever happened, the record goes, and the pool never hears of it.
-        if self.index.node(&key).is_some_and(|n| !n.pinned())
-            && let Ok(removed) = self.index.remove(&key)
-        {
-            for node in removed {
-                let _ = self.unlink(node);
-            }
-        }
-        while !self.maintenance.is_empty() && Instant::now() < deadline {
-            let mut events = Vec::new();
-            let _ = self.pump(&mut events);
-            std::thread::sleep(Duration::from_micros(200));
-        }
-        self.evicted.retain(|evicted| *evicted != key);
-        if let Some(a) = &self.announce {
-            a.view.sink().lock().unwrap().retain(|n| n.key != key);
-        }
-        self.sync_budget();
-        result
-    }
-
-    /// Drive the transport without announcing anything.
-    fn pump(&mut self, events: &mut Vec<StoreEvent>) -> Result<()> {
-        self.reclaim_inputs();
-        let mut completed = Vec::new();
-        let polled = self.transport.poll(&mut completed);
-        for event in completed {
-            self.apply(event, events);
-        }
-        polled
-    }
-
-    fn probe_cycle(
-        &mut self,
-        checkpoint: &PublishedCheckpoint,
-        deadline: Instant,
-        cold: bool,
-    ) -> Result<Duration> {
-        let key = checkpoint.key;
-        let pages = checkpoint.tail_pages;
-        if self.write_back(checkpoint)? != StoreOutcome::Queued {
-            return Err(invalid("the disk refused the probe record"));
-        }
-        let mut events = Vec::new();
-        loop {
-            self.pump(&mut events)?;
-            match events.pop() {
-                Some(StoreEvent::Stored { result, .. }) => {
-                    result?;
-                    break;
-                }
-                Some(_) => {}
-                None if Instant::now() >= deadline => {
-                    return Err(invalid("the probe write did not finish"));
-                }
-                None => std::thread::sleep(Duration::from_micros(200)),
-            }
-        }
-        if cold {
-            self.drop_cache(&key);
-        }
-        let node = self
-            .index
-            .node(&key)
-            .ok_or_else(|| invalid("the probe record is not indexed"))?;
-        let _ = node;
-        let hit = HostHit {
-            key,
-            consumed_tokens: key.consumed_tokens,
-            resident_tokens: 0,
-            pages,
-            bytes: self.layout.record_bytes(pages as u64),
-            tier: Tier::Disk,
-            estimated_seconds: 0.0,
-            chain: Match {
-                key,
-                consumed_tokens: key.consumed_tokens,
-                resident_tokens: 0,
-                nodes: vec![key],
-                skip_pages: 0,
-                pages,
-            },
-        };
-        let ticket = InboundTicket {
-            key,
-            pages: checkpoint.chain_pages.clone(),
-            slot: checkpoint.slot,
-        };
-        let started = Instant::now();
-        self.fetch(hit, ticket)?;
-        loop {
-            self.pump(&mut events)?;
-            match events.pop() {
-                Some(StoreEvent::Fetched { result, .. }) => {
-                    result?;
-                    return Ok(started.elapsed());
-                }
-                Some(_) => {}
-                None if Instant::now() >= deadline => {
-                    return Err(invalid("the probe read did not finish"));
-                }
-                None => std::thread::sleep(Duration::from_micros(200)),
-            }
-        }
-    }
-
-    /// Ask the operating system to forget the record file's cached pages.
-    #[cfg(unix)]
-    fn drop_cache(&self, key: &PrefixKey) {
-        use std::os::fd::AsRawFd as _;
-        if let Some(node) = self.index.node(key)
-            && let Ok(file) = std::fs::File::open(&node.location.path)
-        {
-            // Best effort: direct transfers bypass the cache anyway.
-            unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn drop_cache(&self, _key: &PrefixKey) {}
-
     /// What this tier announced for a complete record, as the next tier below
     /// memory: the entry a record spilled here is announced as.
     pub fn announced_entry(&self, key: &PrefixKey) -> Option<IndexEntry> {
@@ -2630,19 +2461,6 @@ impl HostStore for DiskStore {
         if tier == PoolTier::Nvme {
             let _ = DiskStore::retired(self, &key, how);
         }
-    }
-
-    fn probe(
-        &mut self,
-        tier: Tier,
-        scratch: &Scratch,
-        pages: usize,
-        cold: bool,
-    ) -> Result<Option<Duration>> {
-        if tier != Tier::Disk {
-            return Ok(None);
-        }
-        self.probe_restore(scratch, pages, cold).map(Some)
     }
 
     fn pin_export(

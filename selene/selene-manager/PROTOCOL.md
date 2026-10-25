@@ -76,8 +76,7 @@ the instance side (`flare-selene`, `selene::pool`) implements the other.
     changed GPU set is a new id and the old one ages out).
 11. **Within a level, "cheapest"** means the lowest manager-measured
     `est_us_per_page` from completed claims of that source (0 = unknown, ordered
-    last among known), then the longest match. The requester re-ranks levels by
-    its own measured order.
+    last among known), then the longest match. Copy levels use the fixed default order.
 12. **Logical split versus physical page offset.** `Claim.begin_tokens`
     is the exact logical split (the resident prefix end, or for part B exactly
     A's endpoint `consumed_tokens`) and need not be page-aligned. The source
@@ -611,7 +610,7 @@ transfers on the data channel (or shared windows for a local end):
   by that: its claims fail, its export is released, and nothing waits for an `ExportEnd` it cannot
   send.
 - *Levels.* A relayed copy keeps the source's tier level (neighbour GPU, host DRAM, host NVMe); the
-  requester's characterization measures what the path really costs.
+  requester observes completed restores for its cost estimate.
 
 ### 7.6 Flare's view
 

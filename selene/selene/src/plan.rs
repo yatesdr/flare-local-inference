@@ -20,7 +20,7 @@
 
 use std::cmp::Reverse;
 
-use crate::characterize::{Level, Ranking};
+use crate::levels::{Level, Ranking};
 use crate::{Error, History, PrefixKey, Result, worth_transfer};
 
 /// Whose cache a prefix belongs to. It is checked by the sources; the plan carries
@@ -579,20 +579,6 @@ mod tests {
                 &[f.candidate(NeighbourGpu, 1, 0, 0, &[400], 0), same_level],
             )
             .unwrap();
-        assert!(plan.b.is_none());
-    }
-
-    #[test]
-    fn a_pinned_order_changes_which_level_is_closer() {
-        let mut f = Fixture::new();
-        f.ranking = Ranking::for_test(
-            [ThisGpu, HostDram, NeighbourGpu, HostNvme, RemoteNvme],
-            &[(NeighbourGpu, 10.0)],
-        );
-        let near = f.candidate(NeighbourGpu, 1, 0, 0, &[400], 0);
-        let dram = f.candidate(HostDram, 2, 0, 0, &[800], 0);
-        let plan = f.plan(0, &[near, dram]).unwrap();
-        assert_eq!((plan.a.source, plan.endpoint()), (SourceId(2), f.key(800)));
         assert!(plan.b.is_none());
     }
 

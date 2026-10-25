@@ -230,7 +230,7 @@ fn config(path: &std::path::Path) -> (PoolConfig, crate::SharedCopier) {
         gpu_uuids: vec![[7; 16]],
         export_slots: 2,
         claim_slots: 2,
-        level_order: None,
+
         registration_context: 0,
         approve: None,
     };

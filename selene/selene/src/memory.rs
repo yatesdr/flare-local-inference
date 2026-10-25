@@ -34,7 +34,7 @@ use std::{
 };
 
 use crate::{
-    CheckpointId, Error, ExportRefusal, History, PageId, PrefixKey, Result, Scratch, StateSlotId,
+    CheckpointId, Error, ExportRefusal, History, PageId, PrefixKey, Result, StateSlotId,
     index::{NodeEvent, NodeNotice},
     pool::{
         Announcer, HostPin, IndexEntry, MemoryPin, Releases, Tier as PoolTier, TierView,
@@ -1094,121 +1094,6 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// Time the upload of `pages` pages of known bytes from free slabs into the
-    /// scratch ids, including the checksum pass over them, and release the slabs.
-    /// Nothing is indexed and nothing is evicted: without enough free slabs the
-    /// measurement is refused.
-    fn probe_restore(&mut self, scratch: &Scratch, pages: usize) -> Result<Duration> {
-        if pages == 0 || pages > scratch.pages.len() {
-            return Err(invalid(
-                "the probe needs between one page and the scratch pages",
-            ));
-        }
-        if !self.core.outbound.is_empty() || !self.core.inbound.is_empty() {
-            return Err(invalid("a memory probe needs the store idle"));
-        }
-        let mut transfers = self
-            .transfers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if transfers.in_flight() != 0 {
-            return Err(invalid("a memory probe needs the transfer threads idle"));
-        }
-        let pool = &mut self.core.pool;
-        let mut slabs = Vec::with_capacity(pages);
-        for _ in 0..pages {
-            match pool.allocate_page() {
-                Some(slab) => slabs.push(slab),
-                None => break,
-            }
-        }
-        let row = pool.allocate_row();
-        let release = |pool: &mut SlabPool, slabs: &[PageSlab], row: Option<RowSlab>| {
-            for slab in slabs {
-                pool.release_page(*slab);
-            }
-            if let Some(row) = row {
-                pool.release_row(row);
-            }
-        };
-        let Some(row_slab) = row.filter(|_| slabs.len() == pages) else {
-            release(pool, &slabs, row);
-            return Err(invalid("too few free slabs to measure without evicting"));
-        };
-        for (index, slab) in slabs.iter().enumerate() {
-            let bytes = pool.page_mut(*slab);
-            for (offset, byte) in bytes.iter_mut().enumerate() {
-                *byte = (offset ^ index).wrapping_mul(31) as u8;
-            }
-        }
-        pool.row_mut(row_slab).fill(0x5a);
-        let started = Instant::now();
-        // The checksum pass a real restore performs over what it reads.
-        let mut sum = 0u64;
-        for slab in &slabs {
-            sum ^= crate::record::checksum(pool.page(*slab));
-        }
-        sum ^= crate::record::checksum(pool.row(row_slab));
-        std::hint::black_box(sum);
-        let jobs = windows(
-            JobId(u64::MAX),
-            Direction::In,
-            scratch.pages[..pages]
-                .iter()
-                .zip(&slabs)
-                .map(|(page, slab)| (*page, pool.page_address(*slab))),
-            Some((scratch.slot, pool.row_address(row_slab))),
-        );
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let expected = jobs.len();
-        let mut result = Ok(());
-        let mut submitted = 0;
-        let mut replies = Vec::new();
-        for (index, mut job) in jobs.into_iter().enumerate() {
-            job.id = JobId(u64::MAX - index as u64);
-            loop {
-                match transfers.submit(job.clone()) {
-                    Ok(()) => {
-                        submitted += 1;
-                        break;
-                    }
-                    Err(error) if Instant::now() >= deadline => {
-                        result = Err(error);
-                        break;
-                    }
-                    Err(_) => {
-                        transfers.poll(&mut replies);
-                        std::thread::sleep(Duration::from_micros(200));
-                    }
-                }
-            }
-            if result.is_err() {
-                break;
-            }
-        }
-        let mut replied = 0;
-        while replied < submitted {
-            transfers.poll(&mut replies);
-            for reply in replies.drain(..) {
-                replied += 1;
-                if let Err(error) = reply.result {
-                    result = Err(error);
-                }
-            }
-            if replied < submitted {
-                if Instant::now() >= deadline {
-                    // Copies may still read the slabs: keep them out of service.
-                    return Err(invalid("the memory probe did not drain"));
-                }
-                std::thread::sleep(Duration::from_micros(100));
-            }
-        }
-        let elapsed = started.elapsed();
-        let _ = expected;
-        release(pool, &slabs, Some(row_slab));
-        result.map(|()| elapsed)
-    }
-
     /// Announce this store's records through `announcer` and serve them as
     /// exports. Records get their checksums on a thread of their own before they
     /// are announced. A pool split by rank is not readable by the CPU and
@@ -1491,19 +1376,6 @@ impl HostStore for MemoryStore {
             self.flush_announcements(&|_, parent| parent, &|_| None);
         }
         Ok(())
-    }
-
-    fn probe(
-        &mut self,
-        tier: Tier,
-        scratch: &Scratch,
-        pages: usize,
-        _cold: bool,
-    ) -> Result<Option<Duration>> {
-        if tier != Tier::Memory {
-            return Ok(None);
-        }
-        self.probe_restore(scratch, pages).map(Some)
     }
 
     fn closest_tier(&self) -> Option<Tier> {

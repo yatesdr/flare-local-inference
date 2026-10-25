@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use super::*;
 use crate::{
     CheckpointId, Layout, PageId, Retirement, Retiring, StateSlotId,
-    characterize::Ranking,
+    levels::Ranking,
     pool::{
         Answer,
         shared::{FetchFailure, PutRefusal, PutSource},
@@ -44,8 +44,6 @@ struct LocalState {
     pinned: Vec<(Tier, PrefixKey)>,
     refuse_pin: Option<ExportRefusal>,
     announced: bool,
-    /// Microseconds per page this store's own `tier` takes to restore.
-    probe: Option<(Local, u64)>,
     /// What the last local tier offers for a move, coldest first.
     retiring: Vec<Retiring>,
     /// How each offered record's move ended, in order.
@@ -114,21 +112,6 @@ impl HostStore for FakeLocal {
     fn retired(&mut self, key: PrefixKey, _: Tier, how: Retirement) {
         self.0.lock().unwrap().retired.push((key, how));
     }
-    fn probe(
-        &mut self,
-        tier: Local,
-        _: &Scratch,
-        pages: usize,
-        _: bool,
-    ) -> Result<Option<Duration>> {
-        Ok(self
-            .0
-            .lock()
-            .unwrap()
-            .probe
-            .filter(|(held, _)| *held == tier)
-            .map(|(_, per_page)| Duration::from_micros(per_page * pages as u64)))
-    }
     fn pin_export(
         &mut self,
         tier: Tier,
@@ -175,8 +158,6 @@ impl HostPin for NoPin {
 #[derive(Default)]
 struct PoolState {
     ranking: Option<Ranking>,
-    /// Serve the probe record at this level, as a manager would.
-    manager_level: Option<Level>,
     host_pinned: Vec<ExportId>,
     refused: Vec<(ExportId, ExportRefusal)>,
     answer: Option<Arc<Answer>>,
@@ -198,38 +179,9 @@ struct PoolState {
 struct FakePool(Arc<Mutex<PoolState>>, Ranking, Announcer);
 
 impl PoolPort for FakePool {
-    fn begin_lookup(&self, history: &dyn History, held: Vec<HeldRange>) -> LookupTicket {
+    fn begin_lookup(&self, _history: &dyn History, held: Vec<HeldRange>) -> LookupTicket {
         let mut state = self.0.lock().unwrap();
         state.held.push(held);
-        if let Some(level) = state.manager_level {
-            let key = history.aligned_boundaries()[0];
-            let tail = (key.consumed_tokens / PT) as usize;
-            let candidate = PoolCandidate {
-                plan: plan::Candidate {
-                    level,
-                    source: SourceId(9),
-                    generation: 1,
-                    key,
-                    begin_tokens: 0,
-                    skip_pages: 0,
-                    nodes: vec![plan::ChainNode {
-                        key,
-                        tail_pages: tail,
-                    }],
-                    us_per_page: 0,
-                },
-                source: SourceRef {
-                    instance: Vec::new(),
-                    session_incarnation: 0,
-                },
-                tier: Tier::Dram,
-            };
-            let answer = Arc::new(Answer {
-                held: Vec::new(),
-                candidates: vec![candidate],
-            });
-            return LookupTicket::watched(LookupState::Ready(answer), || {});
-        }
         match state.answer.clone() {
             Some(answer) => LookupTicket::watched(LookupState::Ready(answer), || {}),
             None => LookupTicket::watched(LookupState::Pending, || {}),
@@ -237,12 +189,6 @@ impl PoolPort for FakePool {
     }
     fn fetch(&mut self, fetch: PoolFetch) -> Result<u64> {
         let mut state = self.0.lock().unwrap();
-        if state.manager_level.is_some() {
-            let id = 78;
-            state.events.push(PoolEvent::Fetched { id, result: Ok(1) });
-            state.fetches.push(fetch);
-            return Ok(id);
-        }
         if state.reject {
             return Err("the pool is not ready".into());
         }
@@ -271,35 +217,20 @@ impl PoolPort for FakePool {
             .evicted
             .push((key, tier, generation, heir));
     }
-    fn set_ranking(&self, ranking: Ranking) {
-        self.0.lock().unwrap().ranking = Some(ranking);
-    }
     fn observe_restore(&self, level: Level, pages: usize, elapsed: Duration) {
         let mut ranking = self.ranking();
         ranking.observe(level, pages, elapsed);
-        self.set_ranking(ranking);
+        self.0.lock().unwrap().ranking = Some(ranking);
     }
     fn evictions_lost(&self) {
         self.0.lock().unwrap().lost += 1;
     }
     fn put(&mut self, request: PutRequest) -> Result<u64> {
         let mut state = self.0.lock().unwrap();
-        if state.manager_level.is_none() {
-            if !state.ready {
-                return Err("the fake pool takes no puts".into());
-            }
-            if state.put_error {
-                return Err("the pool's command queue is full".into());
-            }
-            let id = state.puts.len() as u64 + 1;
-            state.puts.push((id, request));
-            return Ok(id);
-        }
-        let id = 77;
-        state.events.push(PoolEvent::Put {
-            id,
-            outcome: PutOutcome::Stored { bytes: 1 },
-        });
+        if !state.ready { return Err("the fake pool takes no puts".into()); }
+        if state.put_error { return Err("the pool's command queue is full".into()); }
+        let id = state.puts.len() as u64 + 1;
+        state.puts.push((id, request));
         Ok(id)
     }
     fn cancel_put(&mut self, _: u64) {}
@@ -715,37 +646,6 @@ fn a_pool_part_is_never_planned_ahead_of_a_part_of_the_local_tiers() {
 }
 
 #[test]
-fn the_first_long_restore_is_priced_by_the_fitted_line_not_by_the_few_page_average() {
-    // Timed at 2, 16 and 64 pages: 14 ms of latency and 0.3 ms a page, which is 7.3 ms a
-    // page at the small size.
-    let line = |pages: f64| 14_000.0 + 300.0 * pages;
-    let mut rig = rig_with(Ranking::for_test_sized(
-        Level::HostDram,
-        [line(2.0) / 2.0, line(16.0) / 16.0, line(64.0) / 64.0],
-    ));
-    // The manager has no estimate to give yet (0): only probe-sized claims so far.
-    rig.answer(vec![rig.candidate(Level::HostDram, 1, 0, 0, &[1600], 0)]);
-    let hit = rig.lookup().unwrap();
-    assert_eq!(hit.pages, 100);
-    let fitted = line(100.0) / 1e6;
-    assert!(
-        (hit.estimated_seconds - fitted).abs() < 1e-3,
-        "{}",
-        hit.estimated_seconds
-    );
-    // Half the prefill of 1600 tokens at 8000 tokens a second is 0.1 s: the restore stands
-    // where the small-size average (0.73 s) would have turned it down.
-    assert!(crate::worth_fetching(&hit, 8000.0));
-    assert!(100.0 * line(2.0) / 2.0 / 1e6 > 0.1);
-    // With no estimate of any kind the cost is not held against the restore.
-    let mut rig = rig_with(Ranking::default());
-    rig.answer(vec![rig.candidate(Level::HostDram, 1, 0, 0, &[1600], 0)]);
-    let hit = rig.lookup().unwrap();
-    assert_eq!(hit.estimated_seconds, 0.0);
-    assert!(crate::worth_fetching(&hit, 8000.0));
-}
-
-#[test]
 fn a_second_part_not_worth_fetching_leaves_the_local_hit_alone() {
     let mut rig = rig();
     rig.local_hit(800, Local::Memory);
@@ -1036,78 +936,6 @@ fn a_candidate_starting_above_what_is_held_is_discarded_and_one_at_the_local_end
     rig.local_hit(800, Local::Memory);
     let hit = rig.lookup().unwrap();
     assert_eq!(hit.key, rig.key(1600));
-}
-
-fn scratch() -> Scratch {
-    Scratch {
-        pages: (0..64).map(PageId).collect(),
-        slot: StateSlotId(1),
-    }
-}
-
-#[test]
-fn levels_are_probed_only_at_startup() {
-    let mut rig = rig();
-    // Own DRAM is slow here; the manager serves host NVMe quickly.
-    rig.local.0.lock().unwrap().probe = Some((Local::Memory, 500));
-    rig.pool.lock().unwrap().manager_level = Some(Level::HostNvme);
-    assert!(rig.store.needs_characterization());
-    let line = rig
-        .store
-        .characterize(&scratch())
-        .unwrap()
-        .expect("measured");
-    assert!(line.contains("changed from the default"), "{line}");
-    assert!(line.contains("not measured"), "{line}");
-    let ranking = rig.store.pool().ranking();
-    assert!(ranking.rank(Level::HostNvme) < ranking.rank(Level::HostDram));
-    assert!(ranking.us_per_page(Level::HostDram).unwrap() > 400.0);
-    assert!(ranking.us_per_page(Level::NeighbourGpu).is_none());
-    assert!(
-        ranking.us_per_page(Level::RemoteNvme).is_none(),
-        "the manager serves it as host NVMe"
-    );
-    // Nothing moved: nothing is measured again.
-    assert!(!rig.store.needs_characterization());
-    assert!(rig.store.characterize(&scratch()).unwrap().is_none());
-    // Another call after startup does not trigger another probe.
-    assert!(!rig.store.needs_characterization());
-    assert!(rig.store.characterize(&scratch()).unwrap().is_none());
-    // The pool's events that were not the probe's are kept for the worker.
-    assert!(rig.poll().is_empty());
-}
-
-#[test]
-fn a_pinned_order_is_kept_whatever_is_measured_and_without_stores_or_manager_nothing_is_measured() {
-    let local = FakeLocal::default();
-    let pool = Arc::new(Mutex::new(PoolState::default()));
-    let ranking = Ranking::default();
-    let order = [
-        Level::RemoteNvme,
-        Level::HostNvme,
-        Level::HostDram,
-        Level::NeighbourGpu,
-    ];
-    let mut store = PooledStore::new(
-        local.clone(),
-        FakePool(
-            pool.clone(),
-            ranking,
-            Announcer::new(Arc::new(tokio::sync::Notify::new())),
-        ),
-        identity(),
-        &layout(),
-    )
-    .with_pinned_order(Some(order))
-    .unwrap();
-    local.0.lock().unwrap().probe = Some((Local::Memory, 10));
-    let line = store.characterize(&scratch()).unwrap().unwrap();
-    assert!(line.contains("pinned"), "{line}");
-    assert_eq!(&store.pool().ranking().order()[1..], &order);
-    // With neither tier nor manager, every level stays where it was.
-    let mut bare = rig();
-    let line = bare.store.characterize(&scratch()).unwrap().unwrap();
-    assert!(line.contains("default order"), "{line}");
 }
 
 // ---- the eviction cascade ----

@@ -753,19 +753,19 @@ async fn l5_to_l8_holes_limits_and_validation() {
             boundaries: pool::boundaries(3072),
             before_tokens: 1024,
             held: vec![],
-            level_order: pool::default_order(),
+
             max_candidates: 0,
         })
         .await;
     assert!(reply.candidates.is_empty());
-    // L8: unsorted boundaries, too many boundaries, a bad level order.
+    // L8: unsorted boundaries, too many boundaries, invalid boundaries.
     for request in [
         v2::LookupRequest {
             lookup_id: 3,
             boundaries: vec![pool::pkey(2048), pool::pkey(1024)],
             before_tokens: 5000,
             held: vec![],
-            level_order: pool::default_order(),
+
             max_candidates: 0,
         },
         v2::LookupRequest {
@@ -773,15 +773,7 @@ async fn l5_to_l8_holes_limits_and_validation() {
             boundaries: (0..9).map(|n| pool::pkey(n * 1024)).collect(),
             before_tokens: 90000,
             held: vec![],
-            level_order: pool::default_order(),
-            max_candidates: 0,
-        },
-        v2::LookupRequest {
-            lookup_id: 5,
-            boundaries: pool::boundaries(1024),
-            before_tokens: 5000,
-            held: vec![],
-            level_order: vec![v2::Level::HostDram as i32],
+
             max_candidates: 0,
         },
     ] {
@@ -795,7 +787,7 @@ async fn l5_to_l8_holes_limits_and_validation() {
             boundaries: pool::boundaries(1024),
             before_tokens: 5000,
             held: vec![],
-            level_order: pool::default_order(),
+
             max_candidates: 0,
         }))
         .await;

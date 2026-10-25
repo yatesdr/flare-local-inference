@@ -14,7 +14,7 @@ use tokio::sync::Notify;
 
 use crate::{
     Error, ExportChain, ExportId, ExportRefusal, History, HostRegistrar, Result, SharedCopier,
-    characterize::{Level, Pages, Ranking},
+    levels::{Level, Ranking},
 };
 
 use super::{
@@ -64,8 +64,6 @@ pub struct PoolConfig {
     pub export_slots: u32,
     /// Claims in flight at once (default 2).
     pub claim_slots: u32,
-    /// An operator-pinned order of the four copy levels, closest first.
-    pub level_order: Option<[Level; 4]>,
     /// The device context made current when registering the shared regions.
     pub registration_context: usize,
     /// Called once at startup with everything the client is about to register (see
@@ -84,8 +82,6 @@ pub struct PoolClient {
     next_fetch: u64,
     next_put: u64,
     registered: Vec<RegisteredRegion>,
-    probe_model: [u8; 32],
-    copier: SharedCopier,
 }
 
 impl PoolClient {
@@ -132,11 +128,6 @@ impl PoolClient {
             super::net::Roots::System,
             STARTUP_WAIT,
         )
-    }
-
-    /// The instance-scoped namespace for startup probe records.
-    pub fn probe_model(&self) -> [u8; 32] {
-        self.probe_model
     }
 
     /// The ranges registered at startup, in the order they were registered. Empty when the
@@ -212,20 +203,6 @@ impl PoolClient {
         let wake = Arc::new(Notify::new());
         let shared = Shared::new(wake.clone());
         shared.set_status(PoolStatus::Connecting);
-        if let Some(order) = config.level_order {
-            let mut levels = vec![Level::ThisGpu];
-            levels.extend(order);
-            let pages = Pages {
-                small: 1,
-                typical: 1,
-                long: 1,
-            };
-            shared.set_ranking(
-                crate::characterize::Characterizer::new(pages, Some(levels))?
-                    .ranking()
-                    .clone(),
-            );
-        }
         let announce = Announcer::new(wake.clone());
         let gpu_uuids = config.gpu_uuids.clone();
         let rank_secret = match &ranks {
@@ -244,10 +221,6 @@ impl PoolClient {
             context: config.registration_context,
             rank_secret,
         });
-        let probe_model = super::probe::instance_probe_model(
-            &settings.scope.model_identity,
-            &settings.instance_id,
-        );
         let mut engine = Engine::new(
             settings.clone(),
             shared.clone(),
@@ -307,16 +280,7 @@ impl PoolClient {
             next_fetch: 0,
             next_put: 0,
             registered,
-            probe_model,
-            copier,
         })
-    }
-
-    pub fn copies_drained(&self) -> bool {
-        self.copier
-            .lock()
-            .map(|copier| copier.in_flight() == 0)
-            .unwrap_or(false)
     }
 
     pub fn status(&self) -> PoolStatus {
@@ -358,12 +322,8 @@ impl PoolClient {
 
     /// Identifies the manager and link of the current session (zero before any
     /// session opened); a change means the copy levels may cost something else.
-    pub fn topology(&self) -> crate::characterize::Topology {
-        crate::characterize::Topology(self.shared.topology())
-    }
-
-    pub fn set_ranking(&self, ranking: Ranking) {
-        self.shared.set_ranking(ranking);
+    pub fn topology(&self) -> crate::levels::Topology {
+        crate::levels::Topology(self.shared.topology())
     }
 
     pub fn observe_restore(&self, level: Level, pages: usize, elapsed: std::time::Duration) {

@@ -12,7 +12,7 @@ use tokio::sync::Notify;
 
 use crate::{
     Direction, ExportChain, ExportId, ExportNode, Job, Layout, PageCopier, PageId, PrefixKey,
-    Registration, Reply, Result, SharedCopier, StateSlotId, characterize::Level, plan,
+    Registration, Reply, Result, SharedCopier, StateSlotId, levels::Level, plan,
     record::checksum, testing::geometry,
 };
 
