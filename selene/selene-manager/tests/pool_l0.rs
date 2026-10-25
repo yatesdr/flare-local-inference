@@ -829,16 +829,14 @@ async fn restart_serves_after_recovery_without_waiting_for_old_instances() {
     old.goodbye(true).await;
     first.stop();
     first.base = base.join("unused");
-    let mut restarted = config;
-    restarted.name = support::instance_name("ready-again");
-    let mut second = Host::open_config(restarted);
+    let mut second = Host::open_config(config);
     second.start();
     let mut pool = Pool::connect(&second.config.socket).await;
     assert_eq!(
         pool.hello.readiness.unwrap().state,
         v2::ReadinessState::Ready as i32
     );
-    assert_ne!(
+    assert_eq!(
         pool.hello.shared_memory.as_ref().unwrap().arena_path,
         old_arena
     );
