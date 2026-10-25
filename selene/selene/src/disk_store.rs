@@ -14,7 +14,9 @@
 //! enqueue, and `poll` advances every pipeline as far as free slabs and queue
 //! space allow before reporting completions.
 
+#[cfg(test)]
 use crate::store::TierStore;
+
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
@@ -2462,9 +2464,6 @@ impl crate::store::TierStore for DiskStore {
             return Err(ExportRefusal::NotFound);
         }
         self.pin_export_files(key, begin_tokens, want_row)
-    }
-    fn closest_tier(&self) -> Option<Tier> {
-        Some(Tier::Disk)
     }
     fn set_spill(&mut self, enabled: bool) {
         self.spill = enabled && self.announce.is_some();

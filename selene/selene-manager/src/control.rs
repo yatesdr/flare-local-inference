@@ -31,6 +31,9 @@ use tonic::{transport::Server, transport::server::Connected};
 
 const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 
+const H2_KEEPALIVE: Duration = Duration::from_secs(10);
+const H2_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// What a connection tells the service about its peer.
 #[derive(Clone)]
 pub struct PeerInfo {
@@ -332,8 +335,8 @@ pub fn serve(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
             })
         });
         let server = Server::builder()
-            .http2_keepalive_interval(Some(Duration::from_secs(10)))
-            .http2_keepalive_timeout(Some(Duration::from_secs(20)))
+            .http2_keepalive_interval(Some(H2_KEEPALIVE))
+            .http2_keepalive_timeout(Some(H2_TIMEOUT))
             .add_service(
                 PoolServer::new(pool_service.clone())
                     .max_decoding_message_size(MAX_MESSAGE)
@@ -360,8 +363,8 @@ pub fn serve(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
                     })
                 });
                 let mut builder = Server::builder()
-                    .http2_keepalive_interval(Some(Duration::from_secs(10)))
-                    .http2_keepalive_timeout(Some(Duration::from_secs(20)));
+                    .http2_keepalive_interval(Some(H2_KEEPALIVE))
+                    .http2_keepalive_timeout(Some(H2_TIMEOUT));
                 if let Some(tls) = network_tls {
                     builder = builder
                         .tls_config(tls)
