@@ -656,7 +656,7 @@ fn a_lookup_that_times_out_is_cancelled_ends_without_candidates_and_pauses_new_o
     rig.open();
     let ticket = rig
         .shared
-        .begin_lookup(rig.now, vec![key(0, 0), key(64, 1)], 128, Vec::new());
+        .begin_lookup(rig.now, vec![key(0, 0), key(64, 1)], 128, 0);
     let commands = rig.shared.take_commands();
     let out = rig.command(commands.into_iter().next().unwrap());
     assert_eq!(pick!(out, Lookup).len(), 1);
@@ -665,7 +665,7 @@ fn a_lookup_that_times_out_is_cancelled_ends_without_candidates_and_pauses_new_o
     assert!(matches!(ticket.state(), crate::pool::LookupState::None));
     let again = rig
         .shared
-        .begin_lookup(rig.now, vec![key(0, 0), key(64, 2)], 128, Vec::new());
+        .begin_lookup(rig.now, vec![key(0, 0), key(64, 2)], 128, 0);
     assert!(
         matches!(again.state(), crate::pool::LookupState::None),
         "no retry storm"
@@ -678,10 +678,10 @@ fn a_refused_lookup_gives_no_candidates_and_a_good_reply_reaches_every_waiter() 
     rig.open();
     let t1 = rig
         .shared
-        .begin_lookup(rig.now, vec![key(0, 0), key(64, 1)], 128, Vec::new());
+        .begin_lookup(rig.now, vec![key(0, 0), key(64, 1)], 128, 0);
     let t2 = rig
         .shared
-        .begin_lookup(rig.now, vec![key(0, 0), key(64, 1)], 128, Vec::new());
+        .begin_lookup(rig.now, vec![key(0, 0), key(64, 1)], 128, 0);
     let mut commands = rig.shared.take_commands();
     assert_eq!(commands.len(), 1);
     let Command::Lookup(sent) = commands.remove(0) else {
@@ -729,7 +729,7 @@ fn a_refused_lookup_gives_no_candidates_and_a_good_reply_reaches_every_waiter() 
     }
     let t3 = rig
         .shared
-        .begin_lookup(rig.now, vec![key(0, 0), key(128, 4)], 256, Vec::new());
+        .begin_lookup(rig.now, vec![key(0, 0), key(128, 4)], 256, 0);
     let Command::Lookup(sent) = rig.shared.take_commands().remove(0) else {
         panic!()
     };
@@ -744,7 +744,7 @@ fn a_refused_lookup_gives_no_candidates_and_a_good_reply_reaches_every_waiter() 
     assert!(matches!(t3.state(), crate::pool::LookupState::None));
     let paused = rig
         .shared
-        .begin_lookup(rig.now, vec![key(0, 0), key(192, 5)], 256, Vec::new());
+        .begin_lookup(rig.now, vec![key(0, 0), key(192, 5)], 256, 0);
     assert!(matches!(paused.state(), crate::pool::LookupState::None));
 }
 

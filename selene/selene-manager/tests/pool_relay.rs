@@ -79,7 +79,7 @@ async fn world(tier: v2::Tier, remote_requester: bool) -> World {
 
 impl World {
     async fn claim(&mut self, id: u64) -> v2::Claim {
-        let reply = self.requester.lookup(900 + id, TOKENS[1], vec![]).await;
+        let reply = self.requester.lookup(900 + id, TOKENS[1], 0).await;
         let candidate = reply
             .candidates
             .into_iter()

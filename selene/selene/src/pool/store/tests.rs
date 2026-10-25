@@ -160,7 +160,7 @@ struct PoolState {
     host_pinned: Vec<ExportId>,
     refused: Vec<(ExportId, ExportRefusal)>,
     answer: Option<Arc<Answer>>,
-    held: Vec<Vec<HeldRange>>,
+    residents: Vec<u64>,
     fetches: Vec<PoolFetch>,
     reject: bool,
     events: Vec<PoolEvent>,
@@ -178,9 +178,9 @@ struct PoolState {
 struct FakePool(Arc<Mutex<PoolState>>, Announcer);
 
 impl PoolPort for FakePool {
-    fn begin_lookup(&self, _history: &dyn History, held: Vec<HeldRange>) -> LookupTicket {
+    fn begin_lookup(&self, _history: &dyn History, resident: u64) -> LookupTicket {
         let mut state = self.0.lock().unwrap();
-        state.held.push(held);
+        state.residents.push(resident);
         match state.answer.clone() {
             Some(answer) => LookupTicket::watched(LookupState::Ready(answer), || {}),
             None => LookupTicket::watched(LookupState::Pending, || {}),
@@ -333,10 +333,7 @@ impl Rig {
     }
 
     fn answer(&self, candidates: Vec<PoolCandidate>) {
-        self.pool.lock().unwrap().answer = Some(Arc::new(Answer {
-            held: Vec::new(),
-            candidates,
-        }));
+        self.pool.lock().unwrap().answer = Some(Arc::new(Answer { candidates }));
     }
 
     fn local_hit(&self, end: u64, tier: Local) {
@@ -361,7 +358,7 @@ impl Rig {
     }
 
     fn lookup(&mut self) -> Option<HostHit> {
-        let ticket = PoolPort::begin_lookup(&self.store.pool, &self.history, Vec::new());
+        let ticket = PoolPort::begin_lookup(&self.store.pool, &self.history, 0);
         let history = self.history.clone();
         self.store.lookup_for(Some(&ticket), &history, 0, u64::MAX)
     }
@@ -635,8 +632,8 @@ fn queued_lookups_do_not_trim_local_prefixes_and_export_events_reach_the_worker(
     rig.local_hit(800, Local::Memory);
     let history = rig.history.clone();
     assert!(rig.store.begin_lookup(&history).is_some());
-    let held = rig.pool.lock().unwrap().held[0].clone();
-    assert!(held.is_empty());
+    let resident = rig.pool.lock().unwrap().residents[0];
+    assert_eq!(resident, 0);
     let export = ExportId(5);
     rig.pool
         .lock()

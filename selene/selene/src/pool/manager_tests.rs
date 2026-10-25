@@ -13,8 +13,8 @@ use std::{
 };
 
 use crate::{
-    History, HostRegistrar, InboundTicket, PageId, PrefixKey, Registration, Result,
-    SplitMapping, StateSlotId, StoreEvent, StoreOutcome, StoreStats,
+    History, HostRegistrar, InboundTicket, PageId, PrefixKey, Registration, Result, SplitMapping,
+    StateSlotId, StoreEvent, StoreOutcome, StoreStats,
     geometry::fingerprint,
     plan::{self, Identity, Request},
     pool::{
@@ -437,7 +437,7 @@ fn fetch_for(
     pages: usize,
     scratch: &[u32],
 ) -> PoolFetch {
-    let ticket = instance.client.begin_lookup(history, Vec::new());
+    let ticket = instance.client.begin_lookup(history, 0);
     wait("the lookup", || {
         !matches!(ticket.state(), LookupState::Pending)
     });
@@ -498,7 +498,7 @@ fn an_instance_restores_a_neighbours_host_record_through_the_real_manager() {
     });
     // The manager learns of it; the requester's lookup then finds it.
     wait("the manager to offer the record", || {
-        let ticket = requester.client.begin_lookup(&history, Vec::new());
+        let ticket = requester.client.begin_lookup(&history, 0);
         let deadline = Instant::now() + Duration::from_secs(2);
         while matches!(ticket.state(), LookupState::Pending) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(2));
@@ -670,7 +670,7 @@ fn a_gpu_checkpoint_is_exported_by_device_copies_and_its_pin_released() {
         bytes: (pages * PAGE + ROW) as u64,
     });
     wait("the manager to offer it", || {
-        let ticket = requester.client.begin_lookup(&history, Vec::new());
+        let ticket = requester.client.begin_lookup(&history, 0);
         let deadline = Instant::now() + Duration::from_secs(2);
         while matches!(ticket.state(), LookupState::Pending) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(2));
@@ -747,7 +747,7 @@ fn announcements_survive_a_manager_restart_and_the_instances_reconnect() {
         bytes: (4 * PAGE + ROW) as u64,
     });
     let offered = |requester: &Instance| {
-        let ticket = requester.client.begin_lookup(&history, Vec::new());
+        let ticket = requester.client.begin_lookup(&history, 0);
         let deadline = Instant::now() + Duration::from_secs(2);
         while matches!(ticket.state(), LookupState::Pending) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(2));
@@ -1089,7 +1089,7 @@ fn drive<S: HostStore>(store: &mut S, what: &str, mut done: impl FnMut(&mut S) -
 }
 
 fn offered(requester: &Instance, history: &TestHistory) -> bool {
-    let ticket = requester.client.begin_lookup(history, Vec::new());
+    let ticket = requester.client.begin_lookup(history, 0);
     let deadline = Instant::now() + Duration::from_secs(2);
     while matches!(ticket.state(), LookupState::Pending) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(2));
@@ -1110,7 +1110,7 @@ fn restore_salted(
     // as the worker would.
     wait("the manager's store to be the only source", || {
         evictor.poll(&mut Vec::new()).unwrap();
-        let ticket = requester.client.begin_lookup(history, Vec::new());
+        let ticket = requester.client.begin_lookup(history, 0);
         let deadline = Instant::now() + Duration::from_secs(2);
         while matches!(ticket.state(), LookupState::Pending) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(2));
@@ -1607,7 +1607,7 @@ fn a_lookup_is_answered_in_well_under_a_millisecond_over_a_unix_socket() {
     for salt in 0..2000u32 {
         let history = salted(salt);
         let started = Instant::now();
-        let ticket = b.client.begin_lookup(&history, Vec::new());
+        let ticket = b.client.begin_lookup(&history, 0);
         while matches!(ticket.state(), LookupState::Pending) {
             std::hint::spin_loop();
         }
@@ -1683,7 +1683,7 @@ fn offer_host_record(
         bytes: (pages * PAGE + ROW) as u64,
     });
     wait("the manager to offer the record", || {
-        let ticket = requester.client.begin_lookup(history, Vec::new());
+        let ticket = requester.client.begin_lookup(history, 0);
         let deadline = Instant::now() + Duration::from_secs(2);
         while matches!(ticket.state(), LookupState::Pending) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(2));
@@ -1823,7 +1823,7 @@ fn a_gpu_checkpoint_on_another_host_is_relayed_through_reserved_staging() {
         bytes: (pages * PAGE + ROW) as u64,
     });
     wait("the manager to offer it", || {
-        let ticket = requester.client.begin_lookup(&history, Vec::new());
+        let ticket = requester.client.begin_lookup(&history, 0);
         let deadline = Instant::now() + Duration::from_secs(2);
         while matches!(ticket.state(), LookupState::Pending) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(2));

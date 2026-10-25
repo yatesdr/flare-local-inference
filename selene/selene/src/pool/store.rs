@@ -30,13 +30,13 @@ use super::{
     exporter::HostPin,
     lookup::{LookupState, LookupTicket},
     shared::{FetchPart, PoolEvent, PoolFetch, PutOutcome, PutRequest},
-    types::{HeldRange, PoolCandidate, SourceRef, Tier},
+    types::{PoolCandidate, SourceRef, Tier},
 };
 
 /// What the store uses of the pool client. [`PoolClient`] is the implementation;
 /// tests of the store's planning and sequencing substitute a recording one.
 pub trait PoolPort {
-    fn begin_lookup(&self, history: &dyn History, held: Vec<HeldRange>) -> LookupTicket;
+    fn begin_lookup(&self, history: &dyn History, resident: u64) -> LookupTicket;
     fn fetch(&mut self, fetch: PoolFetch) -> Result<u64>;
     fn poll(&mut self, events: &mut Vec<PoolEvent>) -> Result<()>;
     fn saved(&self, entry: IndexEntry);
@@ -54,8 +54,8 @@ pub trait PoolPort {
 }
 
 impl PoolPort for PoolClient {
-    fn begin_lookup(&self, history: &dyn History, held: Vec<HeldRange>) -> LookupTicket {
-        PoolClient::begin_lookup(self, history, held)
+    fn begin_lookup(&self, history: &dyn History, resident: u64) -> LookupTicket {
+        PoolClient::begin_lookup(self, history, resident)
     }
     fn fetch(&mut self, fetch: PoolFetch) -> Result<u64> {
         PoolClient::fetch(self, fetch)
@@ -419,7 +419,7 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
     }
 
     fn begin_lookup(&mut self, history: &dyn History) -> Option<LookupTicket> {
-        Some(self.pool.begin_lookup(history, Vec::new()))
+        Some(self.pool.begin_lookup(history, 0))
     }
 
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()> {

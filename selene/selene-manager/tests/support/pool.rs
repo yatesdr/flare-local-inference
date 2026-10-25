@@ -554,15 +554,13 @@ impl Session {
         &mut self,
         id: u64,
         history_tokens: u64,
-        held: Vec<v2::HeldRange>,
+        resident_tokens: u64,
     ) -> v2::LookupReply {
         self.lookup_request(v2::LookupRequest {
             lookup_id: id,
             boundaries: boundaries(history_tokens),
             before_tokens: history_tokens + 1,
-            held,
-
-            max_candidates: 0,
+            resident_tokens,
         })
         .await
     }
@@ -966,9 +964,7 @@ impl Session {
                         digest: vec![4; 16],
                     }],
                     before_tokens: tokens + 1,
-                    held: vec![],
-
-                    max_candidates: 0,
+                    resident_tokens: 0,
                 })
                 .await;
             if let Some(found) = reply

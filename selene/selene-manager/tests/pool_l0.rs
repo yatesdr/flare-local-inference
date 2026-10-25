@@ -138,10 +138,10 @@ async fn h8_scopes_never_see_each_other() {
             .collect(),
     )
     .await;
-    let reply = sb.lookup(1, 1024, vec![]).await;
+    let reply = sb.lookup(1, 1024, 0).await;
     assert!(reply.candidates.is_empty());
     // A claim that names the other scope's source answers like an unknown name.
-    let candidate = sa.lookup(2, 1024, vec![]).await;
+    let candidate = sa.lookup(2, 1024, 0).await;
     assert!(candidate.candidates.is_empty(), "a is its own instance");
     let source_ref = v2::SourceRef {
         instance_id: a.instance_id.to_vec(),
@@ -188,9 +188,9 @@ async fn h10_a_reconnect_supersedes_the_old_stream() {
     assert_eq!(closing.reason, v2::ClosingReason::ClosingSuperseded as i32);
     // The predecessor's entries stop being offered at once.
     let mut other = source(&mut pool, &Ident::new("b")).await;
-    assert!(other.lookup(1, 1024, vec![]).await.candidates.is_empty());
+    assert!(other.lookup(1, 1024, 0).await.candidates.is_empty());
     second.snapshot(chain(&[2048], v2::Tier::Dram, 1)).await;
-    let reply = other.lookup(2, 2048, vec![]).await;
+    let reply = other.lookup(2, 2048, 0).await;
     assert_eq!(candidates_of(&reply).len(), 1);
     assert_eq!(
         reply.candidates[0].key.as_ref().unwrap().consumed_tokens,
@@ -220,7 +220,7 @@ async fn i1_to_i4_notices_apply_in_order_and_gaps_demand_a_resync() {
         .await;
     assert_eq!(ack.applied_through, 1);
     let mut b = source(&mut pool, &Ident::new("b")).await;
-    assert_eq!(b.lookup(1, 1024, vec![]).await.candidates.len(), 1);
+    assert_eq!(b.lookup(1, 1024, 0).await.candidates.len(), 1);
     // I2: a duplicate batch changes nothing.
     a.send_notices_at(1, vec![saved(entry(1024, None, v2::Tier::Dram, 1))])
         .await;
@@ -231,7 +231,7 @@ async fn i1_to_i4_notices_apply_in_order_and_gaps_demand_a_resync() {
         })
         .await;
     assert_eq!(ack.applied_through, 1);
-    assert_eq!(b.lookup(2, 1024, vec![]).await.candidates.len(), 1);
+    assert_eq!(b.lookup(2, 1024, 0).await.candidates.len(), 1);
     // I3: a gap drops the batch and demands a snapshot; later notices are ignored.
     a.send_notices_at(5, vec![saved(entry(2048, None, v2::Tier::Dram, 1))])
         .await;
@@ -242,12 +242,12 @@ async fn i1_to_i4_notices_apply_in_order_and_gaps_demand_a_resync() {
     a.send_notices_at(2, vec![saved(entry(2048, None, v2::Tier::Dram, 1))])
         .await;
     assert_eq!(
-        b.lookup(3, 2048, vec![]).await.candidates.len(),
+        b.lookup(3, 2048, 0).await.candidates.len(),
         1,
         "only the old entry"
     );
     assert!(
-        b.lookup(4, 2048, vec![]).await.candidates.iter().all(|c| c
+        b.lookup(4, 2048, 0).await.candidates.iter().all(|c| c
             .key
             .as_ref()
             .unwrap()
@@ -271,22 +271,22 @@ async fn i5_to_i9_generations_spills_compactions() {
     lower.generation = 4;
     lower.bytes = 1;
     a.notices(vec![saved(lower)]).await;
-    let reply = b.lookup(1, 1024, vec![]).await;
+    let reply = b.lookup(1, 1024, 0).await;
     assert_eq!(reply.candidates[0].generation, 5);
     let mut higher = e.clone();
     higher.generation = 6;
     a.notices(vec![saved(higher)]).await;
-    assert_eq!(b.lookup(2, 1024, vec![]).await.candidates[0].generation, 6);
+    assert_eq!(b.lookup(2, 1024, 0).await.candidates[0].generation, 6);
     // I6: an eviction of an older generation does not remove a newer one.
     a.notices(vec![evicted(1024, v2::Tier::Dram, 5)]).await;
-    assert_eq!(b.lookup(3, 1024, vec![]).await.candidates.len(), 1);
+    assert_eq!(b.lookup(3, 1024, 0).await.candidates.len(), 1);
     a.notices(vec![evicted(1024, v2::Tier::Dram, 6)]).await;
-    assert!(b.lookup(4, 1024, vec![]).await.candidates.is_empty());
+    assert!(b.lookup(4, 1024, 0).await.candidates.is_empty());
     // I7: a spill adds the lower tier and removes the upper in one step.
     a.notices(vec![saved(entry(2048, None, v2::Tier::Gpu, 9))])
         .await;
     assert_eq!(
-        b.lookup(5, 2048, vec![]).await.candidates[0].level,
+        b.lookup(5, 2048, 0).await.candidates[0].level,
         v2::Level::NeighbourGpu as i32
     );
     a.notices(vec![spilled(
@@ -295,7 +295,7 @@ async fn i5_to_i9_generations_spills_compactions() {
         9,
     )])
     .await;
-    let reply = b.lookup(6, 2048, vec![]).await;
+    let reply = b.lookup(6, 2048, 0).await;
     assert_eq!(reply.candidates.len(), 1);
     assert_eq!(reply.candidates[0].level, v2::Level::HostDram as i32);
     // I23-ish: generations are per tier, so a low DRAM generation does not shadow GPU.
@@ -305,7 +305,7 @@ async fn i5_to_i9_generations_spills_compactions() {
     ])
     .await;
     a.notices(vec![evicted(3072, v2::Tier::Dram, 2)]).await;
-    let reply = b.lookup(7, 3072, vec![]).await;
+    let reply = b.lookup(7, 3072, 0).await;
     let at_3072: Vec<_> = reply
         .candidates
         .iter()
@@ -330,7 +330,7 @@ async fn i8_a_compacted_node_is_no_longer_an_endpoint_but_the_chain_holds() {
             .collect(),
     )
     .await;
-    assert_eq!(b.lookup(1, 3072, vec![]).await.candidates.len(), 3);
+    assert_eq!(b.lookup(1, 3072, 0).await.candidates.len(), 3);
     // mid is compacted into leaf: leaf's parent becomes root and it owns the tail.
     let heir = entry(3072, Some(1024), v2::Tier::Dram, 1);
     a.notices(vec![v2::Notice {
@@ -343,7 +343,7 @@ async fn i8_a_compacted_node_is_no_longer_an_endpoint_but_the_chain_holds() {
         })),
     }])
     .await;
-    let reply = b.lookup(2, 3072, vec![]).await;
+    let reply = b.lookup(2, 3072, 0).await;
     let keys: Vec<u64> = reply
         .candidates
         .iter()
@@ -379,7 +379,7 @@ async fn i10_to_i15_snapshots_install_atomically() {
         ),
         (3, 1, 4)
     );
-    assert_eq!(b.lookup(1, 2048, vec![]).await.candidates.len(), 2);
+    assert_eq!(b.lookup(1, 2048, 0).await.candidates.len(), 2);
     // A15: expected_next is W + 1 + buffered applied; 5 applies, 4 is skipped.
     a.send_notices_at(4, vec![saved(entry(3072, None, v2::Tier::Dram, 1))])
         .await;
@@ -408,7 +408,7 @@ async fn i10_to_i15_snapshots_install_atomically() {
         .snapshot_at(vec![entry(6144, None, v2::Tier::Dram, 1)], 5, vec![])
         .await;
     assert_eq!(installed.entries, 1);
-    let reply = b.lookup(2, 6144, vec![]).await;
+    let reply = b.lookup(2, 6144, 0).await;
     let keys: Vec<u64> = reply
         .candidates
         .iter()
@@ -440,7 +440,7 @@ async fn i11_to_i13_bad_resyncs() {
         v2::ResyncReason::ResyncGap as i32
     );
     // The installed entries stay as hints.
-    assert_eq!(b.lookup(1, 1024, vec![]).await.candidates.len(), 1);
+    assert_eq!(b.lookup(1, 1024, 0).await.candidates.len(), 1);
     // I12: more buffered deltas than the bound.
     a.send(c::M::ResyncBegin(v2::ResyncBegin {
         resync_id: 2,
@@ -544,7 +544,7 @@ async fn a13_a_stalled_resync_times_out_without_holding_anyone() {
     let required = a.resync_required().await;
     assert_eq!(required.reason, v2::ResyncReason::ResyncTimeout as i32);
     let mut c_session = source(&mut pool, &Ident::new("c")).await;
-    assert_eq!(c_session.lookup(1, 1024, vec![]).await.candidates.len(), 1);
+    assert_eq!(c_session.lookup(1, 1024, 0).await.candidates.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -556,7 +556,7 @@ async fn i18_and_i19_stale_incarnations_and_session_end() {
     a.notices(vec![saved(entry(1024, None, v2::Tier::Dram, 1))])
         .await;
     let mut b = source(&mut pool, &Ident::new("b")).await;
-    assert_eq!(b.lookup(1, 1024, vec![]).await.candidates.len(), 1);
+    assert_eq!(b.lookup(1, 1024, 0).await.candidates.len(), 1);
     // A message with the wrong session incarnation closes the stream.
     let mut stale = pool.open(&Ident::new("s")).await;
     stale
@@ -591,7 +591,7 @@ async fn i18_and_i19_stale_incarnations_and_session_end() {
     drop(a);
     let mut removed = false;
     for id in 10..60 {
-        if b.lookup(id, 1024, vec![]).await.candidates.is_empty() {
+        if b.lookup(id, 1024, 0).await.candidates.is_empty() {
             removed = true;
             break;
         }
@@ -636,38 +636,20 @@ async fn l1_to_l3_ordering_trimming_and_the_requesters_own_entries() {
                 .collect(),
         )
         .await;
-    let reply = c_session.lookup(1, 5000, vec![]).await;
+    let reply = c_session.lookup(1, 5000, 0).await;
     let found = candidates_of(&reply);
     assert!(
         found
             .iter()
             .all(|(_, id, _)| *id != ic.instance_id.to_vec())
     );
-    // L1: by level order (GPU, DRAM, NVMe), each candidate reaches its own endpoint.
-    let levels: Vec<i32> = found.iter().map(|f| f.0).collect();
-    assert_eq!(
-        levels,
-        vec![
-            v2::Level::NeighbourGpu as i32,
-            v2::Level::NeighbourGpu as i32,
-            v2::Level::NeighbourGpu as i32,
-            v2::Level::NeighbourGpu as i32,
-            v2::Level::HostDram as i32,
-            v2::Level::HostDram as i32,
-            v2::Level::HostDram as i32,
-            v2::Level::HostNvme as i32
-        ][..levels.len().min(8)],
-        "{found:?}"
+    assert_eq!(found.len(), 8, "at most max_candidates");
+    assert!(
+        found.windows(2).all(|w| w[0].2 >= w[1].2),
+        "longest endpoints first"
     );
-    assert_eq!(levels.len(), 8, "at most max_candidates");
-    // Longest match first within a level.
     assert_eq!(found[0].2, 4096);
-    // L3: a held range at a closer level trims a farther candidate.
-    let held = vec![v2::HeldRange {
-        level: v2::Level::NeighbourGpu as i32,
-        end: Some(pool::pkey(2048)),
-    }];
-    let reply = c_session.lookup(2, 5000, held).await;
+    let reply = c_session.lookup(2, 5000, 2048).await;
     let dram = reply
         .candidates
         .iter()
@@ -678,18 +660,12 @@ async fn l1_to_l3_ordering_trimming_and_the_requesters_own_entries() {
     assert_eq!(dram.begin_tokens, 2048);
     assert_eq!(dram.pages, (3072 - 2048) / 64);
     assert_eq!(dram.skip_pages, 0);
-    // A held range as deep as the candidate removes it.
-    let held = vec![v2::HeldRange {
-        level: v2::Level::NeighbourGpu as i32,
-        end: Some(pool::pkey(3072)),
-    }];
-    let reply = c_session.lookup(3, 5000, held).await;
+    let reply = c_session.lookup(3, 5000, 3072).await;
     assert!(
         reply
             .candidates
             .iter()
-            .all(|c| c.key.as_ref().unwrap().consumed_tokens > 3072
-                || c.level == v2::Level::NeighbourGpu as i32)
+            .all(|c| c.key.as_ref().unwrap().consumed_tokens > 3072)
     );
 }
 
@@ -714,7 +690,7 @@ async fn l1b_records_shorter_than_a_block_do_not_crowd_out_a_long_history_s_cand
     )
     .await;
     // A history with blocks of its own is offered the long records only.
-    let reply = c_session.lookup(1, 5000, vec![]).await;
+    let reply = c_session.lookup(1, 5000, 0).await;
     let found = candidates_of(&reply);
     assert_eq!(found.len(), 3, "{found:?}");
     assert!(
@@ -722,7 +698,7 @@ async fn l1b_records_shorter_than_a_block_do_not_crowd_out_a_long_history_s_cand
         "{found:?}"
     );
     // A history shorter than a block has only the root bucket, so it still sees them.
-    let reply = c_session.lookup(2, 500, vec![]).await;
+    let reply = c_session.lookup(2, 500, 0).await;
     assert_eq!(candidates_of(&reply).len(), 8, "capped at max_candidates");
 }
 
@@ -739,7 +715,7 @@ async fn l5_to_l8_holes_limits_and_validation() {
     let mut broken = chain(&[1024, 2048, 3072], v2::Tier::Dram, 1);
     broken.remove(1);
     a.notices(broken.into_iter().map(saved).collect()).await;
-    let reply = b.lookup(1, 3072, vec![]).await;
+    let reply = b.lookup(1, 3072, 0).await;
     let keys: Vec<u64> = reply
         .candidates
         .iter()
@@ -752,9 +728,7 @@ async fn l5_to_l8_holes_limits_and_validation() {
             lookup_id: 2,
             boundaries: pool::boundaries(3072),
             before_tokens: 1024,
-            held: vec![],
-
-            max_candidates: 0,
+            resident_tokens: 0,
         })
         .await;
     assert!(reply.candidates.is_empty());
@@ -764,17 +738,13 @@ async fn l5_to_l8_holes_limits_and_validation() {
             lookup_id: 3,
             boundaries: vec![pool::pkey(2048), pool::pkey(1024)],
             before_tokens: 5000,
-            held: vec![],
-
-            max_candidates: 0,
+            resident_tokens: 0,
         },
         v2::LookupRequest {
             lookup_id: 4,
             boundaries: (0..9).map(|n| pool::pkey(n * 1024)).collect(),
             before_tokens: 90000,
-            held: vec![],
-
-            max_candidates: 0,
+            resident_tokens: 0,
         },
     ] {
         let reply = b.lookup_request(request).await;
@@ -786,9 +756,7 @@ async fn l5_to_l8_holes_limits_and_validation() {
             lookup_id: id,
             boundaries: pool::boundaries(1024),
             before_tokens: 5000,
-            held: vec![],
-
-            max_candidates: 0,
+            resident_tokens: 0,
         }))
         .await;
     }
@@ -821,7 +789,7 @@ async fn l4_instance_candidates_need_shared_memory_on_both_sides() {
             .collect(),
     )
     .await;
-    let reply = b.lookup(1, 1024, vec![]).await;
+    let reply = b.lookup(1, 1024, 0).await;
     assert_eq!(
         reply.candidates[0]
             .source
@@ -842,7 +810,7 @@ async fn l4_instance_candidates_need_shared_memory_on_both_sides() {
             .collect(),
     )
     .await;
-    let reply = b.lookup(2, 2048, vec![]).await;
+    let reply = b.lookup(2, 2048, 0).await;
     assert!(
         reply
             .candidates
@@ -871,7 +839,7 @@ async fn l9_not_ready_answers_with_a_retry_hint() {
         host.start();
         let mut pool = Pool::connect(&host.config.socket).await;
         let mut a = source(&mut pool, &ident).await;
-        assert!(a.lookup(1, 1024, vec![]).await.status == v2::LookupStatus::LookupOk as i32);
+        assert!(a.lookup(1, 1024, 0).await.status == v2::LookupStatus::LookupOk as i32);
         a.goodbye(true).await;
         drop(a);
         host.stop();
@@ -885,7 +853,7 @@ async fn l9_not_ready_answers_with_a_retry_hint() {
     let mut pool = Pool::connect(&host.config.socket).await;
     let mut other = pool.open(&Ident::new("b")).await;
     other.snapshot(vec![]).await;
-    let reply = other.lookup(1, 1024, vec![]).await;
+    let reply = other.lookup(1, 1024, 0).await;
     assert_eq!(reply.status, v2::LookupStatus::LookupNotReady as i32);
     assert!(reply.retry_after_ms > 0);
     let info = other.readiness().await;
@@ -990,7 +958,7 @@ async fn r2_r3_and_s2_ready_when_remembered_sources_return_or_the_wait_ends() {
     let info = wait_ready(&mut watcher).await;
     assert_eq!(info.sources_expected, 0);
     assert!(started.elapsed() < Duration::from_secs(5));
-    assert!(watcher.lookup(1, 1024, vec![]).await.status == v2::LookupStatus::LookupOk as i32);
+    assert!(watcher.lookup(1, 1024, 0).await.status == v2::LookupStatus::LookupOk as i32);
     host.stop();
     host.base = std::env::temp_dir().join(format!("selene-unused2-{}", std::process::id()));
 
@@ -1007,7 +975,7 @@ async fn r2_r3_and_s2_ready_when_remembered_sources_return_or_the_wait_ends() {
     let mut x = pool.open(&Ident::new("x").restarted()).await;
     x.snapshot(vec![]).await;
     assert_eq!(
-        watcher.lookup(1, 1024, vec![]).await.status,
+        watcher.lookup(1, 1024, 0).await.status,
         v2::LookupStatus::LookupNotReady as i32
     );
     wait_ready(&mut watcher).await;
@@ -1074,7 +1042,7 @@ async fn r13_shutdown_drains_claims_then_closes_sessions() {
         )
         .await;
     let mut requester = self::source(&mut pool, &Ident::new("req")).await;
-    let candidate = requester.lookup(1, 1024, vec![]).await.candidates[0].clone();
+    let candidate = requester.lookup(1, 1024, 0).await.candidates[0].clone();
     requester
         .claim(requester.claim_for(1, &candidate, 0, true))
         .await;
@@ -1096,7 +1064,7 @@ async fn r13_shutdown_drains_claims_then_closes_sessions() {
     let refused = pool.open(&Ident::new("late")).await;
     assert_eq!(refused.opened.status, v2::OpenStatus::ShuttingDown as i32);
     assert_eq!(
-        requester.lookup(2, 1024, vec![]).await.status,
+        requester.lookup(2, 1024, 0).await.status,
         v2::LookupStatus::LookupNotReady as i32
     );
     requester
@@ -1161,14 +1129,14 @@ async fn i9_a_leaf_leaves_its_page_only_ancestors_until_they_are_named() {
     };
     // Only the leaf is named: nothing cascades in the manager.
     a.notices(vec![evicted(3072, v2::Tier::Dram, 1)]).await;
-    assert_eq!(keys(&b.lookup(1, 3072, vec![]).await), vec![2048, 1024]);
+    assert_eq!(keys(&b.lookup(1, 3072, 0).await), vec![2048, 1024]);
     // The ancestors that left with it arrive as their own notices, one per node.
     a.notices(vec![
         evicted(2048, v2::Tier::Dram, 1),
         evicted(1024, v2::Tier::Dram, 1),
     ])
     .await;
-    assert!(b.lookup(2, 3072, vec![]).await.candidates.is_empty());
+    assert!(b.lookup(2, 3072, 0).await.candidates.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1238,7 +1206,7 @@ async fn x4_batch_chunk_and_chain_limits_are_enforced() {
         )
         .await;
     let mut d = source(&mut pool, &Ident::new("d")).await;
-    let reply = d.lookup(1, 3072, vec![]).await;
+    let reply = d.lookup(1, 3072, 0).await;
     let keys: Vec<u64> = reply
         .candidates
         .iter()
