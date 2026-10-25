@@ -409,6 +409,37 @@ fn capacities(
     Ok((execution + cached, low, cached))
 }
 
+/// Keep the same server allowance and system share as integrated GPU planning.
+fn host_pool_budget(future: u64) -> Result<u64> {
+    #[cfg(unix)]
+    let (available, total) = {
+        let info = std::fs::read_to_string("/proc/meminfo").map_err(|e| e.to_string())?;
+        let total = info
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                (fields.next()? == "MemTotal:").then_some(())?;
+                let kib = fields.next()?.parse::<u64>().ok()?;
+                (fields.next()? == "kB").then_some(kib)?.checked_mul(1024)
+            })
+            .ok_or_else(|| invalid("Linux MemTotal is required to budget pool host memory"))?;
+        (shared_available(&info, usize::MAX)? as u64, total)
+    };
+    #[cfg(windows)]
+    let (available, total) = unsafe {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut memory: MEMORYSTATUSEX = std::mem::zeroed();
+        memory.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if GlobalMemoryStatusEx(&mut memory) == 0 {
+            return Err(std::io::Error::last_os_error().to_string().into());
+        }
+        (memory.ullAvailPhys, memory.ullTotalPhys)
+    };
+    Ok(available
+        .saturating_sub(future)
+        .saturating_sub(INTEGRATED_HOST_BYTES + total / INTEGRATED_SYSTEM_SHARE))
+}
+
 impl NativeModel {
     /// Refuse an occupied limit smaller than the known fixed model storage before loading it.
     pub(super) unsafe fn check_memory_limit(
@@ -471,7 +502,7 @@ impl NativeModel {
         initial: &[MemorySnapshot],
         embedding_host_bytes: u64,
     ) -> Result<()> {
-        // The host prefix store registers and streams after the caches are backed.
+        // Local host tiers register after cache backing; pool regions register before sizing.
         let reserve = headroom(&self.server_config)?;
         let page_tokens = self.server_config["page_tokens"]
             .as_u64()
@@ -609,6 +640,68 @@ impl NativeModel {
             .as_u64()
             .ok_or_else(|| invalid("model requires a prepared context ceiling"))?;
         let ceiling = page_ceiling(options.kv_cache_limit, context, active as u64, &contract)?;
+        if let Some(pool) = &options.prefix_cache.pool {
+            if self.cluster().is_some() {
+                return Err(invalid(
+                    "a multi-host package cannot share prefixes through a pool",
+                ));
+            }
+            let minimum_pages = ceiling
+                .map_or(active as u64 * 8192u64.div_ceil(page_tokens), |limit| {
+                    limit.minimum
+                });
+            let minimum = packages
+                .iter()
+                .map(|package| {
+                    bytes(package, 0, 1 + active as u64 * width)?
+                        .checked_add(bytes(package, 1, minimum_pages)?)
+                        .ok_or_else(|| invalid("minimum cache footprint overflow"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // Establish that local serving fits even if the pool is refused.
+            capacities(
+                packages,
+                &available,
+                active as u64,
+                width,
+                page_tokens,
+                ceiling,
+            )?;
+            let host = host_pool_budget(host_future).map_err(|error| error.to_string());
+            let budget = crate::offload::pool::Budget {
+                host,
+                devices: available
+                    .iter()
+                    .zip(&minimum)
+                    .zip(&self.ranks)
+                    .map(|((&available, &minimum), rank)| {
+                        (available.saturating_sub(minimum), rank.integrated)
+                    })
+                    .collect(),
+            };
+            let geometry = packages
+                .iter()
+                .map(|package| cache_geometry(package, contract.cache.page_tokens as u64, 1, 1))
+                .collect::<Result<Vec<_>>>()?;
+            let uuids = self
+                .ranks
+                .iter()
+                .map(|rank| crate::cuda::device_uuid(rank.device))
+                .collect::<Result<Vec<_>>>()?;
+            let (prepared, charges) = crate::offload::pool::PreparedPool::start(
+                pool,
+                super::model::offload_identity(&self.server_config)?,
+                &geometry,
+                uuids,
+                self.ranks[0].context as usize,
+                budget,
+                progress,
+            )?;
+            for (available, charge) in available.iter_mut().zip(charges) {
+                *available = available.saturating_sub(charge);
+            }
+            self.pool = Some(prepared);
+        }
         let (local_rows, local_pages, _) = capacities(
             packages,
             &available,
@@ -1200,6 +1293,34 @@ mod tests {
             }),
         });
         assert!(cache_geometry(&options, 64, 8, 16).is_err());
+    }
+
+    #[test]
+    fn pool_registration_reduces_kv_supply_within_occupied_and_reserve_limits() {
+        let gib = 1u64 << 30;
+        let packages = [package(4096, 1 << 20, 65536)];
+        let memory = MemorySnapshot {
+            free: 20 * gib,
+            total: 32 * gib,
+        };
+        for limit in [
+            None,
+            Some(MemoryLimit::Bytes(16 * gib)),
+            Some(MemoryLimit::Reserve(4 * gib)),
+            Some(MemoryLimit::Fraction(0.5)),
+        ] {
+            let available =
+                limited_budget(memory, 4 * gib, limit, HEADROOM_BYTES, false, 0).unwrap();
+            let before = capacities(&packages, &[available], 1, 1, 64, None).unwrap();
+            let budget = crate::offload::pool::Budget {
+                host: Ok(32 * gib),
+                devices: vec![(available, false)],
+            };
+            let charges = budget.charges(32 * gib, (32 * gib) / 512);
+            let after = capacities(&packages, &[available - charges[0]], 1, 1, 64, None).unwrap();
+            assert!(after.1 < before.1);
+            assert!(after.1 >= 8192 / 64);
+        }
     }
 
     #[test]

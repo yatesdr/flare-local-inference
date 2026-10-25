@@ -17,6 +17,7 @@ pub struct NativeModel {
     pub(super) server_config: serde_json::Value,
     engram: Vec<(std::sync::Arc<crate::engram::Shared>, usize)>,
     offload: Option<std::sync::Arc<crate::offload::Shared>>,
+    pub(super) pool: Option<crate::offload::pool::PreparedPool>,
     cluster: Option<ClusterRank>,
     roce: Vec<Option<RoceSpec>>,
 }
@@ -526,6 +527,7 @@ impl NativeModel {
             server_config,
             engram: Vec::new(),
             offload: None,
+            pool: None,
             cluster,
             roce,
         };
@@ -748,10 +750,22 @@ impl NativeModel {
             manifest.buffers.iter().find(|buffer| buffer.name == name)
                 .map(|buffer| buffer.nbytes as u64)
         })?;
-        let shard = self.cluster.as_ref().map(|cluster| (cluster.rank, cluster.world));
-        let prepared = crate::offload::prepare_with_inputs(
-            &options.prefix_cache, root, identity, geometry, contexts, staging, shard,
+        let shard = self
+            .cluster
+            .as_ref()
+            .map(|cluster| (cluster.rank, cluster.world));
+        let mut prepared = crate::offload::prepare_with_inputs(
+            &options.prefix_cache,
+            root,
+            identity,
+            geometry,
+            contexts,
+            staging,
+            shard,
         )?;
+        if let crate::offload::Preparation::Store(store) = &mut prepared {
+            store.pool = self.pool.take();
+        }
         let summary = prepared.summary();
         self.offload = prepared.into_shared();
         phase.finish(summary);
@@ -885,6 +899,7 @@ impl NativeModel {
 impl Drop for NativeModel {
     fn drop(&mut self) {
         self.offload.take();
+        self.pool.take();
         self.engram.clear();
         // Rank zero owns the shared reservations and releases them after every peer.
         while self.ranks.pop().is_some() {}
@@ -983,6 +998,7 @@ mod tests {
             server_config: serde_json::Value::Null,
             engram: Vec::new(),
             offload: None,
+            pool: None,
             cluster: None,
             roce: Vec::new(),
         };
