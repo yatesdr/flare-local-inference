@@ -39,6 +39,7 @@ message Hello {
 // Second frame from rank 0, after the agent's AgentHello matched.
 message Bind {
   bytes rank_secret = 1;
+  bytes instance_id = 2;    // rank 0's, over every rank's GPUs
 }
 
 // First frame from the agent.

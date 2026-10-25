@@ -237,7 +237,7 @@ async fn shutdown(engine: &mut Engine, link: &Link) -> Result<()> {
 }
 
 /// Why the manager could not be reached.
-enum Unreachable {
+pub(crate) enum Unreachable {
     /// Possibly for now.
     Retry(String),
     /// For as long as this process runs: its certificate cannot be verified.
@@ -323,7 +323,9 @@ fn pem_of(der: &[u8]) -> String {
     text
 }
 
-async fn connect(link: &Link) -> std::result::Result<(Channel, wire::Encryption), Unreachable> {
+pub(crate) async fn connect(
+    link: &Link,
+) -> std::result::Result<(Channel, wire::Encryption), Unreachable> {
     match &link.address {
         PoolAddress::Unix(path) => {
             let path = path.clone();
@@ -492,7 +494,7 @@ async fn establish(engine: &mut Engine, link: &Link) -> std::result::Result<Esta
         instance_name: st.name.clone(),
         scope: Some(super::codec::scope_to(&st.scope)),
         process_nonce: st.nonce.to_vec(),
-        rank_secret: Vec::new(),
+        rank_secret: st.rank_secret.map(|s| s.to_vec()).unwrap_or_default(),
         export_slots: if regions.is_some() || dial.is_some() {
             st.export_slots
         } else {

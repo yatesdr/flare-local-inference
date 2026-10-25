@@ -24,6 +24,7 @@ use super::{
     exporter::HostPin,
     identity::{self, Scope},
     lookup::{LookupState, LookupTicket},
+    rank::RankSet,
     shared::{Command, PoolEvent, PoolFetch, PoolStatus, PutRequest, Shared},
     startup::{Approve, RegisteredRegion, Startup},
     types::{HeldRange, Tier},
@@ -110,6 +111,27 @@ impl PoolClient {
         Self::start_trusting(config, copier, registrar, super::net::Roots::System)
     }
 
+    /// Rank 0 of a multi-process instance: the tensor-parallel ranks are separate
+    /// processes, `ranks.links[i]` reaches rank `i + 1`, whose
+    /// [`RankAgent`](super::agent::RankAgent) moves that rank's slices. `copier` serves
+    /// this rank only (its layout is the scope's rank-0 slice); `config.scope` and
+    /// `config.gpu_uuids` describe the whole instance.
+    pub fn start_ranked(
+        config: PoolConfig,
+        ranks: RankSet,
+        copier: SharedCopier,
+        registrar: Arc<dyn HostRegistrar + Send + Sync>,
+    ) -> Result<PoolClient> {
+        Self::start_waiting(
+            config,
+            Some(ranks),
+            copier,
+            registrar,
+            super::net::Roots::System,
+            STARTUP_WAIT,
+        )
+    }
+
     /// The ranges registered at startup, in the order they were registered. Empty when the
     /// client did not attach.
     pub fn registered_regions(&self) -> &[RegisteredRegion] {
@@ -123,28 +145,40 @@ impl PoolClient {
         registrar: Arc<dyn HostRegistrar + Send + Sync>,
         roots: super::net::Roots,
     ) -> Result<PoolClient> {
-        Self::start_waiting(config, copier, registrar, roots, STARTUP_WAIT)
+        Self::start_waiting(config, None, copier, registrar, roots, STARTUP_WAIT)
     }
 
     /// [`PoolClient::start_trusting`] with the startup wait named, so a test need not wait ten
-    /// seconds for a manager that is not there.
+    /// seconds for a manager that is not there, and with the ranks of a multi-process instance.
     pub(crate) fn start_waiting(
         config: PoolConfig,
+        ranks: Option<RankSet>,
         copier: SharedCopier,
         registrar: Arc<dyn HostRegistrar + Send + Sync>,
         roots: super::net::Roots,
         wait: Duration,
     ) -> Result<PoolClient> {
         let geometry = &config.scope.geometry;
+        let slices = Arc::new(super::slice::SliceLayout::new(geometry)?);
         {
             let layout = copier.lock().unwrap().layout().clone();
-            if layout.page_record_bytes != geometry.page_record_bytes
-                || layout.row_record_bytes != geometry.row_record_bytes
-            {
+            // A rank of a multi-process instance copies only its own slice.
+            let (page, row) = match &ranks {
+                Some(_) => (slices.rank(0).page_len, slices.rank(0).row_len),
+                None => (geometry.page_record_bytes, geometry.row_record_bytes),
+            };
+            if layout.page_record_bytes != page || layout.row_record_bytes != row {
                 return Err(Error::new(
                     "the pool scope does not match the copier's layout",
                 ));
             }
+        }
+        if let Some(set) = &ranks
+            && set.links.len() + 1 != slices.world()
+        {
+            return Err(Error::new(
+                "the number of rank links does not match the scope's rank count",
+            ));
         }
         if config.tenant.is_empty() || config.tenant != config.scope.tenant {
             return Err(Error::new(
@@ -186,6 +220,11 @@ impl PoolClient {
             );
         }
         let announce = Announcer::new(wake.clone());
+        let rank_secret = match &ranks {
+            Some(_) => Some(identity::secret()?),
+            None => None,
+        };
+        let fingerprint = config.scope.layout_fingerprint;
         let settings = Arc::new(Settings {
             instance_id,
             nonce: identity::process_nonce()?,
@@ -195,14 +234,27 @@ impl PoolClient {
             export_slots: config.export_slots,
             claim_slots: config.claim_slots,
             context: config.registration_context,
+            slices: slices.clone(),
+            rank_secret,
         });
-        let engine = Engine::new(
-            settings,
+        let mut engine = Engine::new(
+            settings.clone(),
             shared.clone(),
             announce.clone(),
             copier,
             registrar,
         );
+        if let (Some(set), Some(secret)) = (ranks, rank_secret) {
+            engine.set_ranks(super::engine::Ranks::new(
+                set,
+                slices,
+                secret,
+                settings.nonce,
+                settings.instance_id,
+                fingerprint,
+                wake.clone(),
+            )?);
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let startup = Arc::new(Startup::new());
         let link = conn::Link {

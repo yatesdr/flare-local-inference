@@ -8,7 +8,7 @@
 //! one result after every destination write has drained, whatever happened.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     time::Instant,
 };
 
@@ -26,6 +26,7 @@ use super::{
     },
     CLAIM_DEADLINE_MS, Engine, Owner, RESTORE_DEADLINE,
     coverage::Coverage,
+    ranks::XferOwner,
 };
 
 /// A record the claim is expected to be granted, derived from the plan.
@@ -99,14 +100,29 @@ struct Restore {
 
 struct Window {
     jobs_left: u32,
+    /// Shared-memory peer ranks that have not yet drained their copy of this window.
+    peers_left: BTreeSet<usize>,
     released: bool,
     /// The staging slot holding the window, when it came over the data channel.
     slot: Option<u32>,
 }
 
+/// A peer rank's part of a claim.
+struct PeerPart {
+    rank: usize,
+    xfer: u64,
+    shared: bool,
+    /// The agent's `Done`: the rank has drained and covered its slice (or failed).
+    done: Option<std::result::Result<(), String>>,
+    /// The agent could not prove it drained.
+    quarantined: bool,
+    cancelled: bool,
+}
+
 struct Claim {
     restore: u64,
     part: usize,
+    peers: Vec<PeerPart>,
     total_pages: u64,
     wants_row: bool,
     pages: Vec<PageId>,
@@ -238,6 +254,7 @@ impl Engine {
             Claim {
                 restore,
                 part: index,
+                peers: Vec::new(),
                 coverage: Coverage::new(expected),
                 total_pages,
                 wants_row: p.row,
@@ -323,6 +340,15 @@ impl Engine {
                         }
                     }
                 }
+                if let Err(error) = self.open_peer_parts(id, &granted) {
+                    return self.fail_restore(
+                        restore,
+                        Some(id),
+                        Some(part),
+                        error,
+                        wire::CopyOutcome::CopyErrorOutcome,
+                    );
+                }
                 let next = part + 1;
                 if self
                     .requester
@@ -368,8 +394,28 @@ impl Engine {
     }
 
     /// Take up a window. A slot the window did not keep is freed.
-    fn window_ready(&mut self, ready: wire::WindowReady, slot: Option<u32>) {
-        let taken = self.take_window(ready, slot);
+    fn window_ready(&mut self, mut ready: wire::WindowReady, slot: Option<u32>) {
+        // A multi-process instance's shared window comes with every shared rank's slice
+        // sums; this rank checks its own and passes the others on to their agents.
+        let others = if self.ranks.is_some() && slot.is_none() {
+            let mut all = std::mem::take(&mut ready.rank_sums);
+            match all.iter().position(|sums| sums.rank == 0) {
+                Some(position) => {
+                    let mine = all.remove(position);
+                    ready.page_xxh3 = mine.page_xxh3;
+                    ready.row_xxh3 = mine.row_xxh3;
+                    ready.has_row = mine.has_row;
+                    all
+                }
+                None => {
+                    ready.page_xxh3.clear();
+                    all
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let taken = self.take_window(ready, slot, others);
         if let (false, Some(slot)) = (taken, slot) {
             self.free_slot(slot);
         }
@@ -377,13 +423,36 @@ impl Engine {
 
     /// `false` when the window was not taken up and its slot, if any, is still the
     /// caller's. Once a window is recorded its slot belongs to it.
-    fn take_window(&mut self, ready: wire::WindowReady, slot: Option<u32>) -> bool {
+    fn take_window(
+        &mut self,
+        ready: wire::WindowReady,
+        slot: Option<u32>,
+        others: Vec<wire::RankSums>,
+    ) -> bool {
         let id = ready.claim_id;
         let Some(spec) = ready.window else {
             return false;
         };
         let memory = self.memory();
+        // What a window's pages and row measure for this rank: a whole window of a
+        // single-process instance or in shared memory (this rank reads its slice, at the
+        // start of each record), or only this rank's slices when a channel brought them.
         let (page_bytes, row_bytes) = (self.st.page_record_bytes(), self.st.row_record_bytes());
+        let (stride, hash_len, row_hash_len) = match (&self.ranks, slot) {
+            (Some(ranks), Some(_)) => {
+                let mine = ranks.layout.rank(0);
+                (mine.page_len, mine.page_len, mine.row_len)
+            }
+            (Some(ranks), None) => {
+                let mine = ranks.layout.rank(0);
+                (page_bytes, mine.page_len, mine.row_len)
+            }
+            (None, _) => (page_bytes, page_bytes, row_bytes),
+        };
+        let (page_bytes, row_bytes) = match (&self.ranks, slot) {
+            (Some(_), Some(_)) => (hash_len, row_hash_len),
+            _ => (page_bytes, row_bytes),
+        };
         let Some(claim) = self.requester.claims.get_mut(&id) else {
             return false;
         };
@@ -408,6 +477,7 @@ impl Engine {
             spec.index,
             Window {
                 jobs_left: 0,
+                peers_left: BTreeSet::new(),
                 released: false,
                 slot,
             },
@@ -443,10 +513,13 @@ impl Engine {
             );
             return true;
         }
-        let page_len = page_bytes as usize;
+        let (stride, hash_len, row_hash_len) =
+            (stride as usize, hash_len as usize, row_hash_len as usize);
         let mismatch = (0..count)
-            .any(|i| checksum(&bytes[i * page_len..(i + 1) * page_len]) != ready.page_xxh3[i])
-            || (spec.row && checksum(&bytes[count * page_len..]) != ready.row_xxh3);
+            .any(|i| checksum(&bytes[i * stride..i * stride + hash_len]) != ready.page_xxh3[i])
+            || (spec.row
+                && checksum(&bytes[count * stride..count * stride + row_hash_len])
+                    != ready.row_xxh3);
         if mismatch {
             // Nothing was copied, so the window is free to go back at once.
             self.release_window(id, spec.index);
@@ -469,13 +542,13 @@ impl Engine {
         while first < count || (count == 0 && jobs.is_empty()) {
             let end = (first + WINDOW_PAGES).min(count);
             let pages = (first..end)
-                .map(|i| (claim.pages[dest + i], base + i * page_len))
+                .map(|i| (claim.pages[dest + i], base + i * stride))
                 .collect();
             let last = end == count;
             let row = (last && spec.row).then(|| {
                 (
                     claim.slot.expect("a part with a row has a slot"),
-                    base + count * page_len,
+                    base + count * stride,
                 )
             });
             jobs.push(Job {
@@ -490,8 +563,18 @@ impl Engine {
                 break;
             }
         }
+        // The shared-memory peers copy their own slices of this window in step.
+        let mut forward = Vec::new();
+        let mut missing = None;
+        for peer in claim.peers.iter().filter(|p| p.shared && p.done.is_none()) {
+            match others.iter().find(|sums| sums.rank as usize == peer.rank) {
+                Some(sums) => forward.push((peer.rank, peer.xfer, sums.clone())),
+                None => missing = Some(peer.rank),
+            }
+        }
         let window = claim.windows.get_mut(&spec.index).expect("inserted");
         window.jobs_left = jobs.len() as u32;
+        window.peers_left = forward.iter().map(|(rank, _, _)| *rank).collect();
         claim.jobs_outstanding += jobs.len() as u32;
         for job in jobs {
             self.queue_job(
@@ -502,7 +585,194 @@ impl Engine {
                 },
             );
         }
+        if let Some(rank) = missing {
+            self.fail_restore(
+                restore,
+                Some(id),
+                Some(part),
+                Error::new(format!("the manager gave no checksums for rank {rank}")),
+                wire::CopyOutcome::CopyErrorOutcome,
+            );
+            return true;
+        }
+        for (rank, xfer, sums) in forward {
+            let sent = self.ranks.as_ref().is_some_and(|ranks| {
+                ranks.send_window(
+                    rank,
+                    super::super::rank::link::Window {
+                        xfer,
+                        spec: Some(spec.clone()),
+                        sums: Some(super::super::rank::link::SliceSums {
+                            pages: sums.page_xxh3,
+                            row: sums.row_xxh3,
+                            has_row: sums.has_row,
+                        }),
+                    },
+                )
+            });
+            if !sent {
+                self.fail_restore(
+                    restore,
+                    Some(id),
+                    Some(part),
+                    Error::new(format!("rank {rank}'s link is down")),
+                    wire::CopyOutcome::CopyErrorOutcome,
+                );
+                return true;
+            }
+        }
         true
+    }
+
+    /// Start every peer rank's part of a granted claim.
+    fn open_peer_parts(
+        &mut self,
+        id: u64,
+        granted: &wire::ClaimGranted,
+    ) -> std::result::Result<(), Error> {
+        use super::super::rank::link;
+        let Some(ranks) = self.ranks.as_mut() else {
+            return Ok(());
+        };
+        let Some(claim) = self.requester.claims.get_mut(&id) else {
+            return Ok(());
+        };
+        let (page_bytes, row_bytes) = (self.st.page_record_bytes(), self.st.row_record_bytes());
+        for rank in 1..ranks.world() {
+            let channel = granted
+                .rank_channels
+                .iter()
+                .find(|c| c.rank as usize == rank)
+                .and_then(|c| c.channel.clone());
+            let shared = channel.is_none();
+            let expected = if shared {
+                wire::RankMode::RankShared
+            } else {
+                wire::RankMode::RankChannel
+            };
+            if ranks.mode(rank) != Some(expected) {
+                return Err(Error::new(format!(
+                    "rank {rank}'s attachment does not match the grant's mode for it"
+                )));
+            }
+            let open = link::Open {
+                dir: link::Dir::In as i32,
+                kind: wire::rank_fence::Kind::Claim as i32,
+                fence_id: id,
+                records: granted.records.clone(),
+                pages: claim.pages.iter().map(|page| page.0).collect(),
+                has_slot: claim.slot.is_some(),
+                slot: claim.slot.map_or(0, |slot| slot.0),
+                channel,
+                page_bytes,
+                row_bytes,
+                ..Default::default()
+            };
+            let xfer = ranks
+                .open(rank, XferOwner::Claim(id), open)
+                .ok_or_else(|| Error::new(format!("rank {rank} is not attached")))?;
+            claim.peers.push(PeerPart {
+                rank,
+                xfer,
+                shared,
+                done: None,
+                quarantined: false,
+                cancelled: false,
+            });
+        }
+        Ok(())
+    }
+
+    /// A shared-memory peer drained its copy of one window.
+    pub(crate) fn on_peer_window_done(
+        &mut self,
+        claim_id: u64,
+        rank: usize,
+        index: u32,
+        result: std::result::Result<(), String>,
+    ) {
+        let Some(claim) = self.requester.claims.get_mut(&claim_id) else {
+            return;
+        };
+        let (restore, part) = (claim.restore, claim.part);
+        if let Some(window) = claim.windows.get_mut(&index) {
+            window.peers_left.remove(&rank);
+        }
+        if let Err(error) = result {
+            self.fail_restore(
+                restore,
+                Some(claim_id),
+                Some(part),
+                Error::new(format!("rank {rank}: {error}")),
+                wire::CopyOutcome::CopyErrorOutcome,
+            );
+        }
+        let done = self
+            .requester
+            .claims
+            .get(&claim_id)
+            .and_then(|c| c.windows.get(&index))
+            .is_some_and(|w| w.jobs_left == 0 && w.peers_left.is_empty() && !w.released);
+        if done {
+            self.release_window(claim_id, index);
+        }
+        self.drive_claim(claim_id);
+    }
+
+    /// A peer rank ended its part of a claim: it has drained, or says it cannot prove it.
+    pub(crate) fn on_peer_done(
+        &mut self,
+        claim_id: u64,
+        rank: usize,
+        result: std::result::Result<(), String>,
+        quarantined: bool,
+    ) {
+        let Some(claim) = self.requester.claims.get_mut(&claim_id) else {
+            return;
+        };
+        let (restore, part) = (claim.restore, claim.part);
+        let Some(peer) = claim
+            .peers
+            .iter_mut()
+            .find(|p| p.rank == rank && p.done.is_none())
+        else {
+            return;
+        };
+        peer.done = Some(result.clone());
+        peer.quarantined = quarantined;
+        if quarantined {
+            // The rank cannot show its copies stopped: nothing it may write is released.
+            return self.quarantine();
+        }
+        // A shared peer that is done owes no window any more.
+        for window in claim.windows.values_mut() {
+            window.peers_left.remove(&rank);
+        }
+        if let Err(error) = result {
+            self.fail_restore(
+                restore,
+                Some(claim_id),
+                Some(part),
+                Error::new(format!("rank {rank}: {error}")),
+                wire::CopyOutcome::CopyErrorOutcome,
+            );
+        }
+        let ready: Vec<u32> = self
+            .requester
+            .claims
+            .get(&claim_id)
+            .map(|c| {
+                c.windows
+                    .iter()
+                    .filter(|(_, w)| w.jobs_left == 0 && w.peers_left.is_empty() && !w.released)
+                    .map(|(index, _)| *index)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for index in ready {
+            self.release_window(claim_id, index);
+        }
+        self.drive_claim(claim_id);
     }
 
     /// The manager ended a claim's transfer cleanly.
@@ -606,7 +876,7 @@ impl Engine {
             .claims
             .get(&id)
             .and_then(|c| c.windows.get(&window))
-            .is_some_and(|w| w.jobs_left == 0 && !w.released);
+            .is_some_and(|w| w.jobs_left == 0 && w.peers_left.is_empty() && !w.released);
         if done {
             self.release_window(id, window);
         }
@@ -718,6 +988,7 @@ impl Engine {
             } else if claim.coverage.complete()
                 && claim.windows.values().all(|w| w.released)
                 && (claim.ended || !claim.via_channel)
+                && claim.peers.iter().all(|p| matches!(p.done, Some(Ok(()))))
             {
                 claim.verdict_ok = true;
                 Some(wire::CopyOutcome::CopyOk)
@@ -735,7 +1006,8 @@ impl Engine {
         let gone = claim
             .terminal
             .as_ref()
-            .is_some_and(|t| !t.fence_required || claim.fence_sent);
+            .is_some_and(|t| !t.fence_required || claim.fence_sent)
+            && claim.peers.iter().all(|p| p.done.is_some());
         if gone {
             // Slots of windows that never reached a release go back with the claim.
             if let Some(mut claim) = self.requester.claims.remove(&id) {
@@ -756,11 +1028,12 @@ impl Engine {
         let Some(restore) = self.requester.restores.get(&id) else {
             return;
         };
-        let drained = !self
-            .requester
-            .claims
-            .values()
-            .any(|c| c.restore == id && (c.jobs_outstanding > 0 || c.channel_open));
+        let drained = !self.requester.claims.values().any(|c| {
+            c.restore == id
+                && (c.jobs_outstanding > 0
+                    || c.channel_open
+                    || c.peers.iter().any(|p| p.done.is_none()))
+        });
         let result = if restore.failure.is_some() {
             if !drained {
                 return;
@@ -792,6 +1065,7 @@ impl Engine {
         let source = part
             .and_then(|p| restore.parts.get(p))
             .map(|p| (p.fetch.candidate.source.clone(), p.fetch.candidate.tier));
+        eprintln!("warning: restore {id} failed: {error}");
         restore.failure.get_or_insert(FetchFailure {
             error,
             part,
@@ -807,6 +1081,22 @@ impl Engine {
             .collect();
         for claim_id in claims {
             self.withdraw_queued(claim_id);
+            let claim = self.requester.claims.get_mut(&claim_id).expect("listed");
+            // The peer ranks stop too; their `Done` come back after they have drained.
+            let cancels: Vec<u64> = claim
+                .peers
+                .iter_mut()
+                .filter(|p| p.done.is_none() && !p.cancelled)
+                .map(|p| {
+                    p.cancelled = true;
+                    p.xfer
+                })
+                .collect();
+            if let Some(ranks) = &self.ranks {
+                for xfer in cancels {
+                    ranks.cancel(xfer);
+                }
+            }
             let claim = self.requester.claims.get_mut(&claim_id).expect("listed");
             // No more windows are wanted; the task goes and reports `Closed`.
             if let Some(channel) = &claim.channel {
