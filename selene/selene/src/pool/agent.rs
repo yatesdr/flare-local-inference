@@ -42,7 +42,7 @@ use super::{
     shared::PoolStatus,
     shm::Regions,
     slice::{SliceLayout, SliceSums},
-    startup::{RegisteredRegion, Startup},
+    startup::{Approve, PlannedRegion, RegisteredRegion, Startup},
     wire::{self, rank_client_message as rc, rank_server_message as rs},
 };
 
@@ -208,6 +208,11 @@ pub struct AgentConfig {
     pub gpu_uuid: [u8; 16],
     /// This rank's record files, when its local tier is sharded.
     pub records: Option<Box<dyn RankRecords>>,
+    /// Called once at startup with everything this agent is about to register (the manager's
+    /// shared files and/or its own data-channel staging), after the manager's first Hello and
+    /// before any registration. `Err(reason)` registers nothing: the agent is disabled with one
+    /// warning, and rank 0 turns the pool off for every rank. `None` approves.
+    pub approve: Option<Approve>,
 }
 
 /// A running agent.
@@ -261,6 +266,7 @@ impl RankAgent {
             copier: config.copier,
             registrar: config.registrar,
             startup: startup.clone(),
+            approve: config.approve,
             shared: None,
             wake: wake.clone(),
             stop: stop.clone(),
@@ -409,6 +415,7 @@ struct Agent {
     copier: SharedCopier,
     registrar: Arc<dyn HostRegistrar + Send + Sync>,
     startup: Arc<Startup>,
+    approve: Option<Approve>,
     /// The manager's shared files as they were when mapped and registered at startup.
     shared: Option<(wire::SharedMemory, Arc<Regions>)>,
     wake: Arc<Notify>,
@@ -456,6 +463,12 @@ fn run(mut agent: Agent) -> Result<()> {
 
 impl Agent {
     fn set_status(&self, status: PoolStatus) {
+        if let PoolStatus::Disabled(reason) = &status {
+            // All ranks use the pool or none do: rank 0 hears it.
+            self.end.send(Msg::Disabled(link::Disabled {
+                reason: reason.clone(),
+            }));
+        }
         *self.status.lock().unwrap() = status;
     }
 
@@ -591,7 +604,11 @@ impl Agent {
                         });
                         return true;
                     }
-                    Incoming::Message(Msg::Close(_)) => return false,
+                    Incoming::Message(Msg::Close(_)) => {
+                        *self.status.lock().unwrap() =
+                            PoolStatus::Disabled("rank 0 is not using the pool".into());
+                        return false;
+                    }
                     Incoming::Message(_) => {}
                 }
             }
@@ -674,6 +691,40 @@ impl Agent {
             match self.reach(&link).await {
                 Ok((_client, hello)) => {
                     if !self.startup.begin() {
+                        return false;
+                    }
+                    let mut plan = Vec::new();
+                    if let Some(shared) = hello.shared_memory.as_ref() {
+                        plan.push(PlannedRegion {
+                            name: "arena",
+                            bytes: shared.arena_bytes,
+                        });
+                        plan.push(PlannedRegion {
+                            name: "staging",
+                            bytes: shared.staging_bytes,
+                        });
+                    }
+                    if !hello.data_transports.is_empty() {
+                        plan.push(PlannedRegion {
+                            name: "data-staging",
+                            bytes: Staging::planned_bytes(STAGING_SLOTS, self.slot_bytes(&hello)),
+                        });
+                    }
+                    if let Some(approve) = &self.approve
+                        && let Err(reason) = approve(&plan)
+                    {
+                        let sizes = plan
+                            .iter()
+                            .map(|region| format!("{} {} bytes", region.name, region.bytes))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        self.registrar = Arc::new(super::startup::ClosedRegistrar);
+                        self.startup.done(Vec::new());
+                        let why = format!(
+                            "the pool's host memory ({sizes}) was not approved ({reason}); using local tiers only"
+                        );
+                        eprintln!("warning: rank {}: {why}", self.rank);
+                        self.set_status(PoolStatus::Disabled(why));
                         return false;
                     }
                     let mut registered = Vec::new();
@@ -834,15 +885,19 @@ impl Agent {
 
     /// The staging a channel leg copies through, registered at startup.
     fn make_staging(&self, hello: &wire::HelloReply) -> Result<Arc<Staging>> {
-        let limits = conn::limits_or_default(hello.limits);
-        let mine = self.layout.rank(self.rank);
-        let slot_bytes = limits.max_window_bytes.max(mine.page_len).max(mine.row_len);
         Ok(Arc::new(Staging::new(
             &*self.registrar,
             self.context,
             STAGING_SLOTS,
-            slot_bytes,
+            self.slot_bytes(hello),
         )?))
+    }
+
+    /// The size of one slot of the data-channel staging.
+    fn slot_bytes(&self, hello: &wire::HelloReply) -> u64 {
+        let limits = conn::limits_or_default(hello.limits);
+        let mine = self.layout.rank(self.rank);
+        limits.max_window_bytes.max(mine.page_len).max(mine.row_len)
     }
 
     fn make_dial(&mut self, link: &conn::Link, hello: &wire::HelloReply) -> Result<()> {

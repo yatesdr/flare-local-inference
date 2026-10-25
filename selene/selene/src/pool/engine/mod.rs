@@ -143,6 +143,8 @@ pub(crate) struct Engine {
     pub(crate) dial: Option<Arc<dyn Dial>>,
     /// The peer ranks of a multi-process instance.
     pub(crate) ranks: Option<ranks::Ranks>,
+    /// Why the pool is off because of a peer rank; the status stays Disabled.
+    ranks_off: Option<String>,
 }
 
 impl Engine {
@@ -182,6 +184,7 @@ impl Engine {
             rdma_broken: Arc::default(),
             dial: None,
             ranks: None,
+            ranks_off: None,
         }
     }
 
@@ -328,6 +331,10 @@ impl Engine {
     }
 
     fn update_status(&self) {
+        if let Some(why) = &self.ranks_off {
+            self.shared.set_status(PoolStatus::Disabled(why.clone()));
+            return;
+        }
         let ranks_attached = self.ranks_attached();
         let status = match &self.sess {
             None => return,
@@ -767,7 +774,14 @@ impl Engine {
                     }
                 }
                 RankEvent::Attached | RankEvent::Detached => {}
-                RankEvent::Lost { rank, reason } => self.rank_lost(rank, &reason),
+                RankEvent::Lost { rank, reason } => self.rank_lost(
+                    rank,
+                    &format!("the link to rank {rank} failed ({reason}); the pool is off"),
+                ),
+                RankEvent::Disabled { rank, reason } => self.rank_lost(
+                    rank,
+                    &format!("rank {rank} will not use the pool ({reason}); the pool is off for every rank"),
+                ),
             }
         }
         if any {
@@ -775,17 +789,25 @@ impl Engine {
         }
     }
 
+    /// Rank 0 is not using the pool: the peers are told, so none of them does.
+    pub(crate) fn close_ranks(&self) {
+        if let Some(ranks) = &self.ranks {
+            ranks.close_all();
+        }
+    }
+
     /// A peer rank's link failed: whatever it was doing, nothing can show it stopped.
-    fn rank_lost(&mut self, rank: usize, reason: &str) {
-        eprintln!("warning: the link to rank {rank} failed ({reason}); the pool is off");
+    fn rank_lost(&mut self, rank: usize, message: &str) {
+        eprintln!("warning: {message}");
         let open = self
             .ranks
             .as_ref()
             .map(|ranks| ranks.open_on(rank))
             .unwrap_or_default();
         if open.is_empty() {
+            self.ranks_off = Some(message.to_string());
             self.shared
-                .set_status(PoolStatus::Disabled(format!("rank {rank}'s link failed")));
+                .set_status(PoolStatus::Disabled(message.to_string()));
             self.shared.fail_lookups();
             return;
         }
