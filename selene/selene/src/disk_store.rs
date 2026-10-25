@@ -2306,6 +2306,10 @@ impl DiskStore {
 }
 
 impl HostStore for DiskStore {
+    fn reused(&mut self, key: PrefixKey) {
+        self.index.touch(&key);
+    }
+
     fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit> {
         self.stats.lookups += 1;
         let chain = self

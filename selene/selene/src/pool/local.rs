@@ -14,6 +14,12 @@ impl Tiers {
 }
 
 impl HostStore for Tiers {
+    fn reused(&mut self, key: PrefixKey) {
+        if let Some(tiers) = &mut self.0 {
+            tiers.reused(key);
+        }
+    }
+
     fn lookup(
         &mut self,
         history: &dyn crate::History,

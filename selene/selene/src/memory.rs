@@ -170,6 +170,10 @@ struct Core {
 }
 
 impl Core {
+    fn reused(&mut self, key: &PrefixKey) {
+        self.index.touch(key);
+    }
+
     fn new(identity: [u8; 32], pool: SlabPool, layout: Layout, flat: bool) -> Self {
         Self {
             index: Index::new(layout.page_tokens),
@@ -1284,6 +1288,10 @@ impl MemoryStore {
 }
 
 impl HostStore for MemoryStore {
+    fn reused(&mut self, key: PrefixKey) {
+        self.core.reused(&key);
+    }
+
     fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit> {
         self.core.lookup(history, resident, before)
     }
@@ -1536,6 +1544,23 @@ mod tests {
                 _ => panic!("unexpected event"),
             })
             .collect()
+    }
+
+    #[test]
+    fn gpu_reuse_refreshes_the_host_record_before_eviction() {
+        let mut core = store_core(2, 2, false);
+        let a = published(&history(64, 1), 64, None, 0, 1);
+        let b = published(&history(64, 2), 64, None, 1, 2);
+        let c = published(&history(64, 3), 64, None, 2, 3);
+        for record in [&a, &b] {
+            assert!(core.store(record).unwrap());
+            finish(&mut core);
+        }
+        core.reused(&a.key);
+        assert!(core.store(&c).unwrap());
+        assert!(core.index.contains(&a.key));
+        assert!(!core.index.contains(&b.key));
+        finish(&mut core);
     }
 
     #[test]

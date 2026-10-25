@@ -1241,6 +1241,7 @@ struct FakeStore {
     pooled: bool,
     /// Token counts of the histories `begin_lookup` received.
     begun: Vec<u64>,
+    reused: Vec<crate::cache::PrefixKey>,
     /// Whether each `lookup_for` call carried a ticket.
     tickets_seen: Vec<bool>,
     /// Tickets dropped without an answer.
@@ -1278,6 +1279,7 @@ impl FakeStore {
             drops: Arc::new(AtomicUsize::new(0)),
             pooled: false,
             begun: Vec::new(),
+            reused: Vec::new(),
             tickets_seen: Vec::new(),
             withdrawn: Arc::new(AtomicUsize::new(0)),
             exports: Vec::new(),
@@ -1291,6 +1293,9 @@ impl FakeStore {
 }
 
 impl crate::offload::PrefixStore for FakeStore {
+    fn reused(&mut self, key: crate::cache::PrefixKey) {
+        self.reused.push(key);
+    }
     fn pooled(&self) -> bool {
         self.pooled
     }
@@ -1571,6 +1576,21 @@ fn fake_store<'w>(worker: &'w mut Worker<'_>) -> &'w mut FakeStore {
     let store = worker.store.as_mut().unwrap().as_mut() as *mut dyn crate::offload::PrefixStore;
     // SAFETY: The worker holds the only store and it was constructed as a FakeStore.
     unsafe { &mut *(store as *mut FakeStore) }
+}
+
+#[test]
+fn a_gpu_hit_refreshes_the_host_record_at_admission() {
+    let fixture = Fixture::new();
+    let (sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let checkpoint = unpinned_checkpoint(&mut worker, 0, 64);
+    let key = worker.scheduler.publication(checkpoint).unwrap().key;
+    worker.attach_store(Some(Box::new(FakeStore::new(None))));
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    sender.send(vec![incoming]).unwrap();
+    worker.admit().unwrap();
+    assert!(worker.active[0].is_some());
+    assert_eq!(fake_store(&mut worker).reused, [key]);
 }
 
 #[test]
