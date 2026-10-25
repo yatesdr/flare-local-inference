@@ -53,7 +53,7 @@ use super::{
 };
 
 /// Windows of one record submitted to the transfer threads at a time.
-pub const IN_FLIGHT_WINDOWS: usize = 2;
+pub const IN_FLIGHT_WINDOWS: usize = crate::pool::WINDOW_CREDITS as usize;
 
 /// Weight of the newest observation in the transfer rate estimates.
 const RATE_WEIGHT: f64 = 0.2;

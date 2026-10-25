@@ -19,6 +19,8 @@ pub mod frame;
 mod host_tests;
 mod identity;
 mod local;
+mod limits;
+pub use limits::{Limits, WINDOW_CREDITS, MAX_WINDOW_BYTES, MAX_CHAIN_NODES, MAX_OPEN_PUTS, PROGRESS_TIMEOUT};
 mod lookup;
 #[cfg(test)]
 mod manager_tests;

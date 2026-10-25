@@ -42,44 +42,15 @@ pub(crate) struct Link {
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(3);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
-const FIRST_BACKOFF: Duration = Duration::from_millis(100);
-const MAX_BACKOFF: Duration = Duration::from_secs(5);
-const BUSY_TICK: Duration = Duration::from_millis(1);
-const IDLE_TICK: Duration = Duration::from_millis(20);
+pub(crate) const FIRST_BACKOFF: Duration = Duration::from_millis(100);
+pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(5);
+pub(crate) const BUSY_TICK: Duration = Duration::from_millis(1);
+pub(crate) const IDLE_TICK: Duration = Duration::from_millis(20);
 const OUTBOUND: usize = 4096;
 const GOODBYE_WAIT: Duration = Duration::from_millis(500);
 
-/// Limits the manager left unstated take the protocol's defaults.
-pub(crate) fn limits_or_default(stated: Option<wire::Limits>) -> wire::Limits {
-    let mut l = stated.unwrap_or_default();
-    let defaults = [
-        (&mut l.max_concurrent_lookups, 8),
-        (&mut l.max_candidates, 8),
-        (&mut l.max_chain_nodes, 4096),
-        (&mut l.max_boundaries, 8192),
-        (&mut l.max_notices_per_batch, 256),
-        (&mut l.max_unacked_notices, 16384),
-        (&mut l.max_resync_chunk_entries, 1024),
-        (&mut l.max_resync_entries, 4_000_000),
-        (&mut l.max_resync_buffered_notices, 65536),
-        (&mut l.max_claims_in_flight, 2),
-        (&mut l.max_export_slots, 2),
-        (&mut l.window_credits, 2),
-        (&mut l.max_claim_deadline_ms, 30000),
-        (&mut l.pin_deadline_ms, 250),
-        (&mut l.progress_timeout_ms, 3000),
-        (&mut l.max_open_puts, 4),
-        (&mut l.resync_timeout_ms, 5000),
-    ];
-    for (field, default) in defaults {
-        if *field == 0 {
-            *field = default;
-        }
-    }
-    if l.max_window_bytes == 0 {
-        l.max_window_bytes = 4 << 20;
-    }
-    l
+pub(crate) fn checked_limits(stated: Option<wire::Limits>) -> wire::Limits {
+    stated.expect("Hello limits were validated")
 }
 
 /// Whether a Hello reply lets this client proceed. `connected_with` is what
@@ -105,6 +76,7 @@ pub(crate) fn check_hello(
             wire::Encryption::try_from(reply.encryption)
         ));
     }
+    super::limits::validate(reply.limits)?;
     Ok(())
 }
 
@@ -448,7 +420,7 @@ async fn attempt(engine: &mut Engine, link: &Link) -> Attempt {
     engine.session_opened(
         hello.manager_incarnation,
         &opened,
-        limits_or_default(hello.limits),
+        checked_limits(hello.limits),
         regions,
     );
     run_session(engine, link, &mut stream, tx).await;
@@ -601,7 +573,7 @@ fn attach(
     link: &Link,
     hello: &wire::HelloReply,
 ) -> std::result::Result<(Option<Arc<Regions>>, Option<Arc<dyn Dial>>), Attempt> {
-    let limits = limits_or_default(hello.limits);
+    let limits = checked_limits(hello.limits);
     let rdma_offered = hello
         .data_transports
         .contains(&(wire::DataTransport::Rdma as i32));
@@ -844,6 +816,7 @@ mod tests {
         encryption: wire::Encryption,
     ) -> wire::HelloReply {
         wire::HelloReply {
+            limits: Some(super::super::limits::wire_defaults()),
             status: status as i32,
             protocol,
             encryption: encryption as i32,
@@ -879,14 +852,13 @@ mod tests {
     }
 
     #[test]
-    fn unstated_limits_take_the_protocol_defaults_and_stated_ones_are_kept() {
-        let limits = limits_or_default(Some(wire::Limits {
-            max_candidates: 3,
-            ..Default::default()
-        }));
-        assert_eq!(limits.max_candidates, 3);
-        assert_eq!(limits.max_notices_per_batch, 256);
-        assert_eq!(limits.pin_deadline_ms, 250);
-        assert_eq!(limits_or_default(None).max_window_bytes, 4 << 20);
+    fn limits_must_be_stated_and_nonzero() {
+        assert!(super::super::limits::validate(None).is_err());
+        let mut limits = super::super::limits::wire_defaults();
+        limits.max_candidates = 3;
+        assert!(super::super::limits::validate(Some(limits)).is_ok());
+        assert_eq!(checked_limits(Some(limits)).max_candidates, 3);
+        limits.max_window_bytes = 0;
+        assert!(super::super::limits::validate(Some(limits)).is_err());
     }
 }
