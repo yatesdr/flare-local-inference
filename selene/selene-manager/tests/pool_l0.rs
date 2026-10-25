@@ -13,8 +13,8 @@ use support::{
 fn host() -> Host {
     let mut host = Host::dram_only(2 * 1024 * 1024);
     // Tight timers keep the timeout cases quick.
-    host.config.pool.limits.pin_deadline_ms = 300;
-    host.config.pool.limits.progress_timeout_ms = 600;
+    host.config.limits.pin_deadline_ms = 300;
+    host.config.limits.progress_timeout_ms = 600;
     host
 }
 
@@ -284,7 +284,7 @@ async fn i8_a_compacted_node_is_no_longer_an_endpoint_but_the_chain_holds() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn i15_a_snapshot_above_the_entry_bound_overflows() {
     let mut host = host();
-    host.config.pool.limits.max_resync_entries = 3;
+    host.config.limits.max_resync_entries = 3;
     host.start();
     let mut pool = Pool::connect(&host.config.socket).await;
     let mut a = pool.open(&Ident::new("a")).await;
@@ -459,8 +459,8 @@ async fn l1b_records_shorter_than_a_block_do_not_crowd_out_a_long_history_s_cand
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l5_to_l8_holes_limits_and_validation() {
     let mut host = host();
-    host.config.pool.limits.max_concurrent_lookups = 2;
-    host.config.pool.limits.max_boundaries = 8;
+    host.config.limits.max_concurrent_lookups = 2;
+    host.config.limits.max_boundaries = 8;
     host.start();
     let mut pool = Pool::connect(&host.config.socket).await;
     let mut a = source(&mut pool, &Ident::new("a")).await;
@@ -593,7 +593,7 @@ fn rooted(label: &str) -> (std::path::PathBuf, selene_manager::store::Config) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r13_shutdown_drains_claims_then_closes_sessions() {
     let mut host = host();
-    host.config.pool.limits.progress_timeout_ms = 5000;
+    host.config.limits.progress_timeout_ms = 5000;
     host.start();
     let mut pool = Pool::connect(&host.config.socket).await;
     let mut source = source(&mut pool, &Ident::new("src")).await;
@@ -706,9 +706,9 @@ async fn i9_a_leaf_leaves_its_page_only_ancestors_until_they_are_named() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn x4_batch_chunk_and_chain_limits_are_enforced() {
     let mut host = host();
-    host.config.pool.limits.max_notices_per_batch = 2;
-    host.config.pool.limits.max_resync_chunk_entries = 2;
-    host.config.pool.limits.max_chain_nodes = 2;
+    host.config.limits.max_notices_per_batch = 2;
+    host.config.limits.max_resync_chunk_entries = 2;
+    host.config.limits.max_chain_nodes = 2;
     host.start();
     let mut pool = Pool::connect(&host.config.socket).await;
     // More notices than a batch may carry closes the session.

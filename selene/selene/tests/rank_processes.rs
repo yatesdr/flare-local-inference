@@ -52,7 +52,7 @@ impl Manager {
         let metrics = free_address();
         let mut config = Config::dram_only(socket.clone(), 16 << 20);
         config.name = format!("selene-ranks-{}-{id}", std::process::id());
-        config.metrics = Some(metrics.to_string());
+        config.metrics = Some(metrics);
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let thread = thread::spawn(move || {

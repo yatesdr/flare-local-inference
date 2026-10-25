@@ -38,54 +38,7 @@ pub use flare_selene::pool::MAX_WINDOW_BYTES as DEFAULT_MAX_WINDOW;
 /// from `--staging`, whose default is larger.
 pub const EMBEDDED_STAGING: usize = 16 * 1024 * 1024;
 
-#[derive(Clone)]
-pub struct Config {
-    pub name: String,
-    pub root: Option<PathBuf>,
-    pub socket: PathBuf,
-    pub memory: usize,
-    pub nvme: u64,
-    pub staging: usize,
-    pub metrics: Option<String>,
-    #[cfg(any(test, feature = "test-support"))]
-    pub faults: disk::Faults,
-    pub max_window_bytes: u64,
-    pub pool: crate::pool::limits::PoolSettings,
-}
-
-impl Config {
-    pub fn new(root: PathBuf, socket: PathBuf, memory: usize, nvme: u64) -> Self {
-        Self {
-            name: "default".into(),
-            root: Some(root),
-            socket,
-            memory,
-            nvme,
-            staging: EMBEDDED_STAGING,
-            metrics: None,
-            #[cfg(any(test, feature = "test-support"))]
-            faults: disk::Faults::default(),
-            max_window_bytes: DEFAULT_MAX_WINDOW,
-            pool: Default::default(),
-        }
-    }
-
-    pub fn dram_only(socket: PathBuf, memory: usize) -> Self {
-        Self {
-            name: "default".into(),
-            root: None,
-            socket,
-            memory,
-            nvme: 0,
-            staging: EMBEDDED_STAGING,
-            metrics: None,
-            #[cfg(any(test, feature = "test-support"))]
-            faults: disk::Faults::default(),
-            max_window_bytes: DEFAULT_MAX_WINDOW,
-            pool: Default::default(),
-        }
-    }
-}
+pub use crate::config::Config;
 
 /// Physical charge of a record: the 4096-byte manager envelope plus the arena
 /// extent's allocator size class (or the padded record for disk-only records).
@@ -561,6 +514,8 @@ impl Store {
         if config.root.is_none() && config.nvme != 0 {
             return Err(invalid("nvme must be 0 without --root"));
         }
+        let memory = usize::try_from(config.memory).map_err(|_| invalid("--memory is too large for this host"))?;
+        let staging = usize::try_from(config.staging).map_err(|_| invalid("--staging is too large for this host"))?;
         let lock = config
             .root
             .as_ref()
@@ -578,9 +533,9 @@ impl Store {
         };
         let local = Local::open(
             &config.name,
-            config.memory,
-            config.staging,
-            config.max_window_bytes,
+            memory,
+            staging,
+            DEFAULT_MAX_WINDOW,
         )
         .map_err(|error| {
             step_error(
@@ -1462,7 +1417,7 @@ impl Store {
             .max(self.charge_total().saturating_add(held_now));
         let first =
             parent.map_or(0, |parent| parent.consumed_tokens / descriptor.page_tokens) as u32;
-        let grants = plan_put_grants(&header, first, self.config.max_window_bytes);
+        let grants = plan_put_grants(&header, first, DEFAULT_MAX_WINDOW);
         let pages = vec![None; header.tail_pages as usize];
         let epoch = self.namespaces[&id].epoch;
         let mut put = Put {
@@ -1629,7 +1584,7 @@ impl Store {
             .parent
             .map_or(0, |parent| parent.consumed_tokens / header.page_tokens)
             as u32;
-        let unit = plan_put_grants(header, first, self.config.max_window_bytes)
+        let unit = plan_put_grants(header, first, DEFAULT_MAX_WINDOW)
             .iter()
             .map(|grant| grant.length.max(4096).next_power_of_two())
             .max()
@@ -3123,7 +3078,7 @@ impl Store {
                 first_page,
                 skip,
                 index + 1 == request.keys.len(),
-                self.config.max_window_bytes,
+                DEFAULT_MAX_WINDOW,
                 index as u32,
                 &mut grants,
             );
@@ -5453,7 +5408,7 @@ impl Store {
                         arena_bytes: self.local.arena_size(),
                         staging_path: self.local.staging_path().to_string_lossy().into_owned(),
                         staging_bytes: self.local.staging_size(),
-                        max_window_bytes: self.config.max_window_bytes,
+                        max_window_bytes: DEFAULT_MAX_WINDOW,
                     });
                 let _ = reply.send(result);
             }

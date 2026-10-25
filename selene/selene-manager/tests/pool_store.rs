@@ -11,8 +11,8 @@ use support::{
 
 fn host() -> Host {
     let mut host = Host::dram_only(8 * 1024 * 1024);
-    host.config.pool.limits.pin_deadline_ms = 1000;
-    host.config.pool.limits.progress_timeout_ms = 3000;
+    host.config.limits.pin_deadline_ms = 1000;
+    host.config.limits.progress_timeout_ms = 3000;
     host
 }
 
@@ -124,7 +124,7 @@ async fn u1_and_c3_a_put_is_stored_indexed_and_served_to_a_claim() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn u2_u8_and_a9_present_queue_and_invalid_metadata() {
     let mut host = host();
-    host.config.pool.limits.max_open_puts = 1;
+    host.config.limits.max_open_puts = 1;
     host.start();
     let mut pool = Pool::connect(&host.config.socket).await;
     let mut writer = open(&mut pool, "writer").await;

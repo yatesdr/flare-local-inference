@@ -82,41 +82,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PeerStream<S> {
     }
 }
 
-/// The entry point for a manager with no network listener (tests and embedding).
-pub fn run(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
-    serve(local_config(&config), config, stop)
-}
-
-/// Build the storage configuration for a manager config. The CLI never sets faults; tests and
-/// disk-fault harnesses pass their own `store::Config` straight to `serve`.
-pub fn store_config(config: &crate::config::Config) -> Result<Config> {
-    let mut store = Config::new(
-        config.root.clone().unwrap_or_default(),
-        config.socket.clone(),
-        usize::try_from(config.memory)
-            .map_err(|_| invalid("--memory is too large for this host"))?,
-        config.nvme,
-    );
-    store.name = config.name.clone();
-    store.root = config.root.clone();
-    store.staging = usize::try_from(config.staging)
-        .map_err(|_| invalid("--staging is too large for this host"))?;
-    store.metrics = config.metrics.map(|address| address.to_string());
-    Ok(store)
-}
-
-fn local_config(config: &Config) -> crate::config::Config {
-    let mut local = crate::config::Config::defaults();
-    local.name = config.name.clone();
-    local.socket = config.socket.clone();
-    local.socket_explicit = true;
-    local.root = config.root.clone();
-    local.memory = config.memory as u64;
-    local.nvme = config.nvme;
-    local.staging = config.staging as u64;
-    local.metrics = config.metrics.as_deref().and_then(|text| text.parse().ok());
-    local
-}
+pub use serve as run;
 
 async fn watcher(stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Acquire) {
@@ -166,11 +132,7 @@ impl Drop for Cleanup {
 
 /// Opens the store and serves the pool protocol until `stop` is set, then drains the claims in
 /// flight, closes the sessions and releases everything.
-pub fn serve(
-    config: crate::config::Config,
-    store_config: Config,
-    stop: Arc<AtomicBool>,
-) -> Result<()> {
+pub fn serve(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
     config.validate()?;
     for warning in config.startup_warnings() {
         eprintln!("{warning}");
@@ -179,8 +141,12 @@ pub fn serve(
     // leave an accepting listener behind.
     validate_tls(&config)?;
     let data_tls = data_tls(&config)?;
-    let pool_settings = store_config.pool.clone();
-    let store = Store::open(store_config)?;
+    #[cfg(any(test, feature = "test-support"))]
+    let limits = config.limits.clone();
+    #[cfg(not(any(test, feature = "test-support")))]
+    let limits = crate::pool::limits::Limits::default();
+    let drain_wait = Duration::from_millis(u64::from(limits.max_claim_deadline_ms) + 2000);
+    let store = Store::open(config.clone())?;
     let regions = Arc::new(store.regions());
     let directory = config
         .socket
@@ -233,7 +199,7 @@ pub fn serve(
     let (shm, staging_arena, recovered_records) = store.pool_view();
     let pool_config = crate::pool::PoolConfig {
         name: config.name.clone(),
-        limits: pool_settings.limits.clone(),
+        limits,
         encryption: if config.tls_cert.is_some() {
             crate::proto::v2::Encryption::Tls
         } else {
@@ -243,8 +209,6 @@ pub fn serve(
         channel,
         regions: Some(regions.clone()),
     };
-    if let Some(hub) = &pool_config.channel {
-    }
     let (pool_core, pool_handle, pool_events) = crate::pool::Core::new(
         pool_config,
         shm,
@@ -349,8 +313,6 @@ pub fn serve(
     // The network listener outlives the stop request until the pool has drained its claims.
     let serve_stop = Arc::new(AtomicBool::new(false));
     let network_stop = serve_stop.clone();
-    let drain_wait =
-        Duration::from_millis(u64::from(pool_settings.limits.max_claim_deadline_ms) + 2000);
     runtime.block_on(async move {
         let listener = tokio::net::UnixListener::from_std(listener)?;
         let incoming = UnixListenerStream::new(listener).map(move |stream| {
