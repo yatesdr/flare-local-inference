@@ -389,6 +389,7 @@ fn l0_06_multiprocess_kill_recovery() {
         wait(|| base.join("gate").exists());
         child.kill().unwrap();
         let status = child.wait().unwrap();
+        remove_children_shm(child.id());
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         let lock = disk::RootLock::acquire(&config.root.as_ref().unwrap().clone()).unwrap();
@@ -433,6 +434,7 @@ fn l0_06_multiprocess_kill_recovery() {
         assert_eq!(snapshot.unwrap(), recovered.len());
         restarted.kill().unwrap();
         restarted.wait().unwrap();
+        remove_children_shm(restarted.id());
         fs::remove_dir_all(base).unwrap();
     }
 }
@@ -841,6 +843,7 @@ async fn l0_21_live_disconnected_client_quarantine() {
     );
     child.kill().unwrap();
     child.wait().unwrap();
+    remove_children_shm(child.id());
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         match probe.put(key(256), None, PutOptions::default()).await {
@@ -944,10 +947,12 @@ fn l0_24_signal_handling() {
     let base = base("signal");
     fs::create_dir_all(base.join("run")).unwrap();
     let socket = base.join("run/manager.sock");
+    let name = instance_name("signal");
+    let _shm = support::ShmCleanup::new(&name);
     let mut child = Command::new(env!("CARGO_BIN_EXE_selene"))
         .args([
             "--name",
-            &instance_name("signal"),
+            &name,
             "--socket",
             socket.to_str().unwrap(),
             "--memory",
@@ -1875,6 +1880,7 @@ fn l0_57_sigkill_never_blocks_a_restart_on_the_same_instance() {
     fs::create_dir_all(base.join("run")).unwrap();
     let socket = base.join("run/manager.sock");
     let name = instance_name("sigkill-restart");
+    let _shm = support::ShmCleanup::new(&name);
     let spawn = |stderr: &str| {
         Command::new(env!("CARGO_BIN_EXE_selene"))
             .args([
@@ -2087,7 +2093,9 @@ fn l0_62_socket_directory_modes() {
             .unwrap()
     };
     let socket = base.join("manager.sock");
-    let mut child = command(&instance_name("socket-mode"), &socket);
+    let name = instance_name("socket-mode");
+    let _shm = support::ShmCleanup::new(&name);
+    let mut child = command(&name, &socket);
     wait(|| socket.exists());
     unsafe {
         libc::kill(child.id() as i32, libc::SIGTERM);
@@ -2098,7 +2106,7 @@ fn l0_62_socket_directory_modes() {
     // A directory the manager creates gets 0770.
     let directory = base.join("run");
     let socket = directory.join("manager.sock");
-    let mut child = command(&instance_name("socket-mode"), &socket);
+    let mut child = command(&name, &socket);
     wait(|| socket.exists());
     unsafe {
         libc::kill(child.id() as i32, libc::SIGTERM);
