@@ -26,7 +26,7 @@ use super::{
     },
     CLAIM_DEADLINE_MS, Engine, Owner, RESTORE_DEADLINE,
     coverage::Coverage,
-    ranks::XferOwner,
+    ranks::{PeerPart, XferOwner},
 };
 
 /// A record the claim is expected to be granted, derived from the plan.
@@ -105,18 +105,6 @@ struct Window {
     released: bool,
     /// The staging slot holding the window, when it came over the data channel.
     slot: Option<u32>,
-}
-
-/// A peer rank's part of a claim.
-struct PeerPart {
-    rank: usize,
-    xfer: u64,
-    shared: bool,
-    /// The agent's `Done`: the rank has drained and covered its slice (or failed).
-    done: Option<std::result::Result<(), String>>,
-    /// The agent could not prove it drained.
-    quarantined: bool,
-    cancelled: bool,
 }
 
 struct Claim {

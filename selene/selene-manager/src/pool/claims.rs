@@ -61,6 +61,11 @@ pub struct Win {
     /// Readers that must finish with the window before it is free, one bit per accessor:
     /// bit 0 is the requester's session (or its own leg), bit `r` the leg of rank `r`.
     pub readers: u64,
+    /// Writers that must finish with the window before it is whole, one bit per accessor like
+    /// `readers`: bit 0 is the source's session (rank 0 and its shared peers) or its own leg.
+    pub writers: u64,
+    /// The slice checksums a multi-process source's ranks stated, by rank.
+    pub stated: Vec<Option<SliceSums>>,
     /// The window's contents have been handed to the pass (or delivered): a repeat is ignored.
     pub arrived: bool,
 }
@@ -272,7 +277,25 @@ impl Core {
                 .source_channel
                 .as_ref()
                 .is_some_and(|open| open.quarantined);
-            let stuck_rank = claim.mp.legs.iter().any(|leg| leg.ch.quarantined);
+            let stuck_rank = claim
+                .mp
+                .legs
+                .iter()
+                .any(|leg| !leg.source && leg.ch.quarantined);
+            let stuck_source_rank = claim
+                .mp
+                .legs
+                .iter()
+                .any(|leg| leg.source && leg.ch.quarantined);
+            let stuck_source_peer = claim.mp.src.as_ref().is_some_and(|side| {
+                side.peers.iter().any(|peer| {
+                    peer.shared
+                        && (peer.fence == Party::Quarantined
+                            || (peer.fence == Party::Pending
+                                && !self.agents.values().any(|a| a.proc() == peer.proc)
+                                && !self.proc_exited_flag(&peer.proc)))
+                })
+            });
             // A shared-memory peer that cannot show it stopped, or that is gone unseen.
             let stuck_peer = claim.mp.req.as_ref().is_some_and(|side| {
                 side.peers.iter().any(|peer| {
@@ -285,7 +308,8 @@ impl Core {
             });
             for window in &claim.windows {
                 if (stuck || stuck_rank || stuck_peer) && window.phase == Phase::RequesterRead
-                    || stuck_source && window.phase == Phase::SourceWrite
+                    || (stuck_source || stuck_source_rank || stuck_source_peer)
+                        && window.phase == Phase::SourceWrite
                 {
                     total += window.plan.length;
                     continue;
@@ -513,6 +537,7 @@ impl Core {
         // The legs that cross the network: to a requester without shared windows, and
         // from a source without shared memory.
         let requester_slices = self.requester_slices(sid);
+        let source_slices = self.requester_slices(source_sid);
         let requester_leg = if mode == v2::CopyMode::DataChannel {
             match self.open_leg(
                 channel::Kind::Get,
@@ -527,7 +552,7 @@ impl Core {
         let source_leg = if self.sessions[&source_sid].shm {
             None
         } else {
-            match self.open_leg(channel::Kind::Put, None) {
+            match self.open_leg(channel::Kind::Put, source_slices.map(|layout| (layout, 0))) {
                 Some(leg) => Some(leg),
                 None => {
                     self.discard_leg(requester_leg);
@@ -543,12 +568,19 @@ impl Core {
         }
         // The requester's peer ranks, when it is a multi-process instance.
         let mut mp_legs = Vec::new();
-        let req_mp = match self.mp_side(sid, key, channel::Kind::Get, &mut mp_legs) {
-            Ok(side) => side,
+        let sides = self
+            .mp_side(sid, key, channel::Kind::Get, &mut mp_legs)
+            .and_then(|req| {
+                self.mp_side(source_sid, key, channel::Kind::Put, &mut mp_legs)
+                    .map(|src| (req, src))
+            });
+        let (req_mp, src_mp) = match sides {
+            Ok(sides) => sides,
             Err(reason) => {
                 for leg in [&requester_leg, &source_leg].into_iter().flatten() {
                     self.channels.remove(&leg.transfer);
                 }
+                self.discard_legs(&mut mp_legs);
                 self.discard_leg(requester_leg);
                 self.discard_leg(source_leg);
                 return refuse(self, reason);
@@ -600,6 +632,7 @@ impl Core {
             source_channel: source_leg,
             mp: MpState {
                 req: req_mp,
+                src: src_mp,
                 legs: mp_legs,
                 ..Default::default()
             },
@@ -607,6 +640,7 @@ impl Core {
         let reserved = claim.reserved_bytes;
         self.claims.insert(key, claim);
         self.exports.insert(export_id, key);
+        let source_rank_channels = self.rank_channels_of(key, true);
         self.send(
             source_sid,
             M::ExportRequest(v2::ExportRequest {
@@ -622,7 +656,7 @@ impl Core {
                 session_incarnation: source_sid,
                 reserved_bytes: reserved,
                 channel: source_channel_ref,
-                rank_channels: Vec::new(),
+                rank_channels: source_rank_channels,
             }),
         );
         Ok(())
@@ -925,6 +959,8 @@ impl Core {
                     page_xxh3: page_xxh3.clone(),
                     row_xxh3,
                     readers: 1,
+                    writers: 0,
+                    stated: Vec::new(),
                     arrived: true,
                 };
                 let index = grant.index as usize;
@@ -939,6 +975,8 @@ impl Core {
                         page_xxh3: Vec::new(),
                         row_xxh3: 0,
                         readers: 0,
+                        writers: 0,
+                        stated: Vec::new(),
                         arrived: true,
                     };
                     filler.plan.index = claim.windows.len() as u32;
@@ -1206,6 +1244,8 @@ impl Core {
                     page_xxh3: Vec::new(),
                     row_xxh3: 0,
                     readers: 0,
+                    writers: 0,
+                    stated: Vec::new(),
                     arrived: false,
                 }
             })
@@ -1235,7 +1275,10 @@ impl Core {
             rank_channels: Vec::new(),
         };
         claim.state = v2::ClaimState::Granted;
-        if let Some(side) = claim.mp.req.as_mut() {
+        for side in [claim.mp.req.as_mut(), claim.mp.src.as_mut()]
+            .into_iter()
+            .flatten()
+        {
             for peer in &mut side.peers {
                 peer.fence = Party::Pending;
             }
@@ -1279,11 +1322,35 @@ impl Core {
                 }
             }
             claim.windows[index].phase = Phase::SourceWrite;
+            let source_peers = claim.mp.src.is_some();
+            let writers = if source_peers {
+                claim
+                    .mp
+                    .legs
+                    .iter()
+                    .filter(|leg| leg.source)
+                    .fold(1u64, |mask, leg| mask | 1 << leg.rank)
+            } else {
+                1
+            };
+            let world = claim.mp.src.as_ref().map_or(0, |side| side.layout.world());
+            claim.windows[index].writers = writers;
+            claim.windows[index].stated = vec![None; world];
             specs.push(claim.spec(index));
         }
         let outstanding = claim.unreleased();
         let (export_id, source_sid) = (claim.export_id, claim.source_sid);
         let source_leg = claim.source_channel.as_ref().map(|leg| leg.transfer);
+        // A multi-process source's peers in channel mode are granted each window on their own
+        // leg, with their own slice's shape.
+        let peer_grants: Vec<(u64, u32)> = claim
+            .mp
+            .legs
+            .iter()
+            .filter(|leg| leg.source)
+            .map(|leg| (leg.ch.transfer, leg.rank))
+            .collect();
+        let source_layout = claim.mp.src.as_ref().map(|side| side.layout.clone());
         if specs.is_empty() && starved && outstanding == 0 {
             self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::NoWindows);
             return;
@@ -1300,7 +1367,7 @@ impl Core {
                     hub.push_grant(
                         transfer,
                         channel::GrantOut {
-                            shape: shape_of(spec),
+                            shape: shape_for(spec, source_layout.as_deref(), 0),
                             region,
                             offset: spec.offset,
                         },
@@ -1312,9 +1379,27 @@ impl Core {
                 source_sid,
                 M::ExportFill(v2::ExportFill {
                     export_id,
-                    windows: specs,
+                    windows: specs.clone(),
                 }),
             );
+        }
+        if let (Some(hub), Some(layout)) = (&self.cfg.channel, &source_layout) {
+            for (transfer, rank) in peer_grants {
+                for spec in &specs {
+                    let region = u8::try_from(spec.region)
+                        .ok()
+                        .and_then(crate::data::Region::from_u8);
+                    let Some(region) = region else { continue };
+                    hub.push_grant(
+                        transfer,
+                        channel::GrantOut {
+                            shape: shape_for(spec, Some(layout), rank as usize),
+                            region,
+                            offset: spec.offset,
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -1358,6 +1443,39 @@ impl Core {
             return Err(Violation::new("WindowFilled without a status"));
         }
         let plan = window.plan;
+        if claim.mp.src.is_some() {
+            // A multi-process source states its ranks' slice checksums, not whole ones.
+            let valid = m.page_xxh3.is_empty()
+                && !m.rank_sums.is_empty()
+                && m.rank_sums.iter().all(|sums| {
+                    sums.page_xxh3.len() == plan.page_count as usize && sums.has_row == plan.row
+                });
+            if !valid {
+                self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
+                return Ok(());
+            }
+            if terminal {
+                window.phase = Phase::Free;
+                window.extent = None;
+                self.reclaim(key);
+                return Ok(());
+            }
+            let parts = m
+                .rank_sums
+                .into_iter()
+                .map(|sums| {
+                    (
+                        sums.rank as usize,
+                        SliceSums {
+                            pages: sums.page_xxh3,
+                            row: sums.has_row.then_some(sums.row_xxh3),
+                        },
+                    )
+                })
+                .collect();
+            self.stated_part(key, index as u32, parts, 0);
+            return Ok(());
+        }
         if m.page_xxh3.len() != plan.page_count as usize || m.has_row != plan.row {
             self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
             return Ok(());
@@ -1412,6 +1530,18 @@ impl Core {
             window.phase = Phase::Free;
             window.extent = None;
             self.reclaim(key);
+            return;
+        }
+        if claim.mp.src.is_some() {
+            // The rank-0 leg of a multi-process source states rank 0's slice.
+            let parts = vec![(
+                0,
+                SliceSums {
+                    pages: page_xxh3,
+                    row: row_xxh3,
+                },
+            )];
+            self.stated_part(key, index, parts, 0);
             return;
         }
         if window.arrived {
@@ -1833,6 +1963,24 @@ impl Core {
                 row_xxh3,
                 page_xxh3,
             } => match self.channels.get(&transfer).copied() {
+                Some(ChanOwner::ClaimRank(key, leg)) => {
+                    let rank = self
+                        .claims
+                        .get(&key)
+                        .and_then(|claim| claim.mp.legs.get(leg))
+                        .filter(|leg| leg.source)
+                        .map(|leg| leg.rank);
+                    if let Some(rank) = rank {
+                        let parts = vec![(
+                            rank as usize,
+                            SliceSums {
+                                pages: page_xxh3,
+                                row: row_xxh3,
+                            },
+                        )];
+                        self.stated_part(key, index, parts, rank);
+                    }
+                }
                 Some(ChanOwner::Put(key)) => {
                     self.put_window_filled(key, index, page_xxh3, row_xxh3)
                 }
@@ -1881,14 +2029,21 @@ impl Core {
                             open.ch.quarantined = false;
                         }
                         // A leg that ends before the claim is over, with windows it never
-                        // read, fails the claim; one that read them all is simply done.
+                        // read or wrote, fails the claim; one that finished is simply done.
                         let owed = self.claims.get(&key).is_some_and(|claim| {
                             !claim.is_terminal()
                                 && claim.mp.legs.get(leg).is_some_and(|open| {
-                                    claim.windows.iter().any(|w| {
-                                        w.phase == Phase::RequesterRead
-                                            && w.readers & (1 << open.rank) != 0
-                                    })
+                                    if open.source {
+                                        claim
+                                            .windows
+                                            .iter()
+                                            .any(|w| !w.arrived && w.phase != Phase::Free)
+                                    } else {
+                                        claim.windows.iter().any(|w| {
+                                            w.phase == Phase::RequesterRead
+                                                && w.readers & (1 << open.rank) != 0
+                                        })
+                                    }
                                 })
                         });
                         if owed {
@@ -2060,9 +2215,25 @@ impl Core {
             .iter()
             .filter(|leg| !leg.source)
             .all(|leg| leg.ch.exited);
+        // A multi-process source's peers likewise.
+        let source_peers_ok = claim.mp.src.as_ref().is_none_or(|side| {
+            side.peers.iter().all(|peer| {
+                !peer.shared
+                    || matches!(peer.fence, Party::Drained | Party::Idle)
+                    || self.proc_exited_flag(&peer.proc)
+            })
+        }) && claim
+            .mp
+            .legs
+            .iter()
+            .filter(|leg| leg.source)
+            .all(|leg| leg.ch.exited);
         // The assembly pass reads manager memory too.
         let quiet = claim.mp.passes == 0;
-        let (source_ok, requester_ok) = (source_ok && quiet, requester_ok && peers_ok && quiet);
+        let (source_ok, requester_ok) = (
+            source_ok && source_peers_ok && quiet,
+            requester_ok && peers_ok && quiet,
+        );
         let claim = self.claims.get_mut(&key).expect("claim exists");
         for window in &mut claim.windows {
             match window.phase {
@@ -2388,6 +2559,20 @@ impl Core {
     }
 }
 
+/// The shape a window has on one rank's leg: its slice's length when the instance is a
+/// multi-process one, else the whole window's.
+fn shape_for(
+    spec: &v2::WindowSpec,
+    layout: Option<&flare_selene::pool::SliceLayout>,
+    rank: usize,
+) -> Shape {
+    let mut shape = shape_of(spec);
+    if let Some(layout) = layout {
+        shape.length = layout.slice_bytes(rank, spec.page_count, spec.row);
+    }
+    shape
+}
+
 fn shape_of(spec: &v2::WindowSpec) -> Shape {
     Shape {
         index: spec.index,
@@ -2518,6 +2703,8 @@ mod tests {
                     page_xxh3: Vec::new(),
                     row_xxh3: 0,
                     readers: 0,
+                    writers: 0,
+                    stated: Vec::new(),
                     arrived: false,
                 }],
                 requester_fence: Party::Pending,

@@ -3,7 +3,7 @@
 //! instance of the same shape holds, slice by slice.
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -170,6 +170,11 @@ fn address_for(manager: &Manager, reach: Reach) -> PoolAddress {
 }
 
 fn instance_reaching(manager: &Manager, world: usize, reach: &[Reach]) -> Instance {
+    instance_seeded(manager, world, reach, 2)
+}
+
+/// As [`instance_reaching`]; the GPUs, and so the instance, differ with `seed`.
+fn instance_seeded(manager: &Manager, world: usize, reach: &[Reach], seed: u8) -> Instance {
     let mut links = Vec::new();
     let mut peer_ends = Vec::new();
     for _ in 1..world {
@@ -178,8 +183,7 @@ fn instance_reaching(manager: &Manager, world: usize, reach: &[Reach]) -> Instan
         peer_ends.push(peer);
     }
     let (copier, gpu0) = SimulatedGpu::shared(&[local()]).unwrap();
-    let mut gpus: Vec<[u8; 16]> = vec![[2; 16]];
-    gpus.extend((1..world).map(|r| [2 + r as u8; 16]));
+    let gpus: Vec<[u8; 16]> = (0..world).map(|r| [seed + r as u8; 16]).collect();
     let rank0 = PoolClient::start_ranked(
         config_at(
             address_for(manager, reach[0]),
@@ -423,5 +427,223 @@ fn restore_through(manager: &Manager, world: usize, reach: &[Reach]) {
     let _ = source.client.close();
 }
 
-#[allow(dead_code)]
-fn unused(_: &Mutex<()>) {}
+// ---- exports from a multi-process instance ---------------------------------------
+
+use crate::{ExportChain, ExportNode};
+
+/// Put a GPU checkpoint of `pages` pages and its row on every rank of `source`, in the
+/// pages `first..` and slot 5, and announce it. Returns its key.
+fn publish(source: &Instance, history: &TestHistory, world: usize, pages: usize) -> PrefixKey {
+    let data = bytes_of(world, pages);
+    let (page, _) = whole(world);
+    for (rank, memory) in source.memory.iter().enumerate() {
+        for p in 0..pages {
+            let from = p * page + rank * 8192;
+            memory
+                .pages
+                .lock()
+                .unwrap()
+                .insert(20 + p as u32, data[from..from + 8192].to_vec());
+        }
+        let from = pages * page + rank * 4096;
+        memory
+            .rows
+            .lock()
+            .unwrap()
+            .insert(5, data[from..from + 4096].to_vec());
+    }
+    let key = history.key_at(pages as u64 * PT).unwrap();
+    let (page, row) = whole(world);
+    source.rank0.saved(IndexEntry {
+        key,
+        parent: None,
+        bucket: history.bucket_at(key.consumed_tokens).unwrap(),
+        tail_pages: pages as u32,
+        row: true,
+        tier: Tier::Gpu,
+        generation: 5,
+        bytes: (pages * page + row) as u64,
+    });
+    key
+}
+
+fn wait_offered(client: &PoolClient, history: &TestHistory) {
+    wait("the offer to be indexed", || {
+        let ticket = client.begin_lookup(history, Vec::new());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while matches!(ticket.state(), LookupState::Pending) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        matches!(ticket.state(), LookupState::Ready(a) if !a.candidates.is_empty())
+    });
+}
+
+/// The worker's side of a GPU export: pin the chain, answer, and wait for the pin to end.
+fn serve_export(source: &mut Instance, key: PrefixKey, pages: usize) {
+    let export = source.event("an export request", |e| match e {
+        PoolEvent::Export(request) => {
+            assert_eq!((request.tier, request.generation), (Tier::Gpu, 5));
+            Some(request.export)
+        }
+        _ => None,
+    });
+    source.rank0.export_pinned(
+        export,
+        ExportChain {
+            nodes: vec![ExportNode {
+                key,
+                generation: 5,
+                pages: (0..pages).map(|p| PageId(20 + p as u32)).collect(),
+            }],
+            skip_pages: 0,
+            row: Some(StateSlotId(5)),
+        },
+    );
+    source.event("the pin to be released", |e| match e {
+        PoolEvent::ExportEnded { export: ended } if *ended == export => Some(()),
+        _ => None,
+    });
+}
+
+/// A plain single-process instance of the same shape, as a requester.
+struct Plain {
+    client: PoolClient,
+    memory: GpuMemory,
+}
+
+fn plain(manager: &Manager, world: usize, reach: Reach) -> Plain {
+    let (copier, memory) = SimulatedGpu::shared(&ranks(world)).unwrap();
+    let client = PoolClient::start(
+        config_at(address_for(manager, reach), "plain", world, vec![[9; 16]]),
+        copier,
+        Arc::new(OkRegistrar),
+    )
+    .unwrap();
+    Plain { client, memory }
+}
+
+fn expect_fetched(client: &mut PoolClient, what: &str, want: u64) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let mut events = Vec::new();
+        client.poll(&mut events).unwrap();
+        for event in events {
+            if let PoolEvent::Fetched { result, .. } = event {
+                assert_eq!(
+                    result.as_ref().map(|b| *b).map_err(|f| f.error.to_string()),
+                    Ok(want),
+                    "{what}"
+                );
+                return;
+            }
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn export_to_plain(manager: &Manager, world: usize, source_reach: &[Reach], plain_reach: Reach) {
+    let mut source = instance_reaching(manager, world, source_reach);
+    let mut requester = plain(manager, world, plain_reach);
+    source.ready();
+    wait("the requester", || {
+        requester.client.status() == PoolStatus::Ready
+    });
+    let history = history_of(4000);
+    let pages = 4;
+    let key = publish(&source, &history, world, pages);
+    wait_offered(&requester.client, &history);
+    let scratch = [300, 301, 302, 303];
+    let fetch = fetch_for(&requester.client, world, &history, pages, &scratch);
+    requester.client.fetch(fetch).unwrap();
+    serve_export(&mut source, key, pages);
+    let (page, row) = whole(world);
+    expect_fetched(
+        &mut requester.client,
+        "the restore",
+        (pages * page + row) as u64,
+    );
+    let data = bytes_of(world, pages);
+    let landed = requester.memory.pages.lock().unwrap();
+    for (i, id) in scratch.iter().enumerate() {
+        assert_eq!(
+            landed.get(id).map(Vec::as_slice),
+            Some(&data[i * page..(i + 1) * page]),
+            "page {i} of the whole record"
+        );
+    }
+    assert_eq!(
+        requester
+            .memory
+            .rows
+            .lock()
+            .unwrap()
+            .get(&9)
+            .map(Vec::as_slice),
+        Some(&data[pages * page..]),
+        "the whole row"
+    );
+    drop(landed);
+    source.close();
+    let _ = requester.client.close();
+}
+
+#[test]
+fn a_two_rank_instance_exports_a_gpu_checkpoint_to_a_single_process_instance() {
+    export_to_plain(
+        &Manager::start(),
+        2,
+        &[Reach::Local, Reach::Local],
+        Reach::Local,
+    );
+}
+
+#[test]
+fn a_peer_on_a_channel_writes_its_slice_of_an_export_to_the_manager() {
+    let manager = Manager::start_network(false);
+    export_to_plain(&manager, 2, &[Reach::Local, Reach::Network], Reach::Local);
+}
+
+#[test]
+fn a_whole_instance_on_channels_exports_to_a_remote_single_process_instance() {
+    let manager = Manager::start_network(false);
+    export_to_plain(&manager, 3, &[Reach::Network; 3], Reach::Network);
+}
+
+#[test]
+fn three_ranks_mixing_shared_memory_and_channels_export_to_a_multi_process_instance() {
+    let manager = Manager::start_network(false);
+    let world = 3;
+    let mut source = instance_reaching(
+        &manager,
+        world,
+        &[Reach::Local, Reach::Network, Reach::Local],
+    );
+    let mut requester = instance_seeded(
+        &manager,
+        world,
+        &[Reach::Local, Reach::Local, Reach::Network],
+        40,
+    );
+    source.ready();
+    requester.ready();
+    let history = history_of(4000);
+    let pages = 4;
+    let key = publish(&source, &history, world, pages);
+    wait_offered(&requester.rank0, &history);
+    let scratch = [300, 301, 302, 303];
+    let fetch = fetch_for(&requester.rank0, world, &history, pages, &scratch);
+    requester.rank0.fetch(fetch).unwrap();
+    serve_export(&mut source, key, pages);
+    let (page, row) = whole(world);
+    let result = requester.event("the restore", |e| match e {
+        PoolEvent::Fetched { result, .. } => {
+            Some(result.as_ref().map(|b| *b).map_err(|f| f.error.to_string()))
+        }
+        _ => None,
+    });
+    assert_eq!(result, Ok((pages * page + row) as u64));
+    assert_slices(&requester, world, pages, &scratch);
+    source.close();
+    requester.close();
+}
