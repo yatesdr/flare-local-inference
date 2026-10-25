@@ -25,8 +25,9 @@ use std::{
     time::Duration,
 };
 
-use flare_selene::pool::frame::{
-    Carrier, NO_SLOT, Shape, TOKEN_BYTES, ToInstance, ToManager, Window,
+use flare_selene::pool::{
+    SliceLayout,
+    frame::{Carrier, NO_SLOT, Shape, TOKEN_BYTES, ToInstance, ToManager, Window},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -101,6 +102,10 @@ struct Queues {
 
 struct Transfer {
     kind: Kind,
+    /// A leg of a multi-process instance's rank: the transfer carries only that rank's
+    /// slice of each window (`Shape::length` is the slice's length), gathered out of the
+    /// window before it is sent and scattered into it after it is received.
+    slicing: Option<(Arc<SliceLayout>, usize)>,
     token: [u8; TOKEN_BYTES],
     queues: Mutex<Queues>,
     wake: Notify,
@@ -259,11 +264,34 @@ impl Hub {
 
     /// Begin a transfer. Its token authenticates the one connection that serves it.
     pub fn open(&self, kind: Kind) -> io::Result<(u64, [u8; TOKEN_BYTES])> {
+        self.open_with(kind, None)
+    }
+
+    /// Begin the leg of rank `rank` of a multi-process instance: only that rank's slices of
+    /// the windows travel on it.
+    pub fn open_rank(
+        &self,
+        kind: Kind,
+        layout: Arc<SliceLayout>,
+        rank: usize,
+    ) -> io::Result<(u64, [u8; TOKEN_BYTES])> {
+        if rank >= layout.world() {
+            return Err(invalid("no such rank"));
+        }
+        self.open_with(kind, Some((layout, rank)))
+    }
+
+    fn open_with(
+        &self,
+        kind: Kind,
+        slicing: Option<(Arc<SliceLayout>, usize)>,
+    ) -> io::Result<(u64, [u8; TOKEN_BYTES])> {
         let token = random_token()?;
         let transfer = self.inner.next.fetch_add(1, Ordering::Relaxed);
         let (stopped, _) = watch::channel(false);
         let entry = Arc::new(Transfer {
             kind,
+            slicing,
             token,
             queues: Mutex::new(Queues {
                 windows: VecDeque::new(),
@@ -521,6 +549,12 @@ async fn run(
         },
         _ => return End::Failed("the instance did not open with a hello".into()),
     }
+    if rdma.is_some() && entry.slicing.is_some() {
+        let _ = ToInstance::Abort("a rank's leg uses the stream carrier".into())
+            .write(conn)
+            .await;
+        return End::Failed("a rank's leg asked for RDMA".into());
+    }
     let result = match (entry.kind, rdma.as_mut()) {
         (Kind::Get, None) => send_windows(inner, transfer, entry, conn).await,
         (Kind::Put, None) => receive_windows(inner, transfer, entry, conn).await,
@@ -614,13 +648,37 @@ async fn send_windows(
             return Ok(());
         };
         // SAFETY: see `window_bytes`; the slice is only read.
-        let payload = unsafe {
-            window_bytes(
-                &*inner.regions,
-                window.region,
-                window.offset,
-                window.shape.length,
-            )?
+        let packed;
+        let payload: &[u8] = match &entry.slicing {
+            None => unsafe {
+                window_bytes(
+                    &*inner.regions,
+                    window.region,
+                    window.offset,
+                    window.shape.length,
+                )?
+            },
+            Some((layout, rank)) => {
+                let (pages, row) = (window.shape.page_count, window.shape.row);
+                if window.shape.length != layout.slice_bytes(*rank, pages, row) {
+                    return Err(invalid("a rank window's length is not its slice's"));
+                }
+                // SAFETY: as above, over the whole window the slice lies in.
+                let whole = unsafe {
+                    window_bytes(
+                        &*inner.regions,
+                        window.region,
+                        window.offset,
+                        layout.window_bytes(pages, row),
+                    )?
+                };
+                let mut bytes = vec![0u8; window.shape.length as usize];
+                layout
+                    .gather(*rank, whole, pages, row, &mut bytes)
+                    .map_err(|error| invalid(error.to_string()))?;
+                packed = bytes;
+                &packed
+            }
         };
         let frame = ToInstance::Window(Window {
             shape: window.shape,
@@ -929,19 +987,47 @@ async fn receive_windows(
                 return Err(invalid("a filled window does not match its grant"));
             }
             // SAFETY: see `window_bytes`; the store leased this window to the put.
-            let payload = unsafe {
-                window_bytes(
-                    &*inner.regions,
-                    grant.region,
-                    grant.offset,
-                    grant.shape.length,
-                )?
-            };
-            timeout(IO_TIMEOUT, reader.read_exact(payload))
-                .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "the instance stopped writing")
-                })??;
+            match &entry.slicing {
+                None => {
+                    let payload = unsafe {
+                        window_bytes(
+                            &*inner.regions,
+                            grant.region,
+                            grant.offset,
+                            grant.shape.length,
+                        )?
+                    };
+                    timeout(IO_TIMEOUT, reader.read_exact(payload))
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "the instance stopped writing")
+                        })??;
+                }
+                Some((layout, rank)) => {
+                    let (pages, row) = (grant.shape.page_count, grant.shape.row);
+                    if grant.shape.length != layout.slice_bytes(*rank, pages, row) {
+                        return Err(invalid("a rank window's length is not its slice's"));
+                    }
+                    let mut packed = vec![0u8; grant.shape.length as usize];
+                    timeout(IO_TIMEOUT, reader.read_exact(&mut packed))
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "the instance stopped writing")
+                        })??;
+                    // SAFETY: as above, over the whole window the slice lies in.
+                    let whole = unsafe {
+                        window_bytes(
+                            &*inner.regions,
+                            grant.region,
+                            grant.offset,
+                            layout.window_bytes(pages, row),
+                        )?
+                    };
+                    layout
+                        .scatter(*rank, whole, pages, row, &packed)
+                        .map_err(|error| invalid(error.to_string()))?;
+                }
+            }
             inner.counters.add(0, grant.shape.length);
             let _ = inner.events.send(Event::Filled {
                 transfer,
@@ -1277,6 +1363,162 @@ mod tests {
         ));
         hub.stop(transfer);
         assert!(matches!(next(&mut events).await, Event::Closed { .. }));
+    }
+
+    fn rank_layout(world: usize) -> Arc<SliceLayout> {
+        use flare_selene::pool::{Geometry, RankPlanes};
+        let rank = RankPlanes {
+            plane_bytes: vec![4096, 4096],
+            row_bytes: 4096,
+        };
+        Arc::new(
+            SliceLayout::new(&Geometry {
+                page_tokens: 64,
+                ranks: vec![rank; world],
+                page_record_bytes: world as u64 * 8192,
+                row_record_bytes: world as u64 * 4096,
+            })
+            .unwrap(),
+        )
+    }
+
+    fn rank_shape(layout: &SliceLayout, rank: usize, index: u32, pages: u32, row: bool) -> Shape {
+        Shape {
+            length: layout.slice_bytes(rank, pages, row),
+            ..shape(index, pages, row)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ranks_leg_carries_only_its_slices_of_each_window_and_other_ranks_see_theirs() {
+        let regions = regions();
+        let (hub, mut events, address) = start(regions.clone(), None);
+        let layout = rank_layout(3);
+        let window: Vec<u8> = (0..layout.window_bytes(2, true) as usize)
+            .map(|i| (i % 241) as u8)
+            .collect();
+        fill(&regions, Region::Staging, 8192, &window);
+        let mut transfers = Vec::new();
+        for rank in 0..3 {
+            let (transfer, token) = hub.open_rank(Kind::Get, layout.clone(), rank).unwrap();
+            let conn = connect(&address, &token).await;
+            hub.push_window(
+                transfer,
+                WindowOut {
+                    shape: rank_shape(&layout, rank, 0, 2, true),
+                    page_xxh3: vec![1, 2],
+                    row_xxh3: 3,
+                    region: Region::Staging,
+                    offset: 8192,
+                },
+            );
+            hub.finish(transfer);
+            transfers.push((transfer, conn));
+        }
+        for (rank, (_, conn)) in transfers.iter_mut().enumerate() {
+            let ToInstance::Window(got) = ToInstance::read(conn, 64).await.unwrap() else {
+                panic!("expected a window");
+            };
+            assert_eq!(got.shape, rank_shape(&layout, rank, 0, 2, true));
+            let mut payload = vec![0u8; got.shape.length as usize];
+            conn.read_exact(&mut payload).await.unwrap();
+            let mut expect = vec![0u8; payload.len()];
+            layout.gather(rank, &window, 2, true, &mut expect).unwrap();
+            assert_eq!(payload, expect, "rank {rank}");
+            assert_eq!(ToInstance::read(conn, 64).await.unwrap(), ToInstance::End);
+        }
+        let mut sent = 0;
+        let mut closed = 0;
+        while sent < 3 || closed < 3 {
+            match next(&mut events).await {
+                Event::Sent { .. } => sent += 1,
+                Event::Closed { .. } => closed += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_ranks_legs_of_a_put_assemble_one_window_and_a_wrong_length_ends_the_leg() {
+        let regions = regions();
+        let (hub, mut events, address) = start(regions.clone(), None);
+        let layout = rank_layout(2);
+        let truth: Vec<u8> = (0..layout.window_bytes(2, true) as usize)
+            .map(|i| (i % 233) as u8)
+            .collect();
+        for rank in [1usize, 0] {
+            let (transfer, token) = hub.open_rank(Kind::Put, layout.clone(), rank).unwrap();
+            let mut conn = connect(&address, &token).await;
+            hub.push_grant(
+                transfer,
+                GrantOut {
+                    shape: rank_shape(&layout, rank, 0, 2, true),
+                    region: Region::Staging,
+                    offset: 16384,
+                },
+            );
+            let ToInstance::Grant(granted) = ToInstance::read(&mut conn, 64).await.unwrap() else {
+                panic!("expected a grant");
+            };
+            assert_eq!(granted, rank_shape(&layout, rank, 0, 2, true));
+            let mut packed = vec![0u8; granted.length as usize];
+            layout.gather(rank, &truth, 2, true, &mut packed).unwrap();
+            ToManager::Filled {
+                index: 0,
+                row_xxh3: Some(3),
+                page_xxh3: vec![1, 2],
+                slot: NO_SLOT,
+            }
+            .write(&mut conn)
+            .await
+            .unwrap();
+            conn.write_all(&packed).await.unwrap();
+            let Event::Filled { index, .. } = next(&mut events).await else {
+                panic!("expected Filled");
+            };
+            assert_eq!(index, 0);
+            hub.stop(transfer);
+            assert!(matches!(next(&mut events).await, Event::Closed { .. }));
+        }
+        regions
+            .with_read(Region::Staging, 16384, truth.len(), &mut |window| {
+                assert_eq!(window, &truth[..], "both ranks' slices are in place");
+                Ok(())
+            })
+            .unwrap();
+        // A grant whose shape is not the rank's slice ends the leg.
+        let (transfer, token) = hub.open_rank(Kind::Put, layout.clone(), 0).unwrap();
+        let mut conn = connect(&address, &token).await;
+        hub.push_grant(
+            transfer,
+            GrantOut {
+                shape: shape(0, 2, true),
+                region: Region::Staging,
+                offset: 16384,
+            },
+        );
+        let ToInstance::Grant(_) = ToInstance::read(&mut conn, 64).await.unwrap() else {
+            panic!("expected a grant");
+        };
+        ToManager::Filled {
+            index: 0,
+            row_xxh3: Some(3),
+            page_xxh3: vec![1, 2],
+            slot: NO_SLOT,
+        }
+        .write(&mut conn)
+        .await
+        .unwrap();
+        conn.write_all(&vec![0u8; 3 * PAGE]).await.unwrap();
+        let mut failed = false;
+        loop {
+            match next(&mut events).await {
+                Event::Failed { .. } => failed = true,
+                Event::Closed { .. } => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(failed);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
