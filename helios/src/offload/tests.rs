@@ -18,7 +18,7 @@ fn pool(address: &str) -> PoolOptions {
 }
 
 #[test]
-fn a_pool_with_shards_keeps_one_local_rank_and_refuses_memory_and_direct() {
+fn a_pool_with_shards_keeps_one_local_rank_and_refuses_memory_retention() {
     let mut options = PrefixCacheOffload {
         pool: Some(pool("unix:/run/selene.sock")),
         ..Default::default()
@@ -50,15 +50,6 @@ fn a_pool_with_shards_keeps_one_local_rank_and_refuses_memory_and_direct() {
             .unwrap()
             .to_string()
             .contains("disk only")
-    );
-    options.memory_bytes = None;
-    options.transport = Some(Transport::Direct);
-    assert!(
-        prepare(&options)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("direct")
     );
 }
 
@@ -109,11 +100,6 @@ fn disabled_preparation_requires_no_geometry_context_or_worker_binding() {
         PrefixCacheOffload {
             memory_bytes: Some(0),
             disk_limit: Some(0),
-            ..Default::default()
-        },
-        PrefixCacheOffload {
-            memory_bytes: Some(0),
-            transport: Some(Transport::Direct),
             ..Default::default()
         },
     ] {

@@ -20,7 +20,7 @@ _SECTIONS = {
                  "speculative_token_capacity": int, "speculative_graph_budget": int},
     "memory": {"reserve": str},
     "preparation": {"compile_workers": int, "autotune_effort": str, "checkpoint_token_file": str},
-    "prefix_cache": {"memory": str, "disk_limit": str, "disk_transport": str},
+    "prefix_cache": {"memory": str, "disk_limit": str},
     "paths": {"hub_cache": str, "kernel_cache": str, "package_cache": str, "export_staging": str,
               "prefix_cache": str, "cuda": str},
 }
@@ -33,7 +33,7 @@ _BUILT_IN = {
     "preparation.compile_workers": 0,
     "preparation.autotune_effort": "default",
     "preparation.checkpoint_token_file": "~/.config/flare/agent.token",
-    "prefix_cache.memory": "", "prefix_cache.disk_limit": "", "prefix_cache.disk_transport": "",
+    "prefix_cache.memory": "", "prefix_cache.disk_limit": "",
     "paths.hub_cache": "~/.cache/huggingface/hub", "paths.kernel_cache": "~/.cache/flare/kernels",
     "paths.package_cache": "~/.cache/flare/packages",
     "paths.export_staging": "",
@@ -41,7 +41,6 @@ _BUILT_IN = {
     "paths.cuda": "",
 }
 AUTOTUNE_EFFORTS = ("off", "default", "audit")
-_TRANSPORTS = ("staged", "direct")
 _SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:([KMGT])(?:iB|B)?)?", re.IGNORECASE)
 
 
@@ -89,9 +88,6 @@ class Configuration:
         for key in ("prefix_cache.memory", "prefix_cache.disk_limit"):
             if configuration.get(key).value:
                 parse_size(configuration.get(key).value, key.replace(".", " "))
-        transport = configuration.get("prefix_cache.disk_transport").value
-        if transport and transport not in _TRANSPORTS:
-            raise UsageError(f"{resolved}: disk_transport in [prefix_cache] must be one of {', '.join(_TRANSPORTS)}")
         return configuration
 
     @staticmethod

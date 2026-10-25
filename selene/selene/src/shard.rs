@@ -1,7 +1,7 @@
 //! Framed byte links shared by the rank record relay and pool protocol.
 use crate::{
     Error, InboundTicket, JobId, PageId, PrefixKey, PublishedCheckpoint, Result, SharedCopier,
-    StateSlotId, Transport,
+    StateSlotId,
     disk::DiskThread,
     disk_store::{DiskTransport, FetchSegment, Staged, TransportEvent},
     geometry::invalid,
@@ -771,10 +771,6 @@ fn decode_event(payload: &[u8]) -> Result<(Kind, JobId, Result<u64>)> {
 }
 
 impl DiskTransport for Sharded {
-    fn kind(&self) -> Transport {
-        Transport::Staged
-    }
-
     fn store(
         &mut self,
         id: JobId,

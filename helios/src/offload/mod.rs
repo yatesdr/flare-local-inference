@@ -22,15 +22,17 @@ mod registrar;
 pub mod shard;
 pub mod transfer;
 
+pub use flare_selene::pool::{
+    DEFAULT_POOL_TENANT, PoolOptions, parse_pool_address, parse_pool_tenant,
+};
 pub use flare_selene::{
     CacheGeometry, ExportChain, ExportId, ExportNode, ExportRefusal, HostHit,
-    INITIAL_DIRECT_DISK_RATE, INITIAL_MEMORY_RATE, INITIAL_PREFILL_RATE, INITIAL_STAGED_DISK_RATE,
+    INITIAL_MEMORY_RATE, INITIAL_PREFILL_RATE, INITIAL_STAGED_DISK_RATE,
     InboundTicket, JobId, Layout, Plane, PublishedCheckpoint, StoreOutcome, StoreReason,
-    StoreStats, Tier, Transport, disk, disk_store, geometry, index, input, pool::LookupTicket,
-    record, slab, worth_fetching,
+    StoreStats, Tier, disk, disk_store, geometry, index, input, pool::LookupTicket, record, slab,
+    worth_fetching,
 };
 pub use flare_selene::{HostStore as PrefixStore, StoreEvent};
-pub use flare_selene::pool::{PoolOptions, DEFAULT_POOL_TENANT, parse_pool_address, parse_pool_tenant};
 use flare_selene::{HostStore, composite, memory};
 
 use std::path::PathBuf;
@@ -51,7 +53,6 @@ pub struct PrefixCacheOffload {
     pub disk: Option<PathBuf>,
     /// Bytes of record files kept on disk; zero selects no disk store.
     pub disk_limit: Option<u64>,
-    pub transport: Option<Transport>,
     /// Pool manager through which this instance shares prefix checkpoints.
     pub pool: Option<PoolOptions>,
 }
@@ -167,7 +168,6 @@ pub struct Resolved {
     /// The model's record directory, or `None` for no disk store.
     pub directory: Option<PathBuf>,
     pub disk_limit: u64,
-    pub transport: Transport,
 }
 
 /// Host resources the loader prepares once per process and the model worker
@@ -247,14 +247,10 @@ impl Prepared {
         }
         if let Some(directory) = &self.resolved.directory {
             parts.push(format!(
-                "disk {} (limit {}, {} records, {})",
+                "disk {} (limit {}, {} records, staged)",
                 directory.display(),
                 gibibytes(self.resolved.disk_limit),
                 self.scanned.len(),
-                match self.resolved.transport {
-                    Transport::Staged => "staged",
-                    Transport::Direct => "direct",
-                }
             ));
         }
         parts.join(" · ")
@@ -386,10 +382,7 @@ pub fn prepare_with_inputs(
         )
         .into());
     }
-    let transport = options.transport.unwrap_or(Transport::Staged);
-    if transport == Transport::Direct {
-        return Err("the direct prefix cache transport is not available".into());
-    }
+
     let mut notes = Vec::new();
     let directory = match options
         .disk
@@ -482,7 +475,6 @@ pub fn prepare_with_inputs(
             memory_bytes,
             directory,
             disk_limit,
-            transport,
         },
         identity,
         fingerprint,
@@ -592,23 +584,19 @@ pub fn open(prepared: Prepared) -> Result<Box<dyn PrefixStore>> {
             } else {
                 tier_transfers()?
             };
-            let transport: Box<dyn disk_store::DiskTransport> = match resolved.transport {
-                Transport::Staged if !shards.is_empty() => {
-                    if memory_pool.is_some() {
-                        return Err(
-                            "a multi-host package keeps host prefix records on disk only".into(),
-                        );
-                    }
-                    shard::transport(staging_pool, disk_transfers, shards)?
+            let transport: Box<dyn disk_store::DiskTransport> = if !shards.is_empty() {
+                if memory_pool.is_some() {
+                    return Err(
+                        "a multi-host package keeps host prefix records on disk only".into(),
+                    );
                 }
-                Transport::Staged => Box::new(disk_store::Staged::new(
+                shard::transport(staging_pool, disk_transfers, shards)?
+            } else {
+                Box::new(disk_store::Staged::new(
                     staging_pool,
                     disk_transfers,
                     disk::DiskThread::start("flare-offload-disk")?,
-                )),
-                Transport::Direct => {
-                    return Err("the direct prefix cache transport is not available".into());
-                }
+                ))
             };
             let mut store = disk_store::DiskStore::new(
                 directory,
