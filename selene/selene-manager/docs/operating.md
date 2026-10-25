@@ -84,6 +84,39 @@ staging files, so any of them can read another tenant's mapped bytes. Tenants ar
 boundary on one host. When tenants must not see each other's data, give each trust boundary its
 own uid (with distinct manager names) or its own host.
 
+### The manager's network card is the pool's aggregate bandwidth
+
+Every copy between hosts passes through this manager: a restore that crosses the network
+leaves the source's host, is assembled in the manager's staging and reaches the requester over
+the manager's data listener (a source or requester on the manager's own host uses shared
+memory and does not touch the card). The manager's NIC therefore bounds the pool's total
+cross-host copy rate, summed over every instance and every rank, in both directions. A
+multi-process instance (tensor-parallel ranks that are separate processes) multiplies the
+number of copies in flight by its rank count, but moves the same bytes: each rank sends or
+receives only its own slice, so a record of N bytes crosses the card once whatever the number
+of ranks. Size the card (or bond several) for the aggregate you expect, put the manager on the
+host whose card has the most headroom, and watch `selene_pool_channel_bytes_total`. Hashing for
+multi-process instances (verifying a source's slices and computing the stored checksums, or the
+reverse) runs on up to eight threads of the manager's host, overlapped with the network.
+
+## Multi-process instances
+
+An instance whose tensor-parallel ranks are separate processes (possibly on separate hosts)
+is one instance of the pool. Rank 0 opens the only session; every other rank runs an agent
+that attaches to the manager with the `Rank` stream and moves only its own slice of each
+window, in the manager's shared memory when it is on the manager's host and rank 0 is too, and
+on its own data channel otherwise. Records at rest are the ordinary composite records: an
+instance of this kind and a single-process instance of the same shape share them.
+
+- Claims, exports and puts of such an instance are refused (`RANKS_DETACHED`, put
+  `PUT_NOT_READY`) until every rank is attached.
+- A rank that was replaced keeps its obligations: the manager reuses memory a rank could still
+  touch only after that rank (identified by its own process, not by its number) attests it
+  stopped, says goodbye quiesced, or exits. `selene_pool_quarantined_bytes` includes ranks.
+- When rank 0 dies, the agents stay attached only to drain; they cannot be granted anything.
+- The link between rank 0 and its agents is the instance's own, outside the manager: it is as
+  trusted as the instance's execution rendezvous.
+
 ## Startup
 
 At start the manager prints a warning for each option that widens its exposure:
@@ -168,6 +201,7 @@ refusal as a normal outcome and move to another candidate, another tier, or reco
 | `NOT_FOUND`, `GENERATION_CHANGED`, `CHAIN_GAP`, `NO_HEADROOM` | The source no longer has it, or has no room to pin it. | None. |
 | `SOURCE_TIMEOUT` | The source did not answer within `pin_deadline_ms` (default 250). | Look at the source's load. |
 | `SOURCE_LOST` / `REQUESTER_LOST` | The other side's stream ended. | Look at the instance that went. |
+| `RANKS_DETACHED` / `RANK_LOST` | A rank of a multi-process instance is not attached, or its attachment ended during the transfer. | Look at that rank's process. |
 | `COPY_ERROR` / `CHECKSUM` | A read, write or checksum failed, or the copy was not exact. | Alert on repeats; check the device. |
 | `DEADLINE` / `NO_PROGRESS` | The claim ran past its deadline or stopped making progress (3s). | Look at copy throughput. |
 | put `PRESENT` | Already stored and committed: success, nothing transferred. | None. |
