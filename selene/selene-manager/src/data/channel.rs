@@ -1181,6 +1181,30 @@ mod tests {
 
     const PAGE: usize = 4096;
 
+    /// Runs a test's future on its own runtime and fails with a message, instead of hanging,
+    /// if it has not finished in [`TEST_LIMIT`]: every wait in these tests is for a peer that
+    /// is in the same test, so a stuck one is a bug to report, never a reason to wait.
+    const TEST_LIMIT: Duration = Duration::from_secs(60);
+
+    fn bounded(test: impl std::future::Future<Output = ()>) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let name = std::thread::current()
+            .name()
+            .unwrap_or("a test")
+            .to_string();
+        runtime.block_on(async {
+            if timeout(TEST_LIMIT, test).await.is_err() {
+                panic!("{name} did not finish within {TEST_LIMIT:?}: a connection or event it waits for never came");
+            }
+        });
+        // A stuck background task must not keep the process either.
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+
     fn regions() -> Arc<LocalRegions> {
         Arc::new(LocalRegions::new(
             Arena::new(1 << 20).unwrap(),
@@ -1236,240 +1260,252 @@ mod tests {
             .expect("the hub is alive")
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_claims_windows_arrive_in_order_with_their_checksums_and_end() {
-        let regions = regions();
-        let (hub, mut events, address) = start(regions.clone(), None);
-        let (transfer, token) = hub.open(Kind::Get).unwrap();
-        let first: Vec<u8> = (0..2 * PAGE + PAGE).map(|i| (i % 251) as u8).collect();
-        let second = vec![7u8; PAGE];
-        fill(&regions, Region::Arena, 0, &first);
-        fill(&regions, Region::Staging, 8192, &second);
-        let mut conn = connect(&address, &token).await;
-        hub.push_window(
-            transfer,
-            WindowOut {
-                shape: shape(0, 2, true),
-                page_xxh3: vec![11, 12],
-                row_xxh3: 13,
-                region: Region::Arena,
-                offset: 0,
-            },
-        );
-        hub.push_window(
-            transfer,
-            WindowOut {
-                shape: shape(1, 1, false),
-                page_xxh3: vec![21],
-                row_xxh3: 0,
-                region: Region::Staging,
-                offset: 8192,
-            },
-        );
-        hub.finish(transfer);
-        let mut payload = vec![0u8; first.len()];
-        let ToInstance::Window(window) = ToInstance::read(&mut conn, 64).await.unwrap() else {
-            panic!("expected a window");
-        };
-        assert_eq!(window.shape, shape(0, 2, true));
-        assert_eq!(
-            (window.page_xxh3.clone(), window.row_xxh3),
-            (vec![11, 12], 13)
-        );
-        conn.read_exact(&mut payload).await.unwrap();
-        assert_eq!(payload, first);
-        let ToInstance::Window(window) = ToInstance::read(&mut conn, 64).await.unwrap() else {
-            panic!("expected a second window");
-        };
-        assert_eq!(window.shape.index, 1);
-        let mut payload = vec![0u8; PAGE];
-        conn.read_exact(&mut payload).await.unwrap();
-        assert_eq!(payload, second);
-        assert_eq!(
-            ToInstance::read(&mut conn, 64).await.unwrap(),
-            ToInstance::End
-        );
-        // Sent twice, then the handler leaves on its own.
-        assert!(matches!(
-            next(&mut events).await,
-            Event::Sent { index: 0, .. }
-        ));
-        assert!(matches!(
-            next(&mut events).await,
-            Event::Sent { index: 1, .. }
-        ));
-        assert!(matches!(next(&mut events).await, Event::Closed { .. }));
-        assert!(
-            hub.stop(transfer),
-            "an exited handler leaves nothing to wait for"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_token_serves_one_connection_and_a_wrong_token_none() {
-        let (hub, mut events, address) = start(regions(), None);
-        let (transfer, token) = hub.open(Kind::Get).unwrap();
-        let _first = connect(&address, &token).await;
-        // Wait until the first connection has been attached, or the second could win the race.
-        while hub.handlers() == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        // The token is spent: a second connection is closed without a byte.
-        let mut second = connect(&address, &token).await;
-        assert!(ToInstance::read(&mut second, 64).await.is_err());
-        let mut wrong = connect(&address, &[9; TOKEN_BYTES]).await;
-        assert!(ToInstance::read(&mut wrong, 64).await.is_err());
-        assert!(!hub.stop(transfer), "a handler is attached");
-        assert!(matches!(next(&mut events).await, Event::Closed { .. }));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stopping_before_any_connection_needs_no_wait_and_blocks_a_late_one() {
-        let (hub, _events, address) = start(regions(), None);
-        let (transfer, token) = hub.open(Kind::Get).unwrap();
-        assert!(hub.stop(transfer), "no handler ever ran");
-        let mut late = connect(&address, &token).await;
-        assert!(ToInstance::read(&mut late, 64).await.is_err());
-        assert_eq!(hub.handlers(), 0);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stopping_a_stalled_transfer_ends_its_handler_and_reports_closed() {
-        let regions = regions();
-        let (hub, mut events, address) = start(regions.clone(), None);
-        let (transfer, token) = hub.open(Kind::Get).unwrap();
-        // The instance connects and never reads: the socket buffers fill.
-        let _conn = connect(&address, &token).await;
-        fill(&regions, Region::Arena, 0, &vec![1u8; 1 << 20]);
-        for index in 0..64 {
+    #[test]
+    fn a_claims_windows_arrive_in_order_with_their_checksums_and_end() {
+        bounded(async {
+            let regions = regions();
+            let (hub, mut events, address) = start(regions.clone(), None);
+            let (transfer, token) = hub.open(Kind::Get).unwrap();
+            let first: Vec<u8> = (0..2 * PAGE + PAGE).map(|i| (i % 251) as u8).collect();
+            let second = vec![7u8; PAGE];
+            fill(&regions, Region::Arena, 0, &first);
+            fill(&regions, Region::Staging, 8192, &second);
+            let mut conn = connect(&address, &token).await;
             hub.push_window(
                 transfer,
                 WindowOut {
-                    shape: Shape {
-                        length: 1 << 20,
-                        page_count: 256,
-                        ..shape(index, 0, false)
-                    },
-                    page_xxh3: vec![0; 256],
-                    row_xxh3: 0,
+                    shape: shape(0, 2, true),
+                    page_xxh3: vec![11, 12],
+                    row_xxh3: 13,
                     region: Region::Arena,
                     offset: 0,
                 },
             );
-        }
-        // Wait until the handler is stuck in a write (some windows went, not all).
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(hub.handlers(), 1);
-        assert!(!hub.stop(transfer));
-        loop {
-            match next(&mut events).await {
-                Event::Closed { transfer: closed } => {
-                    assert_eq!(closed, transfer);
-                    break;
+            hub.push_window(
+                transfer,
+                WindowOut {
+                    shape: shape(1, 1, false),
+                    page_xxh3: vec![21],
+                    row_xxh3: 0,
+                    region: Region::Staging,
+                    offset: 8192,
+                },
+            );
+            hub.finish(transfer);
+            let mut payload = vec![0u8; first.len()];
+            let ToInstance::Window(window) = ToInstance::read(&mut conn, 64).await.unwrap() else {
+                panic!("expected a window");
+            };
+            assert_eq!(window.shape, shape(0, 2, true));
+            assert_eq!(
+                (window.page_xxh3.clone(), window.row_xxh3),
+                (vec![11, 12], 13)
+            );
+            conn.read_exact(&mut payload).await.unwrap();
+            assert_eq!(payload, first);
+            let ToInstance::Window(window) = ToInstance::read(&mut conn, 64).await.unwrap() else {
+                panic!("expected a second window");
+            };
+            assert_eq!(window.shape.index, 1);
+            let mut payload = vec![0u8; PAGE];
+            conn.read_exact(&mut payload).await.unwrap();
+            assert_eq!(payload, second);
+            assert_eq!(
+                ToInstance::read(&mut conn, 64).await.unwrap(),
+                ToInstance::End
+            );
+            // Sent twice, then the handler leaves on its own.
+            assert!(matches!(
+                next(&mut events).await,
+                Event::Sent { index: 0, .. }
+            ));
+            assert!(matches!(
+                next(&mut events).await,
+                Event::Sent { index: 1, .. }
+            ));
+            assert!(matches!(next(&mut events).await, Event::Closed { .. }));
+            assert!(
+                hub.stop(transfer),
+                "an exited handler leaves nothing to wait for"
+            );
+        })
+    }
+
+    #[test]
+    fn a_token_serves_one_connection_and_a_wrong_token_none() {
+        bounded(async {
+            let (hub, mut events, address) = start(regions(), None);
+            let (transfer, token) = hub.open(Kind::Get).unwrap();
+            let _first = connect(&address, &token).await;
+            // Wait until the first connection has been attached, or the second could win the race.
+            while hub.handlers() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // The token is spent: a second connection is closed without a byte.
+            let mut second = connect(&address, &token).await;
+            assert!(ToInstance::read(&mut second, 64).await.is_err());
+            let mut wrong = connect(&address, &[9; TOKEN_BYTES]).await;
+            assert!(ToInstance::read(&mut wrong, 64).await.is_err());
+            assert!(!hub.stop(transfer), "a handler is attached");
+            assert!(matches!(next(&mut events).await, Event::Closed { .. }));
+        })
+    }
+
+    #[test]
+    fn stopping_before_any_connection_needs_no_wait_and_blocks_a_late_one() {
+        bounded(async {
+            let (hub, _events, address) = start(regions(), None);
+            let (transfer, token) = hub.open(Kind::Get).unwrap();
+            assert!(hub.stop(transfer), "no handler ever ran");
+            let mut late = connect(&address, &token).await;
+            assert!(ToInstance::read(&mut late, 64).await.is_err());
+            assert_eq!(hub.handlers(), 0);
+        })
+    }
+
+    #[test]
+    fn stopping_a_stalled_transfer_ends_its_handler_and_reports_closed() {
+        bounded(async {
+            let regions = regions();
+            let (hub, mut events, address) = start(regions.clone(), None);
+            let (transfer, token) = hub.open(Kind::Get).unwrap();
+            // The instance connects and never reads: the socket buffers fill.
+            let _conn = connect(&address, &token).await;
+            fill(&regions, Region::Arena, 0, &vec![1u8; 1 << 20]);
+            for index in 0..64 {
+                hub.push_window(
+                    transfer,
+                    WindowOut {
+                        shape: Shape {
+                            length: 1 << 20,
+                            page_count: 256,
+                            ..shape(index, 0, false)
+                        },
+                        page_xxh3: vec![0; 256],
+                        row_xxh3: 0,
+                        region: Region::Arena,
+                        offset: 0,
+                    },
+                );
+            }
+            // Wait until the handler is stuck in a write (some windows went, not all).
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(hub.handlers(), 1);
+            assert!(!hub.stop(transfer));
+            loop {
+                match next(&mut events).await {
+                    Event::Closed { transfer: closed } => {
+                        assert_eq!(closed, transfer);
+                        break;
+                    }
+                    Event::Sent { .. } => {}
+                    other => panic!("unexpected {other:?}"),
                 }
-                Event::Sent { .. } => {}
-                other => panic!("unexpected {other:?}"),
             }
-        }
-        assert_eq!(hub.handlers(), 0);
+            assert_eq!(hub.handlers(), 0);
+        })
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_peer_that_drops_mid_transfer_fails_it_and_closes_the_handler() {
-        let regions = regions();
-        let (hub, mut events, address) = start(regions.clone(), None);
-        let (transfer, token) = hub.open(Kind::Get).unwrap();
-        let conn = connect(&address, &token).await;
-        drop(conn);
-        fill(&regions, Region::Arena, 0, &vec![1u8; 1 << 20]);
-        for index in 0..32 {
-            hub.push_window(
-                transfer,
-                WindowOut {
-                    shape: Shape {
-                        length: 1 << 20,
-                        page_count: 256,
-                        ..shape(index, 0, false)
+    #[test]
+    fn a_peer_that_drops_mid_transfer_fails_it_and_closes_the_handler() {
+        bounded(async {
+            let regions = regions();
+            let (hub, mut events, address) = start(regions.clone(), None);
+            let (transfer, token) = hub.open(Kind::Get).unwrap();
+            let conn = connect(&address, &token).await;
+            drop(conn);
+            fill(&regions, Region::Arena, 0, &vec![1u8; 1 << 20]);
+            for index in 0..32 {
+                hub.push_window(
+                    transfer,
+                    WindowOut {
+                        shape: Shape {
+                            length: 1 << 20,
+                            page_count: 256,
+                            ..shape(index, 0, false)
+                        },
+                        page_xxh3: vec![0; 256],
+                        row_xxh3: 0,
+                        region: Region::Arena,
+                        offset: 0,
                     },
-                    page_xxh3: vec![0; 256],
-                    row_xxh3: 0,
-                    region: Region::Arena,
-                    offset: 0,
+                );
+            }
+            let mut failed = false;
+            loop {
+                match next(&mut events).await {
+                    Event::Failed { .. } => failed = true,
+                    Event::Closed { .. } => break,
+                    Event::Sent { .. } => {}
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            assert!(failed, "the broken connection is reported");
+        })
+    }
+
+    #[test]
+    fn a_puts_windows_are_filled_from_what_the_instance_writes() {
+        bounded(async {
+            let regions = regions();
+            let (hub, mut events, address) = start(regions.clone(), None);
+            let (transfer, token) = hub.open(Kind::Put).unwrap();
+            let mut conn = connect(&address, &token).await;
+            hub.push_grant(
+                transfer,
+                GrantOut {
+                    shape: shape(0, 2, true),
+                    region: Region::Staging,
+                    offset: 4096,
                 },
             );
-        }
-        let mut failed = false;
-        loop {
-            match next(&mut events).await {
-                Event::Failed { .. } => failed = true,
-                Event::Closed { .. } => break,
-                Event::Sent { .. } => {}
-                other => panic!("unexpected {other:?}"),
+            let ToInstance::Grant(granted) = ToInstance::read(&mut conn, 64).await.unwrap() else {
+                panic!("expected a grant");
+            };
+            assert_eq!(granted, shape(0, 2, true));
+            let bytes: Vec<u8> = (0..3 * PAGE).map(|i| (i % 13) as u8).collect();
+            ToManager::Filled {
+                index: 0,
+                row_xxh3: Some(3),
+                page_xxh3: vec![1, 2],
+                slot: NO_SLOT,
             }
-        }
-        assert!(failed, "the broken connection is reported");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_puts_windows_are_filled_from_what_the_instance_writes() {
-        let regions = regions();
-        let (hub, mut events, address) = start(regions.clone(), None);
-        let (transfer, token) = hub.open(Kind::Put).unwrap();
-        let mut conn = connect(&address, &token).await;
-        hub.push_grant(
-            transfer,
-            GrantOut {
-                shape: shape(0, 2, true),
-                region: Region::Staging,
-                offset: 4096,
-            },
-        );
-        let ToInstance::Grant(granted) = ToInstance::read(&mut conn, 64).await.unwrap() else {
-            panic!("expected a grant");
-        };
-        assert_eq!(granted, shape(0, 2, true));
-        let bytes: Vec<u8> = (0..3 * PAGE).map(|i| (i % 13) as u8).collect();
-        ToManager::Filled {
-            index: 0,
-            row_xxh3: Some(3),
-            page_xxh3: vec![1, 2],
-            slot: NO_SLOT,
-        }
-        .write(&mut conn)
-        .await
-        .unwrap();
-        conn.write_all(&bytes).await.unwrap();
-        let Event::Filled {
-            index,
-            row_xxh3,
-            page_xxh3,
-            ..
-        } = next(&mut events).await
-        else {
-            panic!("expected Filled");
-        };
-        assert_eq!((index, row_xxh3, page_xxh3), (0, Some(3), vec![1, 2]));
-        regions
-            .with_read(Region::Staging, 4096, bytes.len(), &mut |src| {
-                assert_eq!(src, &bytes[..]);
-                Ok(())
-            })
+            .write(&mut conn)
+            .await
             .unwrap();
-        // A second grant is served the same way, after the first.
-        hub.push_grant(
-            transfer,
-            GrantOut {
-                shape: shape(1, 1, false),
-                region: Region::Staging,
-                offset: 65536,
-            },
-        );
-        assert!(matches!(
-            ToInstance::read(&mut conn, 64).await.unwrap(),
-            ToInstance::Grant(_)
-        ));
-        hub.stop(transfer);
-        assert!(matches!(next(&mut events).await, Event::Closed { .. }));
+            conn.write_all(&bytes).await.unwrap();
+            let Event::Filled {
+                index,
+                row_xxh3,
+                page_xxh3,
+                ..
+            } = next(&mut events).await
+            else {
+                panic!("expected Filled");
+            };
+            assert_eq!((index, row_xxh3, page_xxh3), (0, Some(3), vec![1, 2]));
+            regions
+                .with_read(Region::Staging, 4096, bytes.len(), &mut |src| {
+                    assert_eq!(src, &bytes[..]);
+                    Ok(())
+                })
+                .unwrap();
+            // A second grant is served the same way, after the first.
+            hub.push_grant(
+                transfer,
+                GrantOut {
+                    shape: shape(1, 1, false),
+                    region: Region::Staging,
+                    offset: 65536,
+                },
+            );
+            assert!(matches!(
+                ToInstance::read(&mut conn, 64).await.unwrap(),
+                ToInstance::Grant(_)
+            ));
+            hub.stop(transfer);
+            assert!(matches!(next(&mut events).await, Event::Closed { .. }));
+        })
     }
 
     fn rank_layout(world: usize) -> Arc<SliceLayout> {
@@ -1496,80 +1532,121 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_ranks_leg_carries_only_its_slices_of_each_window_and_other_ranks_see_theirs() {
-        let regions = regions();
-        let (hub, mut events, address) = start(regions.clone(), None);
-        let layout = rank_layout(3);
-        let window: Vec<u8> = (0..layout.window_bytes(2, true) as usize)
-            .map(|i| (i % 241) as u8)
-            .collect();
-        fill(&regions, Region::Staging, 8192, &window);
-        let mut transfers = Vec::new();
-        for rank in 0..3 {
-            let (transfer, token) = hub.open_rank(Kind::Get, layout.clone(), rank).unwrap();
-            let conn = connect(&address, &token).await;
-            hub.push_window(
-                transfer,
-                WindowOut {
-                    shape: rank_shape(&layout, rank, 0, 2, true),
-                    page_xxh3: vec![1, 2],
-                    row_xxh3: 3,
-                    region: Region::Staging,
-                    offset: 8192,
-                },
-            );
-            hub.finish(transfer);
-            transfers.push((transfer, conn));
-        }
-        for (rank, (_, conn)) in transfers.iter_mut().enumerate() {
-            let ToInstance::Window(got) = ToInstance::read(conn, 64).await.unwrap() else {
-                panic!("expected a window");
-            };
-            assert_eq!(got.shape, rank_shape(&layout, rank, 0, 2, true));
-            let mut payload = vec![0u8; got.shape.length as usize];
-            conn.read_exact(&mut payload).await.unwrap();
-            let mut expect = vec![0u8; payload.len()];
-            layout.gather(rank, &window, 2, true, &mut expect).unwrap();
-            assert_eq!(payload, expect, "rank {rank}");
-            assert_eq!(ToInstance::read(conn, 64).await.unwrap(), ToInstance::End);
-        }
-        let mut sent = 0;
-        let mut closed = 0;
-        while sent < 3 || closed < 3 {
-            match next(&mut events).await {
-                Event::Sent { .. } => sent += 1,
-                Event::Closed { .. } => closed += 1,
-                other => panic!("unexpected {other:?}"),
+    #[test]
+    fn a_ranks_leg_carries_only_its_slices_of_each_window_and_other_ranks_see_theirs() {
+        bounded(async {
+            let regions = regions();
+            let (hub, mut events, address) = start(regions.clone(), None);
+            let layout = rank_layout(3);
+            let window: Vec<u8> = (0..layout.window_bytes(2, true) as usize)
+                .map(|i| (i % 241) as u8)
+                .collect();
+            fill(&regions, Region::Staging, 8192, &window);
+            let mut transfers = Vec::new();
+            for rank in 0..3 {
+                let (transfer, token) = hub.open_rank(Kind::Get, layout.clone(), rank).unwrap();
+                let conn = connect(&address, &token).await;
+                hub.push_window(
+                    transfer,
+                    WindowOut {
+                        shape: rank_shape(&layout, rank, 0, 2, true),
+                        page_xxh3: vec![1, 2],
+                        row_xxh3: 3,
+                        region: Region::Staging,
+                        offset: 8192,
+                    },
+                );
+                hub.finish(transfer);
+                transfers.push((transfer, conn));
             }
-        }
+            for (rank, (_, conn)) in transfers.iter_mut().enumerate() {
+                let ToInstance::Window(got) = ToInstance::read(conn, 64).await.unwrap() else {
+                    panic!("expected a window");
+                };
+                assert_eq!(got.shape, rank_shape(&layout, rank, 0, 2, true));
+                let mut payload = vec![0u8; got.shape.length as usize];
+                conn.read_exact(&mut payload).await.unwrap();
+                let mut expect = vec![0u8; payload.len()];
+                layout.gather(rank, &window, 2, true, &mut expect).unwrap();
+                assert_eq!(payload, expect, "rank {rank}");
+                assert_eq!(ToInstance::read(conn, 64).await.unwrap(), ToInstance::End);
+            }
+            let mut sent = 0;
+            let mut closed = 0;
+            while sent < 3 || closed < 3 {
+                match next(&mut events).await {
+                    Event::Sent { .. } => sent += 1,
+                    Event::Closed { .. } => closed += 1,
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        })
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_ranks_legs_of_a_put_assemble_one_window_and_a_wrong_length_ends_the_leg() {
-        let regions = regions();
-        let (hub, mut events, address) = start(regions.clone(), None);
-        let layout = rank_layout(2);
-        let truth: Vec<u8> = (0..layout.window_bytes(2, true) as usize)
-            .map(|i| (i % 233) as u8)
-            .collect();
-        for rank in [1usize, 0] {
-            let (transfer, token) = hub.open_rank(Kind::Put, layout.clone(), rank).unwrap();
+    #[test]
+    fn the_ranks_legs_of_a_put_assemble_one_window_and_a_wrong_length_ends_the_leg() {
+        bounded(async {
+            let regions = regions();
+            let (hub, mut events, address) = start(regions.clone(), None);
+            let layout = rank_layout(2);
+            let truth: Vec<u8> = (0..layout.window_bytes(2, true) as usize)
+                .map(|i| (i % 233) as u8)
+                .collect();
+            for rank in [1usize, 0] {
+                let (transfer, token) = hub.open_rank(Kind::Put, layout.clone(), rank).unwrap();
+                let mut conn = connect(&address, &token).await;
+                hub.push_grant(
+                    transfer,
+                    GrantOut {
+                        shape: rank_shape(&layout, rank, 0, 2, true),
+                        region: Region::Staging,
+                        offset: 16384,
+                    },
+                );
+                let ToInstance::Grant(granted) = ToInstance::read(&mut conn, 64).await.unwrap()
+                else {
+                    panic!("expected a grant");
+                };
+                assert_eq!(granted, rank_shape(&layout, rank, 0, 2, true));
+                let mut packed = vec![0u8; granted.length as usize];
+                layout.gather(rank, &truth, 2, true, &mut packed).unwrap();
+                ToManager::Filled {
+                    index: 0,
+                    row_xxh3: Some(3),
+                    page_xxh3: vec![1, 2],
+                    slot: NO_SLOT,
+                }
+                .write(&mut conn)
+                .await
+                .unwrap();
+                conn.write_all(&packed).await.unwrap();
+                let Event::Filled { index, .. } = next(&mut events).await else {
+                    panic!("expected Filled");
+                };
+                assert_eq!(index, 0);
+                hub.stop(transfer);
+                assert!(matches!(next(&mut events).await, Event::Closed { .. }));
+            }
+            regions
+                .with_read(Region::Staging, 16384, truth.len(), &mut |window| {
+                    assert_eq!(window, &truth[..], "both ranks' slices are in place");
+                    Ok(())
+                })
+                .unwrap();
+            // A grant whose shape is not the rank's slice ends the leg.
+            let (transfer, token) = hub.open_rank(Kind::Put, layout.clone(), 0).unwrap();
             let mut conn = connect(&address, &token).await;
             hub.push_grant(
                 transfer,
                 GrantOut {
-                    shape: rank_shape(&layout, rank, 0, 2, true),
+                    shape: shape(0, 2, true),
                     region: Region::Staging,
                     offset: 16384,
                 },
             );
-            let ToInstance::Grant(granted) = ToInstance::read(&mut conn, 64).await.unwrap() else {
+            let ToInstance::Grant(_) = ToInstance::read(&mut conn, 64).await.unwrap() else {
                 panic!("expected a grant");
             };
-            assert_eq!(granted, rank_shape(&layout, rank, 0, 2, true));
-            let mut packed = vec![0u8; granted.length as usize];
-            layout.gather(rank, &truth, 2, true, &mut packed).unwrap();
             ToManager::Filled {
                 index: 0,
                 row_xxh3: Some(3),
@@ -1579,94 +1656,60 @@ mod tests {
             .write(&mut conn)
             .await
             .unwrap();
-            conn.write_all(&packed).await.unwrap();
-            let Event::Filled { index, .. } = next(&mut events).await else {
-                panic!("expected Filled");
-            };
-            assert_eq!(index, 0);
-            hub.stop(transfer);
-            assert!(matches!(next(&mut events).await, Event::Closed { .. }));
-        }
-        regions
-            .with_read(Region::Staging, 16384, truth.len(), &mut |window| {
-                assert_eq!(window, &truth[..], "both ranks' slices are in place");
-                Ok(())
-            })
-            .unwrap();
-        // A grant whose shape is not the rank's slice ends the leg.
-        let (transfer, token) = hub.open_rank(Kind::Put, layout.clone(), 0).unwrap();
-        let mut conn = connect(&address, &token).await;
-        hub.push_grant(
-            transfer,
-            GrantOut {
-                shape: shape(0, 2, true),
-                region: Region::Staging,
-                offset: 16384,
-            },
-        );
-        let ToInstance::Grant(_) = ToInstance::read(&mut conn, 64).await.unwrap() else {
-            panic!("expected a grant");
-        };
-        ToManager::Filled {
-            index: 0,
-            row_xxh3: Some(3),
-            page_xxh3: vec![1, 2],
-            slot: NO_SLOT,
-        }
-        .write(&mut conn)
-        .await
-        .unwrap();
-        conn.write_all(&vec![0u8; 3 * PAGE]).await.unwrap();
-        let mut failed = false;
-        loop {
-            match next(&mut events).await {
-                Event::Failed { .. } => failed = true,
-                Event::Closed { .. } => break,
-                other => panic!("unexpected {other:?}"),
+            conn.write_all(&vec![0u8; 3 * PAGE]).await.unwrap();
+            let mut failed = false;
+            loop {
+                match next(&mut events).await {
+                    Event::Failed { .. } => failed = true,
+                    Event::Closed { .. } => break,
+                    other => panic!("unexpected {other:?}"),
+                }
             }
-        }
-        assert!(failed);
+            assert!(failed);
+        })
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_filled_window_that_disagrees_with_its_grant_fails_the_put_without_writing() {
-        let regions = regions();
-        let (hub, mut events, address) = start(regions.clone(), None);
-        let (transfer, token) = hub.open(Kind::Put).unwrap();
-        let mut conn = connect(&address, &token).await;
-        hub.push_grant(
-            transfer,
-            GrantOut {
-                shape: shape(0, 2, false),
-                region: Region::Staging,
-                offset: 0,
-            },
-        );
-        let _ = ToInstance::read(&mut conn, 64).await.unwrap();
-        // One checksum for a two-page window.
-        ToManager::Filled {
-            index: 0,
-            row_xxh3: None,
-            page_xxh3: vec![1],
-            slot: NO_SLOT,
-        }
-        .write(&mut conn)
-        .await
-        .unwrap();
-        conn.write_all(&vec![0xee; 2 * PAGE]).await.unwrap();
-        loop {
-            match next(&mut events).await {
-                Event::Failed { .. } => {}
-                Event::Closed { .. } => break,
-                other => panic!("unexpected {other:?}"),
+    #[test]
+    fn a_filled_window_that_disagrees_with_its_grant_fails_the_put_without_writing() {
+        bounded(async {
+            let regions = regions();
+            let (hub, mut events, address) = start(regions.clone(), None);
+            let (transfer, token) = hub.open(Kind::Put).unwrap();
+            let mut conn = connect(&address, &token).await;
+            hub.push_grant(
+                transfer,
+                GrantOut {
+                    shape: shape(0, 2, false),
+                    region: Region::Staging,
+                    offset: 0,
+                },
+            );
+            let _ = ToInstance::read(&mut conn, 64).await.unwrap();
+            // One checksum for a two-page window.
+            ToManager::Filled {
+                index: 0,
+                row_xxh3: None,
+                page_xxh3: vec![1],
+                slot: NO_SLOT,
             }
-        }
-        regions
-            .with_read(Region::Staging, 0, 2 * PAGE, &mut |src| {
-                assert!(src.iter().all(|byte| *byte == 0), "nothing was written");
-                Ok(())
-            })
+            .write(&mut conn)
+            .await
             .unwrap();
+            conn.write_all(&vec![0xee; 2 * PAGE]).await.unwrap();
+            loop {
+                match next(&mut events).await {
+                    Event::Failed { .. } => {}
+                    Event::Closed { .. } => break,
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            regions
+                .with_read(Region::Staging, 0, 2 * PAGE, &mut |src| {
+                    assert!(src.iter().all(|byte| *byte == 0), "nothing was written");
+                    Ok(())
+                })
+                .unwrap();
+        })
     }
 
     fn certificate() -> (Arc<rustls::ServerConfig>, rustls::RootCertStore) {
@@ -1685,64 +1728,66 @@ mod tests {
         (config, roots)
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_tls_hub_serves_a_client_that_trusts_it_and_refuses_one_that_does_not() {
-        use rustls::pki_types::ServerName;
-        let regions = regions();
-        let (config, roots) = certificate();
-        let (hub, mut events, address) = start(regions.clone(), Some(config));
-        assert!(hub.encrypted());
-        let (transfer, token) = hub.open(Kind::Get).unwrap();
-        fill(&regions, Region::Arena, 0, &vec![5u8; PAGE]);
-        hub.push_window(
-            transfer,
-            WindowOut {
-                shape: shape(0, 1, false),
-                page_xxh3: vec![1],
-                row_xxh3: 0,
-                region: Region::Arena,
-                offset: 0,
-            },
-        );
-        hub.finish(transfer);
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let client = |roots: rustls::RootCertStore| {
-            let config = rustls::ClientConfig::builder_with_provider(provider.clone())
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-            tokio_rustls::TlsConnector::from(Arc::new(config))
-        };
-        // A client with some other root fails the handshake; the token stays good.
-        let tcp = TcpStream::connect(&address).await.unwrap();
-        let name = ServerName::try_from("localhost").unwrap();
-        let (_, other_roots) = certificate();
-        assert!(
-            client(other_roots)
-                .connect(name.clone(), tcp)
+    #[test]
+    fn a_tls_hub_serves_a_client_that_trusts_it_and_refuses_one_that_does_not() {
+        bounded(async {
+            use rustls::pki_types::ServerName;
+            let regions = regions();
+            let (config, roots) = certificate();
+            let (hub, mut events, address) = start(regions.clone(), Some(config));
+            assert!(hub.encrypted());
+            let (transfer, token) = hub.open(Kind::Get).unwrap();
+            fill(&regions, Region::Arena, 0, &vec![5u8; PAGE]);
+            hub.push_window(
+                transfer,
+                WindowOut {
+                    shape: shape(0, 1, false),
+                    page_xxh3: vec![1],
+                    row_xxh3: 0,
+                    region: Region::Arena,
+                    offset: 0,
+                },
+            );
+            hub.finish(transfer);
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let client = |roots: rustls::RootCertStore| {
+                let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+                tokio_rustls::TlsConnector::from(Arc::new(config))
+            };
+            // A client with some other root fails the handshake; the token stays good.
+            let tcp = TcpStream::connect(&address).await.unwrap();
+            let name = ServerName::try_from("localhost").unwrap();
+            let (_, other_roots) = certificate();
+            assert!(
+                client(other_roots)
+                    .connect(name.clone(), tcp)
+                    .await
+                    .is_err()
+            );
+            let tcp = TcpStream::connect(&address).await.unwrap();
+            let mut conn = client(roots).connect(name, tcp).await.unwrap();
+            conn.write_all(&token).await.unwrap();
+            ToManager::Hello(Carrier::Stream)
+                .write(&mut conn)
                 .await
-                .is_err()
-        );
-        let tcp = TcpStream::connect(&address).await.unwrap();
-        let mut conn = client(roots).connect(name, tcp).await.unwrap();
-        conn.write_all(&token).await.unwrap();
-        ToManager::Hello(Carrier::Stream)
-            .write(&mut conn)
-            .await
-            .unwrap();
-        let ToInstance::Window(window) = ToInstance::read(&mut conn, 64).await.unwrap() else {
-            panic!("expected a window");
-        };
-        assert_eq!(window.page_xxh3, vec![1]);
-        let mut payload = vec![0u8; PAGE];
-        conn.read_exact(&mut payload).await.unwrap();
-        assert!(payload.iter().all(|byte| *byte == 5));
-        assert_eq!(
-            ToInstance::read(&mut conn, 64).await.unwrap(),
-            ToInstance::End
-        );
-        assert!(matches!(next(&mut events).await, Event::Sent { .. }));
+                .unwrap();
+            let ToInstance::Window(window) = ToInstance::read(&mut conn, 64).await.unwrap() else {
+                panic!("expected a window");
+            };
+            assert_eq!(window.page_xxh3, vec![1]);
+            let mut payload = vec![0u8; PAGE];
+            conn.read_exact(&mut payload).await.unwrap();
+            assert!(payload.iter().all(|byte| *byte == 5));
+            assert_eq!(
+                ToInstance::read(&mut conn, 64).await.unwrap(),
+                ToInstance::End
+            );
+            assert!(matches!(next(&mut events).await, Event::Sent { .. }));
+        })
     }
 
     #[test]
@@ -1901,108 +1946,112 @@ mod tests {
         Box::new(stream)
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_ranks_slices_are_gathered_into_packed_staging_and_written_into_its_slot() {
-        let (hub, mut events, address, regions, staging, remote) = start_fake_rdma();
-        let layout = rank_layout(3);
-        let window: Vec<u8> = (0..layout.window_bytes(3, true) as usize)
-            .map(|i| (i % 239) as u8)
-            .collect();
-        fill(&regions, Region::Arena, 0, &window);
-        for rank in [0usize, 2] {
-            let (transfer, token) = hub.open_rank(Kind::Get, layout.clone(), rank).unwrap();
-            let mut conn = dial_rdma(&address, &token).await;
-            let slot = 32768u64;
-            ToManager::Credit {
-                offset: slot,
-                length: layout.slice_bytes(rank, 3, true),
+    #[test]
+    fn a_ranks_slices_are_gathered_into_packed_staging_and_written_into_its_slot() {
+        bounded(async {
+            let (hub, mut events, address, regions, staging, remote) = start_fake_rdma();
+            let layout = rank_layout(3);
+            let window: Vec<u8> = (0..layout.window_bytes(3, true) as usize)
+                .map(|i| (i % 239) as u8)
+                .collect();
+            fill(&regions, Region::Arena, 0, &window);
+            for rank in [0usize, 2] {
+                let (transfer, token) = hub.open_rank(Kind::Get, layout.clone(), rank).unwrap();
+                let mut conn = dial_rdma(&address, &token).await;
+                let slot = 32768u64;
+                ToManager::Credit {
+                    offset: slot,
+                    length: layout.slice_bytes(rank, 3, true),
+                }
+                .write(&mut conn)
+                .await
+                .unwrap();
+                hub.push_window(
+                    transfer,
+                    WindowOut {
+                        shape: rank_shape(&layout, rank, 0, 3, true),
+                        page_xxh3: vec![1, 2, 3],
+                        row_xxh3: 4,
+                        region: Region::Arena,
+                        offset: 0,
+                    },
+                );
+                hub.finish(transfer);
+                let ToInstance::Window(got) = frame(&mut conn).await else {
+                    panic!("expected a window");
+                };
+                assert_eq!(got.slot, slot, "named by the slot it was written into");
+                assert_eq!(got.shape, rank_shape(&layout, rank, 0, 3, true));
+                let mut expect = vec![0u8; got.shape.length as usize];
+                layout.gather(rank, &window, 3, true, &mut expect).unwrap();
+                assert_eq!(
+                    &remote.lock().unwrap()[slot as usize..slot as usize + expect.len()],
+                    &expect[..],
+                    "rank {rank}'s slice landed in its slot"
+                );
+                assert_eq!(frame(&mut conn).await, ToInstance::End);
+                assert!(matches!(
+                    next(&mut events).await,
+                    Event::Sent { index: 0, .. }
+                ));
+                assert!(matches!(next(&mut events).await, Event::Closed { .. }));
             }
-            .write(&mut conn)
-            .await
-            .unwrap();
-            hub.push_window(
-                transfer,
-                WindowOut {
-                    shape: rank_shape(&layout, rank, 0, 3, true),
-                    page_xxh3: vec![1, 2, 3],
-                    row_xxh3: 4,
-                    region: Region::Arena,
-                    offset: 0,
-                },
-            );
-            hub.finish(transfer);
-            let ToInstance::Window(got) = frame(&mut conn).await else {
-                panic!("expected a window");
-            };
-            assert_eq!(got.slot, slot, "named by the slot it was written into");
-            assert_eq!(got.shape, rank_shape(&layout, rank, 0, 3, true));
-            let mut expect = vec![0u8; got.shape.length as usize];
-            layout.gather(rank, &window, 3, true, &mut expect).unwrap();
-            assert_eq!(
-                &remote.lock().unwrap()[slot as usize..slot as usize + expect.len()],
-                &expect[..],
-                "rank {rank}'s slice landed in its slot"
-            );
-            assert_eq!(frame(&mut conn).await, ToInstance::End);
-            assert!(matches!(
-                next(&mut events).await,
-                Event::Sent { index: 0, .. }
-            ));
-            assert!(matches!(next(&mut events).await, Event::Closed { .. }));
-        }
-        assert_eq!(staging.used(), 0, "the packed staging came back");
+            assert_eq!(staging.used(), 0, "the packed staging came back");
+        })
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_ranks_slice_is_read_into_packed_staging_and_scattered_into_the_window() {
-        let (hub, mut events, address, regions, staging, remote) = start_fake_rdma();
-        let layout = rank_layout(2);
-        let truth: Vec<u8> = (0..layout.window_bytes(2, true) as usize)
-            .map(|i| (i % 227) as u8)
-            .collect();
-        for rank in [1usize, 0] {
-            let (transfer, token) = hub.open_rank(Kind::Put, layout.clone(), rank).unwrap();
-            let mut conn = dial_rdma(&address, &token).await;
-            hub.push_grant(
-                transfer,
-                GrantOut {
-                    shape: rank_shape(&layout, rank, 0, 2, true),
-                    region: Region::Arena,
-                    offset: 8192,
-                },
-            );
-            let ToInstance::Grant(granted) = frame(&mut conn).await else {
-                panic!("expected a grant");
-            };
-            let mut packed = vec![0u8; granted.length as usize];
-            layout.gather(rank, &truth, 2, true, &mut packed).unwrap();
-            let slot = 65536u64;
-            remote.lock().unwrap()[slot as usize..slot as usize + packed.len()]
-                .copy_from_slice(&packed);
-            ToManager::Filled {
-                index: 0,
-                row_xxh3: Some(3),
-                page_xxh3: vec![1, 2],
-                slot,
+    #[test]
+    fn a_ranks_slice_is_read_into_packed_staging_and_scattered_into_the_window() {
+        bounded(async {
+            let (hub, mut events, address, regions, staging, remote) = start_fake_rdma();
+            let layout = rank_layout(2);
+            let truth: Vec<u8> = (0..layout.window_bytes(2, true) as usize)
+                .map(|i| (i % 227) as u8)
+                .collect();
+            for rank in [1usize, 0] {
+                let (transfer, token) = hub.open_rank(Kind::Put, layout.clone(), rank).unwrap();
+                let mut conn = dial_rdma(&address, &token).await;
+                hub.push_grant(
+                    transfer,
+                    GrantOut {
+                        shape: rank_shape(&layout, rank, 0, 2, true),
+                        region: Region::Arena,
+                        offset: 8192,
+                    },
+                );
+                let ToInstance::Grant(granted) = frame(&mut conn).await else {
+                    panic!("expected a grant");
+                };
+                let mut packed = vec![0u8; granted.length as usize];
+                layout.gather(rank, &truth, 2, true, &mut packed).unwrap();
+                let slot = 65536u64;
+                remote.lock().unwrap()[slot as usize..slot as usize + packed.len()]
+                    .copy_from_slice(&packed);
+                ToManager::Filled {
+                    index: 0,
+                    row_xxh3: Some(3),
+                    page_xxh3: vec![1, 2],
+                    slot,
+                }
+                .write(&mut conn)
+                .await
+                .unwrap();
+                let Event::Filled { index, .. } = next(&mut events).await else {
+                    panic!("expected Filled");
+                };
+                assert_eq!(index, 0);
+                assert_eq!(frame(&mut conn).await, ToInstance::Taken(0));
+                hub.stop(transfer);
+                assert!(matches!(next(&mut events).await, Event::Closed { .. }));
             }
-            .write(&mut conn)
-            .await
-            .unwrap();
-            let Event::Filled { index, .. } = next(&mut events).await else {
-                panic!("expected Filled");
-            };
-            assert_eq!(index, 0);
-            assert_eq!(frame(&mut conn).await, ToInstance::Taken(0));
-            hub.stop(transfer);
-            assert!(matches!(next(&mut events).await, Event::Closed { .. }));
-        }
-        regions
-            .with_read(Region::Arena, 8192, truth.len(), &mut |window| {
-                assert_eq!(window, &truth[..], "both slices are in their places");
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(staging.used(), 0, "the packed staging came back");
+            regions
+                .with_read(Region::Arena, 8192, truth.len(), &mut |window| {
+                    assert_eq!(window, &truth[..], "both slices are in their places");
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(staging.used(), 0, "the packed staging came back");
+        })
     }
 
     #[cfg(feature = "rdma")]
@@ -2072,225 +2121,238 @@ mod tests {
             (hub, events, address)
         }
 
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn a_claims_windows_are_written_into_lent_slots_and_named() {
-            let regions = regions();
-            let (hub, mut events, address) = start_rdma(regions.clone());
-            assert!(hub.offers_rdma());
-            let instance = Instance::new();
-            let (transfer, token) = hub.open(Kind::Get).unwrap();
-            let (mut stream, pair) = instance.dial(&address, &token).await;
-            // Two slots lent, and two windows: each lands in the slot lent for it.
-            for offset in [0u64, 4 * PAGE as u64] {
+        #[test]
+        fn a_claims_windows_are_written_into_lent_slots_and_named() {
+            bounded(async {
+                let regions = regions();
+                let (hub, mut events, address) = start_rdma(regions.clone());
+                assert!(hub.offers_rdma());
+                let instance = Instance::new();
+                let (transfer, token) = hub.open(Kind::Get).unwrap();
+                let (mut stream, pair) = instance.dial(&address, &token).await;
+                // Two slots lent, and two windows: each lands in the slot lent for it.
+                for offset in [0u64, 4 * PAGE as u64] {
+                    ToManager::Credit {
+                        offset,
+                        length: 4 * PAGE as u64,
+                    }
+                    .write(&mut stream)
+                    .await
+                    .unwrap();
+                }
+                let first: Vec<u8> = (0..2 * PAGE).map(|i| (i % 253) as u8).collect();
+                let second: Vec<u8> = (0..PAGE).map(|i| (i % 7 + 1) as u8).collect();
+                fill(&regions, Region::Arena, 0, &first);
+                fill(&regions, Region::Staging, 8192, &second);
+                hub.push_window(
+                    transfer,
+                    WindowOut {
+                        shape: shape(0, 2, false),
+                        page_xxh3: vec![1, 2],
+                        row_xxh3: 0,
+                        region: Region::Arena,
+                        offset: 0,
+                    },
+                );
+                hub.push_window(
+                    transfer,
+                    WindowOut {
+                        shape: shape(1, 1, false),
+                        page_xxh3: vec![3],
+                        row_xxh3: 0,
+                        region: Region::Staging,
+                        offset: 8192,
+                    },
+                );
+                hub.finish(transfer);
+                let ToInstance::Window(one) = ToInstance::read(&mut stream, 64).await.unwrap()
+                else {
+                    panic!("expected a window");
+                };
+                assert_eq!(
+                    (one.shape.index, one.slot, one.page_xxh3.clone()),
+                    (0, 0, vec![1, 2])
+                );
+                assert_eq!(instance.bytes(0, 2 * PAGE), &first[..]);
+                let ToInstance::Window(two) = ToInstance::read(&mut stream, 64).await.unwrap()
+                else {
+                    panic!("expected a second window");
+                };
+                assert_eq!((two.shape.index, two.slot), (1, 4 * PAGE as u64));
+                assert_eq!(instance.bytes(4 * PAGE, PAGE), &second[..]);
+                assert_eq!(
+                    ToInstance::read(&mut stream, 64).await.unwrap(),
+                    ToInstance::End
+                );
+                assert!(matches!(
+                    next(&mut events).await,
+                    Event::Sent { index: 0, .. }
+                ));
+                assert!(matches!(
+                    next(&mut events).await,
+                    Event::Sent { index: 1, .. }
+                ));
+                assert!(matches!(next(&mut events).await, Event::Closed { .. }));
+                let moved = hub.moved();
+                assert_eq!(moved.windows, [0, 2]);
+                assert_eq!(moved.bytes, [0, 3 * PAGE as u64]);
+                drop(pair);
+            })
+        }
+
+        #[test]
+        fn a_window_that_does_not_fit_the_lent_slot_fails_the_transfer() {
+            bounded(async {
+                let regions = regions();
+                let (hub, mut events, address) = start_rdma(regions.clone());
+                let instance = Instance::new();
+                let (transfer, token) = hub.open(Kind::Get).unwrap();
+                let (mut stream, _pair) = instance.dial(&address, &token).await;
                 ToManager::Credit {
-                    offset,
+                    offset: 0,
+                    length: PAGE as u64,
+                }
+                .write(&mut stream)
+                .await
+                .unwrap();
+                hub.push_window(
+                    transfer,
+                    WindowOut {
+                        shape: shape(0, 2, false),
+                        page_xxh3: vec![1, 2],
+                        row_xxh3: 0,
+                        region: Region::Arena,
+                        offset: 0,
+                    },
+                );
+                assert!(matches!(next(&mut events).await, Event::Failed { .. }));
+                assert!(matches!(next(&mut events).await, Event::Closed { .. }));
+                assert!(instance.bytes(0, PAGE).iter().all(|byte| *byte == 0));
+            })
+        }
+
+        #[test]
+        fn a_puts_slot_is_read_into_the_window_and_released() {
+            bounded(async {
+                let regions = regions();
+                let (hub, mut events, address) = start_rdma(regions.clone());
+                let instance = Instance::new();
+                let (transfer, token) = hub.open(Kind::Put).unwrap();
+                let (mut stream, _pair) = instance.dial(&address, &token).await;
+                hub.push_grant(
+                    transfer,
+                    GrantOut {
+                        shape: shape(0, 2, true),
+                        region: Region::Staging,
+                        offset: 4096,
+                    },
+                );
+                let ToInstance::Grant(granted) = ToInstance::read(&mut stream, 64).await.unwrap()
+                else {
+                    panic!("expected a grant");
+                };
+                assert_eq!(granted, shape(0, 2, true));
+                let bytes: Vec<u8> = (0..3 * PAGE).map(|i| (i % 13) as u8).collect();
+                instance
+                    .bytes(2 * PAGE, bytes.len())
+                    .copy_from_slice(&bytes);
+                ToManager::Filled {
+                    index: 0,
+                    row_xxh3: Some(3),
+                    page_xxh3: vec![1, 2],
+                    slot: 2 * PAGE as u64,
+                }
+                .write(&mut stream)
+                .await
+                .unwrap();
+                let Event::Filled {
+                    index, page_xxh3, ..
+                } = next(&mut events).await
+                else {
+                    panic!("expected Filled");
+                };
+                assert_eq!((index, page_xxh3), (0, vec![1, 2]));
+                regions
+                    .with_read(Region::Staging, 4096, bytes.len(), &mut |src| {
+                        assert_eq!(src, &bytes[..]);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(
+                    ToInstance::read(&mut stream, 64).await.unwrap(),
+                    ToInstance::Taken(0)
+                );
+                hub.stop(transfer);
+                assert!(matches!(next(&mut events).await, Event::Closed { .. }));
+            })
+        }
+
+        #[test]
+        fn stopping_an_rdma_transfer_fences_its_pair_before_it_reports_closed() {
+            bounded(async {
+                let regions = regions();
+                let (hub, mut events, address) = start_rdma(regions.clone());
+                let instance = Instance::new();
+                let (transfer, token) = hub.open(Kind::Get).unwrap();
+                let (mut stream, pair) = instance.dial(&address, &token).await;
+                ToManager::Credit {
+                    offset: 0,
                     length: 4 * PAGE as u64,
                 }
                 .write(&mut stream)
                 .await
                 .unwrap();
-            }
-            let first: Vec<u8> = (0..2 * PAGE).map(|i| (i % 253) as u8).collect();
-            let second: Vec<u8> = (0..PAGE).map(|i| (i % 7 + 1) as u8).collect();
-            fill(&regions, Region::Arena, 0, &first);
-            fill(&regions, Region::Staging, 8192, &second);
-            hub.push_window(
-                transfer,
-                WindowOut {
-                    shape: shape(0, 2, false),
-                    page_xxh3: vec![1, 2],
-                    row_xxh3: 0,
-                    region: Region::Arena,
-                    offset: 0,
-                },
-            );
-            hub.push_window(
-                transfer,
-                WindowOut {
-                    shape: shape(1, 1, false),
-                    page_xxh3: vec![3],
-                    row_xxh3: 0,
-                    region: Region::Staging,
-                    offset: 8192,
-                },
-            );
-            hub.finish(transfer);
-            let ToInstance::Window(one) = ToInstance::read(&mut stream, 64).await.unwrap() else {
-                panic!("expected a window");
-            };
-            assert_eq!(
-                (one.shape.index, one.slot, one.page_xxh3.clone()),
-                (0, 0, vec![1, 2])
-            );
-            assert_eq!(instance.bytes(0, 2 * PAGE), &first[..]);
-            let ToInstance::Window(two) = ToInstance::read(&mut stream, 64).await.unwrap() else {
-                panic!("expected a second window");
-            };
-            assert_eq!((two.shape.index, two.slot), (1, 4 * PAGE as u64));
-            assert_eq!(instance.bytes(4 * PAGE, PAGE), &second[..]);
-            assert_eq!(
-                ToInstance::read(&mut stream, 64).await.unwrap(),
-                ToInstance::End
-            );
-            assert!(matches!(
-                next(&mut events).await,
-                Event::Sent { index: 0, .. }
-            ));
-            assert!(matches!(
-                next(&mut events).await,
-                Event::Sent { index: 1, .. }
-            ));
-            assert!(matches!(next(&mut events).await, Event::Closed { .. }));
-            let moved = hub.moved();
-            assert_eq!(moved.windows, [0, 2]);
-            assert_eq!(moved.bytes, [0, 3 * PAGE as u64]);
-            drop(pair);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert_eq!(hub.handlers(), 1);
+                assert!(!hub.stop(transfer));
+                assert!(matches!(next(&mut events).await, Event::Closed { .. }));
+                assert_eq!(hub.handlers(), 0);
+                drop(pair);
+            })
         }
 
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn a_window_that_does_not_fit_the_lent_slot_fails_the_transfer() {
-            let regions = regions();
-            let (hub, mut events, address) = start_rdma(regions.clone());
-            let instance = Instance::new();
-            let (transfer, token) = hub.open(Kind::Get).unwrap();
-            let (mut stream, _pair) = instance.dial(&address, &token).await;
-            ToManager::Credit {
-                offset: 0,
-                length: PAGE as u64,
-            }
-            .write(&mut stream)
-            .await
-            .unwrap();
-            hub.push_window(
-                transfer,
-                WindowOut {
-                    shape: shape(0, 2, false),
-                    page_xxh3: vec![1, 2],
-                    row_xxh3: 0,
-                    region: Region::Arena,
-                    offset: 0,
-                },
-            );
-            assert!(matches!(next(&mut events).await, Event::Failed { .. }));
-            assert!(matches!(next(&mut events).await, Event::Closed { .. }));
-            assert!(instance.bytes(0, PAGE).iter().all(|byte| *byte == 0));
-        }
-
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn a_puts_slot_is_read_into_the_window_and_released() {
-            let regions = regions();
-            let (hub, mut events, address) = start_rdma(regions.clone());
-            let instance = Instance::new();
-            let (transfer, token) = hub.open(Kind::Put).unwrap();
-            let (mut stream, _pair) = instance.dial(&address, &token).await;
-            hub.push_grant(
-                transfer,
-                GrantOut {
-                    shape: shape(0, 2, true),
-                    region: Region::Staging,
-                    offset: 4096,
-                },
-            );
-            let ToInstance::Grant(granted) = ToInstance::read(&mut stream, 64).await.unwrap()
-            else {
-                panic!("expected a grant");
-            };
-            assert_eq!(granted, shape(0, 2, true));
-            let bytes: Vec<u8> = (0..3 * PAGE).map(|i| (i % 13) as u8).collect();
-            instance
-                .bytes(2 * PAGE, bytes.len())
-                .copy_from_slice(&bytes);
-            ToManager::Filled {
-                index: 0,
-                row_xxh3: Some(3),
-                page_xxh3: vec![1, 2],
-                slot: 2 * PAGE as u64,
-            }
-            .write(&mut stream)
-            .await
-            .unwrap();
-            let Event::Filled {
-                index, page_xxh3, ..
-            } = next(&mut events).await
-            else {
-                panic!("expected Filled");
-            };
-            assert_eq!((index, page_xxh3), (0, vec![1, 2]));
-            regions
-                .with_read(Region::Staging, 4096, bytes.len(), &mut |src| {
-                    assert_eq!(src, &bytes[..]);
-                    Ok(())
-                })
-                .unwrap();
-            assert_eq!(
-                ToInstance::read(&mut stream, 64).await.unwrap(),
-                ToInstance::Taken(0)
-            );
-            hub.stop(transfer);
-            assert!(matches!(next(&mut events).await, Event::Closed { .. }));
-        }
-
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn stopping_an_rdma_transfer_fences_its_pair_before_it_reports_closed() {
-            let regions = regions();
-            let (hub, mut events, address) = start_rdma(regions.clone());
-            let instance = Instance::new();
-            let (transfer, token) = hub.open(Kind::Get).unwrap();
-            let (mut stream, pair) = instance.dial(&address, &token).await;
-            ToManager::Credit {
-                offset: 0,
-                length: 4 * PAGE as u64,
-            }
-            .write(&mut stream)
-            .await
-            .unwrap();
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            assert_eq!(hub.handlers(), 1);
-            assert!(!hub.stop(transfer));
-            assert!(matches!(next(&mut events).await, Event::Closed { .. }));
-            assert_eq!(hub.handlers(), 0);
-            drop(pair);
-        }
-
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn a_manager_without_rdma_or_with_tls_refuses_an_rdma_hello() {
-            let regions = regions();
-            let (hub, mut events, address) = start(regions.clone(), None);
-            let instance = Instance::new();
-            let (_transfer, token) = hub.open(Kind::Get).unwrap();
-            let mut stream = TcpStream::connect(&address).await.unwrap();
-            stream.write_all(&token).await.unwrap();
-            let pair = rdma::Pair::new(&instance.device).unwrap();
-            ToManager::Hello(Carrier::Rdma(pair.handshake().encode().to_vec()))
-                .write(&mut stream)
-                .await
-                .unwrap();
-            let ToInstance::Abort(why) = ToInstance::read(&mut stream, 64).await.unwrap() else {
-                panic!("expected an abort");
-            };
-            assert!(why.contains("does not offer RDMA"), "{why}");
-            assert!(matches!(next(&mut events).await, Event::Failed { .. }));
-            // TLS and RDMA do not mix at the hub either.
-            let generated =
-                rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-            let tls = server_config(
-                generated.cert.pem().as_bytes(),
-                generated.signing_key.serialize_pem().as_bytes(),
-            )
-            .unwrap();
-            let device = crate::data::ibv::Device::open(regions.clone()).unwrap();
-            let listener = StdListener::bind("127.0.0.1:0").unwrap();
-            assert!(
-                Hub::start(
-                    &Handle::current(),
-                    listener,
-                    regions,
-                    Some(tls),
-                    64,
-                    Some(Arc::new(device)),
+        #[test]
+        fn a_manager_without_rdma_or_with_tls_refuses_an_rdma_hello() {
+            bounded(async {
+                let regions = regions();
+                let (hub, mut events, address) = start(regions.clone(), None);
+                let instance = Instance::new();
+                let (_transfer, token) = hub.open(Kind::Get).unwrap();
+                let mut stream = TcpStream::connect(&address).await.unwrap();
+                stream.write_all(&token).await.unwrap();
+                let pair = rdma::Pair::new(&instance.device).unwrap();
+                ToManager::Hello(Carrier::Rdma(pair.handshake().encode().to_vec()))
+                    .write(&mut stream)
+                    .await
+                    .unwrap();
+                let ToInstance::Abort(why) = ToInstance::read(&mut stream, 64).await.unwrap()
+                else {
+                    panic!("expected an abort");
+                };
+                assert!(why.contains("does not offer RDMA"), "{why}");
+                assert!(matches!(next(&mut events).await, Event::Failed { .. }));
+                // TLS and RDMA do not mix at the hub either.
+                let generated =
+                    rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+                let tls = server_config(
+                    generated.cert.pem().as_bytes(),
+                    generated.signing_key.serialize_pem().as_bytes(),
                 )
-                .is_err()
-            );
+                .unwrap();
+                let device = crate::data::ibv::Device::open(regions.clone()).unwrap();
+                let listener = StdListener::bind("127.0.0.1:0").unwrap();
+                assert!(
+                    Hub::start(
+                        &Handle::current(),
+                        listener,
+                        regions,
+                        Some(tls),
+                        64,
+                        Some(Arc::new(device)),
+                    )
+                    .is_err()
+                );
+            })
         }
     }
 }
