@@ -28,10 +28,10 @@ mod rank_tests;
 pub mod rdma;
 mod shared;
 mod shm;
-mod startup;
 pub mod slice;
 #[cfg(test)]
 mod smoke_tests;
+mod startup;
 mod store;
 pub(crate) mod tiers;
 #[allow(clippy::all, dead_code)]

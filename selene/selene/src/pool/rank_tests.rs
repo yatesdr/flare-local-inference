@@ -192,6 +192,8 @@ struct Faults {
     /// The peers keep a host-tier record of this many pages in their own files; the rank
     /// listed has a wrong persisted checksum in its files.
     host: Option<(usize, Option<usize>)>,
+    /// What the peers' agents register through.
+    registrar: Option<Arc<crate::pool::manager_tests::CountingRegistrar>>,
 }
 
 struct Gate {
@@ -330,7 +332,10 @@ fn instance_with(
                 instance_name: format!("agent-{rank}"),
                 link,
                 copier,
-                registrar: Arc::new(OkRegistrar),
+                registrar: match &faults.registrar {
+                    Some(counting) => counting.clone(),
+                    None => Arc::new(OkRegistrar),
+                },
                 registration_context: 0,
                 gpu_uuid: gpus[rank],
                 records: faults.host.map(|(pages, bad)| -> Box<dyn RankRecords> {
@@ -998,6 +1003,7 @@ fn a_restore_is_reported_only_after_every_rank_drained_and_no_rank_is_read_early
         gates: vec![(1, gate.clone())],
         cuts: Vec::new(),
         host: None,
+        registrar: None,
     };
     let mut scenario = scenario(&manager, 2, &[Reach::Local, Reach::Local], &faults);
     scenario.serve(None);
@@ -1041,6 +1047,7 @@ fn a_rank_whose_copy_fails_fails_the_whole_restore_once_and_the_next_restore_wor
         gates: vec![(1, gate.clone())],
         cuts: Vec::new(),
         host: None,
+        registrar: None,
     };
     let mut scenario = scenario(&manager, 2, &[Reach::Local, Reach::Local], &faults);
     scenario.serve(None);
@@ -1075,6 +1082,7 @@ fn a_cut_link_with_a_rank_still_copying_stops_the_pool_and_reports_nothing() {
         gates: vec![(1, gate.clone())],
         cuts: vec![(1, cut.clone())],
         host: None,
+        registrar: None,
     };
     let mut scenario = scenario(&manager, 2, &[Reach::Local, Reach::Local], &faults);
     scenario.serve(None);
@@ -1525,4 +1533,39 @@ fn a_two_rank_instance_spills_a_record_from_its_ranks_files() {
 fn a_peer_on_a_channel_spills_its_files_slices() {
     let manager = Manager::start_network(false);
     host_put(&manager, 2, &[Reach::Local, Reach::Network]);
+}
+
+#[test]
+fn an_agent_registers_at_startup_and_never_again_across_a_manager_restart() {
+    let mut manager = Manager::start();
+    let counting = Arc::new(crate::pool::manager_tests::CountingRegistrar::default());
+    let faults = Faults {
+        registrar: Some(counting.clone()),
+        ..Default::default()
+    };
+    let requester = instance_with(&manager, 2, &[Reach::Local, Reach::Local], 2, &faults);
+    requester.ready();
+    assert_eq!(
+        requester.agents[0]
+            .registered_regions()
+            .iter()
+            .map(|r| r.name)
+            .collect::<Vec<_>>(),
+        ["arena", "staging"],
+        "the agent registered the manager's two regions at startup"
+    );
+    assert_eq!(counting.calls.lock().unwrap().len(), 2);
+    let before = requester.rank0.topology();
+    manager.restart();
+    wait("rank 0 and its agent to attach again", || {
+        requester.rank0.topology() != before
+            && requester.rank0.status() == PoolStatus::Ready
+            && requester.agents[0].status() == PoolStatus::Ready
+    });
+    assert_eq!(
+        counting.calls.lock().unwrap().len(),
+        2,
+        "nothing was registered after startup"
+    );
+    requester.close();
 }

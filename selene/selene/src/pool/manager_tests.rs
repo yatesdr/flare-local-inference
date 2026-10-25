@@ -770,8 +770,8 @@ fn announcements_survive_a_manager_restart_and_the_instances_reconnect() {
 
 /// Counts what is registered, and refuses nothing.
 #[derive(Default)]
-struct CountingRegistrar {
-    calls: std::sync::Mutex<Vec<(usize, usize)>>,
+pub(crate) struct CountingRegistrar {
+    pub(crate) calls: std::sync::Mutex<Vec<(usize, usize)>>,
 }
 impl HostRegistrar for CountingRegistrar {
     fn register(&self, _: usize, address: usize, bytes: usize) -> Result<Box<dyn Registration>> {
