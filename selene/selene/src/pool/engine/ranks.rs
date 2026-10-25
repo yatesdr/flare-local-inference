@@ -65,6 +65,62 @@ pub(crate) struct PeerWindow {
     pub(crate) sums: Vec<(usize, crate::pool::SliceSums)>,
 }
 
+#[derive(Default)]
+pub(super) struct PeerSet {
+    pub parts: Vec<PeerPart>,
+    pub windows: HashMap<u32, PeerWindow>,
+}
+
+impl PeerSet {
+    pub fn take_uncancelled(&mut self) -> Vec<u64> {
+        self.parts
+            .iter_mut()
+            .filter(|p| p.done.is_none() && !p.cancelled)
+            .map(|p| {
+                p.cancelled = true;
+                p.xfer
+            })
+            .collect()
+    }
+
+    pub fn window_done(
+        &mut self,
+        index: u32,
+        rank: usize,
+        result: std::result::Result<(), String>,
+        sums: Option<SliceSums>,
+    ) -> Option<std::result::Result<(), String>> {
+        let window = self.windows.get_mut(&index)?;
+        if !window.left.remove(&rank) {
+            return None;
+        }
+        Some(match (result, sums) {
+            (Ok(()), Some(sums)) => {
+                window.sums.push((rank, sums));
+                Ok(())
+            }
+            (Err(why), _) => Err(why),
+            (Ok(()), None) => Err("the rank stated no checksums".into()),
+        })
+    }
+
+    pub fn done(
+        &mut self,
+        rank: usize,
+        result: &std::result::Result<(), String>,
+        quarantined: bool,
+    ) {
+        if let Some(peer) = self
+            .parts
+            .iter_mut()
+            .find(|p| p.rank == rank && p.done.is_none())
+        {
+            peer.done = Some(result.clone());
+            peer.quarantined = quarantined;
+        }
+    }
+}
+
 /// Who a transfer belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum XferOwner {
