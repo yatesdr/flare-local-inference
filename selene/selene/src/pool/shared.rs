@@ -320,7 +320,7 @@ impl Shared {
     }
 
     /// Identifies the manager and link the session runs over; 0 while no session
-    /// is ready. This identifies the topology timed by the startup probe.
+    /// is ready.
     pub(crate) fn topology(&self) -> u64 {
         if self.status() != PoolStatus::Ready {
             return 0;

@@ -1400,6 +1400,7 @@ impl HostStore for CompositeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{Ids, checkpoint, pattern, test_directory};
     use crate::testing::{StoppedCopier, TestHistory as PrefixHistory};
     use crate::{
         CacheGeometry, INITIAL_MEMORY_RATE, Layout, PageId, StateSlotId,
@@ -1432,81 +1433,8 @@ mod tests {
         history
     }
 
-    /// Mints distinct checkpoint ids in publication order.
-    struct Ids {
-        count: u32,
-    }
-
-    impl Ids {
-        fn new() -> Self {
-            Self { count: 0 }
-        }
-
-        fn next(&mut self) -> CheckpointId {
-            self.count += 1;
-            CheckpointId::new(u64::from(self.count))
-        }
-    }
-
-    fn checkpoint(
-        ids: &mut Ids,
-        history: &PrefixHistory,
-        consumed: u64,
-        parent: Option<u64>,
-        chain_pages: Vec<PageId>,
-        tail_pages: usize,
-        slot: StateSlotId,
-    ) -> PublishedCheckpoint {
-        PublishedCheckpoint {
-            id: ids.next(),
-            key: history.key_at(consumed).unwrap(),
-            parent: parent.map(|parent| history.key_at(parent).unwrap()),
-            bucket: history.bucket_at(consumed).unwrap(),
-            chain_pages,
-            tail_pages,
-            slot,
-        }
-    }
-
     fn pages(range: std::ops::Range<u32>) -> Vec<PageId> {
         range.map(PageId).collect()
-    }
-
-    /// A fresh directory for one test under `FLARE_OFFLOAD_TEST_DIR` or the
-    /// system temporary directory, or `None` when it refuses direct I/O.
-    fn test_directory(test: &str) -> Option<PathBuf> {
-        let base = std::env::var_os("FLARE_OFFLOAD_TEST_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let directory = base.join(format!(
-            "flare-offload-composite-{test}-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory).unwrap();
-        let probe = directory.join(".probe");
-        match crate::os::direct_file(&probe, true) {
-            Ok(_) => {
-                fs::remove_file(&probe).unwrap();
-                Some(directory)
-            }
-            Err(error) if cfg!(unix) && error.raw_os_error() == Some(libc::EINVAL) => {
-                eprintln!(
-                    "skipping {test}: {} refuses direct I/O",
-                    directory.display()
-                );
-                fs::remove_dir_all(&directory).unwrap();
-                None
-            }
-            Err(error) => panic!("probe {}: {error}", probe.display()),
-        }
-    }
-
-    fn pattern(bytes: &mut [u8], seed: u64) {
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            let index = index as u64;
-            *byte = (index.wrapping_mul(31) ^ seed.wrapping_mul(7919) ^ (index >> 8)) as u8;
-        }
     }
 
     /// A composite over `pages` page slabs and `rows` row slabs of
@@ -1680,7 +1608,7 @@ mod tests {
 
     #[test]
     fn oversized_chains_stream_without_evicting_retained_records() {
-        let Some(directory) = test_directory("oversized-chain") else {
+        let Some(directory) = test_directory("composite", "oversized-chain") else {
             return;
         };
         let full = history(2000);
@@ -1751,7 +1679,7 @@ mod tests {
 
     #[test]
     fn streamed_store_failure_preserves_ram_and_releases_parent_pins() {
-        let Some(directory) = test_directory("streamed-failure") else {
+        let Some(directory) = test_directory("composite", "streamed-failure") else {
             return;
         };
         let mut store = composite(&directory, 4, 2, 1 << 30);
@@ -1813,7 +1741,7 @@ mod tests {
 
     #[test]
     fn retention_planning_accounts_for_pinned_and_incomplete_copies() {
-        let Some(directory) = test_directory("retention-pressure") else {
+        let Some(directory) = test_directory("composite", "retention-pressure") else {
             return;
         };
         let mut store = composite(&directory, 20, 3, 1 << 30);
@@ -1850,7 +1778,7 @@ mod tests {
 
     #[test]
     fn new_requires_matching_flat_tiers_and_independent_staged_transfers() {
-        let Some(directory) = test_directory("new") else {
+        let Some(directory) = test_directory("composite", "new") else {
             return;
         };
         let geometry = geometry();
@@ -1901,7 +1829,7 @@ mod tests {
 
     #[test]
     fn rejected_disk_endpoint_does_not_hide_a_warm_ancestor() {
-        let Some(directory) = test_directory("cost-fallback") else {
+        let Some(directory) = test_directory("composite", "cost-fallback") else {
             return;
         };
         let full = history(2000);
@@ -1933,7 +1861,7 @@ mod tests {
 
     #[test]
     fn store_dedupes_pins_the_parent_and_reports_a_failed_memory_copy() {
-        let Some(directory) = test_directory("store") else {
+        let Some(directory) = test_directory("composite", "store") else {
             return;
         };
         let mut store = composite(&directory, 48, 4, 1 << 30);
@@ -2007,7 +1935,7 @@ mod tests {
 
     #[test]
     fn write_through_reserves_the_file_and_marks_the_memory_copy_durable() {
-        let Some(directory) = test_directory("write-through") else {
+        let Some(directory) = test_directory("composite", "write-through") else {
             return;
         };
         let mut store = composite(&directory, 48, 4, 1 << 30);
@@ -2175,7 +2103,7 @@ mod tests {
 
     #[test]
     fn a_failed_disk_write_removes_the_memory_copy_and_fails_waiting_children() {
-        let Some(directory) = test_directory("write-failure") else {
+        let Some(directory) = test_directory("composite", "write-failure") else {
             return;
         };
         let mut store = composite(&directory, 16, 4, 1 << 30);
@@ -2249,7 +2177,7 @@ mod tests {
 
     #[test]
     fn read_through_restores_a_file_into_memory_before_the_upload() {
-        let Some(directory) = test_directory("read-through") else {
+        let Some(directory) = test_directory("composite", "read-through") else {
             return;
         };
         let mut store = composite(&directory, 48, 4, 1 << 30);
@@ -2405,7 +2333,7 @@ mod tests {
 
     #[test]
     fn a_fetch_attaches_to_a_record_another_fetch_is_reading() {
-        let Some(directory) = test_directory("attach") else {
+        let Some(directory) = test_directory("composite", "attach") else {
             return;
         };
         let mut store = composite(&directory, 16, 4, 1 << 30);
@@ -2480,7 +2408,7 @@ mod tests {
 
     #[test]
     fn disk_eviction_removes_memory_copies_once_their_pins_are_released() {
-        let Some(directory) = test_directory("eviction") else {
+        let Some(directory) = test_directory("composite", "eviction") else {
             return;
         };
         let full = history(4000);
@@ -2574,7 +2502,7 @@ mod tests {
 
     #[test]
     fn close_finishes_a_pending_disk_write() {
-        let Some(directory) = test_directory("close") else {
+        let Some(directory) = test_directory("composite", "close") else {
             return;
         };
         let mut store = composite(&directory, 16, 4, 1 << 30);
@@ -2607,7 +2535,7 @@ mod tests {
     #[test]
     fn memory_and_disk_records_are_announced_under_the_disk_parents_and_exported_per_tier() {
         use crate::pool::{Announcer, HostWindow, Notice, Tier as PoolTier};
-        let Some(directory) = test_directory("announce") else {
+        let Some(directory) = test_directory("composite", "announce") else {
             return;
         };
         let full = history(2000);
@@ -2731,7 +2659,7 @@ mod tests {
 
     #[test]
     fn a_pooled_record_waits_in_memory_and_is_written_when_memory_needs_the_room() {
-        let Some(directory) = test_directory("pooled-parked") else {
+        let Some(directory) = test_directory("composite", "pooled-parked") else {
             return;
         };
         let mut store = composite(&directory, 12, 4, 1 << 30);
@@ -2803,7 +2731,7 @@ mod tests {
 
     #[test]
     fn a_failed_write_is_tried_once_more_and_then_the_record_is_dropped() {
-        let Some(directory) = test_directory("pooled-failed-write") else {
+        let Some(directory) = test_directory("composite", "pooled-failed-write") else {
             return;
         };
         for recovers in [true, false] {
@@ -2852,7 +2780,7 @@ mod tests {
 
     #[test]
     fn a_full_write_queue_drops_the_coldest_parked_leaves_instead_of_queueing() {
-        let Some(directory) = test_directory("pooled-queue-full") else {
+        let Some(directory) = test_directory("composite", "pooled-queue-full") else {
             return;
         };
         let mut store = composite(&directory, 16, 16, 1 << 30);
@@ -2882,7 +2810,7 @@ mod tests {
 
     #[test]
     fn a_full_disk_holds_its_coldest_file_for_the_manager_and_drops_it_once_moved() {
-        let Some(directory) = test_directory("pooled-disk-full") else {
+        let Some(directory) = test_directory("composite", "pooled-disk-full") else {
             return;
         };
         let record_bytes = PAGE_RECORD + ROW_RECORD;
@@ -2941,7 +2869,7 @@ mod tests {
     #[test]
     fn a_record_leaving_memory_for_its_file_is_announced_as_one_spill() {
         use crate::pool::{Announcer, Notice, Tier as Pool};
-        let Some(directory) = test_directory("pooled-spill-notice") else {
+        let Some(directory) = test_directory("composite", "pooled-spill-notice") else {
             return;
         };
         let mut store = composite(&directory, 12, 4, 1 << 30);
@@ -3036,7 +2964,7 @@ mod tests {
 
     #[test]
     fn a_publication_is_noted_and_local_mode_writes_through_on_write_back() {
-        let Some(directory) = test_directory("noted-local") else {
+        let Some(directory) = test_directory("composite", "noted-local") else {
             return;
         };
         let mut store = composite(&directory, 12, 4, 1 << 30);

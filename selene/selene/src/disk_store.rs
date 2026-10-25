@@ -2688,6 +2688,7 @@ impl HostStore for DiskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{Ids, checkpoint, pattern, test_directory};
     use crate::testing::{StoppedCopier, TestHistory as PrefixHistory};
     use crate::{
         slab::{STAGING_PAGE_SLABS, STAGING_ROW_SLABS},
@@ -2756,42 +2757,6 @@ mod tests {
             row,
             bytes,
             modified: UNIX_EPOCH + CREATED + Duration::from_secs(age),
-        }
-    }
-
-    /// Mints distinct checkpoint ids in publication order.
-    struct Ids {
-        count: u32,
-    }
-
-    impl Ids {
-        fn new() -> Self {
-            Self { count: 0 }
-        }
-
-        fn next(&mut self) -> CheckpointId {
-            self.count += 1;
-            CheckpointId::new(u64::from(self.count))
-        }
-    }
-
-    fn checkpoint(
-        ids: &mut Ids,
-        history: &PrefixHistory,
-        consumed: u64,
-        parent: Option<u64>,
-        chain_pages: Vec<PageId>,
-        tail_pages: usize,
-        slot: StateSlotId,
-    ) -> PublishedCheckpoint {
-        PublishedCheckpoint {
-            id: ids.next(),
-            key: history.key_at(consumed).unwrap(),
-            parent: parent.map(|parent| history.key_at(parent).unwrap()),
-            bucket: history.bucket_at(consumed).unwrap(),
-            chain_pages,
-            tail_pages,
-            slot,
         }
     }
 
@@ -4177,36 +4142,6 @@ mod tests {
         assert!(plan_windows([(0, 0, false)]).is_empty());
     }
 
-    /// A fresh directory for one test under `FLARE_OFFLOAD_TEST_DIR` or the
-    /// system temporary directory, or `None` when it refuses direct I/O.
-    fn test_directory(test: &str) -> Option<PathBuf> {
-        let base = std::env::var_os("FLARE_OFFLOAD_TEST_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let directory = base.join(format!(
-            "flare-offload-disk-store-{test}-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory).unwrap();
-        let probe = directory.join(".probe");
-        match crate::os::direct_file(&probe, true) {
-            Ok(_) => {
-                fs::remove_file(&probe).unwrap();
-                Some(directory)
-            }
-            Err(error) if cfg!(unix) && error.raw_os_error() == Some(libc::EINVAL) => {
-                eprintln!(
-                    "skipping {test}: {} refuses direct I/O",
-                    directory.display()
-                );
-                fs::remove_dir_all(&directory).unwrap();
-                None
-            }
-            Err(error) => panic!("probe {}: {error}", probe.display()),
-        }
-    }
-
     fn stopped_transfers() -> SharedCopier {
         StoppedCopier::shared(&geometry()).unwrap()
     }
@@ -4214,13 +4149,6 @@ mod tests {
     /// Caller-owned aligned buffers: the slabs of an unregistered pool.
     fn host_pool() -> SlabPool {
         SlabPool::staging(&Layout::new(&geometry()).unwrap()).unwrap()
-    }
-
-    fn pattern(bytes: &mut [u8], seed: u64) {
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            let index = index as u64;
-            *byte = (index.wrapping_mul(31) ^ seed.wrapping_mul(7919) ^ (index >> 8)) as u8;
-        }
     }
 
     fn page_slabs(pool: &mut SlabPool, count: usize, seed: u64) -> Vec<PageSlab> {
@@ -4282,7 +4210,7 @@ mod tests {
 
     #[test]
     fn staged_reads_reject_changed_headers_before_writing_host_or_staging_slabs() {
-        let Some(directory) = test_directory("changed-header") else {
+        let Some(directory) = test_directory("disk-store", "changed-header") else {
             return;
         };
         let geometry = geometry();
@@ -4389,7 +4317,7 @@ mod tests {
 
     #[test]
     fn compacted_record_is_atomically_rewritten_and_survives_rescan() {
-        let Some(directory) = test_directory("row-replacement") else {
+        let Some(directory) = test_directory("disk-store", "row-replacement") else {
             return;
         };
         let full = history(500);
@@ -4503,7 +4431,7 @@ mod tests {
 
     #[test]
     fn staged_moves_records_between_files_and_caller_buffers_without_a_pool() {
-        let Some(directory) = test_directory("host-buffers") else {
+        let Some(directory) = test_directory("disk-store", "host-buffers") else {
             return;
         };
         let geometry = geometry();
@@ -4808,7 +4736,7 @@ mod tests {
 
     #[test]
     fn staged_failures_release_staging_slabs_and_abort_temporary_files() {
-        let Some(directory) = test_directory("failures") else {
+        let Some(directory) = test_directory("disk-store", "failures") else {
             return;
         };
         let geometry = geometry();
@@ -5030,7 +4958,7 @@ mod tests {
 
     #[test]
     fn staged_holds_submissions_at_the_disk_queue_depth_and_finishes_every_record() {
-        let Some(directory) = test_directory("queue-depth") else {
+        let Some(directory) = test_directory("disk-store", "queue-depth") else {
             return;
         };
         let geometry = geometry();

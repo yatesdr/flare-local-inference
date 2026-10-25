@@ -4,11 +4,45 @@
 //! device; these run the stores over the real transfer threads. They are ignored
 //! unless `FLARE_OFFLOAD_TEST_PACKAGE` names a package a free GPU 0 can load.
 
+use flare_selene::{
+    HostStore, StoreEvent,
+    testing::{Ids, checkpoint, pattern as fill, test_directory},
+};
+
+fn seed(plane: usize, unit: u32) -> u64 {
+    (plane as u64 + 1) * 1_000_003 + u64::from(unit)
+}
+
+fn load_test_model(package: &std::ffi::OsStr) -> crate::runtime_package::NativeModel {
+    unsafe {
+        crate::runtime_package::NativeModel::load(
+            crate::runtime_package::test_support::authorize(std::path::Path::new(package)),
+            &[0],
+            &crate::runtime_package::LoadOptions::default(),
+            &crate::startup::StartupProgress::silent(),
+        )
+    }
+    .unwrap()
+}
+
+fn wait_event(store: &mut dyn HostStore, seconds: u64) -> StoreEvent {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let mut events = Vec::new();
+    while events.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no store event within {seconds} s"
+        );
+        store.poll(&mut events).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(events.len(), 1, "{events:?}");
+    events.pop().unwrap()
+}
+
 mod memory {
-    use std::{
-        sync::{Arc, Mutex},
-        time::Duration,
-    };
+    use super::{fill, seed};
+    use std::sync::{Arc, Mutex};
 
     use flare_selene::{
         CheckpointId, HostStore, InboundTicket, Layout, PageId, PrefixKey, PublishedCheckpoint,
@@ -22,36 +56,16 @@ mod memory {
 
     const IDENTITY: [u8; 32] = [7; 32];
 
-    /// The `n`th checkpoint id a GPU cache mints.
-    fn checkpoint_id(n: u32) -> CheckpointId {
-        CheckpointId::new(u64::from(n))
-    }
-
     #[test]
     #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
     fn memory_store_round_trips_a_multi_window_checkpoint() {
-        use std::time::Instant;
-
-        use crate::{
-            cuda::Stream,
-            offload::CacheGeometry,
-            runtime_package::{LoadOptions, NativeModel},
-            startup::StartupProgress,
-        };
+        use crate::{cuda::Stream, offload::CacheGeometry};
 
         let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
             eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
             return;
         };
-        let model = unsafe {
-            NativeModel::load(
-                crate::runtime_package::test_support::authorize(std::path::Path::new(&package)),
-                &[0],
-                &LoadOptions::default(),
-                &StartupProgress::silent(),
-            )
-        }
-        .unwrap();
+        let model = super::load_test_model(&package);
         let manifest = model.manifests().unwrap().remove(0);
         let geometry = vec![manifest.cache.clone().unwrap()];
         let rank: &CacheGeometry = &geometry[0];
@@ -64,13 +78,6 @@ mod memory {
         let targets: Vec<u32> = (300..300 + pages).collect();
         let (source_slot, target_slot) = (1u32, 2u32);
 
-        fn fill(bytes: &mut [u8], seed: u64) {
-            for (index, byte) in bytes.iter_mut().enumerate() {
-                let index = index as u64;
-                *byte = (index.wrapping_mul(31) ^ seed.wrapping_mul(7919) ^ (index >> 8)) as u8;
-            }
-        }
-        let seed = |plane: usize, unit: u32| (plane as u64 + 1) * 1_000_003 + u64::from(unit);
         let row_plane = rank.planes.len();
         let stream = Stream::open(context, device).unwrap();
         let largest = rank
@@ -114,7 +121,7 @@ mod memory {
             .collect();
         history.append(&tokens, &[]).unwrap();
         let checkpoint = PublishedCheckpoint {
-            id: checkpoint_id(1),
+            id: CheckpointId::new(1),
             key: history.key_at(consumed).unwrap(),
             parent: None,
             bucket: history.bucket_at(consumed).unwrap(),
@@ -122,19 +129,9 @@ mod memory {
             tail_pages: pages as usize,
             slot: StateSlotId(source_slot),
         };
-        let wait = |store: &mut MemoryStore| -> StoreEvent {
-            let deadline = Instant::now() + Duration::from_secs(60);
-            let mut events = Vec::new();
-            while events.is_empty() {
-                assert!(Instant::now() < deadline, "no store event within 60 s");
-                store.poll(&mut events).unwrap();
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            assert_eq!(events.len(), 1, "{events:?}");
-            events.pop().unwrap()
-        };
+
         assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
-        match wait(&mut store) {
+        match super::wait_event(&mut store, 60) {
             StoreEvent::Stored { result, .. } => {
                 assert_eq!(
                     result.unwrap(),
@@ -151,7 +148,7 @@ mod memory {
             slot: StateSlotId(target_slot),
         };
         store.fetch(hit, ticket).unwrap();
-        match wait(&mut store) {
+        match super::wait_event(&mut store, 60) {
             StoreEvent::Fetched { result, .. } => {
                 assert_eq!(
                     result.unwrap(),
@@ -199,28 +196,13 @@ mod memory {
     #[test]
     #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
     fn memory_store_round_trips_a_checkpoint_through_a_loaded_package() {
-        use std::time::Instant;
-
-        use crate::{
-            cuda::Stream,
-            offload::CacheGeometry,
-            runtime_package::{LoadOptions, NativeModel},
-            startup::StartupProgress,
-        };
+        use crate::{cuda::Stream, offload::CacheGeometry};
 
         let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
             eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
             return;
         };
-        let model = unsafe {
-            NativeModel::load(
-                crate::runtime_package::test_support::authorize(std::path::Path::new(&package)),
-                &[0],
-                &LoadOptions::default(),
-                &StartupProgress::silent(),
-            )
-        }
-        .unwrap();
+        let model = super::load_test_model(&package);
         let manifest = model.manifests().unwrap().remove(0);
         let geometry = vec![manifest.cache.clone().unwrap()];
         let rank: &CacheGeometry = &geometry[0];
@@ -233,13 +215,6 @@ mod memory {
         let targets = [2u32, 9, capacity / 2 + 1];
         let (source_slot, target_slot) = (1u32, 2u32);
 
-        fn fill(bytes: &mut [u8], seed: u64) {
-            for (index, byte) in bytes.iter_mut().enumerate() {
-                let index = index as u64;
-                *byte = (index.wrapping_mul(31) ^ seed.wrapping_mul(7919) ^ (index >> 8)) as u8;
-            }
-        }
-        let seed = |plane: usize, unit: u32| (plane as u64 + 1) * 1_000_003 + u64::from(unit);
         let row_plane = rank.planes.len();
 
         let stream = Stream::open(context, device).unwrap();
@@ -299,7 +274,7 @@ mod memory {
             .collect();
         history.append(&tokens, &[]).unwrap();
         let checkpoint = PublishedCheckpoint {
-            id: checkpoint_id(1),
+            id: CheckpointId::new(1),
             key: history.key_at(consumed).unwrap(),
             parent: None,
             bucket: history.bucket_at(consumed).unwrap(),
@@ -308,21 +283,9 @@ mod memory {
             slot: StateSlotId(source_slot),
         };
 
-        let wait = |store: &mut MemoryStore| -> StoreEvent {
-            let deadline = Instant::now() + Duration::from_secs(60);
-            let mut events = Vec::new();
-            while events.is_empty() {
-                assert!(Instant::now() < deadline, "no store event within 60 s");
-                store.poll(&mut events).unwrap();
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            assert_eq!(events.len(), 1, "{events:?}");
-            events.pop().unwrap()
-        };
-
         assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().outbound_in_flight, 1);
-        match wait(&mut store) {
+        match super::wait_event(&mut store, 60) {
             StoreEvent::Stored {
                 checkpoint: id,
                 key,
@@ -398,7 +361,7 @@ mod memory {
         };
         store.fetch(hit, ticket).unwrap();
         assert_eq!(store.stats().inbound_in_flight, 1);
-        match wait(&mut store) {
+        match super::wait_event(&mut store, 60) {
             StoreEvent::Fetched { key, result } => {
                 assert_eq!(key, checkpoint.key);
                 assert_eq!(result.unwrap(), 3 * rank.page_bytes() + rank.row.unit_bytes);
@@ -465,7 +428,7 @@ mod memory {
         let mut store = MemoryStore::new(IDENTITY, small, transfers).unwrap();
         assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
         assert!(matches!(
-            wait(&mut store),
+            super::wait_event(&mut store, 60),
             StoreEvent::Stored { result: Ok(_), .. }
         ));
         assert_eq!(store.pool().free_pages(), 0);
@@ -475,7 +438,7 @@ mod memory {
         other.append(&[11, 12, 13, 14, 15], &[]).unwrap();
         let second_consumed = consumed + 5;
         let second = PublishedCheckpoint {
-            id: checkpoint_id(2),
+            id: CheckpointId::new(2),
             key: other.key_at(second_consumed).unwrap(),
             parent: None,
             bucket: other.bucket_at(second_consumed).unwrap(),
@@ -488,7 +451,7 @@ mod memory {
         assert!(!store.index().contains(&checkpoint.key));
         assert!(store.index().contains(&second.key));
         assert_eq!(store.pool().free_pages(), 0);
-        match wait(&mut store) {
+        match super::wait_event(&mut store, 60) {
             StoreEvent::Stored { key, result, .. } => {
                 assert_eq!(key, second.key);
                 result.unwrap();
@@ -506,7 +469,7 @@ mod memory {
         another.append(&[21, 22, 23], &[]).unwrap();
         let third_consumed = consumed + 3;
         let third = PublishedCheckpoint {
-            id: checkpoint_id(3),
+            id: CheckpointId::new(3),
             key: another.key_at(third_consumed).unwrap(),
             parent: None,
             bucket: another.bucket_at(third_consumed).unwrap(),
@@ -533,15 +496,15 @@ mod memory {
 }
 
 mod composite {
+    use super::{Ids, checkpoint, fill, seed, test_directory};
     use std::{
         fs,
-        path::{Path, PathBuf},
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
 
     use flare_selene::{
-        CacheGeometry, CheckpointId, HostStore, INITIAL_MEMORY_RATE, InboundTicket, Layout, PageId,
+        CacheGeometry, HostStore, INITIAL_MEMORY_RATE, InboundTicket, Layout, PageId,
         PublishedCheckpoint, StateSlotId, StoreEvent, StoreOutcome, Tier,
         composite::CompositeStore,
         disk::DiskThread,
@@ -557,72 +520,6 @@ mod composite {
     };
 
     const IDENTITY: [u8; 32] = [0x3c; 32];
-
-    fn checkpoint(
-        ids: &mut Ids,
-        history: &PrefixHistory,
-        consumed: u64,
-        parent: Option<u64>,
-        chain_pages: Vec<PageId>,
-        tail_pages: usize,
-        slot: StateSlotId,
-    ) -> PublishedCheckpoint {
-        PublishedCheckpoint {
-            id: ids.next(),
-            key: history.key_at(consumed).unwrap(),
-            parent: parent.map(|parent| history.key_at(parent).unwrap()),
-            bucket: history.bucket_at(consumed).unwrap(),
-            chain_pages,
-            tail_pages,
-            slot,
-        }
-    }
-
-    /// A fresh directory for one test under `FLARE_OFFLOAD_TEST_DIR` or the
-    /// system temporary directory, or `None` when it refuses direct I/O.
-    fn test_directory(test: &str) -> Option<PathBuf> {
-        let base = std::env::var_os("FLARE_OFFLOAD_TEST_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let directory = base.join(format!(
-            "flare-offload-composite-{test}-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory).unwrap();
-        let probe = directory.join(".probe");
-        match crate::os::direct_file(&probe, true) {
-            Ok(_) => {
-                fs::remove_file(&probe).unwrap();
-                Some(directory)
-            }
-            Err(error) if cfg!(unix) && error.raw_os_error() == Some(libc::EINVAL) => {
-                eprintln!(
-                    "skipping {test}: {} refuses direct I/O",
-                    directory.display()
-                );
-                fs::remove_dir_all(&directory).unwrap();
-                None
-            }
-            Err(error) => panic!("probe {}: {error}", probe.display()),
-        }
-    }
-
-    /// Mints distinct checkpoint ids in publication order.
-    struct Ids {
-        count: u32,
-    }
-
-    impl Ids {
-        fn new() -> Self {
-            Self { count: 0 }
-        }
-
-        fn next(&mut self) -> CheckpointId {
-            self.count += 1;
-            CheckpointId::new(u64::from(self.count))
-        }
-    }
 
     fn poll_until(
         store: &mut CompositeStore,
@@ -656,28 +553,15 @@ mod composite {
     #[test]
     #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
     fn composite_writes_a_child_published_while_its_parent_is_in_flight() {
-        use crate::{
-            cuda::Stream,
-            offload::geometry::fingerprint,
-            runtime_package::{LoadOptions, NativeModel},
-            startup::StartupProgress,
-        };
+        use crate::{cuda::Stream, offload::geometry::fingerprint};
         let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
             eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
             return;
         };
-        let Some(directory) = test_directory("gpu-child") else {
+        let Some(directory) = test_directory("composite", "gpu-child") else {
             return;
         };
-        let model = unsafe {
-            NativeModel::load(
-                crate::runtime_package::test_support::authorize(Path::new(&package)),
-                &[0],
-                &LoadOptions::default(),
-                &StartupProgress::silent(),
-            )
-        }
-        .unwrap();
+        let model = super::load_test_model(&package);
         let manifest = model.manifests().unwrap().remove(0);
         let geometry = vec![manifest.cache.clone().unwrap()];
         let rank = geometry[0].clone();
@@ -989,28 +873,15 @@ mod composite {
     #[test]
     #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
     fn composite_round_trips_through_memory_and_disk_on_a_loaded_package() {
-        use crate::{
-            cuda::Stream,
-            offload::geometry::fingerprint,
-            runtime_package::{LoadOptions, NativeModel},
-            startup::StartupProgress,
-        };
+        use crate::{cuda::Stream, offload::geometry::fingerprint};
         let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
             eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
             return;
         };
-        let Some(directory) = test_directory("gpu") else {
+        let Some(directory) = test_directory("composite", "gpu") else {
             return;
         };
-        let model = unsafe {
-            NativeModel::load(
-                crate::runtime_package::test_support::authorize(Path::new(&package)),
-                &[0],
-                &LoadOptions::default(),
-                &StartupProgress::silent(),
-            )
-        }
-        .unwrap();
+        let model = super::load_test_model(&package);
         let manifest = model.manifests().unwrap().remove(0);
         let geometry = vec![manifest.cache.clone().unwrap()];
         let rank = geometry[0].clone();
@@ -1027,13 +898,6 @@ mod composite {
             ids.into_iter().map(PageId).collect()
         }
 
-        fn fill(bytes: &mut [u8], seed: u64) {
-            for (index, byte) in bytes.iter_mut().enumerate() {
-                let index = index as u64;
-                *byte = (index.wrapping_mul(31) ^ seed.wrapping_mul(7919) ^ (index >> 8)) as u8;
-            }
-        }
-        let seed = |plane: usize, unit: u32| (plane as u64 + 1) * 1_000_003 + u64::from(unit);
         let row_plane = rank.planes.len();
         let stream = Stream::open(context, device).unwrap();
         let largest = rank
@@ -1135,17 +999,6 @@ mod composite {
         let gpu_bytes = 3 * rank.page_bytes() + rank.row.unit_bytes;
         let record_bytes = layout.record_bytes(3);
 
-        fn wait_event(store: &mut CompositeStore) -> StoreEvent {
-            let deadline = Instant::now() + Duration::from_secs(120);
-            let mut events = Vec::new();
-            while events.is_empty() {
-                assert!(Instant::now() < deadline, "no store event within 120 s");
-                store.poll(&mut events).unwrap();
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            assert_eq!(events.len(), 1, "{events:?}");
-            events.pop().unwrap()
-        }
         fn wait_until(store: &mut CompositeStore, mut done: impl FnMut(&CompositeStore) -> bool) {
             let deadline = Instant::now() + Duration::from_secs(120);
             let mut events = Vec::new();
@@ -1161,7 +1014,7 @@ mod composite {
         }
         let store_and_land = |store: &mut CompositeStore, checkpoint: &PublishedCheckpoint| {
             assert_eq!(store.store(checkpoint).unwrap(), StoreOutcome::Queued);
-            match wait_event(store) {
+            match super::wait_event(store, 120) {
                 StoreEvent::Stored {
                     checkpoint: id,
                     key,
@@ -1212,7 +1065,7 @@ mod composite {
         };
         store.fetch(hit, ticket()).unwrap();
         assert_eq!(store.stats().inbound_in_flight, 1);
-        match wait_event(&mut store) {
+        match super::wait_event(&mut store, 120) {
             StoreEvent::Fetched { key, result } => {
                 assert_eq!(key, first.key);
                 assert_eq!(result.unwrap(), gpu_bytes);
@@ -1289,7 +1142,7 @@ mod composite {
         assert_eq!((hit.key, hit.tier), (first.key, Tier::Disk));
         assert!(hit.estimated_seconds > record_bytes as f64 / INITIAL_MEMORY_RATE);
         store.fetch(hit, ticket()).unwrap();
-        match wait_event(&mut store) {
+        match super::wait_event(&mut store, 120) {
             StoreEvent::Fetched { key, result } => {
                 assert_eq!(key, first.key);
                 assert_eq!(result.unwrap(), gpu_bytes);
@@ -1315,7 +1168,7 @@ mod composite {
         let blocked = directory.join(record::temporary_name(&fourth.key));
         fs::create_dir(&blocked).unwrap();
         assert_eq!(store.store(fourth).unwrap(), StoreOutcome::Queued);
-        match wait_event(&mut store) {
+        match super::wait_event(&mut store, 120) {
             StoreEvent::Stored { key, result, .. } => {
                 assert_eq!(key, fourth.key);
                 assert_eq!(result.unwrap(), gpu_bytes);
@@ -1489,7 +1342,7 @@ mod composite {
                 },
             )
             .unwrap();
-        match wait_event(&mut store) {
+        match super::wait_event(&mut store, 120) {
             StoreEvent::Fetched { key, result } => {
                 assert_eq!(key, large.key);
                 assert_eq!(result.unwrap(), record_bytes);
@@ -1510,16 +1363,16 @@ mod composite {
 }
 
 mod disk_store {
+    use super::{Ids, checkpoint, fill, seed, test_directory};
     use std::{
         fs,
-        path::{Path, PathBuf},
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
 
     use flare_selene::{
-        CheckpointId, HostStore, InboundTicket, Layout, PageId, PublishedCheckpoint, StateSlotId,
-        StoreEvent, StoreOutcome, Tier,
+        HostStore, InboundTicket, Layout, PageId, PublishedCheckpoint, StateSlotId, StoreEvent,
+        StoreOutcome, Tier,
         disk::DiskThread,
         disk_store::{DiskStore, Staged},
         record::{self, Scanned},
@@ -1542,101 +1395,22 @@ mod disk_store {
         history
     }
 
-    fn checkpoint(
-        ids: &mut Ids,
-        history: &PrefixHistory,
-        consumed: u64,
-        parent: Option<u64>,
-        chain_pages: Vec<PageId>,
-        tail_pages: usize,
-        slot: StateSlotId,
-    ) -> PublishedCheckpoint {
-        PublishedCheckpoint {
-            id: ids.next(),
-            key: history.key_at(consumed).unwrap(),
-            parent: parent.map(|parent| history.key_at(parent).unwrap()),
-            bucket: history.bucket_at(consumed).unwrap(),
-            chain_pages,
-            tail_pages,
-            slot,
-        }
-    }
-
     fn pages(range: std::ops::Range<u32>) -> Vec<PageId> {
         range.map(PageId).collect()
-    }
-
-    /// A fresh directory for one test under `FLARE_OFFLOAD_TEST_DIR` or the
-    /// system temporary directory, or `None` when it refuses direct I/O.
-    fn test_directory(test: &str) -> Option<PathBuf> {
-        let base = std::env::var_os("FLARE_OFFLOAD_TEST_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let directory = base.join(format!(
-            "flare-offload-disk-store-{test}-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory).unwrap();
-        let probe = directory.join(".probe");
-        match crate::os::direct_file(&probe, true) {
-            Ok(_) => {
-                fs::remove_file(&probe).unwrap();
-                Some(directory)
-            }
-            Err(error) if cfg!(unix) && error.raw_os_error() == Some(libc::EINVAL) => {
-                eprintln!(
-                    "skipping {test}: {} refuses direct I/O",
-                    directory.display()
-                );
-                fs::remove_dir_all(&directory).unwrap();
-                None
-            }
-            Err(error) => panic!("probe {}: {error}", probe.display()),
-        }
-    }
-
-    /// Mints distinct checkpoint ids in publication order.
-    struct Ids {
-        count: u32,
-    }
-
-    impl Ids {
-        fn new() -> Self {
-            Self { count: 0 }
-        }
-
-        fn next(&mut self) -> CheckpointId {
-            self.count += 1;
-            CheckpointId::new(u64::from(self.count))
-        }
     }
 
     #[test]
     #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
     fn staged_store_round_trips_records_through_files_and_a_restart() {
-        use crate::{
-            cuda::Stream,
-            offload::geometry::fingerprint,
-            runtime_package::{LoadOptions, NativeModel},
-            startup::StartupProgress,
-        };
+        use crate::{cuda::Stream, offload::geometry::fingerprint};
         let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
             eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
             return;
         };
-        let Some(directory) = test_directory("round-trip") else {
+        let Some(directory) = test_directory("disk-store", "round-trip") else {
             return;
         };
-        let model = unsafe {
-            NativeModel::load(
-                crate::runtime_package::test_support::authorize(Path::new(&package)),
-                &[0],
-                &LoadOptions::default(),
-                &StartupProgress::silent(),
-            )
-        }
-        .unwrap();
+        let model = super::load_test_model(&package);
         let manifest = model.manifests().unwrap().remove(0);
         let geometry = vec![manifest.cache.clone().unwrap()];
         let rank = geometry[0].clone();
@@ -1660,13 +1434,6 @@ mod disk_store {
             StateSlotId(3),
         );
 
-        fn fill(bytes: &mut [u8], seed: u64) {
-            for (index, byte) in bytes.iter_mut().enumerate() {
-                let index = index as u64;
-                *byte = (index.wrapping_mul(31) ^ seed.wrapping_mul(7919) ^ (index >> 8)) as u8;
-            }
-        }
-        let seed = |plane: usize, unit: u32| (plane as u64 + 1) * 1_000_003 + u64::from(unit);
         let row_plane = rank.planes.len();
         let stream = Stream::open(context, device).unwrap();
         let largest = rank
@@ -1750,17 +1517,7 @@ mod disk_store {
             )
             .unwrap()
         };
-        fn wait(store: &mut DiskStore) -> StoreEvent {
-            let deadline = Instant::now() + Duration::from_secs(120);
-            let mut events = Vec::new();
-            while events.is_empty() {
-                assert!(Instant::now() < deadline, "no store event within 120 s");
-                store.poll(&mut events).unwrap();
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            assert_eq!(events.len(), 1);
-            events.pop().unwrap()
-        }
+
         fn staging_free(store: &mut DiskStore) -> (usize, usize) {
             let pool = store.transport_mut().staged_mut().unwrap().pool().unwrap();
             (pool.free_pages(), pool.free_rows())
@@ -1777,7 +1534,7 @@ mod disk_store {
             checkpoint: stored,
             key,
             result,
-        } = wait(&mut store)
+        } = super::wait_event(&mut store, 120)
         else {
             panic!("expected a Stored event");
         };
@@ -1826,7 +1583,7 @@ mod disk_store {
                 },
             )
             .unwrap();
-        let StoreEvent::Fetched { key, result } = wait(&mut store) else {
+        let StoreEvent::Fetched { key, result } = super::wait_event(&mut store, 120) else {
             panic!("expected a Fetched event");
         };
         assert_eq!(key, root.key);
@@ -1902,7 +1659,7 @@ mod disk_store {
                 },
             )
             .unwrap();
-        let StoreEvent::Fetched { key, result } = wait(&mut store) else {
+        let StoreEvent::Fetched { key, result } = super::wait_event(&mut store, 120) else {
             panic!("expected a Fetched event");
         };
         assert_eq!(key, root.key);
@@ -1928,7 +1685,7 @@ mod disk_store {
             child_slot,
         );
         assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
-        let StoreEvent::Stored { key, result, .. } = wait(&mut store) else {
+        let StoreEvent::Stored { key, result, .. } = super::wait_event(&mut store, 120) else {
             panic!("expected a Stored event");
         };
         assert_eq!(key, child.key);
@@ -1978,7 +1735,7 @@ mod disk_store {
                 },
             )
             .unwrap();
-        let StoreEvent::Fetched { key, result } = wait(&mut store) else {
+        let StoreEvent::Fetched { key, result } = super::wait_event(&mut store, 120) else {
             panic!("expected a Fetched event");
         };
         assert_eq!(key, child.key);
@@ -2063,15 +1820,7 @@ mod geometry {
         let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
             return;
         };
-        let model = unsafe {
-            crate::runtime_package::NativeModel::load(
-                crate::runtime_package::test_support::authorize(std::path::Path::new(&package)),
-                &[0],
-                &crate::runtime_package::LoadOptions::default(),
-                &crate::startup::StartupProgress::silent(),
-            )
-        }
-        .unwrap();
+        let model = super::load_test_model(&package);
         let manifest = model.manifests().unwrap().remove(0);
         let geometry = manifest.cache.unwrap();
         eprintln!(
