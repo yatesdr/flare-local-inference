@@ -29,11 +29,7 @@ pub const MAX_WINDOW_PAGES: u32 = flare_selene::slab::WINDOW_PAGES as u32;
 /// Granted windows per direction per connection.
 pub use flare_selene::pool::WINDOW_CREDITS;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Region {
-    Arena,
-    Staging,
-}
+pub use crate::data::Region;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Direction {
@@ -160,7 +156,8 @@ pub enum ReleaseError {
 
 /// Checks a region-file range. Every window uses checked arithmetic and reports the
 /// peer pid on rejection.
-pub fn check_range(
+#[cfg(test)]
+fn check_range(
     size: u64,
     offset: u64,
     length: u64,
@@ -197,30 +194,17 @@ fn check_range_opt(
     }
 }
 
-enum Hold {
-    Allocated { extent: Extent },
-    Lease(Arc<Extent>),
-    None,
-}
-
 struct Window {
     direction: Direction,
     length: usize,
+    #[cfg(test)]
     within: usize,
-    hold: Hold,
-}
-
-impl Window {
-    fn take_hold(&mut self) -> Hold {
-        std::mem::replace(&mut self.hold, Hold::None)
-    }
+    hold: Arc<Extent>,
 }
 
 impl Drop for Window {
     fn drop(&mut self) {
-        if let Hold::Lease(extent) = &self.hold {
-            extent.release();
-        }
+        self.hold.release();
     }
 }
 
@@ -462,9 +446,6 @@ impl Local {
     pub fn directory(&self) -> &Path {
         &self.directory
     }
-    pub fn boot_nonce(&self) -> &str {
-        &self.boot_nonce
-    }
     pub fn arena_path(&self) -> &Path {
         &self.arena_path
     }
@@ -477,16 +458,13 @@ impl Local {
     pub fn staging_size(&self) -> u64 {
         self.staging_size
     }
-    pub fn max_window_bytes(&self) -> u64 {
-        self.max_window_bytes
-    }
     pub fn arena(&self) -> Arena {
         self.arena.clone()
     }
     pub fn staging(&self) -> Arena {
         self.staging.clone()
     }
-    pub fn region_size(&self, region: Region) -> u64 {
+    fn region_size(&self, region: Region) -> u64 {
         match region {
             Region::Arena => self.arena_size,
             Region::Staging => self.staging_size,
@@ -494,7 +472,8 @@ impl Local {
     }
     /// Base pointer and full mapped length of a region. Valid for the life of the
     /// mapping and stable across allocations.
-    pub fn region_mapping(&self, region: Region) -> (*mut u8, usize) {
+    #[cfg(test)]
+    fn region_mapping(&self, region: Region) -> (*mut u8, usize) {
         match region {
             Region::Arena => self.arena.mapping(),
             Region::Staging => self.staging.mapping(),
@@ -603,36 +582,6 @@ impl Local {
                 self.persist_holders();
             }
         }
-    }
-
-    /// Grants an exclusive writable Put window from `region`.
-    pub fn grant_put(
-        &mut self,
-        connection: u64,
-        transfer: u64,
-        index: u32,
-        region: Region,
-        shape: WindowShape,
-    ) -> std::result::Result<WindowGrant, GrantError> {
-        self.grant_allocated(connection, transfer, index, Direction::Put, region, shape)
-    }
-
-    /// Grants a Get window filled through staging (streaming/NVMe path).
-    pub fn grant_get_staging(
-        &mut self,
-        connection: u64,
-        transfer: u64,
-        index: u32,
-        shape: WindowShape,
-    ) -> std::result::Result<WindowGrant, GrantError> {
-        self.grant_allocated(
-            connection,
-            transfer,
-            index,
-            Direction::Get,
-            Region::Staging,
-            shape,
-        )
     }
 
     /// Grants a shared immutable lease on a stored extent. The extent cannot be
@@ -759,57 +708,9 @@ impl Local {
                 Window {
                     direction,
                     length,
+                    #[cfg(test)]
                     within,
-                    hold: Hold::Lease(extent.clone()),
-                },
-            );
-        Ok(WindowGrant {
-            transfer,
-            index,
-            offset,
-            length: shape.length(),
-            pages: shape.pages,
-            row: shape.row,
-            region,
-        })
-    }
-
-    fn grant_allocated(
-        &mut self,
-        connection: u64,
-        transfer: u64,
-        index: u32,
-        direction: Direction,
-        region: Region,
-        shape: WindowShape,
-    ) -> std::result::Result<WindowGrant, GrantError> {
-        let pid = self.pid(connection)?;
-        let who = Self::pid_text(pid);
-        shape
-            .validate(self.max_window_bytes)
-            .map_err(|error| GrantError::Invalid(format!("{error} ({who})")))?;
-        self.check_credit(connection, direction)?;
-        self.check_new_window(connection, transfer, index, &who)?;
-        let length = usize::try_from(shape.length())
-            .map_err(|_| GrantError::Invalid(format!("window length does not fit ({who})")))?;
-        let (size, extent) = match region {
-            Region::Arena => (self.arena_size, self.arena.allocate(length)),
-            Region::Staging => (self.staging_size, self.staging.allocate(length)),
-        };
-        let extent = extent.ok_or(GrantError::Budget)?;
-        let offset = extent.offset() as u64;
-        check_range_opt(size, offset, shape.length(), pid)?;
-        self.connections
-            .get_mut(&connection)
-            .unwrap()
-            .windows
-            .insert(
-                (transfer, index),
-                Window {
-                    direction,
-                    length,
-                    within: 0,
-                    hold: Hold::Allocated { extent },
+                    hold: extent.clone(),
                 },
             );
         Ok(WindowGrant {
@@ -852,56 +753,14 @@ impl Local {
         before - record.windows.len()
     }
 
-    pub fn window_bytes(&self, connection: u64, transfer: u64, index: u32) -> Option<&[u8]> {
+    #[cfg(test)]
+    fn window_bytes(&self, connection: u64, transfer: u64, index: u32) -> Option<&[u8]> {
         let window = self
             .connections
             .get(&connection)?
             .windows
             .get(&(transfer, index))?;
-        match &window.hold {
-            Hold::Allocated { extent } => Some(extent.bytes()),
-            Hold::Lease(extent) => {
-                Some(&extent.bytes()[window.within..window.within + window.length])
-            }
-            Hold::None => None,
-        }
-    }
-
-    pub fn window_bytes_mut(
-        &mut self,
-        connection: u64,
-        transfer: u64,
-        index: u32,
-    ) -> Option<&mut [u8]> {
-        let window = self
-            .connections
-            .get_mut(&connection)?
-            .windows
-            .get_mut(&(transfer, index))?;
-        match &mut window.hold {
-            Hold::Allocated { extent } => Some(extent.bytes_mut()),
-            Hold::Lease(_) | Hold::None => None,
-        }
-    }
-
-    /// Removes a window allocated from a region and hands its extent to the caller
-    /// (for example to keep bytes alive until a staging write completes). Leases are
-    /// released and yield `None`.
-    pub fn take_allocated(&mut self, connection: u64, transfer: u64, index: u32) -> Option<Extent> {
-        let window = self
-            .connections
-            .get_mut(&connection)?
-            .windows
-            .remove(&(transfer, index))?;
-        let mut window = window;
-        match window.take_hold() {
-            Hold::Allocated { extent } => Some(extent),
-            Hold::Lease(extent) => {
-                extent.release();
-                None
-            }
-            Hold::None => None,
-        }
+        Some(&window.hold.bytes()[window.within..window.within + window.length])
     }
 
     pub fn stats(&self, connection: u64) -> Option<ConnectionStats> {
@@ -924,7 +783,8 @@ impl Local {
     }
 
     /// Bytes held by all live and quarantined windows.
-    pub fn held_bytes(&self) -> u64 {
+    #[cfg(test)]
+    fn held_bytes(&self) -> u64 {
         self.connections
             .values()
             .flat_map(|record| record.windows.values())
@@ -933,7 +793,8 @@ impl Local {
     }
 
     /// Bytes held only by closed, not-yet-confirmed-exited connections.
-    pub fn quarantine_bytes(&self) -> u64 {
+    #[cfg(test)]
+    fn quarantine_bytes(&self) -> u64 {
         self.connections
             .values()
             .filter(|record| record.closed)
@@ -942,12 +803,8 @@ impl Local {
             .sum()
     }
 
-    /// Whether `bytes` can be allocated without reclaiming anything.
-    pub fn can_admit(&self, bytes: u64) -> bool {
-        self.can_allocate(Region::Arena, bytes) || self.can_allocate(Region::Staging, bytes)
-    }
-
-    pub fn can_allocate(&self, region: Region, bytes: u64) -> bool {
+    #[cfg(test)]
+    fn can_allocate(&self, region: Region, bytes: u64) -> bool {
         let Ok(bytes) = usize::try_from(bytes) else {
             return false;
         };
@@ -1310,6 +1167,68 @@ mod tests {
         }
     }
 
+    impl Local {
+        fn grant_fixture(
+            &mut self,
+            connection: u64,
+            transfer: u64,
+            index: u32,
+            direction: Direction,
+            region: Region,
+            shape: WindowShape,
+        ) -> std::result::Result<WindowGrant, GrantError> {
+            shape
+                .validate(self.max_window_bytes)
+                .map_err(|e| GrantError::Invalid(e.to_string()))?;
+            self.check_credit(connection, direction)?;
+            let arena = match region {
+                Region::Arena => &self.arena,
+                Region::Staging => &self.staging,
+            };
+            let extent = Arc::new(
+                arena
+                    .allocate(shape.length() as usize)
+                    .ok_or(GrantError::Budget)?,
+            );
+            match direction {
+                Direction::Put => {
+                    self.grant_put_extent(connection, transfer, index, region, shape, &extent, 0)
+                }
+                Direction::Get => {
+                    self.grant_get_extent(connection, transfer, index, region, shape, &extent, 0)
+                }
+            }
+        }
+
+        fn grant_put(
+            &mut self,
+            connection: u64,
+            transfer: u64,
+            index: u32,
+            region: Region,
+            shape: WindowShape,
+        ) -> std::result::Result<WindowGrant, GrantError> {
+            self.grant_fixture(connection, transfer, index, Direction::Put, region, shape)
+        }
+
+        fn grant_get_staging(
+            &mut self,
+            connection: u64,
+            transfer: u64,
+            index: u32,
+            shape: WindowShape,
+        ) -> std::result::Result<WindowGrant, GrantError> {
+            self.grant_fixture(
+                connection,
+                transfer,
+                index,
+                Direction::Get,
+                Region::Staging,
+                shape,
+            )
+        }
+    }
+
     fn local(name: &str, arena: usize, staging: usize) -> (Local, Cleanup) {
         let local = Local::open(name, arena, staging, 4 * 1024 * 1024).unwrap();
         let cleanup = Cleanup(local.directory().to_path_buf());
@@ -1400,7 +1319,7 @@ mod tests {
         {
             let first = Local::open(&name, 64 * 1024, 64 * 1024, 4 * 1024 * 1024).unwrap();
             directory = first.directory().to_path_buf();
-            old_nonce = first.boot_nonce().to_owned();
+            old_nonce = first.boot_nonce.to_owned();
             assert_eq!(old_nonce.len(), 16);
             assert!(
                 old_nonce
@@ -1419,7 +1338,7 @@ mod tests {
         assert!(!directory.join("staging-0123456789abcdef").exists());
         assert!(!directory.join(format!("arena-{old_nonce}")).exists());
         assert!(!directory.join("leftover.tmp").exists());
-        assert_ne!(second.boot_nonce(), old_nonce);
+        assert_ne!(second.boot_nonce, old_nonce);
         assert!(directory.join("lock").exists());
         assert!(second.arena_path().exists());
         assert_eq!(
@@ -1888,10 +1807,21 @@ mod tests {
             .grant_put(1, 1, 0, Region::Arena, shape(1, false))
             .unwrap();
         assert_ne!(left.arena_path(), right.arena_path());
-        assert_ne!(left.boot_nonce(), right.boot_nonce());
+        assert_ne!(left.boot_nonce, right.boot_nonce);
 
-        left.window_bytes_mut(1, 1, 0).unwrap()[..4].copy_from_slice(b"AAAA");
-        right.window_bytes_mut(1, 1, 0).unwrap()[..4].copy_from_slice(b"BBBB");
+        // SAFETY: these distinct fixture windows are exclusively owned by this test.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                b"AAAA".as_ptr(),
+                left.region_mapping(Region::Arena).0.add(a.offset as usize),
+                4,
+            );
+            std::ptr::copy_nonoverlapping(
+                b"BBBB".as_ptr(),
+                right.region_mapping(Region::Arena).0.add(b.offset as usize),
+                4,
+            );
+        }
         assert_eq!(&left.window_bytes(1, 1, 0).unwrap()[..4], b"AAAA");
         assert_eq!(&right.window_bytes(1, 1, 0).unwrap()[..4], b"BBBB");
         assert_eq!(a.length, b.length);
@@ -1930,5 +1860,4 @@ mod tests {
         }
         assert_eq!(&local.window_bytes(1, 1, 0).unwrap()[..4], b"map!");
     }
-
 }
