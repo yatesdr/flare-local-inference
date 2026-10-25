@@ -507,11 +507,8 @@ impl Local {
                 if pid == 0 {
                     return Err(invalid("peer pid 0"));
                 }
-                match open_pidfd(pid) {
-                    Pidfd::Open(fd) => (Some(pid), Some(fd), false),
-                    Pidfd::Exited => (Some(pid), None, true),
-                    Pidfd::Unknown => (Some(pid), None, false),
-                }
+                let (pidfd, exited) = watch_pid(pid);
+                (Some(pid), pidfd, exited)
             }
             SessionKind::Remote => (None, None, false),
         };
@@ -1088,11 +1085,10 @@ impl Prior {
             if process_start(pid) != Some(start) {
                 continue;
             }
-            match open_pidfd(pid) {
-                Pidfd::Open(fd) => holders.insert(pid, Some(fd)),
-                Pidfd::Unknown => holders.insert(pid, None),
-                Pidfd::Exited => None,
-            };
+            let (pidfd, exited) = watch_pid(pid);
+            if !exited {
+                holders.insert(pid, pidfd);
+            }
         }
         if holders.is_empty() {
             return None;
@@ -1111,22 +1107,16 @@ impl Prior {
     }
 }
 
-pub(crate) enum Pidfd {
-    Open(OwnedFd),
-    Exited,
-    Unknown,
-}
-
-pub(crate) fn open_pidfd(pid: u32) -> Pidfd {
+/// A missing descriptor is not proof of exit unless pidfd_open returned ESRCH.
+pub(crate) fn watch_pid(pid: u32) -> (Option<OwnedFd>, bool) {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) } as i32;
     if fd >= 0 {
-        return Pidfd::Open(unsafe { OwnedFd::from_raw_fd(fd) });
+        return (Some(unsafe { OwnedFd::from_raw_fd(fd) }), false);
     }
-    match io::Error::last_os_error().raw_os_error() {
-        Some(libc::ESRCH) => Pidfd::Exited,
-        // EPERM and everything else is not proof of exit: keep quarantining.
-        _ => Pidfd::Unknown,
-    }
+    (
+        None,
+        io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
+    )
 }
 
 pub(crate) fn pidfd_exited(pidfd: &OwnedFd) -> bool {
