@@ -74,8 +74,6 @@ pub struct MpState {
     /// Passes running on the claim's windows: they read manager memory, so the windows are
     /// not reclaimed until they are over.
     pub passes: u32,
-    /// The requester's exact COPY_OK arrived while some leg had not finished reading.
-    pub copy_ok: bool,
 }
 
 impl MpState {

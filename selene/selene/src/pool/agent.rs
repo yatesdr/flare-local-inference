@@ -370,8 +370,6 @@ struct Xfer {
     pages: Vec<PageId>,
     slot: Option<StateSlotId>,
     shared: bool,
-    /// The mapping this transfer was opened against, kept until it ends.
-    regions: Option<Arc<Regions>>,
     channel: Option<Channel>,
     channel_open: bool,
     ended: bool,
@@ -1085,7 +1083,6 @@ impl Agent {
             pages: open.pages.iter().map(|id| PageId(*id)).collect(),
             slot: open.has_slot.then_some(StateSlotId(open.slot)),
             shared,
-            regions: att.regions.clone(),
             channel: None,
             channel_open: false,
             ended: false,
@@ -1139,10 +1136,10 @@ impl Agent {
             Ok(dest) => dest as usize,
             Err(why) => return self.fail(xfer, why),
         };
-        let Some(region) = run
-            .regions
+        let Some(region) = self
+            .shared
             .as_ref()
-            .and_then(|regions| regions.get(spec.region()))
+            .and_then(|(_, regions)| regions.get(spec.region()))
         else {
             return self.fail(xfer, "window in an unknown region".into());
         };
@@ -1601,10 +1598,10 @@ impl Agent {
             }
             (true, true) => {
                 // The slice this rank wrote into the window, hashed after the drain.
-                let region = run
-                    .regions
+                let region = self
+                    .shared
                     .as_ref()
-                    .and_then(|regions| regions.get(spec.region()));
+                    .and_then(|(_, regions)| regions.get(spec.region()));
                 let Some(bytes) = region.and_then(|r| r.bytes(spec.offset, spec.length)) else {
                     return self.fail(xfer, "window outside its region".into());
                 };
