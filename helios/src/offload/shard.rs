@@ -319,7 +319,7 @@ pub fn join_rank_zero(store: Option<&Shared>, peers: &mut [RankStream]) -> Resul
     Ok(Some(format!(
         "{} of {scanned} records on every rank, limit {}",
         prepared.scanned.len(),
-        super::gibibytes(prepared.resolved.disk_limit)
+        flare_selene::offload::gibibytes(prepared.resolved.disk_limit)
     )))
 }
 
@@ -436,7 +436,7 @@ pub fn join_peer(
     retain(&mut prepared, &agreed)?;
     let summary = format!(
         "serving rank zero, limit {}",
-        super::gibibytes(prepared.resolved.disk_limit)
+        flare_selene::offload::gibibytes(prepared.resolved.disk_limit)
     );
     let directory = prepared
         .resolved

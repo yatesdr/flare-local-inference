@@ -725,7 +725,7 @@ impl NativeModel {
                 .iter()
                 .map(|rank| crate::cuda::device_uuid(rank.device))
                 .collect::<Result<Vec<_>>>()?;
-            let (prepared, charges) = crate::offload::pool::PreparedPool::start(
+            let (prepared, charges) = crate::offload::pool::start(
                 pool,
                 super::model::offload_identity(&self.server_config)?,
                 &geometry,

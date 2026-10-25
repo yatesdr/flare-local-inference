@@ -333,3 +333,18 @@ pub fn pattern(bytes: &mut [u8], seed: u64) {
         *byte = (index.wrapping_mul(31) ^ seed.wrapping_mul(7919) ^ (index >> 8)) as u8;
     }
 }
+
+/// A host registration whose device address is the supplied host address.
+pub struct IdentityRegistrar;
+struct IdentityRegistration(usize);
+impl crate::Registration for IdentityRegistration {
+    fn device_address(&self) -> u64 { self.0 as u64 }
+}
+impl crate::HostRegistrar for IdentityRegistrar {
+    fn register(&self, _: usize, address: usize, _: usize) -> Result<Box<dyn crate::Registration>> {
+        Ok(Box::new(IdentityRegistration(address)))
+    }
+    fn map_split(&self, _: &[(usize, i32, usize)]) -> Result<Box<dyn crate::SplitMapping>> {
+        Err("split mapping is not provided by this fixture".into())
+    }
+}

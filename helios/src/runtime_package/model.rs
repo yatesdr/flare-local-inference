@@ -839,7 +839,7 @@ impl NativeModel {
         if let crate::offload::Preparation::Store(store) = &mut prepared
             && let Some(mut pool) = self.pool.take()
         {
-            pool.prepare_peer(store)?;
+            pool.prepare_peer(store, &crate::offload::transfer::Copiers)?;
             store.pool = Some(pool);
         }
         let summary = prepared.summary();

@@ -1,5 +1,6 @@
 use super::*;
 use flare_selene::pool::PoolStatus;
+use std::sync::Mutex;
 use std::{
     sync::atomic::{AtomicBool, Ordering},
     thread,
@@ -113,7 +114,7 @@ fn wait(mut condition: impl FnMut() -> bool) {
 }
 fn start(manager: &Manager, registrar: Arc<Registrar>, budget: Budget) -> (PreparedPool, Vec<u64>) {
     let geometry = vec![flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)];
-    PreparedPool::start_with_registrar(
+    start_with_registrar(
         &manager.options(),
         [3; 32],
         &geometry,
@@ -152,11 +153,11 @@ fn over_budget_startup_registers_nothing_and_serves_local_only() {
         let (prepared, charges) = start(&manager, registrar.clone(), budget);
         wait(|| {
             matches!(
-                prepared.pool.client.as_ref().unwrap().status(),
+                prepared.client.as_ref().unwrap().status(),
                 PoolStatus::Disabled(_)
             )
         });
-        let PoolStatus::Disabled(reason) = prepared.pool.client.as_ref().unwrap().status() else {
+        let PoolStatus::Disabled(reason) = prepared.client.as_ref().unwrap().status() else {
             unreachable!()
         };
         assert!(
@@ -166,7 +167,6 @@ fn over_budget_startup_registers_nothing_and_serves_local_only() {
         assert_eq!(charges, [0]);
         assert!(
             prepared
-                .pool
                 .client
                 .as_ref()
                 .unwrap()
@@ -228,7 +228,7 @@ fn an_absent_manager_times_out_before_local_readiness_and_never_attaches_late() 
     assert!(started.elapsed() < flare_selene::pool::STARTUP_WAIT + Duration::from_secs(5));
     assert_eq!(charges, [0]);
     assert!(matches!(
-        prepared.pool.client.as_ref().unwrap().status(),
+        prepared.client.as_ref().unwrap().status(),
         PoolStatus::Disabled(_)
     ));
     manager.run();
@@ -248,7 +248,7 @@ fn startup_wait_precedes_readiness_and_restart_never_registers_again() {
     let (ready, readiness) = std::sync::mpsc::channel();
     let startup = thread::spawn(move || {
         let geometry = vec![flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)];
-        let result = PreparedPool::start_with_registrar(
+        let result = start_with_registrar(
             &options,
             [3; 32],
             &geometry,
@@ -274,18 +274,18 @@ fn startup_wait_precedes_readiness_and_restart_never_registers_again() {
     let changed = vec![flare_selene::testing::geometry(128, &[("kv", 4096)], 4096)];
     assert!(
         prepared
-            .start_copies(&[], changed)
+            .start_copies(&[], changed, &super::super::transfer::Copiers)
             .unwrap_err()
             .to_string()
             .contains("layouts disagree")
     );
-    wait(|| prepared.pool.client.as_ref().unwrap().status() == PoolStatus::Ready);
-    let topology = prepared.pool.client.as_ref().unwrap().topology();
+    wait(|| prepared.client.as_ref().unwrap().status() == PoolStatus::Ready);
+    let topology = prepared.client.as_ref().unwrap().topology();
     manager.stop();
     manager.run();
     wait(|| {
-        prepared.pool.client.as_ref().unwrap().topology() != topology
-            && prepared.pool.client.as_ref().unwrap().status() == PoolStatus::Ready
+        prepared.client.as_ref().unwrap().topology() != topology
+            && prepared.client.as_ref().unwrap().status() == PoolStatus::Ready
     });
     assert_eq!(registrar.calls.lock().unwrap().len(), 2);
     manager.stop();
@@ -293,13 +293,13 @@ fn startup_wait_precedes_readiness_and_restart_never_registers_again() {
     manager.run();
     wait(|| {
         matches!(
-            prepared.pool.client.as_ref().unwrap().status(),
+            prepared.client.as_ref().unwrap().status(),
             PoolStatus::Disabled(_)
         )
     });
     assert_eq!(registrar.calls.lock().unwrap().len(), 2);
     assert_eq!(*registrar.drops.lock().unwrap(), 0);
-    prepared.pool.client.as_mut().unwrap().close().unwrap();
+    prepared.client.as_mut().unwrap().close().unwrap();
     assert_eq!(*registrar.drops.lock().unwrap(), 2);
     let mut store = prepared.attach(None).unwrap();
     let mut history = crate::cache::PrefixHistory::new([3; 32]);
@@ -345,7 +345,7 @@ fn peer_registration_budget_disables_the_whole_ranked_instance() {
                 },
                 _ => unlimited(),
             };
-            PreparedPool::start_with_registrar(
+            start_with_registrar(
                 &options,
                 [3; 32],
                 &[flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)],
@@ -360,7 +360,7 @@ fn peer_registration_budget_disables_the_whole_ranked_instance() {
             .unwrap()
         });
         let peers = pool_rank_zero(offer(0), &mut [RankStream::Tcp(zero_stream)]).unwrap();
-        let (mut zero, _) = PreparedPool::start_with_registrar(
+        let (mut zero, _) = start_with_registrar(
             &manager.options(),
             [3; 32],
             &[flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)],
@@ -374,16 +374,14 @@ fn peer_registration_budget_disables_the_whole_ranked_instance() {
         )
         .unwrap();
         let (peer, charges) = peer.join().unwrap();
-        assert!(
-            peer.pool.agent.is_some() && peer.pool.client.is_none() && peer.pool.records.is_none()
-        );
+        assert!(peer.agent.is_some() && peer.client.is_none() && peer.records.is_none());
         if reject {
             assert_eq!(charges, [0]);
             assert!(!peer.approved());
             assert!(peer_registrar.calls.lock().unwrap().is_empty());
             wait(|| {
                 matches!(
-                    zero.pool.client.as_ref().unwrap().status(),
+                    zero.client.as_ref().unwrap().status(),
                     PoolStatus::Disabled(_)
                 )
             });
@@ -394,10 +392,10 @@ fn peer_registration_budget_disables_the_whole_ranked_instance() {
             store.close().unwrap();
         } else {
             assert!(peer.approved());
-            wait(|| zero.pool.client.as_ref().unwrap().status() == PoolStatus::Ready);
-            wait(|| peer.pool.agent.as_ref().unwrap().status() == PoolStatus::Ready);
+            wait(|| zero.client.as_ref().unwrap().status() == PoolStatus::Ready);
+            wait(|| peer.agent.as_ref().unwrap().status() == PoolStatus::Ready);
             assert_eq!(
-                zero.pool.identity.layout,
+                zero.identity.layout,
                 super::super::geometry::fingerprint(&vec![
                     flare_selene::testing::geometry(
                         64,
@@ -444,4 +442,29 @@ fn peer_registration_budget_disables_the_whole_ranked_instance() {
         );
         service.join().unwrap().join().unwrap();
     }
+}
+
+fn start_with_registrar(
+    options: &PoolOptions,
+    identity: [u8; 32],
+    geometry: &[CacheGeometry],
+    gpu_uuids: Vec<[u8; 16]>,
+    registration_context: usize,
+    budget: Budget,
+    _: &StartupProgress,
+    registrar: Arc<Registrar>,
+    peers: Option<PoolPeers>,
+    disk: bool,
+) -> flare_selene::Result<(PreparedPool, Vec<u64>)> {
+    PoolBuilder {
+        options,
+        identity,
+        geometry,
+        gpu_uuids,
+        registration_context,
+        budget,
+        peers,
+        disk,
+    }
+    .start(registrar)
 }

@@ -1,5 +1,42 @@
 use super::*;
 
+fn prepare(
+    options: &PrefixCacheOffload,
+    package: &std::path::Path,
+    identity: [u8; 32],
+    geometry: Vec<CacheGeometry>,
+    contexts: Vec<(usize, i32)>,
+) -> Result<Preparation> {
+    super::prepare(
+        options,
+        package,
+        identity,
+        geometry,
+        contexts,
+        &crate::testing::IdentityRegistrar,
+    )
+}
+fn prepare_with_inputs(
+    options: &PrefixCacheOffload,
+    package: &std::path::Path,
+    identity: [u8; 32],
+    geometry: Vec<CacheGeometry>,
+    contexts: Vec<(usize, i32)>,
+    inputs: u64,
+    shard: Option<(usize, usize)>,
+) -> Result<Preparation> {
+    super::prepare_with_inputs(
+        options,
+        package,
+        identity,
+        geometry,
+        contexts,
+        inputs,
+        shard,
+        &crate::testing::IdentityRegistrar,
+    )
+}
+
 fn test_directory() -> PathBuf {
     static SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     std::env::temp_dir().join(format!(
@@ -22,7 +59,7 @@ fn a_pool_with_shards_keeps_one_local_rank_and_refuses_memory_retention() {
         pool: Some(pool("unix:/run/selene.sock")),
         ..Default::default()
     };
-    let local = flare_selene::testing::geometry(64, &[("kv", 4096)], 4096);
+    let local = crate::testing::geometry(64, &[("kv", 4096)], 4096);
     let prepare = |options: &PrefixCacheOffload| {
         prepare_with_inputs(
             options,
@@ -54,8 +91,7 @@ fn a_pool_with_shards_keeps_one_local_rank_and_refuses_memory_retention() {
 
 #[test]
 fn without_a_pool_nothing_for_it_is_budgeted_or_built() {
-    let layout =
-        Layout::new(&[flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)]).unwrap();
+    let layout = Layout::new(&[crate::testing::geometry(64, &[("kv", 4096)], 4096)]).unwrap();
     assert_eq!(
         PrefixCacheOffload::default()
             .headroom_bytes(1, &layout)
@@ -126,7 +162,7 @@ fn zero_disk_limit_does_not_create_a_record_directory() {
         },
         std::path::Path::new("/missing/model.safetensors"),
         [0; 32],
-        vec![flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)],
+        vec![crate::testing::geometry(64, &[("kv", 4096)], 4096)],
         Vec::new(),
     )
     .unwrap();
@@ -145,7 +181,7 @@ fn zero_disk_limit_does_not_create_a_record_directory() {
 #[test]
 fn zero_disk_limit_avoids_disk_setup_when_memory_is_enabled() {
     let directory = test_directory();
-    let geometry = vec![flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)];
+    let geometry = vec![crate::testing::geometry(64, &[("kv", 4096)], 4096)];
     let memory_bytes = slab::SlabPool::minimum_bytes(&Layout::new(&geometry).unwrap());
     let error = prepare(
         &PrefixCacheOffload {
@@ -179,7 +215,7 @@ fn zero_disk_limit_avoids_disk_setup_when_memory_is_enabled() {
 #[test]
 fn zero_disk_limit_does_not_lock_or_scan_existing_records() {
     let base = test_directory();
-    let geometry = vec![flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)];
+    let geometry = vec![crate::testing::geometry(64, &[("kv", 4096)], 4096)];
     let fingerprint = geometry::fingerprint(&geometry);
     let directory = base.join(record::directory_name(&[0; 32], &fingerprint));
     std::fs::create_dir_all(&directory).unwrap();
