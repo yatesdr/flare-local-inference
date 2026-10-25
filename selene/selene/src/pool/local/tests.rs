@@ -12,6 +12,9 @@ impl HostStore for Hooks {
     fn store(&mut self, _: &PublishedCheckpoint) -> crate::Result<StoreOutcome> {
         Ok(StoreOutcome::Present)
     }
+    fn closest_tier(&self) -> Option<Tier> {
+        Some(Tier::Memory)
+    }
     fn fetch(&mut self, _: HostHit, _: InboundTicket) -> crate::Result<()> {
         Ok(())
     }
@@ -77,6 +80,7 @@ fn the_tiers_beneath_a_pooled_store_receive_every_pool_hook() {
         consumed_tokens: 64,
         digest: [1; 16],
     };
+    assert_eq!(tiers.closest_tier(), Some(Tier::Memory));
     tiers.cascade();
     tiers.set_spill(true);
     assert!(tiers.take_retiring().is_empty());
@@ -106,6 +110,7 @@ fn the_tiers_beneath_a_pooled_store_receive_every_pool_hook() {
     );
     // With no tiers there is nothing to reach.
     let mut none = Tiers::new(None);
+    assert_eq!(none.closest_tier(), None);
     none.cascade();
     assert!(none.take_retiring().is_empty());
     assert!(matches!(

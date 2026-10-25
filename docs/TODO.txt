@@ -136,7 +136,3 @@
     tests/server/test_nemotron.py::test_image_cache_identity: native serving of
     NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB reports 281 cached tokens for a repeated
     287-token prompt; image answers and token identity assertions pass.
-
-[ ] Forward closest_tier through optional pooled local tiers before relying on
-    tier-specific held-copy and write-back estimates. See
-    selene/selene/src/pool/local.rs and selene/selene/src/pool/store.rs.

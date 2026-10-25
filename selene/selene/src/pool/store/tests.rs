@@ -1432,76 +1432,27 @@ fn a_publication_is_noted_and_announced_and_copies_nothing_until_written_back() 
 }
 
 #[test]
-fn a_row_a_few_tokens_past_a_parent_is_declined_and_counted_while_a_long_record_is_kept() {
+fn write_back_copies_row_only_records_even_when_recompute_is_cheaper() {
     let mut rig = rig();
-    // Prefill fast enough that a row alone is not worth restoring for seven
-    // tokens, while a record of fifty pages still is.
-    rig.store.set_prefill_rate(2.5e7);
+    rig.store.set_prefill_rate(1e12);
     let parent = rig.publication(800);
-    // The terminal checkpoint of a prompt: seven tokens on, no page of its own.
     let mut child = rig.publication(800);
     child.key = rig.key(807);
     child.parent = Some(parent.key);
     child.tail_pages = 0;
-    assert_eq!(
-        rig.store.write_back(&child).unwrap(),
-        StoreOutcome::Oversize
-    );
-    assert!(rig.copies().is_empty());
-    assert_eq!(rig.store.stats().store_skipped, 1);
-    // The same long record with no parent, or with a parent far behind it, is kept.
-    assert_eq!(rig.store.write_back(&parent).unwrap(), StoreOutcome::Queued);
-    let mut later = rig.publication(1600);
-    later.parent = Some(parent.key);
-    later.tail_pages = 50;
-    assert_eq!(rig.store.write_back(&later).unwrap(), StoreOutcome::Queued);
-    assert_eq!(rig.store.stats().store_skipped, 1);
+    assert_eq!(rig.store.write_back(&child).unwrap(), StoreOutcome::Queued);
+    assert_eq!(rig.copies(), [child.key]);
+    assert_eq!(rig.store.stats().store_skipped, 0);
 }
 
 #[test]
-fn a_checkpoint_cheaper_to_recompute_than_to_restore_is_never_stored() {
+fn a_pool_hint_never_substitutes_for_a_committed_local_copy() {
     let mut rig = rig();
-    let checkpoint = rig.publication(800);
-    // Prefill so fast that no restore can beat it.
-    rig.store.set_prefill_rate(1e12);
-    assert_eq!(
-        rig.store.write_back(&checkpoint).unwrap(),
-        StoreOutcome::Oversize
-    );
-    assert!(rig.copies().is_empty());
-    // At the ordinary prefill rate it is worth keeping again.
-    rig.store.set_prefill_rate(INITIAL_PREFILL_RATE);
-    assert_eq!(
-        rig.store.write_back(&checkpoint).unwrap(),
-        StoreOutcome::Queued
-    );
-}
-
-#[test]
-fn a_checkpoint_the_pools_dram_already_holds_is_present_and_not_copied_again() {
-    let mut rig = rig();
-    // A lookup showed another instance's DRAM holding the endpoint; an
-    // NVMe holding does not count for an instance with a memory tier.
-    rig.answer(vec![
-        rig.candidate(Level::HostDram, 2, 0, 0, &[800], 0),
-        rig.candidate(Level::HostNvme, 3, 0, 0, &[1600], 0),
-    ]);
+    rig.answer(vec![rig.candidate(Level::HostDram, 2, 0, 0, &[800], 0)]);
     rig.lookup();
-    let held = rig.publication(800);
-    assert_eq!(rig.store.write_back(&held).unwrap(), StoreOutcome::Present);
-    assert!(rig.copies().is_empty());
-    let farther = rig.publication(1600);
-    assert_eq!(
-        rig.store.write_back(&farther).unwrap(),
-        StoreOutcome::Queued
-    );
-    assert_eq!(rig.copies(), [farther.key]);
-    // A key no lookup showed is copied.
-    let unknown = rig.publication(400);
-    assert_eq!(
-        rig.store.write_back(&unknown).unwrap(),
-        StoreOutcome::Queued
-    );
+    let checkpoint = rig.publication(800);
+    assert_eq!(rig.store.write_back(&checkpoint).unwrap(), StoreOutcome::Queued);
+    assert_eq!(rig.copies(), [checkpoint.key]);
 }
 
 #[test]
