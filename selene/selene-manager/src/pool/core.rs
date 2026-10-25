@@ -28,6 +28,8 @@ use tokio::sync::{mpsc, oneshot};
 /// What a data-channel transfer belongs to.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ChanOwner {
+    /// A peer rank's leg of a claim; the index is into the claim's `mp.legs`.
+    ClaimRank(ClaimKey, usize),
     Claim(ClaimKey),
     /// The source leg of a claim relayed through the manager.
     Source(ClaimKey),
@@ -78,6 +80,8 @@ pub struct PoolConfig {
     /// The data channel instances without shared memory copy through, when the
     /// manager listens for other hosts.
     pub channel: Option<Hub>,
+    /// The manager's shared regions, for the window assembly pass of multi-process instances.
+    pub regions: Option<Arc<dyn crate::data::RegionAccess>>,
 }
 
 impl Default for PoolConfig {
@@ -91,6 +95,7 @@ impl Default for PoolConfig {
             encryption: v2::Encryption::Plaintext,
             transports: vec![v2::DataTransport::Tcp],
             channel: None,
+            regions: None,
         }
     }
 }
@@ -163,6 +168,12 @@ pub enum Event {
     },
     /// A data-channel handler reported.
     Channel(channel::Event),
+    /// A window assembly pass finished.
+    Pass {
+        key: super::claims::ClaimKey,
+        index: u32,
+        result: Result<super::pass::PassOut, super::pass::PassError>,
+    },
     Shutdown {
         done: oneshot::Sender<()>,
     },
@@ -461,6 +472,7 @@ impl Core {
             Event::GetAnswer { key, answer } => self.get_answer(key, answer),
             Event::Catalog { scope, event } => self.catalog_event(scope, event),
             Event::Channel(event) => self.channel_event(event),
+            Event::Pass { key, index, result } => self.pass_done(key, index, result),
             Event::Shutdown { done } => self.begin_shutdown(done),
         }
         self.flush_overflowed();
@@ -936,6 +948,7 @@ impl Core {
             .chain(self.claims.values().filter_map(|claim| claim.source_proc))
             .chain(self.puts.keys().map(|key| (key.0, key.1)))
             .chain(self.agents.values().map(|agent| agent.proc()))
+            .chain(self.claims.values().flat_map(|claim| claim.mp.peer_procs()))
             .collect();
         let now = Instant::now();
         let mut forget = Vec::new();

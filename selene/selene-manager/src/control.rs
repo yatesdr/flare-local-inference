@@ -249,6 +249,7 @@ pub fn serve(
         },
         transports: pool_transports(&config),
         channel,
+        regions: Some(regions.clone()),
     };
     let (pool_core, pool_handle, pool_events) = crate::pool::Core::new(
         pool_config,
