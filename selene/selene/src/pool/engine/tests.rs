@@ -188,6 +188,19 @@ fn settings(export_slots: u32) -> Arc<Settings> {
         export_slots,
         claim_slots: 2,
         context: 0,
+        slices: Arc::new(
+            crate::pool::slice::SliceLayout::new(&Geometry {
+                page_tokens: 64,
+                ranks: vec![RankPlanes {
+                    plane_bytes: vec![4096, 4096],
+                    row_bytes: 4096,
+                }],
+                page_record_bytes: PAGE,
+                row_record_bytes: ROW,
+            })
+            .unwrap(),
+        ),
+        rank_secret: None,
     })
 }
 

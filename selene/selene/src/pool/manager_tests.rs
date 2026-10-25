@@ -39,13 +39,13 @@ use crate::{
     slab::SlabPool,
 };
 
-const PT: u64 = 16;
+pub(super) const PT: u64 = 16;
 const PAGE: usize = 8192;
 const ROW: usize = 4096;
 
 static SERIAL: AtomicU32 = AtomicU32::new(0);
 
-struct OkRegistrar;
+pub(super) struct OkRegistrar;
 struct Registered;
 impl Registration for Registered {
     fn device_address(&self) -> u64 {
@@ -83,8 +83,8 @@ fn free_address() -> std::net::SocketAddr {
     }
 }
 
-struct Manager {
-    socket: PathBuf,
+pub(super) struct Manager {
+    pub(super) socket: PathBuf,
     base: PathBuf,
     config: Config,
     stop: Arc<AtomicBool>,
@@ -93,7 +93,7 @@ struct Manager {
 }
 
 impl Manager {
-    fn start() -> Self {
+    pub(super) fn start() -> Self {
         Self::with_memory(16 << 20)
     }
 
@@ -245,7 +245,7 @@ impl Manager {
     }
 
     /// Restart the manager on the same socket.
-    fn restart(&mut self) {
+    pub(super) fn restart(&mut self) {
         self.stop();
         let _ = std::fs::remove_file(&self.socket);
         self.run();
@@ -319,7 +319,7 @@ fn instance_on(manager: &Manager, name: &str, gpu: u8, local: bool) -> Instance 
     }
 }
 
-fn wait(what: &str, mut done: impl FnMut() -> bool) {
+pub(super) fn wait(what: &str, mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !done() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
@@ -357,7 +357,7 @@ fn history() -> TestHistory {
     history_of(4000)
 }
 
-fn history_of(tokens: u32) -> TestHistory {
+pub(super) fn history_of(tokens: u32) -> TestHistory {
     let mut history = TestHistory::new([7; 32]);
     history
         .append(&(0..tokens).collect::<Vec<u32>>(), &[])
@@ -374,7 +374,7 @@ fn identity() -> Identity {
 }
 
 /// A host pin over known bytes, serving the checksums it was given.
-struct TestPin {
+pub(super) struct TestPin {
     chain: HostChain,
     data: Vec<u8>,
     sums: Vec<u64>,
@@ -798,6 +798,7 @@ fn counted_approving(
     config.approve = approve;
     PoolClient::start_waiting(
         config,
+        None,
         copier,
         registrar.clone(),
         super::net::Roots::System,

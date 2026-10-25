@@ -1698,10 +1698,10 @@ impl Core {
             // ExportEnd arrives; the channel reports any that never come.
             let finished = status == v2::ExportEndStatus::ExportComplete
                 && (claim.source_channel.is_some()
-                    || claim
-                        .windows
-                        .iter()
-                        .all(|window| matches!(window.phase, Phase::RequesterRead | Phase::Free)));
+                    || claim.windows.iter().all(|window| {
+                        // A window in the assembly pass has been filled, too.
+                        window.arrived || matches!(window.phase, Phase::RequesterRead | Phase::Free)
+                    }));
             if !finished {
                 self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
                 return Ok(());

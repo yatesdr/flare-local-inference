@@ -323,6 +323,7 @@ fn an_unreachable_manager_leaves_the_client_local_and_close_returns() {
     let started = Instant::now();
     let mut client = PoolClient::start_waiting(
         config,
+        None,
         copier,
         Arc::new(NoRegistrar),
         net::Roots::System,
