@@ -18,8 +18,9 @@ use crate::{
     plan::{self, Identity, Request},
     pool::{
         Checksums, FetchPart, HostChain, HostPin, HostRecord, HostWindow, IndexEntry, LookupState,
-        PoolAddress, PoolClient, PoolConfig, PoolEvent, PoolFetch, PoolStatus, Scope, Tier,
-        agent::{AgentConfig, RankAgent},
+        PoolAddress, PoolClient, PoolConfig, PoolEvent, PoolFetch, PoolStatus, PutBytes, Scope,
+        Tier,
+        agent::{AgentConfig, RankAgent, RankRecords},
         manager_tests::{Manager, OkRegistrar, PT, history_of, wait},
         rank::{RankLink, RankSet, memory_links},
     },
@@ -188,6 +189,9 @@ struct Faults {
     gates: Vec<(usize, Arc<Gate>)>,
     /// Rank r's link to rank 0 can be cut.
     cuts: Vec<(usize, Arc<AtomicBool>)>,
+    /// The peers keep a host-tier record of this many pages in their own files; the rank
+    /// listed has a wrong persisted checksum in its files.
+    host: Option<(usize, Option<usize>)>,
 }
 
 struct Gate {
@@ -329,6 +333,14 @@ fn instance_with(
                 registrar: Arc::new(OkRegistrar),
                 registration_context: 0,
                 gpu_uuid: gpus[rank],
+                records: faults.host.map(|(pages, bad)| -> Box<dyn RankRecords> {
+                    Box::new(RankFiles {
+                        world,
+                        rank,
+                        pages,
+                        bad: bad == Some(rank),
+                    })
+                }),
             })
             .unwrap(),
         );
@@ -985,6 +997,7 @@ fn a_restore_is_reported_only_after_every_rank_drained_and_no_rank_is_read_early
     let faults = Faults {
         gates: vec![(1, gate.clone())],
         cuts: Vec::new(),
+        host: None,
     };
     let mut scenario = scenario(&manager, 2, &[Reach::Local, Reach::Local], &faults);
     scenario.serve(None);
@@ -1027,6 +1040,7 @@ fn a_rank_whose_copy_fails_fails_the_whole_restore_once_and_the_next_restore_wor
     let faults = Faults {
         gates: vec![(1, gate.clone())],
         cuts: Vec::new(),
+        host: None,
     };
     let mut scenario = scenario(&manager, 2, &[Reach::Local, Reach::Local], &faults);
     scenario.serve(None);
@@ -1060,6 +1074,7 @@ fn a_cut_link_with_a_rank_still_copying_stops_the_pool_and_reports_nothing() {
     let faults = Faults {
         gates: vec![(1, gate.clone())],
         cuts: vec![(1, cut.clone())],
+        host: None,
     };
     let mut scenario = scenario(&manager, 2, &[Reach::Local, Reach::Local], &faults);
     scenario.serve(None);
@@ -1188,4 +1203,326 @@ fn a_manager_that_restarts_is_reattached_by_every_rank_and_restores_again() {
     assert_eq!(result, Ok((pages * page + row) as u64));
     assert_slices(&requester, 2, pages, &scratch);
     requester.close();
+}
+
+// ---- the host tier ------------------------------------------------------------------
+
+/// One rank's record files: its slices of the checkpoint `bytes_of` makes, with the slice
+/// checksums persisted beside them (one of which is wrong when `bad`).
+struct RankFiles {
+    world: usize,
+    rank: usize,
+    pages: usize,
+    bad: bool,
+}
+
+impl RankFiles {
+    fn serve(&self, first_page: u32, pages: u32, row: bool, dst: &mut [u8]) -> Result<Checksums> {
+        let data = bytes_of(self.world, self.pages);
+        let (page, _) = whole(self.world);
+        let (mut at, mut sums) = (0, Vec::new());
+        for p in first_page as usize..(first_page + pages) as usize {
+            let from = p * page + self.rank * 8192;
+            dst[at..at + 8192].copy_from_slice(&data[from..from + 8192]);
+            sums.push(checksum(&data[from..from + 8192]));
+            at += 8192;
+        }
+        let row_sum = row.then(|| {
+            let from = self.pages * page + self.rank * 4096;
+            dst[at..at + 4096].copy_from_slice(&data[from..from + 4096]);
+            checksum(&data[from..from + 4096])
+        });
+        if self.bad {
+            sums[0] ^= 1;
+        }
+        Ok(Checksums {
+            pages: sums,
+            row: row_sum,
+        })
+    }
+}
+
+impl RankRecords for RankFiles {
+    fn read(
+        &mut self,
+        _key: PrefixKey,
+        generation: u64,
+        first_page: u32,
+        pages: u32,
+        row: bool,
+        dst: &mut [u8],
+    ) -> Result<Checksums> {
+        assert_eq!(generation, 11, "the generation the index holds");
+        self.serve(first_page, pages, row, dst)
+    }
+    fn fill(
+        &mut self,
+        _key: PrefixKey,
+        first_page: u32,
+        pages: u32,
+        row: bool,
+        dst: &mut [u8],
+    ) -> Result<Checksums> {
+        self.serve(first_page, pages, row, dst)
+    }
+}
+
+/// Rank 0's pin over its own files, as a store hands the engine: its slices, packed.
+struct ZeroPin {
+    chain: HostChain,
+    files: RankFiles,
+}
+
+impl HostPin for ZeroPin {
+    fn chain(&self) -> &HostChain {
+        &self.chain
+    }
+    fn read(&mut self, window: &HostWindow, dst: &mut [u8]) -> Result<Checksums> {
+        self.files
+            .serve(window.first_page, window.page_count, window.row, dst)
+    }
+}
+
+fn zero_pin(world: usize, key: PrefixKey, pages: usize) -> Box<dyn HostPin> {
+    Box::new(ZeroPin {
+        chain: HostChain {
+            records: vec![HostRecord {
+                key,
+                generation: 11,
+                first_page: 0,
+                pages: pages as u32,
+                row: true,
+            }],
+            total_pages: pages as u64,
+            row: true,
+        },
+        files: RankFiles {
+            world,
+            rank: 0,
+            pages,
+            bad: false,
+        },
+    })
+}
+
+/// Rank 0's bytes of a host put.
+struct ZeroBytes(RankFiles);
+
+impl PutBytes for ZeroBytes {
+    fn fill(
+        &mut self,
+        first_page: u64,
+        page_count: u32,
+        row: bool,
+        dst: &mut [u8],
+    ) -> Result<Checksums> {
+        self.0.serve(first_page as u32, page_count, row, dst)
+    }
+}
+
+/// A multi-process source whose records are in its ranks' files exports one to a plain
+/// instance; `bad` names a rank whose persisted checksum is wrong. Returns the fetch result.
+fn host_export(
+    manager: &Manager,
+    world: usize,
+    source_reach: &[Reach],
+    bad: Option<usize>,
+) -> std::result::Result<u64, String> {
+    let pages = 4;
+    let faults = Faults {
+        host: Some((pages, bad)),
+        ..Default::default()
+    };
+    let mut source = instance_with(manager, world, source_reach, 2, &faults);
+    let mut requester = plain(manager, world, Reach::Local);
+    source.ready();
+    wait("the requester", || {
+        requester.client.status() == PoolStatus::Ready
+    });
+    let history = history_of(4000);
+    let key = history.key_at(pages as u64 * PT).unwrap();
+    let (page, row) = whole(world);
+    source.rank0.saved(IndexEntry {
+        key,
+        parent: None,
+        bucket: history.bucket_at(key.consumed_tokens).unwrap(),
+        tail_pages: pages as u32,
+        row: true,
+        tier: Tier::Dram,
+        generation: 11,
+        bytes: (pages * page + row) as u64,
+    });
+    wait_offered(&requester.client, &history);
+    let scratch = [300, 301, 302, 303];
+    let fetch = fetch_for(&requester.client, world, &history, pages, &scratch);
+    requester.client.fetch(fetch).unwrap();
+    let export = source.event("an export request", |e| match e {
+        PoolEvent::Export(request) => Some(request.export),
+        _ => None,
+    });
+    source
+        .rank0
+        .host_pinned(export, zero_pin(world, key, pages));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let result = loop {
+        let mut events = Vec::new();
+        requester.client.poll(&mut events).unwrap();
+        source.poll();
+        if let Some(result) = events.into_iter().find_map(|e| match e {
+            PoolEvent::Fetched { result, .. } => {
+                Some(result.as_ref().map(|b| *b).map_err(|f| f.error.to_string()))
+            }
+            _ => None,
+        }) {
+            break result;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the restore"
+        );
+        thread::sleep(Duration::from_millis(2));
+    };
+    if result.is_ok() {
+        let data = bytes_of(world, pages);
+        let landed = requester.memory.pages.lock().unwrap();
+        for (i, id) in scratch.iter().enumerate() {
+            assert_eq!(
+                landed.get(id).map(Vec::as_slice),
+                Some(&data[i * page..(i + 1) * page]),
+                "page {i} of the whole record"
+            );
+        }
+        assert_eq!(
+            requester
+                .memory
+                .rows
+                .lock()
+                .unwrap()
+                .get(&9)
+                .map(Vec::as_slice),
+            Some(&data[pages * page..]),
+            "the whole row"
+        );
+    }
+    source.close();
+    let _ = requester.client.close();
+    result
+}
+
+#[test]
+fn a_two_rank_instance_exports_a_record_from_its_ranks_files() {
+    let (page, row) = whole(2);
+    assert_eq!(
+        host_export(&Manager::start(), 2, &[Reach::Local, Reach::Local], None),
+        Ok((4 * page + row) as u64)
+    );
+}
+
+#[test]
+fn a_peer_on_a_channel_exports_its_files_slices_to_the_manager() {
+    let manager = Manager::start_network(false);
+    let (page, row) = whole(2);
+    assert_eq!(
+        host_export(&manager, 2, &[Reach::Local, Reach::Network], None),
+        Ok((4 * page + row) as u64)
+    );
+}
+
+#[test]
+fn three_ranks_mixing_shared_memory_and_channels_export_from_their_files() {
+    let manager = Manager::start_network(false);
+    let (page, row) = whole(3);
+    assert_eq!(
+        host_export(
+            &manager,
+            3,
+            &[Reach::Network, Reach::Local, Reach::Network],
+            None
+        ),
+        Ok((4 * page + row) as u64)
+    );
+}
+
+#[test]
+fn a_peers_wrong_persisted_checksum_fails_the_export_from_its_files() {
+    for reach in [Reach::Local, Reach::Network] {
+        let manager = Manager::start_network(false);
+        let result = host_export(&manager, 2, &[Reach::Local, reach], Some(1));
+        assert!(result.is_err(), "a corrupted file reached the requester");
+    }
+}
+
+/// A multi-process writer puts a record from its ranks' files; a plain instance restores it.
+fn host_put(manager: &Manager, world: usize, reach: &[Reach]) {
+    let pages = 4;
+    let faults = Faults {
+        host: Some((pages, None)),
+        ..Default::default()
+    };
+    let mut writer = instance_with(manager, world, reach, 2, &faults);
+    writer.ready();
+    let history = history_of(4000);
+    let key = history.key_at(pages as u64 * PT).unwrap();
+    writer
+        .rank0
+        .put(PutRequest {
+            key,
+            parent: None,
+            bucket: history.bucket_at(key.consumed_tokens).unwrap(),
+            chain_pages: pages as u64,
+            tail_pages: pages as u64,
+            row: true,
+            generation: 1,
+            source: PutSource::Host(Box::new(ZeroBytes(RankFiles {
+                world,
+                rank: 0,
+                pages,
+                bad: false,
+            }))),
+        })
+        .unwrap();
+    let outcome = writer.event("the put", |e| match e {
+        PoolEvent::Put { outcome, .. } => Some(format!("{outcome:?}")),
+        _ => None,
+    });
+    assert!(outcome.starts_with("Stored"), "{outcome}");
+    let (page, row) = whole(world);
+    let mut plain = plain(manager, world, Reach::Local);
+    wait("the reader", || plain.client.status() == PoolStatus::Ready);
+    wait_offered(&plain.client, &history);
+    let scratch = [300, 301, 302, 303];
+    let fetch = fetch_for(&plain.client, world, &history, pages, &scratch);
+    plain.client.fetch(fetch).unwrap();
+    expect_fetched(
+        &mut plain.client,
+        "the restore",
+        (pages * page + row) as u64,
+    );
+    let data = bytes_of(world, pages);
+    let landed = plain.memory.pages.lock().unwrap();
+    for (i, id) in scratch.iter().enumerate() {
+        assert_eq!(
+            landed.get(id).map(Vec::as_slice),
+            Some(&data[i * page..(i + 1) * page]),
+            "page {i}"
+        );
+    }
+    assert_eq!(
+        plain.memory.rows.lock().unwrap().get(&9).map(Vec::as_slice),
+        Some(&data[pages * page..])
+    );
+    drop(landed);
+    let _ = plain.client.close();
+    writer.close();
+}
+
+#[test]
+fn a_two_rank_instance_spills_a_record_from_its_ranks_files() {
+    host_put(&Manager::start(), 2, &[Reach::Local, Reach::Local]);
+}
+
+#[test]
+fn a_peer_on_a_channel_spills_its_files_slices() {
+    let manager = Manager::start_network(false);
+    host_put(&manager, 2, &[Reach::Local, Reach::Network]);
 }

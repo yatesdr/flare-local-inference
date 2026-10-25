@@ -1003,3 +1003,6 @@ slice into a packed buffer from a bounded registered pool, writes it into the ra
 and for a put reads the packed bytes and scatters them. A buffer returns to the pool only after
 the work request completed and the queue pair was quiesced or flushed, else it is quarantined
 with the leg.
+
+The queue-pair path is exercised in tests only with a stand-in device; it has not been run on
+real RDMA hardware.

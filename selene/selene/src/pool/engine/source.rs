@@ -76,6 +76,10 @@ struct Export {
     /// Shared-memory peers that have not yet drained their slice of a window, and the
     /// slice checksums those that have reported.
     peer_windows: HashMap<u32, PeerWindow>,
+    /// Windows whose rank-0 host read is running, and the persisted checksums of those
+    /// that finished before their peers did.
+    host_filling: std::collections::HashSet<u32>,
+    host_sums: HashMap<u32, Checksums>,
 }
 
 #[derive(Default)]
@@ -270,6 +274,8 @@ impl Engine {
             rank_channels: request.rank_channels.clone(),
             peers: Vec::new(),
             peer_windows: HashMap::new(),
+            host_filling: Default::default(),
+            host_sums: HashMap::new(),
         };
         self.source.exports.insert(id, export);
         self.event(PoolEvent::Export(ExportRequest {
@@ -394,8 +400,10 @@ impl Engine {
         // A multi-process instance's peers start before the manager can send a window.
         if self.ranks.is_some() {
             let opened = match &pin {
-                Pin::Gpu(chain) => self.open_export_peers(id, &records, chain, &rank_channels),
-                Pin::Host(_) => Err("a multi-process instance serves GPU exports only".into()),
+                Pin::Gpu(chain) => {
+                    self.open_export_peers(id, &records, Some(chain), &rank_channels)
+                }
+                Pin::Host(_) => self.open_export_peers(id, &records, None, &rank_channels),
             };
             if let Err(why) = opened {
                 eprintln!("warning: export {id} refused: {why}");
@@ -651,19 +659,77 @@ impl Engine {
                     page_count: spec.page_count,
                     row: spec.row,
                 };
+                // Rank 0 reads its own slices; in a shared window they are scattered into
+                // place beside the peers' (a channel's slot holds them packed).
+                let scatter = self
+                    .ranks
+                    .as_ref()
+                    .filter(|_| slot.is_none())
+                    .map(|ranks| ranks.layout.clone());
+                let shared: Vec<(usize, u64)> = run
+                    .peers
+                    .iter()
+                    .filter(|p| p.shared && p.done.is_none())
+                    .map(|p| (p.rank, p.xfer))
+                    .collect();
+                if self.ranks.is_some() {
+                    run.host_filling.insert(spec.index);
+                    if slot.is_none() && !shared.is_empty() {
+                        run.peer_windows.insert(
+                            spec.index,
+                            PeerWindow {
+                                left: shared.iter().map(|(rank, _)| *rank).collect(),
+                                sums: Vec::new(),
+                            },
+                        );
+                    }
+                }
+                let work: Box<dyn FnOnce(&mut [u8]) -> crate::Result<Checksums> + Send> =
+                    match scatter {
+                        Some(layout) => Box::new(move |dst| {
+                            let mut packed = vec![
+                                0u8;
+                                layout.slice_bytes(0, span.page_count, span.row)
+                                    as usize
+                            ];
+                            let sums = pin.lock().unwrap().read(&span, &mut packed)?;
+                            layout.scatter(0, dst, span.page_count, span.row, &packed)?;
+                            Ok(sums)
+                        }),
+                        None => Box::new(move |dst| pin.lock().unwrap().read(&span, dst)),
+                    };
                 let job = FillJob {
                     owner: FillOwner::Export(id),
                     window: spec.index,
                     address,
                     length: spec.length as usize,
-                    work: Box::new(move |dst| pin.lock().unwrap().read(&span, dst)),
+                    work,
                 };
                 if !self.submit_fill(job) {
                     let run = self.source.exports.get_mut(&id).expect("present");
                     run.jobs_outstanding -= 1;
+                    run.host_filling.remove(&spec.index);
                     run.failed = true;
                     self.fill_failed(id, spec.index);
                     return true;
+                }
+                for (rank, xfer) in shared {
+                    let sent = self.ranks.as_ref().is_some_and(|ranks| {
+                        ranks.send_window(
+                            rank,
+                            super::super::rank::link::Window {
+                                xfer,
+                                spec: Some(spec),
+                                sums: None,
+                            },
+                        )
+                    });
+                    if !sent {
+                        if let Some(run) = self.source.exports.get_mut(&id) {
+                            run.failed = true;
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -726,7 +792,12 @@ impl Engine {
 
     pub(super) fn fill_done_if_idle(&mut self, export: u64, index: u32, spec: wire::WindowSpec) {
         if !self.window_still_running(export, index) {
-            self.fill_done(export, spec, None);
+            let supplied = self
+                .source
+                .exports
+                .get_mut(&export)
+                .and_then(|run| run.host_sums.remove(&index));
+            self.fill_done(export, spec, supplied);
         }
     }
 
@@ -739,6 +810,11 @@ impl Engine {
         let owner_is = |o: &Owner| matches!(o, Owner::Export { export: e, window: w } if *e == export && *w == window);
         self.jobs.values().any(owner_is)
             || self.pending.iter().any(|(_, o)| owner_is(o))
+            || self
+                .source
+                .exports
+                .get(&export)
+                .is_some_and(|run| run.host_filling.contains(&window))
             || self
                 .source
                 .exports
@@ -970,8 +1046,18 @@ impl Engine {
                 continue;
             };
             run.jobs_outstanding = run.jobs_outstanding.saturating_sub(1);
+            run.host_filling.remove(&window);
             match (result, run.windows.get(&window).cloned()) {
-                (Ok(sums), Some(spec)) => self.fill_done(export, spec, Some(sums)),
+                (Ok(sums), Some(spec)) => {
+                    if self.window_still_running(export, window) {
+                        // The peers' slices are not all in; the last of them completes it.
+                        if let Some(run) = self.source.exports.get_mut(&export) {
+                            run.host_sums.insert(window, sums);
+                        }
+                    } else {
+                        self.fill_done(export, spec, Some(sums));
+                    }
+                }
                 _ => {
                     run.failed = true;
                     self.fill_failed(export, window);

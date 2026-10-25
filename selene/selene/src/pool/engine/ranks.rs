@@ -363,14 +363,16 @@ impl super::Engine {
         &mut self,
         id: u64,
         records: &[wire::Record],
-        chain: &crate::ExportChain,
+        chain: Option<&crate::ExportChain>,
         rank_channels: &[wire::RankChannel],
     ) -> std::result::Result<(), String> {
         let Some(ranks) = self.ranks.as_mut() else {
             return Ok(());
         };
+        // `None`: a host-tier export, whose peers read their own record files.
         let mut pages = Vec::new();
-        for (index, node) in chain.nodes.iter().enumerate() {
+        for (index, node) in chain.iter().flat_map(|c| c.nodes.iter().enumerate()) {
+            let chain = chain.expect("a chain has nodes");
             let first = if index == 0 { chain.skip_pages } else { 0 } as usize;
             let count = records.get(index).map_or(0, |record| record.pages as usize);
             let Some(slice) = node.pages.get(first..first + count) else {
@@ -400,11 +402,12 @@ impl super::Engine {
                 fence_id: id,
                 records: records.to_vec(),
                 pages: pages.clone(),
-                has_slot: chain.row.is_some(),
-                slot: chain.row.map_or(0, |slot| slot.0),
+                has_slot: chain.is_some_and(|c| c.row.is_some()),
+                slot: chain.and_then(|c| c.row).map_or(0, |slot| slot.0),
                 channel,
                 page_bytes,
                 row_bytes,
+                host: chain.is_none(),
                 ..Default::default()
             };
             let Some(xfer) = ranks.open(rank, XferOwner::Export(id), open) else {
@@ -485,7 +488,7 @@ impl super::Engine {
         rank_channels: &[wire::RankChannel],
     ) -> std::result::Result<(), String> {
         let Some(setup) = self.writer.peer_setup(id, pages) else {
-            return Err("a multi-process instance writes GPU pages only".into());
+            return Err("the put's source cannot be set up for the peer ranks".into());
         };
         let Some(ranks) = self.ranks.as_mut() else {
             return Ok(());
@@ -515,11 +518,13 @@ impl super::Engine {
                 fence_id: id,
                 records: vec![setup.record.clone()],
                 pages: setup.pages.clone(),
-                has_slot: setup.row,
+                has_slot: setup.row && !setup.host,
                 slot: setup.slot,
                 channel,
                 page_bytes,
                 row_bytes,
+                host: setup.host,
+                chain_first: setup.chain_first,
                 ..Default::default()
             };
             let Some(xfer) = ranks.open(rank, XferOwner::Put(id), open) else {
