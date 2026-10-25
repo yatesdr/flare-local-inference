@@ -1,0 +1,129 @@
+// The link between rank 0 of a multi-process instance and each peer rank's agent
+// (package selene.link). It is internal to the selene crate: Flare moves its frames
+// as opaque bytes, the manager never sees it. One frame is one LinkMessage.
+//
+// Rank 0 decides; an agent only moves its own slice of each window, between its GPU
+// and either the manager's shared windows or its own data channel, as told. See
+// docs: "Rank agents".
+syntax = "proto3";
+package selene.link;
+
+import "selene.proto";
+
+message LinkMessage {
+  oneof m {
+    // rank 0 -> agent
+    Hello hello = 1;
+    Bind bind = 2;
+    Open open = 3;
+    Window window = 4;
+    Cancel cancel = 5;
+    Close close = 6;
+    // agent -> rank 0
+    AgentHello agent_hello = 10;
+    Attached attached = 11;
+    Detached detached = 12;
+    WindowDone window_done = 13;
+    Done done = 14;
+  }
+}
+
+// First frame from rank 0.
+message Hello {
+  uint32 rank = 1;          // the agent's rank
+  uint32 world = 2;
+  bytes rank0_nonce = 3;    // rank 0's process_nonce
+  bytes layout = 4;         // the scope's layout fingerprint
+}
+
+// Second frame from rank 0, after the agent's AgentHello matched.
+message Bind {
+  bytes rank_secret = 1;
+}
+
+// First frame from the agent.
+message AgentHello {
+  uint32 rank = 1;
+  uint32 world = 2;
+  bytes agent_nonce = 3;
+  bytes layout = 4;
+  bytes gpu_uuid = 5;
+}
+
+// The agent is attached to the manager. Rank 0 accepts the rank only when the
+// incarnation equals its session's, and binds every later Open to (incarnation,
+// generation).
+message Attached {
+  uint64 manager_incarnation = 1;
+  uint64 generation = 2;
+  selene.v2.RankMode mode = 3;
+}
+
+// The attachment ended. The agent has cancelled and is draining its transfers (their
+// Done follow); it will send Attached again with a new generation.
+message Detached {
+  string reason = 1;
+}
+
+enum Dir {
+  DIR_UNSPECIFIED = 0;
+  IN = 1;    // manager window -> GPU (restore)
+  OUT = 2;   // GPU -> manager window (export, put)
+}
+
+// Start this rank's part of one transfer. xfer is strictly increasing per rank-0 process.
+message Open {
+  uint64 xfer = 1;
+  uint64 manager_incarnation = 2;
+  uint64 generation = 3;
+  Dir dir = 4;
+  selene.v2.RankFence.Kind kind = 5;
+  uint64 fence_id = 6;                // the id RankFence names (claim, export or put id)
+  repeated selene.v2.Record records = 7;
+  repeated uint32 pages = 8;          // this rank's GPU page ids, in the order the transfer consumes pages
+  bool has_slot = 9;
+  uint32 slot = 10;                   // the state slot of the row
+  selene.v2.DataChannelRef channel = 11;   // set: channel mode; unset: shared windows
+  uint64 page_bytes = 12;             // whole page record bytes (window arithmetic)
+  uint64 row_bytes = 13;
+}
+
+message SliceSums {
+  repeated uint64 pages = 1;
+  uint64 row = 2;
+  bool has_row = 3;
+}
+
+// Shared mode: one window of an open transfer. For IN, sums are this rank's slice
+// transfer checksums, which it verifies before the copy; for OUT, sums is unset.
+message Window {
+  uint64 xfer = 1;
+  selene.v2.WindowSpec spec = 2;
+  SliceSums sums = 3;
+}
+
+message Cancel {
+  uint64 xfer = 1;
+}
+
+message Close {}
+
+// Shared mode: this rank's copy of one window drained. For OUT it carries the slice
+// transfer checksums of what the rank wrote.
+message WindowDone {
+  uint64 xfer = 1;
+  uint32 index = 2;
+  bool ok = 3;
+  string error = 4;
+  SliceSums sums = 5;
+}
+
+// The transfer is over for this rank: exact coverage, every accepted job drained and,
+// for a channel, the socket shut down. Exactly one per Open. quarantined: the drain
+// could not be proven and the agent keeps what it cannot release.
+message Done {
+  uint64 xfer = 1;
+  bool ok = 2;
+  string error = 3;
+  bool quarantined = 4;
+}
