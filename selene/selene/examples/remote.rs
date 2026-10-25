@@ -288,7 +288,7 @@ impl Pool {
         let candidate = answer
             .candidates
             .iter()
-            .find(|c| c.plan.source == part.source && c.plan.generation == part.generation)
+            .find(|c| c.plan.source == part.source && c.plan.key == part.end)
             .unwrap()
             .clone();
         let fetch = PoolFetch {

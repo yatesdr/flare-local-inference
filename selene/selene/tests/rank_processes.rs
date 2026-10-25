@@ -194,7 +194,7 @@ struct Cluster {
     agents: Vec<Node>,
 }
 
-fn cluster(world: usize, stalls: &[u64]) -> Cluster {
+fn cluster(world: usize, holds: &[bool]) -> Cluster {
     let manager = Manager::start();
     let socket = manager.socket.to_str().unwrap().to_string();
     let world_text = world.to_string();
@@ -210,7 +210,7 @@ fn cluster(world: usize, stalls: &[u64]) -> Cluster {
     let link = format!("127.0.0.1:{port}");
     let mut agents = Vec::new();
     for rank in 1..world {
-        let stall = stalls.get(rank - 1).copied().unwrap_or(0).to_string();
+        let hold = holds.get(rank - 1).copied().unwrap_or(false).to_string();
         agents.push(Node::spawn(
             &format!("agent {rank}"),
             &[
@@ -223,8 +223,8 @@ fn cluster(world: usize, stalls: &[u64]) -> Cluster {
                 &rank.to_string(),
                 "--link",
                 &link,
-                "--stall-ms",
-                &stall,
+                "--hold-copy",
+                &hold,
             ],
         ));
     }
@@ -283,12 +283,11 @@ fn four_ranks_in_separate_processes_restore_a_record() {
 }
 
 #[test]
-fn a_killed_peer_stops_rank_zero_without_a_result_and_its_windows_come_back_when_it_is_gone() {
-    // The peer's copies take three seconds, so it is killed with a window in its hands.
-    let mut cluster = cluster(2, &[3_000]);
+fn a_killed_peer_stops_rank_zero_and_quarantined_windows_wait_for_process_exit() {
+    // Kill after submission while the peer holds its completion.
+    let mut cluster = cluster(2, &[true]);
     cluster.rank0.send("restore");
-    cluster.source.expect("served", 20);
-    thread::sleep(Duration::from_millis(600));
+    cluster.agents[0].expect("copy pending", 20);
     cluster.agents[0].kill();
     assert!(
         cluster.rank0.says("poll err", 30),
@@ -296,8 +295,12 @@ fn a_killed_peer_stops_rank_zero_without_a_result_and_its_windows_come_back_when
     );
     // No result was ever given for pages the dead rank may have been writing.
     assert!(!cluster.rank0.says("fetched ok", 1));
-    // The windows the dead process held are released once its exit is confirmed.
-    wait_for("the dead rank's windows to be released", || {
+    // Rank zero cannot prove its peer drained and has quarantined the whole claim.
+    wait_for("the claim to be quarantined", || {
+        cluster.manager.gauge("selene_pool_quarantined_bytes") > 0
+    });
+    cluster.rank0.kill();
+    wait_for("all quarantined participants to exit", || {
         cluster.manager.gauge("selene_pool_quarantined_bytes") == 0
     });
     cluster.source.send("quit");
@@ -305,11 +308,11 @@ fn a_killed_peer_stops_rank_zero_without_a_result_and_its_windows_come_back_when
 
 #[test]
 fn a_killed_rank_zero_lets_the_agents_drain_attest_and_exit() {
-    let mut cluster = cluster(2, &[1_500]);
+    let mut cluster = cluster(2, &[true]);
     cluster.rank0.send("restore");
-    cluster.source.expect("served", 20);
-    thread::sleep(Duration::from_millis(400));
+    cluster.agents[0].expect("copy pending", 20);
     cluster.rank0.kill();
+    cluster.agents[0].send("release");
     // The agent sees its link close, finishes the copy it started, attests to the manager and
     // stops.
     assert!(
