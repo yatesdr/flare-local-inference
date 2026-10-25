@@ -59,6 +59,10 @@ fn stalled(idle: Duration, delivered: bool, disk_idle: Option<Duration>) -> bool
 }
 pub const DEFAULT_MAX_WINDOW: u64 = 4 * 1024 * 1024;
 
+/// The staging of a store built in code (an embedding or a test). The command line always sets it
+/// from `--staging`, whose default is larger.
+pub const EMBEDDED_STAGING: usize = 16 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct Config {
     pub name: String,
@@ -82,7 +86,7 @@ impl Config {
             socket,
             memory,
             nvme,
-            staging: 64 * 1024 * 1024,
+            staging: EMBEDDED_STAGING,
             metrics: None,
             faults: disk::Faults::default(),
             write_budget: 0,
@@ -98,7 +102,7 @@ impl Config {
             socket,
             memory,
             nvme: 0,
-            staging: 64 * 1024 * 1024,
+            staging: EMBEDDED_STAGING,
             metrics: None,
             faults: disk::Faults::default(),
             write_budget: 0,
@@ -6710,6 +6714,8 @@ mod tests {
         assert!(location.writing, "a stale completion cleared the new write");
         drop(store);
         let _ = fs::remove_dir_all(directory);
+        // `_root` is the instance's shared-memory directory.
+        let _ = fs::remove_dir_all(_root);
     }
 
     #[test]

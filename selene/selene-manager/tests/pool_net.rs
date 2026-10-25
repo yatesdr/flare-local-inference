@@ -252,10 +252,12 @@ fn startup_names_each_option_that_widens_the_exposure() {
     std::fs::create_dir_all(&dir).unwrap();
     let socket = dir.join("run/m.sock");
     let address = free_address();
+    let name = support::instance_name("warn");
+    let _shm = support::ShmCleanup::new(&name);
     let child = Command::new(env!("CARGO_BIN_EXE_selene"))
         .args([
             "--name",
-            &support::instance_name("warn"),
+            &name,
             "--socket",
             socket.to_str().unwrap(),
             "--memory",

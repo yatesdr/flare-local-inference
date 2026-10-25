@@ -611,12 +611,15 @@ mod tests {
         use std::sync::mpsc as std_mpsc;
 
         let base = std::env::temp_dir().join(format!("selene-cleanup-{}", std::process::id()));
-        let config = crate::store::Config::new(
+        let mut config = crate::store::Config::new(
             base.join("records"),
             base.join("run/m.sock"),
             64 * 1024,
             64 << 20,
         );
+        config.name = format!("selene-cleanup-{}", std::process::id());
+        config.staging = 8 << 20;
+        let shm = std::path::Path::new(crate::local::SHM_ROOT).join(&config.name);
         let store = crate::store::Store::open(config.clone()).unwrap();
         fs::create_dir_all(config.socket.parent().unwrap()).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(&config.socket).unwrap();
@@ -689,5 +692,6 @@ mod tests {
         );
         drop(listener);
         let _ = std::fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(shm);
     }
 }
