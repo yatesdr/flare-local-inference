@@ -824,7 +824,7 @@ fn a_failure_with_a_copy_in_flight_reports_and_fences_only_after_it_drains() {
     // The manager gives up while both copies run.
     let out = rig.send(terminal(
         claim,
-        wire::ClaimState::Expired,
+        wire::ClaimState::Failed,
         wire::ClaimReason::Deadline,
         true,
     ));

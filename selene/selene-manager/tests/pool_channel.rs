@@ -263,7 +263,7 @@ async fn d3_an_instance_that_never_connects_expires_and_its_windows_return() {
     let terminal = reader.claim_terminal(1).await;
     assert_eq!(
         terminal.state,
-        v2::ClaimState::Expired as i32,
+        v2::ClaimState::Failed as i32,
         "{terminal:?}"
     );
     assert_eq!(terminal.reason, v2::ClaimReason::NoProgress as i32);
@@ -301,8 +301,7 @@ async fn d4_a_peer_that_dies_mid_transfer_fails_the_claim_and_frees_the_manager(
     drop(conn);
     let terminal = reader.claim_terminal(1).await;
     assert!(
-        terminal.state == v2::ClaimState::Failed as i32
-            || terminal.state == v2::ClaimState::Expired as i32,
+        terminal.state == v2::ClaimState::Failed as i32,
         "{terminal:?}"
     );
     reader.fence(1, v2::FenceOutcome::Drained).await;
@@ -647,8 +646,7 @@ mod over_rdma {
         drop(dialed);
         let terminal = reader.claim_terminal(1).await;
         assert!(
-            terminal.state == v2::ClaimState::Failed as i32
-                || terminal.state == v2::ClaimState::Expired as i32,
+            terminal.state == v2::ClaimState::Failed as i32,
             "{terminal:?}"
         );
         reader.fence(1, v2::FenceOutcome::Drained).await;

@@ -67,8 +67,6 @@ mod staging_tests {
 
 pub struct PoolConfig {
     pub limits: Limits,
-    /// How long a terminal claim's reply is kept to answer duplicates.
-    pub reply_retention: Duration,
     pub encryption: v2::Encryption,
     pub transports: Vec<v2::DataTransport>,
     /// The data channel instances without shared memory copy through, when the
@@ -82,7 +80,6 @@ impl Default for PoolConfig {
     fn default() -> Self {
         Self {
             limits: Limits::default(),
-            reply_retention: Duration::from_secs(60),
             encryption: v2::Encryption::Plaintext,
             transports: vec![v2::DataTransport::Tcp],
             channel: None,

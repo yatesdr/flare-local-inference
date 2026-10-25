@@ -155,7 +155,7 @@ impl Core {
                 rank,
                 proc,
                 shared,
-                fence: Party::Idle,
+                fence: Party::Drained,
             });
         }
         Ok(Some(MpSide { layout, peers }))
@@ -368,7 +368,7 @@ impl Core {
         let window = &mut claim.windows[index];
         window.phase = Phase::RequesterRead;
         window.readers = 1 | claim.mp.leg_readers();
-        claim.state = v2::ClaimState::Copying;
+        claim.state = v2::ClaimState::Granted;
         claim.last_progress = Instant::now();
         let requester_sid = claim.requester_sid;
         let rank0_leg = claim.channel.as_ref().map(|leg| leg.transfer);
@@ -465,7 +465,7 @@ impl Core {
         {
             for peer in &mut side.peers {
                 if !granted {
-                    peer.fence = Party::Idle;
+                    peer.fence = Party::Drained;
                 } else if exited.contains(&peer.proc) {
                     peer.fence = Party::Drained;
                 }

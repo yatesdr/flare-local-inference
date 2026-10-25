@@ -90,7 +90,6 @@ struct PartRun {
     fetch: FetchPart,
     expected: Vec<ExpectedRecord>,
     claim: Option<u64>,
-    copied: bool,
 }
 
 struct Restore {
@@ -125,7 +124,6 @@ struct Claim {
     jobs_outstanding: u32,
     bad: Option<wire::CopyOutcome>,
     verdict_sent: bool,
-    verdict_ok: bool,
     fence_sent: bool,
     /// The claim's bytes come over the data channel (this session has no shared memory).
     via_channel: bool,
@@ -248,7 +246,6 @@ impl Engine {
                 fetch: part.clone(),
                 expected,
                 claim: None,
-                copied: false,
             });
         }
         Ok(Restore {
@@ -314,7 +311,6 @@ impl Engine {
                 jobs_outstanding: 0,
                 bad: None,
                 verdict_sent: false,
-                verdict_ok: false,
                 fence_sent: false,
                 via_channel: self.dial.is_some(),
                 channel: None,
@@ -974,12 +970,12 @@ impl Engine {
         if let Some(channel) = &claim.channel {
             channel.stop();
         }
-        let (restore, part, verdict_ok) = (claim.restore, claim.part, claim.verdict_ok);
-        if state == wire::ClaimState::Copied as i32 && verdict_ok {
-            if let Some(run) = self.requester.restores.get_mut(&restore) {
-                run.parts[part].copied = true;
-            }
-        } else {
+        let (restore, part, verdict_ok) = (
+            claim.restore,
+            claim.part,
+            claim.verdict_sent && claim.bad.is_none(),
+        );
+        if state != wire::ClaimState::Copied as i32 || !verdict_ok {
             let error = Error::new(format!(
                 "claim ended {:?}: {:?}",
                 wire::ClaimState::try_from(state),
@@ -1037,7 +1033,6 @@ impl Engine {
                 && (claim.ended || !claim.via_channel)
                 && claim.peers.iter().all(|p| matches!(p.done, Some(Ok(()))))
             {
-                claim.verdict_ok = true;
                 Some(wire::CopyOutcome::CopyOk)
             } else {
                 None
@@ -1055,6 +1050,10 @@ impl Engine {
             .as_ref()
             .is_some_and(|t| !t.fence_required || claim.fence_sent)
             && claim.peers.iter().all(|p| p.done.is_some());
+        for message in send {
+            self.emit(message);
+        }
+        self.check_restore(restore);
         if gone {
             // Slots of windows that never reached a release go back with the claim.
             if let Some(mut claim) = self.requester.claims.remove(&id) {
@@ -1065,10 +1064,6 @@ impl Engine {
                 }
             }
         }
-        for message in send {
-            self.emit(message);
-        }
-        self.check_restore(restore);
     }
 
     fn check_restore(&mut self, id: u64) {
@@ -1086,7 +1081,20 @@ impl Engine {
                 return;
             }
             Err(restore.failure.clone().expect("checked"))
-        } else if restore.parts.iter().all(|p| p.copied) {
+        } else if drained
+            && restore.parts.iter().all(|part| {
+                part.claim
+                    .and_then(|id| self.requester.claims.get(&id))
+                    .is_some_and(|claim| {
+                        claim.verdict_sent
+                            && claim.bad.is_none()
+                            && claim
+                                .terminal
+                                .as_ref()
+                                .is_some_and(|t| t.state == wire::ClaimState::Copied as i32)
+                    })
+            })
+        {
             Ok(restore.bytes)
         } else {
             return;

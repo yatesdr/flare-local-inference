@@ -2,7 +2,6 @@
 
 use crate::proto::v2;
 pub use flare_selene::pool::Limits;
-use std::time::Duration;
 
 pub fn to_proto(limits: &Limits) -> v2::Limits {
     v2::Limits {
@@ -25,18 +24,7 @@ pub fn to_proto(limits: &Limits) -> v2::Limits {
 }
 
 /// The pool settings a manager is started with.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PoolSettings {
     pub limits: Limits,
-    /// How long a terminal claim's reply is kept to answer duplicates.
-    pub reply_retention: Duration,
-}
-
-impl Default for PoolSettings {
-    fn default() -> Self {
-        Self {
-            limits: Limits::default(),
-            reply_retention: Duration::from_secs(60),
-        }
-    }
 }

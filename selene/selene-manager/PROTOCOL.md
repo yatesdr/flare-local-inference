@@ -41,7 +41,7 @@ the instance side (`flare-selene`, `selene::pool`) implements the other.
    validates the chain shape. Index entries are hints: late evictions can remove
    a fresh hint and cause a miss, but cannot grant ownership or change bytes.
 6. **COPIED is the requester's word,** and only after exact coverage (section 5).
-   Everything else terminal is `FAILED` or `EXPIRED`.
+   Everything else terminal is `FAILED`.
 7. **Window ownership and reclaim.** A window passes manager, source, requester,
    manager. Each acknowledgment clears only the sending party's obligations
    (`ExportEnd`, `FenceAck`, `WindowReleased`, `Goodbye{quiesced}` are all
@@ -224,19 +224,14 @@ history; any mismatch drops the candidate.
 The manager holds one record per claim, keyed (instance_id, process_nonce,
 claim_id), mutated
 only by the manager's single claim task (so "one authoritative transition" is a
-compare-and-set on that task, not a lock). Three kinds of memory are kept apart:
+compare-and-set on that task, not a lock). Ownership and replay tracking are separate:
 
 - **Fence records** live until every party that could have touched the claim's
-  memory has drained (or its process is confirmed exited), however long
-  quarantine lasts. They are independent of reply retention.
-- **Reply records** (the terminal state and reason) are kept 60 s so duplicate
-  messages are answered.
-- **Replay tracking** is a per-instance high-water mark of claim ids (and put
-  ids). A `Claim` whose id is not above it is refused `INVALID_CLAIM`, so a
-  duplicate after the reply record expired cannot start a second lifecycle. A
-  `FenceAck`, `ExportEnd` or `ClaimRelease` after 60 s resolves through the fence
-  record, or is a no-op if none remains. The per-(instance, process) entry is dropped when its
-  process is confirmed exited and no fence record remains.
+  memory has drained or its process has exited, however long quarantine lasts.
+- **Replay tracking** uses a per-(instance, process) high-water mark. Reusing a
+  claim id is refused `INVALID_CLAIM`, without starting another lifecycle.
+  Fence acknowledgments still resolve through records retained for their memory.
+  A process entry is dropped after exit and after its final fence record is gone.
 
 ```
                       Claim
@@ -244,26 +239,19 @@ compare-and-set on that task, not a lock). Three kinds of memory are kept apart:
    |  refused at once: NOT_READY, CLAIM_LIMIT, SOURCE_LIMIT, UNKNOWN_SOURCE,
    |  STALE_SOURCE, INVALID_CLAIM  ==> FAILED  (ClaimTerminal, fence_required=false)
 
- REQUESTED --PinAck PINNED--> SOURCE_PINNED --grant sent--> GRANTED
- GRANTED --first WindowFilled OK / first data-channel transfer--> COPYING
- COPYING --CopyResult COPY_OK--> COPIED          (also allowed from GRANTED)
-
- any non-terminal --> FAILED   PinAck REFUSED (reason relayed), SOURCE_TIMEOUT,
-                               SOURCE_LOST, REQUESTER_LOST, ClaimRelease (CANCELLED),
-                               WindowFilled FILL_FAILED or non-OK CopyResult
-                               (COPY_ERROR / CHECKSUM), NO_WINDOWS, manager shutdown
- any non-terminal --> EXPIRED  whole-claim deadline, or progress_timeout with
-                               no WindowFilled/WindowReleased
+ REQUESTED --pin held, grant sent--> GRANTED
+ GRANTED --exact CopyResult COPY_OK--> COPIED
+ any non-terminal --> FAILED  refusal, loss, cancellation, copy error,
+                              deadline or no-progress timeout (reason preserved)
 ```
 
-Terminal means: `COPIED`, `FAILED`, `EXPIRED`. The first transition into a
+Terminal means `COPIED` or `FAILED`. The first transition into a
 terminal state wins and is final; later events for the claim only cause
 idempotent replies and fence bookkeeping. On entering a terminal state the
 manager, in this order:
 
 1. records the state and reason;
-2. sends `ClaimTerminal` to the requester (once; again only in answer to a later
-   `ClaimRelease`);
+2. sends `ClaimTerminal` to the requester once;
 3. sends `ExportCancel` to the source if its export has not ended;
 4. stops the data-channel transfer if any;
 5. starts fence tracking (section 7).
@@ -278,8 +266,8 @@ with exactly `total_pages` pages and the row. Anything else becomes
 `FAILED{COPY_ERROR}`. The requester performs the same coverage check on its side
 before sending `COPY_OK`.
 
-Manager-store sources have no export: `REQUESTED -> SOURCE_PINNED` is the
-manager's own reference on the record, taken inside the `Claim` handling, so
+Manager-store sources have no export: the manager takes its own reference
+on the record inside `Claim` handling before granting it, so
 refusals (record evicted) are immediate and identical on the wire.
 
 ### Message flow, normal GPU export (shared windows, retained)
@@ -291,11 +279,11 @@ requester          manager                    source (model worker via poll)
                   | ExportRequest{reserved_bytes}->| poll -> worker:
                   |                               |   revalidate chain, size <= reserved, headroom, pin_checkpoint
                   |<------------------ PinAck PINNED{records}
-                  | SOURCE_PINNED; allocate windows
+                  | pin held; allocate windows
  <--ClaimGranted--|  GRANTED (hold is now in force)
                   | ExportFill{windows} --------->| D2H into windows (lowest-priority stream)
                   |<------------ WindowFilled{i, xxh3}  (after the D2H drained)
- <--WindowReady---|  COPYING
+ <--WindowReady---|  GRANTED
  H2D from window i
  WindowReleased-->|  (after H2D drained)
                   |<------------ ExportEnd{COMPLETE, DRAINED}   (pin released after last fill)
@@ -346,7 +334,7 @@ that does not know it (restarted, or the claim was cancelled and forgotten).
 
 | Message | Duplicate or late arrival |
 |---|---|
-| `Claim` with a known id | answered with the current state if terminal, else ignored |
+| `Claim` with a reused id | refused `INVALID_CLAIM` |
 | `ClaimRelease` | no effect once terminal; unknown id answered `ClaimTerminal{FAILED, UNKNOWN_CLAIM}` |
 | `WindowReleased` | each (claim, index) returns its credit once |
 | `CopyResult` | first one counts; others ignored |
@@ -718,8 +706,8 @@ published. Waiting restores use the bounded claim-slot queue.
 | Retained staging for a GPU export | whole export reserved before the pin | manager reserves, source checks | `NO_WINDOWS`, immediate |
 | Pin answer time | `pin_deadline_ms` 250 | manager timer | `SOURCE_TIMEOUT`, late pin released |
 | Window credits (streamed claims and puts) | 2 | manager | no more windows until a release |
-| Claim deadline | clamped to 30 s | manager | `EXPIRED{DEADLINE}` |
-| No progress | 3 s | manager | `EXPIRED{NO_PROGRESS}` |
+| Claim deadline | clamped to 30 s | manager | `FAILED{DEADLINE}` |
+| No progress | 3 s | manager | `FAILED{NO_PROGRESS}` |
 | Concurrent lookups | 8 | manager | `OVERLOADED` |
 | Candidates, nodes, boundaries | 8, 4096, 8192 | both | trimmed (client) or `INVALID` (manager) |
 

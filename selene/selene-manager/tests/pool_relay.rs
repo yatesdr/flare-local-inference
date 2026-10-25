@@ -31,7 +31,6 @@ fn net() -> Net {
             store.pool.limits.pin_deadline_ms = 600;
             store.pool.limits.progress_timeout_ms = 600;
             store.pool.limits.max_window_bytes = 8 * PAGE_BYTES;
-            store.pool.reply_retention = Duration::from_millis(1500);
         },
     )
 }
@@ -381,8 +380,7 @@ async fn r5_a_requester_that_dies_mid_relay_cancels_the_export_and_stops_the_sou
     let _ = tokio::join!(source, requester);
     let terminal = w.requester.claim_terminal(1).await;
     assert!(
-        terminal.state == v2::ClaimState::Failed as i32
-            || terminal.state == v2::ClaimState::Expired as i32,
+        terminal.state == v2::ClaimState::Failed as i32,
         "{terminal:?}"
     );
     // The source is told to stop and releases what it pinned.
@@ -420,7 +418,7 @@ async fn r6_a_stalled_source_leg_expires_the_claim_and_the_manager_closes_it() {
     let terminal = w.requester.claim_terminal(1).await;
     assert_eq!(
         terminal.state,
-        v2::ClaimState::Expired as i32,
+        v2::ClaimState::Failed as i32,
         "{terminal:?}"
     );
     assert_eq!(terminal.reason, v2::ClaimReason::NoProgress as i32);
@@ -464,7 +462,7 @@ async fn r7_a_source_that_never_connects_expires_the_claim_and_returns_the_windo
     let terminal = w.requester.claim_terminal(1).await;
     assert_eq!(
         terminal.state,
-        v2::ClaimState::Expired as i32,
+        v2::ClaimState::Failed as i32,
         "{terminal:?}"
     );
     w.requester.fence(1, v2::FenceOutcome::Drained).await;
