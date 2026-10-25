@@ -11,10 +11,7 @@ use super::{
     core::{Core, Nonce, OpenPeer, ProcKey},
     index::InstanceId,
 };
-use crate::{
-    local::{Pidfd, open_pidfd},
-    proto::v2,
-};
+use crate::proto::v2;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
@@ -152,16 +149,7 @@ impl Core {
             link: None,
         });
         entry.idle_since = None;
-        if entry.pid.is_none()
-            && let Some(pid) = started_pid
-        {
-            entry.pid = Some(pid);
-            match open_pidfd(pid) {
-                Pidfd::Open(fd) => entry.pidfd = Some(fd),
-                Pidfd::Exited => entry.exited = true,
-                Pidfd::Unknown => {}
-            }
-        }
+        entry.watch(started_pid);
         self.agents.insert(
             aid,
             Agent {

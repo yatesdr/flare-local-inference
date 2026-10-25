@@ -12,7 +12,7 @@ use super::{
 use crate::{
     arena::Arena,
     data::channel::{self, Hub},
-    local::{Pidfd, open_pidfd, pidfd_exited},
+    local::{pidfd_exited, watch_pid},
     proto::v2::{self, server_message::M},
 };
 use std::{
@@ -216,6 +216,19 @@ pub(super) struct Proc {
     pub idle_since: Option<Instant>,
     /// The process's connection to the manager's store, opened on first use.
     pub link: Option<Link>,
+}
+
+impl Proc {
+    pub(super) fn watch(&mut self, pid: Option<u32>) {
+        if self.pid.is_none()
+            && let Some(pid) = pid
+        {
+            self.pid = Some(pid);
+            let (pidfd, exited) = watch_pid(pid);
+            self.pidfd = pidfd;
+            self.exited |= exited;
+        }
+    }
 }
 
 pub(super) struct ScopeState {
@@ -579,16 +592,7 @@ impl Core {
             link: None,
         });
         entry.idle_since = None;
-        if entry.pid.is_none() {
-            if let Some(pid) = started_pid {
-                entry.pid = Some(pid);
-                match open_pidfd(pid) {
-                    Pidfd::Open(fd) => entry.pidfd = Some(fd),
-                    Pidfd::Exited => entry.exited = true,
-                    Pidfd::Unknown => {}
-                }
-            }
-        }
+        entry.watch(started_pid);
         let fresh = !self.scopes.contains_key(&scope.id);
         self.scopes.entry(scope.id).or_insert_with(|| ScopeState {
             valid: scope.clone(),
