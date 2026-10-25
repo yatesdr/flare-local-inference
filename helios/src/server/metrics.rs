@@ -267,6 +267,7 @@ pub(super) struct Metrics {
     host_bytes_out: AtomicU64,
     host_bytes_in: AtomicU64,
     host_outbound_in_flight: AtomicU64,
+    host_parked_records: AtomicU64,
     host_inbound_in_flight: AtomicU64,
     host_memory_records: AtomicU64,
     host_memory_bytes: AtomicU64,
@@ -517,6 +518,7 @@ impl Metrics {
                 &self.host_outbound_in_flight,
                 stats.outbound_in_flight as u64,
             ),
+            (&self.host_parked_records, stats.parked_records as u64),
             (&self.host_inbound_in_flight, stats.inbound_in_flight as u64),
             (&self.host_memory_records, stats.memory_records as u64),
             (&self.host_memory_bytes, stats.memory_bytes),
@@ -969,6 +971,11 @@ impl Metrics {
                 "host_cache_outbound_in_flight",
                 "Host store copy-outs in progress.",
                 &self.host_outbound_in_flight,
+            ),
+            (
+                "host_cache_parked_records",
+                "Host store records held in memory for a later write to disk, with no copy running.",
+                &self.host_parked_records,
             ),
             (
                 "host_cache_inbound_in_flight",

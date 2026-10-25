@@ -171,6 +171,8 @@ pub struct StoreStats {
     pub bytes_out: u64,
     pub bytes_in: u64,
     pub outbound_in_flight: usize,
+    /// Records held in memory for a later write to disk: complete, no copy running.
+    pub parked_records: usize,
     pub inbound_in_flight: usize,
     pub memory_records: usize,
     pub memory_bytes: u64,

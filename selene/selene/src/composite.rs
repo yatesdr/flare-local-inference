@@ -1330,8 +1330,16 @@ impl HostStore for CompositeStore {
     fn stats(&self) -> StoreStats {
         let memory = self.memory.stats();
         let disk = self.disk.stats();
+        // A parked record has its outbound entry but no copy running.
+        let parked = self
+            .parked
+            .values()
+            .filter(|parked| !parked.writing)
+            .count();
         StoreStats {
-            outbound_in_flight: self.outbound.len() + disk.outbound_in_flight,
+            outbound_in_flight: self.outbound.len().saturating_sub(parked)
+                + disk.outbound_in_flight,
+            parked_records: parked,
             inbound_in_flight: self.inbound.len() + disk.inbound_in_flight,
             memory_records: memory.memory_records,
             memory_bytes: memory.memory_bytes,
@@ -2650,7 +2658,10 @@ mod tests {
         let mut ids = Ids::new();
         let root = parked_root(&mut store, &mut ids, 1, 640);
 
-        // The copy landed and the file is reserved, but nothing is written.
+        // The copy landed and the file is reserved, but nothing is written, and
+        // nothing is in flight: the record is parked, not copying.
+        let stats = store.stats();
+        assert_eq!((stats.outbound_in_flight, stats.parked_records), (0, 1));
         let node = store.disk.index().node(&root.key).unwrap();
         assert!(!node.ready && node.pinned() && node.row);
         assert!(store.outbound[&root.key].write.is_none());
@@ -2690,7 +2701,11 @@ mod tests {
         );
         assert!(store.parked[&root.key].writing);
         assert_eq!(store.jobs.len(), 1);
+        // Once its write runs it is in flight and no longer parked.
+        let stats = store.stats();
+        assert_eq!((stats.outbound_in_flight, stats.parked_records), (1, 0));
         poll_until(&mut store, &mut events, |store| store.outbound.is_empty());
+        assert_eq!(store.stats().parked_records, 0);
         let node = store.disk.index().node(&root.key).unwrap();
         assert!(node.ready && !node.pinned());
         assert!(store.memory.record(&root.key).unwrap().durable);
