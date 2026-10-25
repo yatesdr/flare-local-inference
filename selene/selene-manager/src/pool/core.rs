@@ -212,7 +212,6 @@ pub(super) struct Session {
     pub lookups: HashSet<u64>,
     /// `Goodbye` with this value was received.
     pub goodbye: Option<bool>,
-    pub installed_once: bool,
     /// The outbound queue overflowed; the session is closed at the next turn.
     pub overflowed: bool,
     /// Set for rank 0 of a multi-process instance.
@@ -674,7 +673,6 @@ impl Core {
                 staged: None,
                 lookups: HashSet::new(),
                 goodbye: None,
-                installed_once: false,
                 overflowed: false,
                 ranks,
             },

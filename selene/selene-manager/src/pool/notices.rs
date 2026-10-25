@@ -221,7 +221,6 @@ impl Core {
         let session = self.sessions.get_mut(&sid).expect("checked above");
         session.need_resync = false;
         session.resync_requested = false;
-        session.installed_once = true;
         session.expected_next = watermark + 1 + buffered;
         let applied_through = session.expected_next - 1;
         self.send(

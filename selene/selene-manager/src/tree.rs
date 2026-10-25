@@ -11,10 +11,6 @@ pub struct Node<L> {
     pub location: L,
     children: u32,
     pins: u32,
-    /// An operator pinned this record; independent of transfer pins.
-    admin: bool,
-    /// Number of admin-pinned descendants that need this node as an ancestor.
-    admin_children: u32,
     accessed: u64,
 }
 
@@ -26,21 +22,7 @@ impl<L> Node<L> {
         self.children
     }
     pub fn pinned(&self) -> bool {
-        self.pins > 0 || self.admin || self.admin_children > 0
-    }
-
-    pub fn admin_pinned(&self) -> bool {
-        self.admin
-    }
-
-    /// Toggle the operator pin. Returns whether the direct flag changed; ancestors keep a
-    /// reference count so a pinned record cannot lose its chain to eviction or purge.
-    pub fn set_admin(&mut self, on: bool) -> bool {
-        if self.admin == on {
-            return false;
-        }
-        self.admin = on;
-        true
+        self.pins > 0
     }
 }
 
@@ -118,8 +100,6 @@ impl<L> Tree<L> {
                 location,
                 children: 0,
                 pins: 0,
-                admin: false,
-                admin_children: 0,
                 accessed: 0,
             },
         );
@@ -153,41 +133,6 @@ impl<L> Tree<L> {
             .checked_sub(1)
             .ok_or_else(|| invalid("host record has no pin to release"))?;
         Ok(())
-    }
-
-    /// Toggle an operator pin. Repeated calls with the same value are no-ops. Returns the
-    /// number of records whose direct protection changed (zero or one).
-    pub fn admin_pin(&mut self, key: &Key, on: bool) -> Result<u32> {
-        let Some(node) = self.nodes.get(key) else {
-            return Err(invalid("cannot pin an unindexed host record"));
-        };
-        if node.admin == on {
-            return Ok(0);
-        }
-        let before = node.pinned();
-        self.nodes.get_mut(key).unwrap().admin = on;
-        let mut changed = u32::from(self.nodes[key].pinned() != before);
-        let mut parent = self.nodes[key].parent;
-        while let Some(current) = parent {
-            let before = self.nodes[&current].pinned();
-            let node = self.nodes.get_mut(&current).unwrap();
-            node.admin_children = if on {
-                node.admin_children.saturating_add(1)
-            } else {
-                node.admin_children.saturating_sub(1)
-            };
-            if node.pinned() != before {
-                changed += 1;
-            }
-            parent = node.parent;
-        }
-        Ok(changed)
-    }
-
-    /// Remove every record, pinned or not. Used by a namespace purge; the caller retires the
-    /// extents and emits the removals.
-    pub fn take_all(&mut self) -> Vec<Node<L>> {
-        std::mem::take(&mut self.nodes).into_values().collect()
     }
 
     fn remove(&mut self, key: &Key) -> Result<Vec<Node<L>>> {

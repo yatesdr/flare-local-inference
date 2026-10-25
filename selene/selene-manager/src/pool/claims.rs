@@ -76,7 +76,6 @@ pub enum ExportState {
     None,
     Requested,
     Pinned,
-    Refused,
     Ended(Party),
 }
 
@@ -1163,7 +1162,7 @@ impl Core {
         let result = v2::PinResult::try_from(ack.result).unwrap_or(v2::PinResult::Unspecified);
         match result {
             v2::PinResult::Refused => {
-                claim.export = ExportState::Refused;
+                claim.export = ExportState::None;
                 claim.source_fence = Party::Idle;
                 let reason = refusal_reason(ack.refusal);
                 self.finish(key, v2::ClaimState::Failed, reason);
@@ -1268,7 +1267,6 @@ impl Core {
         claim.records = ack.records.clone();
         claim.total_pages = ack.total_pages;
         claim.row = ack.row;
-        claim.state = v2::ClaimState::SourcePinned;
         let now = Instant::now();
         claim.granted_at = Some(now);
         claim.last_progress = now;
@@ -2726,7 +2724,6 @@ mod tests {
                 staged: None,
                 lookups: HashSet::new(),
                 goodbye: None,
-                installed_once: true,
                 overflowed: false,
                 ranks: None,
             },
