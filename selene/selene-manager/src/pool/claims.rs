@@ -341,6 +341,9 @@ impl Core {
         if !self.ready() {
             return refuse(self, v2::ClaimReason::NotReady);
         }
+        if !self.ranks_ready(sid) {
+            return refuse(self, v2::ClaimReason::RanksDetached);
+        }
         if claim_slots == 0 || self.claims_in_flight((instance, nonce)) >= claim_slots as usize {
             return refuse(self, v2::ClaimReason::ClaimLimit);
         }
@@ -399,6 +402,9 @@ impl Core {
             }
             // A source or a requester without shared memory is relayed through the data
             // channel, which needs a manager that serves one.
+            if !self.ranks_ready(current) {
+                return refuse(self, v2::ClaimReason::RanksDetached);
+            }
             let source_session = &self.sessions[&current];
             if (mode == v2::CopyMode::DataChannel || !source_session.shm)
                 && self.cfg.channel.is_none()
@@ -1934,6 +1940,14 @@ impl Core {
         }
     }
 
+    // ------------------------------------------------------------------ rank agents
+
+    /// An agent attested that it drained one transfer.
+    pub(super) fn agent_fence(&mut self, _agent: ProcKey, _kind: i32, _id: u64, _party: Party) {}
+
+    /// An attached agent is gone or replaced: transfers it takes part in fail.
+    pub(super) fn agent_gone(&mut self, _agent: ProcKey) {}
+
     // ------------------------------------------------------------------ processes
 
     /// A process is confirmed gone: nothing it did can touch memory any more.
@@ -2115,6 +2129,7 @@ mod tests {
                 goodbye: None,
                 installed_once: true,
                 overflowed: false,
+                ranks: None,
             },
         );
         (core, rx)

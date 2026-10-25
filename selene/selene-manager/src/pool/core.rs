@@ -6,6 +6,7 @@ use super::{
     claims::{Claim, ClaimKey},
     index::{InstanceId, ScopeIndex, SourceId, Staged},
     limits::Limits,
+    ranks::{Agent, Ranks, Retained},
     store_bridge::{CatalogFeed, Link, PutKey, PutRec, StoreHandle},
     validate_scope,
 };
@@ -133,6 +134,20 @@ pub enum Event {
     Closed {
         sid: u64,
     },
+    /// A peer rank's agent attaches.
+    RankOpen {
+        peer: OpenPeer,
+        attach: Box<v2::RankAttach>,
+        tx: mpsc::Sender<v2::RankServerMessage>,
+        reply: oneshot::Sender<Option<u64>>,
+    },
+    RankMessage {
+        aid: u64,
+        message: Box<v2::RankClientMessage>,
+    },
+    RankClosed {
+        aid: u64,
+    },
     PutAnswer {
         process: ProcKey,
         put_id: u64,
@@ -181,6 +196,8 @@ pub(super) struct Session {
     pub installed_once: bool,
     /// The outbound queue overflowed; the session is closed at the next turn.
     pub overflowed: bool,
+    /// Set for rank 0 of a multi-process instance.
+    pub ranks: Option<Ranks>,
 }
 
 pub(super) struct Instance {
@@ -222,6 +239,12 @@ pub struct Core {
     pub(super) next_session: u64,
     pub(super) instances: HashMap<InstanceId, Instance>,
     pub(super) procs: HashMap<ProcKey, Proc>,
+    /// Attached peer ranks of multi-process instances, by attachment id.
+    pub(super) agents: HashMap<u64, Agent>,
+    /// What ended rank-0 sessions leave so their agents can still drain.
+    pub(super) retained: HashMap<ProcKey, Retained>,
+    /// A session of this process is being replaced by another of the same process.
+    pub(super) reconnecting: Option<ProcKey>,
     pub(super) scopes: HashMap<ScopeId, ScopeState>,
     pub(super) claims: HashMap<super::claims::ClaimKey, Claim>,
     pub(super) exports: HashMap<u64, super::claims::ClaimKey>,
@@ -327,6 +350,9 @@ impl Core {
             next_session: 0,
             instances: HashMap::new(),
             procs: HashMap::new(),
+            agents: HashMap::new(),
+            retained: HashMap::new(),
+            reconnecting: None,
             scopes: HashMap::new(),
             claims: HashMap::new(),
             exports: HashMap::new(),
@@ -416,6 +442,17 @@ impl Core {
             }
             Event::Message { sid, message } => self.message(sid, *message),
             Event::Closed { sid } => self.session_lost(sid),
+            Event::RankOpen {
+                peer,
+                attach,
+                tx,
+                reply,
+            } => {
+                let aid = self.rank_open(peer, *attach, tx);
+                let _ = reply.send(aid);
+            }
+            Event::RankMessage { aid, message } => self.rank_message(aid, *message),
+            Event::RankClosed { aid } => self.rank_closed(aid),
             Event::PutAnswer {
                 process,
                 put_id,
@@ -427,6 +464,7 @@ impl Core {
             Event::Shutdown { done } => self.begin_shutdown(done),
         }
         self.flush_overflowed();
+        self.flush_agent_overflow();
     }
 
     // ------------------------------------------------------------------ sending
@@ -491,7 +529,7 @@ impl Core {
 
     // ------------------------------------------------------------------ open
 
-    fn open(
+    pub(super) fn open(
         &mut self,
         peer: OpenPeer,
         open: v2::OpenSession,
@@ -525,6 +563,17 @@ impl Core {
         ) else {
             return refuse(v2::OpenStatus::InvalidScope, self);
         };
+        let ranks = if open.rank_secret.is_empty() {
+            None
+        } else {
+            match <[u8; 32]>::try_from(open.rank_secret.as_slice()) {
+                Ok(secret) if scope.descriptor.ranks.len() >= 2 => Some(Ranks {
+                    world: scope.descriptor.ranks.len() as u32,
+                    secret,
+                }),
+                _ => return refuse(v2::OpenStatus::InvalidScope, self),
+            }
+        };
         let limits = &self.cfg.limits;
         let shm = peer.unix && peer.uid == self.euid && peer.gid == self.egid;
         // A session without shared memory serves exports over the data channel.
@@ -536,11 +585,14 @@ impl Core {
         let claim_slots = open.claim_slots.min(limits.max_claims_in_flight);
 
         if let Some(old) = self.instances.get(&instance).and_then(|i| i.current) {
+            // The same process reconnecting keeps its agents; another process does not.
+            self.reconnecting = Some((instance, nonce));
             self.close_session(
                 old,
                 v2::ClosingReason::ClosingSuperseded,
                 "a newer session opened",
             );
+            self.reconnecting = None;
         }
 
         self.next_session += 1;
@@ -603,6 +655,7 @@ impl Core {
                 goodbye: None,
                 installed_once: false,
                 overflowed: false,
+                ranks,
             },
         );
         if self.remembered.touch(instance, SystemTime::now()) {
@@ -665,6 +718,12 @@ impl Core {
         }
         self.session_claims_lost(sid, &session);
         self.puts_lost(&session);
+        if let Some(ranks) = &session.ranks
+            && is_current
+            && self.reconnecting != Some(proc_key)
+        {
+            self.rank0_lost(session.instance, session.nonce, ranks.secret);
+        }
         if self.remembered.touch(session.instance, SystemTime::now()) {
             self.barrier_dirty = true;
         }
@@ -845,6 +904,7 @@ impl Core {
         self.poll_exits();
         self.lookup_pass();
         self.claim_timers(now);
+        self.prune_retained();
         self.prune_procs();
         self.resync_timers(now);
         // Keep live instances fresh in the persisted list.
@@ -875,6 +935,7 @@ impl Core {
             .chain(self.claims.keys().map(|key| (key.0, key.1)))
             .chain(self.claims.values().filter_map(|claim| claim.source_proc))
             .chain(self.puts.keys().map(|key| (key.0, key.1)))
+            .chain(self.agents.values().map(|agent| agent.proc()))
             .collect();
         let now = Instant::now();
         let mut forget = Vec::new();
