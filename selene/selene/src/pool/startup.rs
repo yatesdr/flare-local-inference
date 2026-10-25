@@ -24,6 +24,18 @@ pub struct RegisteredRegion {
     pub bytes: usize,
 }
 
+/// A range the client is about to register, offered to the approval callback before any is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedRegion {
+    /// As [`RegisteredRegion::name`].
+    pub name: &'static str,
+    /// Its length in bytes.
+    pub bytes: u64,
+}
+
+/// Judges the complete registration plan. `Err(reason)` registers nothing.
+pub type Approve = std::sync::Arc<dyn Fn(&[PlannedRegion]) -> Result<(), String> + Send + Sync>;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     /// The I/O thread has not reached the manager yet.

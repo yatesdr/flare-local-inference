@@ -25,7 +25,7 @@ use super::{
     identity::{self, Scope},
     lookup::{LookupState, LookupTicket},
     shared::{Command, PoolEvent, PoolFetch, PoolStatus, PutRequest, Shared},
-    startup::{RegisteredRegion, Startup},
+    startup::{Approve, RegisteredRegion, Startup},
     types::{HeldRange, Tier},
 };
 
@@ -67,6 +67,11 @@ pub struct PoolConfig {
     pub level_order: Option<[Level; 4]>,
     /// The device context made current when registering the shared regions.
     pub registration_context: usize,
+    /// Called once at startup with everything the client is about to register (see
+    /// [`PlannedRegion`]), after the manager's first Hello and before the first registration.
+    /// `Err(reason)` registers nothing: the pool is off for this process, with one warning naming
+    /// the sizes and the reason. `None` approves.
+    pub approve: Option<Approve>,
 }
 
 /// The in-process pool client. Built only when a pool address is configured.
@@ -207,6 +212,7 @@ impl PoolClient {
             wake,
             stop: stop.clone(),
             startup: startup.clone(),
+            approve: config.approve,
         };
         let thread = std::thread::Builder::new()
             .name("selene-pool".into())

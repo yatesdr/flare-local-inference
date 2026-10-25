@@ -23,7 +23,7 @@ use super::{
     net::{self, Dial},
     shared::PoolStatus,
     shm::{Attachment, Regions},
-    startup::{RegisteredRegion, Startup},
+    startup::{Approve, PlannedRegion, RegisteredRegion, Startup},
     wire::{self, client_message::M as Out, server_message::M as In},
 };
 
@@ -36,6 +36,8 @@ pub(crate) struct Link {
     pub stop: Arc<AtomicBool>,
     /// The registration window `PoolClient::start` waits on.
     pub startup: Arc<Startup>,
+    /// The startup approval of the registration plan, if any.
+    pub approve: Option<Approve>,
 }
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(3);
@@ -636,6 +638,37 @@ fn attach(
             // The first connect: the only time anything is registered.
             if !link.startup.begin() {
                 return Err(Attempt::Ended);
+            }
+            let plan = match hello.shared_memory.as_ref() {
+                Some(shared) => vec![
+                    PlannedRegion {
+                        name: "arena",
+                        bytes: shared.arena_bytes,
+                    },
+                    PlannedRegion {
+                        name: "staging",
+                        bytes: shared.staging_bytes,
+                    },
+                ],
+                None if network.is_some() => vec![PlannedRegion {
+                    name: "data-staging",
+                    bytes: engine.net_staging_bytes(&limits),
+                }],
+                None => Vec::new(),
+            };
+            if let Some(approve) = &link.approve {
+                if let Err(reason) = approve(&plan) {
+                    let sizes = plan
+                        .iter()
+                        .map(|region| format!("{} {} bytes", region.name, region.bytes))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    engine.close_registration();
+                    link.startup.done(Vec::new());
+                    return Err(Attempt::Disabled(format!(
+                        "the pool's host memory ({sizes}) was not approved ({reason}); using local tiers only"
+                    )));
+                }
             }
             let mut registered = Vec::new();
             let (attachment, regions, net) = match hello.shared_memory.as_ref() {

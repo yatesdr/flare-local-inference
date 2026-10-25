@@ -779,6 +779,7 @@ fn attach_pool(
         claim_slots: 2,
         level_order: None,
         registration_context,
+        approve: None,
     };
     let store = PooledStore::connect(
         adapter::Tiers::new(local),

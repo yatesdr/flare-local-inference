@@ -221,6 +221,7 @@ fn config(path: &std::path::Path) -> (PoolConfig, crate::SharedCopier) {
         claim_slots: 2,
         level_order: None,
         registration_context: 0,
+        approve: None,
     };
     (config, copier)
 }
