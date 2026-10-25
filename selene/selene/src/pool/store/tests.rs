@@ -157,7 +157,6 @@ impl HostPin for NoPin {
 
 #[derive(Default)]
 struct PoolState {
-    ranking: Option<Ranking>,
     host_pinned: Vec<ExportId>,
     refused: Vec<(ExportId, ExportRefusal)>,
     answer: Option<Arc<Answer>>,
@@ -176,7 +175,7 @@ struct PoolState {
 }
 
 #[derive(Clone)]
-struct FakePool(Arc<Mutex<PoolState>>, Ranking, Announcer);
+struct FakePool(Arc<Mutex<PoolState>>, Announcer);
 
 impl PoolPort for FakePool {
     fn begin_lookup(&self, _history: &dyn History, held: Vec<HeldRange>) -> LookupTicket {
@@ -199,14 +198,6 @@ impl PoolPort for FakePool {
         events.append(&mut self.0.lock().unwrap().events);
         Ok(())
     }
-    fn ranking(&self) -> Ranking {
-        self.0
-            .lock()
-            .unwrap()
-            .ranking
-            .clone()
-            .unwrap_or_else(|| self.1.clone())
-    }
     fn saved(&self, entry: IndexEntry) {
         self.0.lock().unwrap().saved.push(entry);
     }
@@ -217,25 +208,24 @@ impl PoolPort for FakePool {
             .evicted
             .push((key, tier, generation, heir));
     }
-    fn observe_restore(&self, level: Level, bytes: u64, elapsed: Duration) {
-        let mut ranking = self.ranking();
-        ranking.observe(level, bytes, elapsed);
-        self.0.lock().unwrap().ranking = Some(ranking);
-    }
     fn evictions_lost(&self) {
         self.0.lock().unwrap().lost += 1;
     }
     fn put(&mut self, request: PutRequest) -> Result<u64> {
         let mut state = self.0.lock().unwrap();
-        if !state.ready { return Err("the fake pool takes no puts".into()); }
-        if state.put_error { return Err("the pool's command queue is full".into()); }
+        if !state.ready {
+            return Err("the fake pool takes no puts".into());
+        }
+        if state.put_error {
+            return Err("the pool's command queue is full".into());
+        }
         let id = state.puts.len() as u64 + 1;
         state.puts.push((id, request));
         Ok(id)
     }
     fn cancel_put(&mut self, _: u64) {}
     fn announcer(&self) -> Announcer {
-        self.2.clone()
+        self.1.clone()
     }
     fn host_pinned(&mut self, export: ExportId, _: Box<dyn HostPin>) {
         self.0.lock().unwrap().host_pinned.push(export);
@@ -274,12 +264,11 @@ fn rig() -> Rig {
 fn rig_with(ranking: Ranking) -> Rig {
     let local = FakeLocal::default();
     let pool = Arc::new(Mutex::new(PoolState::default()));
-    Rig {
+    let mut rig = Rig {
         store: PooledStore::new(
             local.clone(),
             FakePool(
                 pool.clone(),
-                ranking,
                 Announcer::new(Arc::new(tokio::sync::Notify::new())),
             ),
             identity(),
@@ -288,7 +277,9 @@ fn rig_with(ranking: Ranking) -> Rig {
         local,
         pool,
         history: history(),
-    }
+    };
+    rig.store.rates = ranking;
+    rig
 }
 
 impl Rig {
@@ -328,7 +319,6 @@ impl Rig {
                 begin_tokens: begin,
                 skip_pages: (begin / PT - first_start) as usize,
                 nodes,
-
             },
             source: SourceRef {
                 instance: vec![source],
@@ -410,113 +400,122 @@ fn failure(part: usize, source: (SourceRef, Tier), no_headroom: bool) -> FetchFa
     }
 }
 
-// ---- two sources ----
+// ---- single-source restores ----
 
 #[test]
-fn local_restores_observe_only_successful_transfers_at_their_own_level() {
-    for tier in [Local::Memory, Local::Disk] {
-        for succeeds in [false, true] {
-            let mut rig = rig();
-            rig.local_hit(800, tier);
-            let hit = rig.store.lookup(&rig.history, 0, u64::MAX).unwrap();
-            let ticket = rig.ticket(&hit);
-            let key = hit.key;
-            let before = rig.store.pool.ranking();
-            rig.store.fetch(hit, ticket).unwrap();
-            assert_eq!(rig.store.pool.ranking(), before);
-            rig.local
-                .0
-                .lock()
-                .unwrap()
-                .events
-                .push(StoreEvent::Fetched {
-                    key,
-                    result: if succeeds {
-                        Ok(1)
-                    } else {
-                        Err("copy failed".into())
-                    },
-                });
-            assert_eq!(fetched(&rig.poll()), [(key, succeeds)]);
-            assert_eq!(rig.store.pool.ranking() != before, succeeds);
-            assert!(rig.store.local_timings.is_empty());
-        }
+fn only_successful_pool_restores_refine_the_level_bandwidth() {
+    for success in [false, true] {
+        let mut rig = rig();
+        rig.answer(vec![rig.candidate(Level::HostDram, 1, 0, 0, &[800], 0)]);
+        let hit = rig.lookup().unwrap();
+        let ticket = rig.ticket(&hit);
+        let before = rig.store.rates.clone();
+        rig.store.fetch(hit, ticket).unwrap();
+        assert_eq!(rig.store.rates, before);
+        rig.pool.lock().unwrap().events.push(PoolEvent::Fetched {
+            id: 1,
+            result: if success {
+                Ok(4096)
+            } else {
+                Err(failure(
+                    0,
+                    (
+                        SourceRef {
+                            instance: vec![1],
+                            session_incarnation: 1,
+                        },
+                        Tier::Dram,
+                    ),
+                    false,
+                ))
+            },
+        });
+        assert_eq!(fetched(&rig.poll()), [(rig.key(800), success)]);
+        assert_eq!(rig.store.rates != before, success);
     }
 }
 
 #[test]
-fn local_first_part_then_pool_part_with_one_row_from_the_pool() {
+fn a_longer_pool_copy_is_the_only_source_even_when_a_local_prefix_is_closer() {
     let mut rig = rig();
-    let ranking = rig.store.pool.ranking();
     rig.local_hit(800, Local::Memory);
-    rig.answer(vec![rig.candidate(Level::HostNvme, 2, 800, 0, &[1600], 0)]);
+    rig.answer(vec![rig.candidate(
+        Level::RemoteNvme,
+        2,
+        0,
+        0,
+        &[640, 1600],
+        0,
+    )]);
     let hit = rig.lookup().unwrap();
     assert_eq!((hit.key, hit.pages), (rig.key(1600), 100));
     let ticket = rig.ticket(&hit);
-    rig.store.fetch(hit, ticket).unwrap();
-    {
-        let local = rig.local.0.lock().unwrap();
-        assert_eq!(local.fetches.len(), 1);
-        assert_eq!(local.fetches[0].1.key, rig.key(800));
-        assert_eq!(
-            local.fetches[0].1.pages.len(),
-            50,
-            "A takes the first 50 destination pages"
-        );
-    }
-    assert!(
-        rig.pool.lock().unwrap().fetches.is_empty(),
-        "the pool part follows the local part"
-    );
-    rig.local
-        .0
-        .lock()
-        .unwrap()
-        .events
-        .push(StoreEvent::Fetched {
-            key: rig.key(800),
-            result: Ok(1),
-        });
-    assert!(
-        fetched(&rig.poll()).is_empty(),
-        "A done is not the restore done"
-    );
-    assert_ne!(rig.store.pool.ranking(), ranking);
-    let fetch = rig.pool.lock().unwrap().fetches[0].clone();
+    rig.store.fetch(hit, ticket.clone()).unwrap();
+    assert!(rig.local.0.lock().unwrap().fetches.is_empty());
+    let state = rig.pool.lock().unwrap();
+    let fetch = &state.fetches[0];
     assert_eq!(fetch.parts.len(), 1);
-    let part = &fetch.parts[0];
-    assert_eq!(
-        (part.part.begin_tokens, part.part.pages, part.part.row),
-        (800, 50, true)
-    );
-    assert_eq!(part.pages.first(), Some(&PageId(50)));
-    assert_eq!(part.slot, Some(StateSlotId(3)));
-    rig.pool.lock().unwrap().events.push(PoolEvent::Fetched {
-        id: 1,
-        result: Ok(5),
-    });
-    assert_eq!(fetched(&rig.poll()), [(rig.key(1600), true)]);
+    assert_eq!(fetch.parts[0].pages, ticket.pages);
+    assert_eq!(fetch.parts[0].slot, Some(ticket.slot));
+    assert!(fetch.parts[0].part.row);
 }
 
 #[test]
-fn a_failed_local_part_fails_the_restore_without_asking_the_pool() {
+fn a_longer_local_copy_wins_over_a_closer_pool_copy() {
     let mut rig = rig();
-    rig.local_hit(800, Local::Memory);
-    rig.answer(vec![rig.candidate(Level::HostNvme, 2, 800, 0, &[1600], 0)]);
+    rig.local_hit(1600, Local::Disk);
+    rig.answer(vec![rig.candidate(Level::HostDram, 2, 0, 0, &[800], 0)]);
     let hit = rig.lookup().unwrap();
     let ticket = rig.ticket(&hit);
     rig.store.fetch(hit, ticket).unwrap();
-    rig.local
-        .0
-        .lock()
-        .unwrap()
-        .events
-        .push(StoreEvent::Fetched {
-            key: rig.key(800),
-            result: Err("disk".into()),
-        });
-    assert_eq!(fetched(&rig.poll()), [(rig.key(1600), false)]);
+    assert_eq!(rig.local.0.lock().unwrap().fetches.len(), 1);
     assert!(rig.pool.lock().unwrap().fetches.is_empty());
+}
+
+#[test]
+fn a_failed_pool_source_is_not_replanned_and_reports_once_after_drain() {
+    let mut rig = rig();
+    rig.answer(vec![
+        rig.candidate(Level::HostDram, 1, 0, 0, &[1600], 0),
+        rig.candidate(Level::HostNvme, 2, 0, 0, &[1600], 0),
+    ]);
+    let hit = rig.lookup().unwrap();
+    let ticket = rig.ticket(&hit);
+    rig.store.fetch(hit, ticket).unwrap();
+    rig.pool.lock().unwrap().events.push(PoolEvent::Fetched {
+        id: 1,
+        result: Err(failure(
+            0,
+            (
+                SourceRef {
+                    instance: vec![1],
+                    session_incarnation: 1,
+                },
+                Tier::Dram,
+            ),
+            false,
+        )),
+    });
+    assert_eq!(fetched(&rig.poll()), [(rig.key(1600), false)]);
+    assert!(rig.poll().is_empty());
+    assert_eq!(rig.pool.lock().unwrap().fetches.len(), 1);
+}
+
+#[test]
+fn a_source_without_headroom_is_skipped_on_the_next_lookup() {
+    let mut rig = rig();
+    let candidate = rig.candidate(Level::HostDram, 1, 0, 0, &[1600], 0);
+    let source = (candidate.source.clone(), candidate.tier);
+    rig.answer(vec![candidate]);
+    let hit = rig.lookup().unwrap();
+    let ticket = rig.ticket(&hit);
+    rig.store.fetch(hit, ticket).unwrap();
+    rig.pool.lock().unwrap().events.push(PoolEvent::Fetched {
+        id: 1,
+        result: Err(failure(0, source, true)),
+    });
+    assert_eq!(fetched(&rig.poll()), [(rig.key(1600), false)]);
+    assert!(rig.lookup().is_none());
 }
 
 #[test]
@@ -557,115 +556,6 @@ fn a_failed_pool_restore_falls_back_to_the_local_copy_of_the_same_endpoint() {
 }
 
 #[test]
-fn a_pool_part_refused_after_the_local_part_fails_the_restore_once() {
-    let mut rig = rig();
-    rig.local_hit(800, Local::Memory);
-    rig.answer(vec![rig.candidate(Level::HostNvme, 2, 800, 0, &[1600], 0)]);
-    let hit = rig.lookup().unwrap();
-    let ticket = rig.ticket(&hit);
-    rig.store.fetch(hit, ticket).unwrap();
-    rig.pool.lock().unwrap().reject = true;
-    rig.local
-        .0
-        .lock()
-        .unwrap()
-        .events
-        .push(StoreEvent::Fetched {
-            key: rig.key(800),
-            result: Ok(1),
-        });
-    assert_eq!(fetched(&rig.poll()), [(rig.key(1600), false)]);
-    assert!(fetched(&rig.poll()).is_empty());
-}
-
-#[test]
-fn two_pool_parts_are_one_pool_restore_with_the_row_in_the_last_part_only() {
-    let mut rig = rig();
-    rig.answer(vec![
-        rig.candidate(Level::HostDram, 1, 0, 0, &[800], 0),
-        rig.candidate(Level::HostNvme, 2, 800, 0, &[1600], 0),
-    ]);
-    let hit = rig.lookup().unwrap();
-    assert_eq!((hit.key, hit.pages), (rig.key(1600), 100));
-    let ticket = rig.ticket(&hit);
-    rig.store.fetch(hit, ticket).unwrap();
-    let fetch = rig.pool.lock().unwrap().fetches[0].clone();
-    assert_eq!(fetch.parts.len(), 2);
-    let (a, b) = (&fetch.parts[0], &fetch.parts[1]);
-    assert_eq!(
-        (a.part.begin_tokens, a.part.pages, a.part.row),
-        (0, 50, false)
-    );
-    assert_eq!(
-        (b.part.begin_tokens, b.part.pages, b.part.row),
-        (800, 50, true)
-    );
-    assert_eq!((a.slot, b.slot), (None, Some(StateSlotId(3))));
-    assert_eq!(a.pages.len() + b.pages.len(), 100);
-    assert_eq!(b.pages[0], PageId(50), "disjoint and contiguous");
-    assert!(rig.local.0.lock().unwrap().fetches.is_empty());
-}
-
-#[test]
-fn a_split_inside_a_page_gives_a_row_only_second_part() {
-    let mut rig = rig();
-    rig.answer(vec![
-        rig.candidate(Level::HostDram, 1, 0, 0, &[808], 0),
-        rig.candidate(Level::HostNvme, 2, 808, 0, &[815], 0),
-    ]);
-    let hit = rig.lookup().unwrap();
-    assert_eq!(hit.key, rig.key(815));
-    let ticket = rig.ticket(&hit);
-    assert_eq!(ticket.pages.len(), 50, "floor(815/16) pages");
-    rig.store.fetch(hit, ticket).unwrap();
-    let fetch = rig.pool.lock().unwrap().fetches[0].clone();
-    let b = &fetch.parts[1];
-    assert_eq!((b.part.pages, b.part.row, b.pages.len()), (0, true, 0));
-    assert_eq!(b.slot, Some(StateSlotId(3)));
-}
-
-#[test]
-fn a_pool_part_is_never_planned_ahead_of_a_part_of_the_local_tiers() {
-    // A neighbour's pages end at 808; this host's own disk ends at 815, in the same page.
-    // The plan would take the pages from the neighbour and the row from the disk, which
-    // the store cannot run in that order. It must restore from the pool alone.
-    let mut rig = rig();
-    rig.local_hit(815, Local::Disk);
-    rig.answer(vec![rig.candidate(Level::NeighbourGpu, 1, 0, 0, &[808], 0)]);
-    let hit = rig.lookup().unwrap();
-    assert_eq!(hit.key, rig.key(808));
-    let ticket = rig.ticket(&hit);
-    rig.store.fetch(hit, ticket).unwrap();
-    let fetch = rig.pool.lock().unwrap().fetches[0].clone();
-    assert_eq!(fetch.parts.len(), 1);
-    assert!(fetch.parts[0].part.row, "the pool part carries the row");
-    assert!(
-        rig.local.0.lock().unwrap().fetches.is_empty(),
-        "nothing is fetched locally"
-    );
-}
-
-#[test]
-fn a_second_part_not_worth_fetching_leaves_the_local_hit_alone() {
-    let mut rig = rig_with(Ranking::for_test(Level::DEFAULT_ORDER, &[(Level::HostNvme, 50_000_000.0)]));
-    rig.local_hit(800, Local::Memory);
-    rig.answer(vec![rig.candidate(
-        Level::HostNvme,
-        2,
-        800,
-        0,
-        &[1600],
-        50_000_000,
-    )]);
-    let hit = rig.lookup().unwrap();
-    assert_eq!(hit.key, rig.key(800), "the local match is the answer");
-    let ticket = rig.ticket(&hit);
-    rig.store.fetch(hit, ticket).unwrap();
-    assert!(rig.pool.lock().unwrap().fetches.is_empty());
-    assert_eq!(rig.local.0.lock().unwrap().fetches.len(), 1);
-}
-
-#[test]
 fn without_an_answer_the_local_lookup_is_used() {
     let mut rig = rig();
     rig.local_hit(800, Local::Disk);
@@ -691,102 +581,6 @@ fn without_an_answer_the_local_lookup_is_used() {
 }
 
 // ---- failure ----
-
-fn two_pool_sources(rig: &Rig) {
-    rig.answer(vec![
-        rig.candidate(Level::HostDram, 1, 0, 0, &[800], 0),
-        rig.candidate(Level::HostNvme, 2, 800, 0, &[1600], 0),
-        rig.candidate(Level::RemoteNvme, 3, 800, 0, &[1600], 0),
-    ]);
-}
-
-#[test]
-fn a_failed_second_part_is_replanned_from_another_source_of_the_same_endpoint() {
-    let mut rig = rig();
-    two_pool_sources(&rig);
-    let hit = rig.lookup().unwrap();
-    let ticket = rig.ticket(&hit);
-    rig.store.fetch(hit, ticket).unwrap();
-    let b = rig.pool.lock().unwrap().fetches[0].parts[1]
-        .candidate
-        .clone();
-    rig.pool.lock().unwrap().events.push(PoolEvent::Fetched {
-        id: 1,
-        result: Err(failure(1, (b.source.clone(), b.tier), false)),
-    });
-    assert!(fetched(&rig.poll()).is_empty(), "replanned, not failed");
-    let again = rig.pool.lock().unwrap().fetches[1].clone();
-    assert_eq!(again.parts.len(), 2);
-    assert_eq!(
-        again.parts[1].candidate.source.instance,
-        vec![3],
-        "the next source"
-    );
-    assert_eq!(again.parts[1].part.end, rig.key(1600));
-    rig.pool.lock().unwrap().events.push(PoolEvent::Fetched {
-        id: 2,
-        result: Ok(9),
-    });
-    assert_eq!(fetched(&rig.poll()), [(rig.key(1600), true)]);
-    // A restore wholly from the pool is counted by the pool, once, with its bytes.
-    let stats = rig.store.stats();
-    assert_eq!(
-        (stats.fetched, stats.fetch_failed, stats.bytes_in),
-        (1, 0, 9)
-    );
-}
-
-#[test]
-fn with_no_other_source_the_restore_fails_once() {
-    let mut rig = rig();
-    rig.answer(vec![
-        rig.candidate(Level::HostDram, 1, 0, 0, &[800], 0),
-        rig.candidate(Level::HostNvme, 2, 800, 0, &[1600], 0),
-    ]);
-    let hit = rig.lookup().unwrap();
-    let ticket = rig.ticket(&hit);
-    rig.store.fetch(hit, ticket).unwrap();
-    let b = rig.pool.lock().unwrap().fetches[0].parts[1]
-        .candidate
-        .clone();
-    rig.pool.lock().unwrap().events.push(PoolEvent::Fetched {
-        id: 1,
-        result: Err(failure(1, (b.source.clone(), b.tier), false)),
-    });
-    assert_eq!(fetched(&rig.poll()), [(rig.key(1600), false)]);
-    assert_eq!(rig.pool.lock().unwrap().fetches.len(), 1);
-    let stats = rig.store.stats();
-    assert_eq!((stats.fetched, stats.fetch_failed), (0, 1));
-}
-
-#[test]
-fn a_source_without_headroom_is_skipped_for_a_moment() {
-    let mut rig = rig();
-    two_pool_sources(&rig);
-    let hit = rig.lookup().unwrap();
-    let ticket = rig.ticket(&hit);
-    rig.store.fetch(hit, ticket).unwrap();
-    let b = rig.pool.lock().unwrap().fetches[0].parts[1]
-        .candidate
-        .clone();
-    rig.pool.lock().unwrap().events.push(PoolEvent::Fetched {
-        id: 1,
-        result: Err(failure(1, (b.source.clone(), b.tier), true)),
-    });
-    rig.poll();
-    rig.pool.lock().unwrap().events.push(PoolEvent::Fetched {
-        id: 2,
-        result: Ok(9),
-    });
-    rig.poll();
-    // A new lookup that offers only the refused source finds no pool plan.
-    rig.answer(vec![
-        rig.candidate(Level::HostDram, 1, 0, 0, &[800], 0),
-        rig.candidate(Level::HostNvme, 2, 800, 0, &[1600], 0),
-    ]);
-    let hit = rig.lookup().unwrap();
-    assert_eq!(hit.key, rig.key(800), "A alone: source 2 is skipped");
-}
 
 #[test]
 fn a_pool_that_refuses_the_fetch_leaves_no_event_behind() {
@@ -836,19 +630,13 @@ fn gpu_publications_are_announced_and_their_evictions_reported() {
 }
 
 #[test]
-fn the_local_end_is_held_when_a_lookup_begins_and_export_events_reach_the_worker() {
+fn queued_lookups_do_not_trim_local_prefixes_and_export_events_reach_the_worker() {
     let mut rig = rig();
     rig.local_hit(800, Local::Memory);
     let history = rig.history.clone();
     assert!(rig.store.begin_lookup(&history).is_some());
     let held = rig.pool.lock().unwrap().held[0].clone();
-    assert_eq!(
-        held,
-        [HeldRange {
-            level: Level::HostDram,
-            end: rig.key(800)
-        }]
-    );
+    assert!(held.is_empty());
     let export = ExportId(5);
     rig.pool
         .lock()
@@ -927,15 +715,15 @@ fn a_candidate_that_disagrees_with_the_history_is_dropped_and_the_others_kept() 
 }
 
 #[test]
-fn a_candidate_starting_above_what_is_held_is_discarded_and_one_at_the_local_end_is_kept() {
+fn a_candidate_starting_after_the_resident_prefix_never_stitches_to_a_local_prefix() {
     let mut rig = rig();
     // Nothing local and nothing resident: a candidate that begins at 800 leaves a hole.
     rig.answer(vec![rig.candidate(Level::HostNvme, 2, 800, 0, &[1600], 0)]);
     assert!(rig.lookup().is_none());
-    // With a local part ending at 800 it is the second part.
+    // The local prefix is usable; the pool source still leaves a hole.
     rig.local_hit(800, Local::Memory);
     let hit = rig.lookup().unwrap();
-    assert_eq!(hit.key, rig.key(1600));
+    assert_eq!(hit.key, rig.key(800));
 }
 
 // ---- the eviction cascade ----
@@ -1262,7 +1050,6 @@ fn a_publication_is_noted_and_announced_and_copies_nothing_until_written_back() 
 #[test]
 fn write_back_copies_row_only_records_even_when_recompute_is_cheaper() {
     let mut rig = rig();
-    rig.store.set_prefill_rate(1e12);
     let parent = rig.publication(800);
     let mut child = rig.publication(800);
     child.key = rig.key(807);
@@ -1279,7 +1066,10 @@ fn a_pool_hint_never_substitutes_for_a_committed_local_copy() {
     rig.answer(vec![rig.candidate(Level::HostDram, 2, 0, 0, &[800], 0)]);
     rig.lookup();
     let checkpoint = rig.publication(800);
-    assert_eq!(rig.store.write_back(&checkpoint).unwrap(), StoreOutcome::Queued);
+    assert_eq!(
+        rig.store.write_back(&checkpoint).unwrap(),
+        StoreOutcome::Queued
+    );
     assert_eq!(rig.copies(), [checkpoint.key]);
 }
 

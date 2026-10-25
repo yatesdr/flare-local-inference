@@ -14,7 +14,6 @@ use tokio::sync::Notify;
 
 use crate::{
     Error, ExportChain, ExportId, ExportRefusal, History, HostRegistrar, Result, SharedCopier,
-    levels::{Level, Ranking},
 };
 
 use super::{
@@ -315,19 +314,10 @@ impl PoolClient {
         self.announce.evicted(key, tier, generation, heir);
     }
 
-    /// The order in use for restore sources.
-    pub fn ranking(&self) -> Ranking {
-        self.shared.ranking()
-    }
-
     /// Identifies the manager and link of the current session (zero before any
     /// session opened); a change means the copy levels may cost something else.
     pub fn topology(&self) -> crate::levels::Topology {
         crate::levels::Topology(self.shared.topology())
-    }
-
-    pub fn observe_restore(&self, level: Level, bytes: u64, elapsed: std::time::Duration) {
-        self.shared.observe_restore(level, bytes, elapsed);
     }
 
     /// Start a lookup for a queued request. Identical prefixes share one wire

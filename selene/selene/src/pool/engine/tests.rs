@@ -12,8 +12,8 @@ use tokio::sync::Notify;
 
 use crate::{
     Direction, ExportChain, ExportId, ExportNode, Job, Layout, PageCopier, PageId, PrefixKey,
-    Registration, Reply, Result, SharedCopier, StateSlotId, levels::Level, plan,
-    record::checksum, testing::geometry,
+    Registration, Reply, Result, SharedCopier, StateSlotId, levels::Level, plan, record::checksum,
+    testing::geometry,
 };
 
 use super::{
@@ -349,7 +349,6 @@ pub(super) fn candidate(
                     tail_pages: *tail_pages,
                 })
                 .collect(),
-
         },
         source: SourceRef {
             instance: vec![source as u8],
@@ -710,7 +709,6 @@ fn a_refused_lookup_gives_no_candidates_and_a_good_reply_reaches_every_waiter() 
             row: true,
         }],
         skip_pages: 0,
-
     };
     let mut malformed = candidate.clone();
     malformed.key = Some(wire::PrefixKey {
@@ -778,7 +776,6 @@ fn windows_for(rig: &mut Rig, claim: u64) -> Vec<wire::ClientMessage> {
 fn a_restore_copies_every_window_releases_after_the_drain_and_reports_after_the_terminal() {
     let mut rig = Rig::new();
     rig.open();
-    let ranking = rig.shared.ranking();
     let (_, claim) = granted_single(&mut rig);
     let out = windows_for(&mut rig, claim);
     assert!(
@@ -808,7 +805,6 @@ fn a_restore_copies_every_window_releases_after_the_drain_and_reports_after_the_
         fetched(&rig.events()).is_empty(),
         "COPIED is the manager's word"
     );
-    assert_eq!(rig.shared.ranking(), ranking);
     {
         let copier = rig.copier.lock().unwrap();
         let sent = pattern(1, 2 * PAGE as usize);
@@ -831,7 +827,6 @@ fn a_restore_copies_every_window_releases_after_the_drain_and_reports_after_the_
     ));
     let events = rig.events();
     assert_eq!(fetched(&events), [(1, Ok(3 * PAGE + ROW))]);
-    assert_ne!(rig.shared.ranking(), ranking);
 }
 
 #[test]
@@ -864,7 +859,6 @@ fn records_that_do_not_match_the_plan_are_abandoned_after_nothing_was_copied() {
 fn a_corrupt_window_is_never_copied_and_the_restore_fails_with_a_checksum_verdict() {
     let mut rig = Rig::new();
     rig.open();
-    let ranking = rig.shared.ranking();
     let (_, claim) = granted_single(&mut rig);
     let mut w0 = ready(&rig, claim, window(0, 0, 0, 2, false, 0), 1);
     // Corrupt the persisted bytes after the source computed its checksums.
@@ -891,7 +885,6 @@ fn a_corrupt_window_is_never_copied_and_the_restore_fails_with_a_checksum_verdic
         pick!(out, FenceAck)[0].outcome,
         wire::FenceOutcome::Drained as i32
     );
-    assert_eq!(rig.shared.ranking(), ranking);
 }
 
 #[test]
@@ -1033,207 +1026,16 @@ fn a_window_that_repeats_a_page_is_not_a_row_of_its_own() {
     );
 }
 
-// ---- two parts --------------------------------------------------------------
-
-/// A at 128 tokens (2 pages) from one source, B to 192 tokens (1 page and the row) from another.
-fn two_parts() -> PoolFetch {
-    let (n1, n2) = (key(128, 1), key(192, 2));
-    let a = candidate(Level::HostDram, 1, n1, &[(n1, 2)]);
-    let b = candidate(Level::RemoteNvme, 2, n2, &[(n2, 1)]);
-    PoolFetch {
-        id: 1,
-        page_tokens: 64,
-        parts: vec![
-            part(a, 0, 2, 0, false, &[n1], 0, &[10, 11]),
-            part(b, 128, 1, 2, true, &[n2], 0, &[12]),
-        ],
-    }
-}
-
-fn grant(claim: u64, records: Vec<wire::Record>, pages: u64, row: bool) -> In {
-    In::ClaimGranted(wire::ClaimGranted {
-        claim_id: claim,
-        records,
-        total_pages: pages,
-        row,
-        channel: None,
-        window_credits: 2,
-        retained: true,
-        ..Default::default()
-    })
-}
-
-fn record(k: PrefixKey, first: u32, pages: u32, row: bool) -> wire::Record {
-    wire::Record {
-        key: Some(super::super::codec::key_to(k)),
-        generation: 4,
-        first_page: first,
-        pages,
-        row,
-    }
-}
-
 #[test]
-fn two_parts_are_claimed_in_order_copy_to_disjoint_ranges_and_fetch_the_row_once() {
+fn multiple_sources_are_rejected_before_any_claim_or_copy() {
     let mut rig = Rig::new();
     rig.open();
-    let fetch = two_parts();
+    let mut fetch = single_part();
+    fetch.parts.push(fetch.parts[0].clone());
     let out = rig.command(Command::Fetch(fetch));
-    let claims = pick!(out, Claim);
-    assert_eq!(claims.len(), 1, "B waits until A is held");
-    let a = &claims[0];
-    assert!(!a.want_row);
-    assert_eq!(a.part, wire::PlanPart::PartA as i32);
-    let out = rig.send(grant(
-        a.claim_id,
-        vec![record(key(128, 1), 0, 2, false)],
-        2,
-        false,
-    ));
-    let b = pick!(out, Claim)[0].clone();
-    assert_eq!((b.begin_tokens, b.want_row), (128, true));
-    assert_eq!(b.part, wire::PlanPart::PartB as i32);
-    assert!(b.claim_id > a.claim_id);
-    rig.send(grant(
-        b.claim_id,
-        vec![record(key(192, 2), 0, 1, true)],
-        1,
-        true,
-    ));
-    let wa = ready(&rig, a.claim_id, window(0, 0, 0, 2, false, 0), 1);
-    let wb = ready(&rig, b.claim_id, window(0, 0, 0, 1, true, 4 * PAGE), 2);
-    rig.send(In::WindowReady(wa));
-    rig.send(In::WindowReady(wb));
-    let out = rig.drain_copies();
-    let verdicts = pick!(out, CopyResult);
-    assert_eq!(verdicts.len(), 2);
-    assert!(
-        verdicts
-            .iter()
-            .all(|v| v.outcome == wire::CopyOutcome::CopyOk as i32)
-    );
-    {
-        let copier = rig.copier.lock().unwrap();
-        assert_eq!(
-            copier
-                .gpu_pages
-                .keys()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>(),
-            [10, 11, 12].into()
-        );
-        assert_eq!(copier.gpu_rows.len(), 1, "one row, from B");
-        assert!(copier.submitted.iter().filter(|j| j.row.is_some()).count() == 1);
-    }
-    rig.send(terminal(
-        a.claim_id,
-        wire::ClaimState::Copied,
-        wire::ClaimReason::ReasonNone,
-        false,
-    ));
-    assert!(fetched(&rig.events()).is_empty(), "both parts or nothing");
-    rig.send(terminal(
-        b.claim_id,
-        wire::ClaimState::Copied,
-        wire::ClaimReason::ReasonNone,
-        false,
-    ));
-    assert_eq!(fetched(&rig.events()), [(1, Ok(3 * PAGE + ROW))]);
-}
-
-#[test]
-fn when_b_fails_during_the_copy_a_is_abandoned_after_the_drain_and_one_failure_is_reported() {
-    let mut rig = Rig::new();
-    rig.open();
-    let out = rig.command(Command::Fetch(two_parts()));
-    let a = pick!(out, Claim)[0].claim_id;
-    let b = pick!(
-        rig.send(grant(a, vec![record(key(128, 1), 0, 2, false)], 2, false)),
-        Claim
-    )[0]
-    .claim_id;
-    rig.send(grant(b, vec![record(key(192, 2), 0, 1, true)], 1, true));
-    let wa = ready(&rig, a, window(0, 0, 0, 2, false, 0), 1);
-    rig.send(In::WindowReady(wa));
-    // B's source dies: the claim fails while A's copy is running.
-    let out = rig.send(terminal(
-        b,
-        wire::ClaimState::Failed,
-        wire::ClaimReason::SourceLost,
-        true,
-    ));
-    assert_eq!(pick!(out, FenceAck).len(), 1, "B had nothing in flight");
-    assert!(
-        pick!(out, CopyResult).is_empty(),
-        "A's verdict waits for its copy"
-    );
-    assert!(fetched(&rig.events()).is_empty());
-    let out = rig.drain_copies();
-    assert_eq!(
-        pick!(out, CopyResult)[0].outcome,
-        wire::CopyOutcome::CopyAbandoned as i32
-    );
-    let events = rig.events();
-    let results = fetched(&events);
-    assert_eq!(results.len(), 1);
-    assert!(results[0].1.is_err());
-    if let PoolEvent::Fetched {
-        result: Err(failure),
-        ..
-    } = &events[0]
-    {
-        assert_eq!(failure.part, Some(1));
-    }
-}
-
-#[test]
-fn a_failed_a_claim_stops_b_from_ever_being_claimed() {
-    let mut rig = Rig::new();
-    rig.open();
-    let out = rig.command(Command::Fetch(two_parts()));
-    let a = pick!(out, Claim)[0].claim_id;
-    let out = rig.send(terminal(
-        a,
-        wire::ClaimState::Failed,
-        wire::ClaimReason::NoHeadroom,
-        false,
-    ));
     assert!(pick!(out, Claim).is_empty());
     assert!(fetched(&rig.events())[0].1.is_err());
-}
-
-#[test]
-fn when_a_fails_after_b_was_granted_b_is_released_and_the_restore_fails_once() {
-    let mut rig = Rig::new();
-    rig.open();
-    let out = rig.command(Command::Fetch(two_parts()));
-    let a = pick!(out, Claim)[0].claim_id;
-    let b = pick!(
-        rig.send(grant(a, vec![record(key(128, 1), 0, 2, false)], 2, false)),
-        Claim
-    )[0]
-    .claim_id;
-    rig.send(grant(b, vec![record(key(192, 2), 0, 1, true)], 1, true));
-    let wb = ready(&rig, b, window(0, 0, 0, 1, true, 4 * PAGE), 2);
-    rig.send(In::WindowReady(wb));
-    let out = rig.send(terminal(
-        a,
-        wire::ClaimState::Failed,
-        wire::ClaimReason::SourceLost,
-        true,
-    ));
-    assert_eq!(pick!(out, FenceAck).len(), 1, "A had nothing in flight");
-    assert!(
-        pick!(out, CopyResult).is_empty(),
-        "B's copy is still running"
-    );
-    assert!(fetched(&rig.events()).is_empty());
-    let out = rig.drain_copies();
-    assert_eq!(
-        pick!(out, CopyResult)[0].outcome,
-        wire::CopyOutcome::CopyAbandoned as i32
-    );
-    assert_eq!(fetched(&rig.events()).len(), 1);
+    assert!(rig.copier.lock().unwrap().submitted.is_empty());
 }
 
 #[test]
