@@ -4,10 +4,47 @@ use super::{
     PooledStore, RankAgent, RankSet, RegisteredRegion, pool_address, pool_scope,
 };
 use crate::{
-    CacheGeometry, HostRegistrar, HostStore, Layout, Registration, Result, SharedCopier,
-    SplitMapping, plan::Identity,
+    CacheGeometry, HostRegistrar, HostStore, Layout, Registration, Result, SplitMapping,
+    plan::Identity,
 };
-use std::sync::Arc;
+use crate::{
+    PageCopier,
+    copier::{Job, Reply},
+};
+use std::sync::{Arc, Mutex};
+
+/// Registration precedes cache sizing; copying starts with the final cache geometry.
+struct Copier {
+    layout: Layout,
+    transfers: Option<Box<dyn crate::PageCopier>>,
+}
+
+impl PageCopier for Copier {
+    fn layout(&self) -> &Layout {
+        &self.layout
+    }
+    fn submit(&mut self, job: Job) -> crate::Result<()> {
+        self.transfers
+            .as_mut()
+            .ok_or("pool copies are not initialized")?
+            .submit(job)
+    }
+    fn poll(&mut self, replies: &mut Vec<Reply>) {
+        if let Some(transfers) = &mut self.transfers {
+            transfers.poll(replies);
+        }
+    }
+    fn in_flight(&self) -> usize {
+        self.transfers
+            .as_ref()
+            .map_or(0, |copier| copier.in_flight())
+    }
+    fn close(&mut self) -> crate::Result<()> {
+        self.transfers
+            .as_mut()
+            .map_or(Ok(()), |copier| copier.close())
+    }
+}
 
 pub struct PoolBuilder<'a> {
     pub options: &'a PoolOptions,
@@ -27,12 +64,12 @@ pub struct PreparedPool {
     pub identity: Identity,
     listener: Option<(std::net::TcpListener, [u8; 16])>,
     layout: Layout,
+    copier: Arc<Mutex<Copier>>,
 }
 
 impl PoolBuilder<'_> {
     pub fn start(
         self,
-        copier: SharedCopier,
         registrar: Arc<dyn HostRegistrar + Send + Sync>,
     ) -> Result<(PreparedPool, Vec<u64>)> {
         let Self {
@@ -45,6 +82,10 @@ impl PoolBuilder<'_> {
             mut peers,
             disk,
         } = self;
+        let copier = Arc::new(Mutex::new(Copier {
+            layout: Layout::new(geometry)?,
+            transfers: None,
+        }));
         let listener = peers.as_mut().and_then(|peers| peers.listener.take());
         let registrar: Arc<dyn HostRegistrar + Send + Sync> = Arc::new(PoolRegistrar(registrar));
         let devices = budget.devices.clone();
@@ -117,6 +158,7 @@ impl PoolBuilder<'_> {
             records,
             listener,
             layout: copier.lock().unwrap().layout().clone(),
+            copier: copier.clone(),
             identity,
         };
         if prepared.registered_regions().is_empty() {
@@ -134,6 +176,46 @@ impl PoolBuilder<'_> {
 }
 
 impl PreparedPool {
+    pub fn prepare_peer(
+        &mut self,
+        prepared: &crate::offload::Prepared,
+        factory: &dyn crate::offload::CopierFactory,
+    ) -> Result<()> {
+        if self.agent.is_some() {
+            self.start_copies(&prepared.contexts, prepared.geometry.clone(), factory)?;
+            if let Some(records) = &self.records
+                && let Some(directory) = &prepared.directory_lock
+            {
+                records.bind(
+                    prepared
+                        .resolved
+                        .directory
+                        .clone()
+                        .ok_or("a rank's records need a disk directory")?,
+                    prepared.identity,
+                    prepared.fingerprint,
+                    prepared.geometry.clone(),
+                    directory.clone(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn start_copies(
+        &self,
+        contexts: &[(usize, i32)],
+        geometry: Vec<CacheGeometry>,
+        factory: &dyn crate::offload::CopierFactory,
+    ) -> Result<()> {
+        let mut copier = self.copier.lock().unwrap();
+        if Layout::new(&geometry)? != copier.layout {
+            return Err("pool registration and final cache layouts disagree".into());
+        }
+        copier.transfers = Some(factory.unmapped(contexts, geometry)?);
+        Ok(())
+    }
+
     fn registration_costs(&self) -> Result<(u64, u64)> {
         Ok(Budget::costs(
             self.registered_regions()

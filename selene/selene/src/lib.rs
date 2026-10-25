@@ -21,6 +21,7 @@ pub mod geometry;
 pub mod index;
 pub mod input;
 pub mod memory;
+pub mod offload;
 pub mod os;
 pub mod plan;
 pub mod pool;

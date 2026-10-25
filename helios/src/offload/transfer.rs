@@ -1759,3 +1759,13 @@ mod tests {
         }
     }
 }
+
+pub(crate) struct Copiers;
+impl flare_selene::offload::CopierFactory for Copiers {
+    fn mapped(&self, contexts: &[(usize, i32)], geometry: Vec<flare_selene::CacheGeometry>, slabs: &flare_selene::slab::SlabPool) -> flare_selene::Result<flare_selene::SharedCopier> {
+        Ok(std::sync::Arc::new(std::sync::Mutex::new(Transfers::start(contexts, geometry, slabs)?)))
+    }
+    fn unmapped(&self, contexts: &[(usize, i32)], geometry: Vec<flare_selene::CacheGeometry>) -> flare_selene::Result<Box<dyn flare_selene::PageCopier>> {
+        Ok(Box::new(Transfers::start_unmapped(contexts, geometry)?))
+    }
+}
