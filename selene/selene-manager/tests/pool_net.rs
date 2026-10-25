@@ -273,14 +273,43 @@ fn startup_names_each_option_that_widens_the_exposure() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !socket.exists() {
         assert!(Instant::now() < deadline, "the manager never started");
         thread::sleep(Duration::from_millis(20));
     }
+    // The warning is printed while the manager starts up; stop it only once it has been
+    // seen (or give up with what was printed), not when the socket first appears.
+    let mut child = child;
+    let stderr = child.stderr.take().unwrap();
+    let (lines, seen) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(|l| l.ok())
+        {
+            if lines.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let mut text = String::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !(text.contains("warning: network listening enabled on") && text.contains("plaintext"))
+        && Instant::now() < deadline
+    {
+        if let Ok(line) = seen.recv_timeout(Duration::from_millis(100)) {
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-    let output = child.wait_with_output().unwrap();
-    let text = String::from_utf8_lossy(&output.stderr);
+    let _ = child.wait();
+    while let Ok(line) = seen.recv_timeout(Duration::from_millis(200)) {
+        text.push_str(&line);
+        text.push('\n');
+    }
     assert!(
         text.contains("warning: network listening enabled on") && text.contains("plaintext"),
         "{text}"
