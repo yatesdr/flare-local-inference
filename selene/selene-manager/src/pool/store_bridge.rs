@@ -812,19 +812,7 @@ impl Core {
                     "a multi-process writer states slice checksums",
                 ));
             }
-            let parts = m
-                .rank_sums
-                .into_iter()
-                .map(|sums| {
-                    (
-                        sums.rank as usize,
-                        flare_selene::pool::SliceSums {
-                            pages: sums.page_xxh3,
-                            row: sums.has_row.then_some(sums.row_xxh3),
-                        },
-                    )
-                })
-                .collect();
+            let parts = super::mp::rank_sums(m.rank_sums);
             self.put_stated_part(key, m.index, parts, 0);
             return Ok(());
         }
@@ -851,37 +839,26 @@ impl Core {
         let Some(window) = mp.windows.get_mut(&index) else {
             return;
         };
-        if window.arrived || window.writers & (1 << slot) == 0 {
+        if window.arrived {
             return;
         }
-        let shaped = parts.iter().all(|(rank, sums)| {
-            *rank < window.stated.len()
-                && sums.pages.len() == window.pages as usize
-                && sums.row.is_some() == window.row
-        });
-        let fresh = parts.iter().all(|(rank, _)| {
-            window
-                .stated
-                .get(*rank)
-                .is_some_and(|stated| stated.is_none())
-        });
-        if !shaped || !fresh {
-            return self.put_fail_by_key(
-                key,
-                v2::Reason::Invalid,
-                "a rank's slice checksums do not fit its window",
-            );
-        }
-        for (rank, sums) in parts {
-            window.stated[rank] = Some(sums);
-        }
-        window.writers &= !(1 << slot);
-        if window.writers != 0 {
-            return;
-        }
-        let stated: Option<Vec<flare_selene::pool::SliceSums>> = window.stated.drain(..).collect();
-        let Some(stated) = stated else {
-            return self.put_fail_by_key(key, v2::Reason::Invalid, "a rank stated nothing");
+        let stated = match super::mp::accept_parts(
+            &mut window.stated,
+            &mut window.writers,
+            parts,
+            slot,
+            window.pages,
+            window.row,
+        ) {
+            Ok(Some(stated)) => stated,
+            Ok(None) => return,
+            Err(()) => {
+                return self.put_fail_by_key(
+                    key,
+                    v2::Reason::Invalid,
+                    "a rank's slice checksums do not fit its window",
+                );
+            }
         };
         window.arrived = true;
         let Some(regions) = self.cfg.regions.clone() else {
@@ -955,10 +932,8 @@ impl Core {
         };
         mp.passes == 0
             && mp.legs.iter().all(|leg| leg.ch.exited)
-            && mp.peers.iter().all(|peer| {
-                !peer.shared
-                    || matches!(peer.fence, Party::Drained)
-                    || self.procs.get(&peer.proc).is_none_or(|p| p.exited)
+            && super::mp::peers_quiet(&mp.peers, |proc| {
+                self.procs.get(proc).is_none_or(|p| p.exited)
             })
     }
 
