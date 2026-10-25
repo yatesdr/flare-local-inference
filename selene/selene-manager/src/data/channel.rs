@@ -39,6 +39,7 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 
 use super::{DataChannel, Region, RegionAccess, invalid};
+use crate::arena::{Arena, Extent};
 
 /// A connection that has not presented its token by then is dropped.
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -167,6 +168,9 @@ struct Inner {
     state: Mutex<State>,
     next: AtomicU64,
     handle: Handle,
+    /// The registered region a rank's leg gathers its packed slices in before they cross the
+    /// network, and scatters them from after.
+    packed: Mutex<Option<Arena>>,
     /// Tests hold back `Closed` to play a handler whose exit cannot be observed.
     #[cfg(test)]
     closed_delay: Mutex<Duration>,
@@ -220,6 +224,7 @@ impl Hub {
             }),
             next: AtomicU64::new(1),
             handle: handle.clone(),
+            packed: Mutex::new(None),
             #[cfg(test)]
             closed_delay: Mutex::new(Duration::ZERO),
         });
@@ -230,6 +235,12 @@ impl Hub {
         };
         handle.spawn(accept_loop(accepting, listener, closed));
         Ok((Hub { inner, closing }, receiver))
+    }
+
+    /// Give rank legs on RDMA the registered arena to pack their slices in. Without one, a
+    /// rank's leg that asks for RDMA is refused and uses the stream.
+    pub fn set_packed(&self, arena: Arena) {
+        *self.inner.packed.lock().unwrap() = Some(arena);
     }
 
     /// The `host:port` clients are told to connect to. A host that is the
@@ -495,8 +506,10 @@ async fn serve(inner: Arc<Inner>, stream: TcpStream) {
     // An RDMA transfer's channel lives here, outside the handler, so it can be fenced
     // properly whichever way the handler ends.
     let mut rdma: Option<Box<dyn DataChannel>> = None;
+    // Packed staging a work request may still touch: freed only after the queue pair is fenced.
+    let held: Mutex<Vec<Extent>> = Mutex::new(Vec::new());
     let result = tokio::select! {
-        result = run(&inner, transfer, &entry, &mut conn, &mut rdma) => result,
+        result = run(&inner, transfer, &entry, &mut conn, &mut rdma, &held) => result,
         _ = async { let _ = stopped.wait_for(|stop| *stop).await; } => End::Stopped,
     };
     // Fence the queue pair: it moves to the error state, its requests are flushed and it is
@@ -509,6 +522,8 @@ async fn serve(inner: Arc<Inner>, stream: TcpStream) {
         })
         .await;
     }
+    // Nothing is in flight any more, so the packed staging goes back.
+    held.lock().unwrap().clear();
     // Say goodbye if the peer will listen (a TLS peer needs the close notice to tell an
     // end from a cut), then drop the connection: only now is the transfer's memory quiet.
     let _ = timeout(GOODBYE, conn.shutdown()).await;
@@ -531,6 +546,7 @@ async fn run(
     entry: &Transfer,
     conn: &mut Box<dyn Conn>,
     rdma: &mut Option<Box<dyn DataChannel>>,
+    held: &Mutex<Vec<Extent>>,
 ) -> End {
     let hello = match timeout(IO_TIMEOUT, ToManager::read(&mut *conn, inner.max_pages)).await {
         Ok(Ok(frame)) => frame,
@@ -549,20 +565,20 @@ async fn run(
         },
         _ => return End::Failed("the instance did not open with a hello".into()),
     }
-    if rdma.is_some() && entry.slicing.is_some() {
-        let _ = ToInstance::Abort("a rank's leg uses the stream carrier".into())
+    if rdma.is_some() && entry.slicing.is_some() && inner.packed.lock().unwrap().is_none() {
+        let _ = ToInstance::Abort("this manager has no packed staging for a rank's leg".into())
             .write(conn)
             .await;
-        return End::Failed("a rank's leg asked for RDMA".into());
+        return End::Failed("a rank's leg asked for RDMA without packed staging".into());
     }
     let result = match (entry.kind, rdma.as_mut()) {
         (Kind::Get, None) => send_windows(inner, transfer, entry, conn).await,
         (Kind::Put, None) => receive_windows(inner, transfer, entry, conn).await,
         (Kind::Get, Some(channel)) => {
-            send_windows_rdma(inner, transfer, entry, conn, channel).await
+            send_windows_rdma(inner, transfer, entry, conn, channel, held).await
         }
         (Kind::Put, Some(channel)) => {
-            receive_windows_rdma(inner, transfer, entry, conn, channel).await
+            receive_windows_rdma(inner, transfer, entry, conn, channel, held).await
         }
     };
     match result {
@@ -744,6 +760,7 @@ async fn send_windows_rdma(
     entry: &Transfer,
     conn: &mut Box<dyn Conn>,
     channel: &mut Box<dyn DataChannel>,
+    held: &Mutex<Vec<Extent>>,
 ) -> io::Result<()> {
     let (mut reader, mut writer) = tokio::io::split(conn);
     let (lend, mut lent) = mpsc::unbounded_channel::<(u64, u64)>();
@@ -798,16 +815,55 @@ async fn send_windows_rdma(
             if length > lent_bytes || !offset.is_multiple_of(4096) {
                 return Err(invalid("a window does not fit the slot the instance lent"));
             }
+            // A rank's slices are strided in the window: gathered into packed staging first,
+            // and that buffer is what crosses the network.
+            let (from_region, from_offset) = match &entry.slicing {
+                None => (window.region, window.offset),
+                Some((layout, rank)) => {
+                    let (pages, row) = (window.shape.page_count, window.shape.row);
+                    if length != layout.slice_bytes(*rank, pages, row) {
+                        return Err(invalid("a rank window's length is not its slice's"));
+                    }
+                    let arena = inner
+                        .packed
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .ok_or_else(|| invalid("no packed staging for a rank's leg"))?;
+                    let mut packed = arena
+                        .allocate(length as usize)
+                        .ok_or_else(|| io::Error::other("packed staging is full"))?;
+                    // SAFETY: see `window_bytes`; the window is only read.
+                    let whole = unsafe {
+                        window_bytes(
+                            &*inner.regions,
+                            window.region,
+                            window.offset,
+                            layout.window_bytes(pages, row),
+                        )?
+                    };
+                    layout
+                        .gather(*rank, whole, pages, row, packed.bytes_mut())
+                        .map_err(|error| invalid(error.to_string()))?;
+                    let at = packed.offset() as u64;
+                    held.lock().unwrap().push(packed);
+                    (Region::Staging, at)
+                }
+            };
             channel.write(
                 transfer,
                 window.shape.index,
-                window.region,
-                window.offset,
+                from_region,
+                from_offset,
                 length,
                 Region::Staging,
                 offset,
             )?;
             rdma_done(channel, transfer, window.shape.index).await?;
+            if entry.slicing.is_some() {
+                // The write completed: the packed buffer is no longer read.
+                held.lock().unwrap().pop();
+            }
             let frame = ToInstance::Window(Window {
                 shape: window.shape,
                 page_xxh3: window.page_xxh3,
@@ -843,6 +899,7 @@ async fn receive_windows_rdma(
     entry: &Transfer,
     conn: &mut Box<dyn Conn>,
     channel: &mut Box<dyn DataChannel>,
+    held: &Mutex<Vec<Extent>>,
 ) -> io::Result<()> {
     let (mut reader, mut writer) = tokio::io::split(conn);
     let (expect, mut expected) = mpsc::unbounded_channel::<GrantOut>();
@@ -903,16 +960,62 @@ async fn receive_windows_rdma(
             {
                 return Err(invalid("a filled window does not match its grant"));
             }
-            channel.read(
-                transfer,
-                index,
-                grant.region,
-                grant.offset,
-                grant.shape.length,
-                Region::Staging,
-                slot,
-            )?;
-            rdma_done(channel, transfer, index).await?;
+            match &entry.slicing {
+                None => {
+                    channel.read(
+                        transfer,
+                        index,
+                        grant.region,
+                        grant.offset,
+                        grant.shape.length,
+                        Region::Staging,
+                        slot,
+                    )?;
+                    rdma_done(channel, transfer, index).await?;
+                }
+                Some((layout, rank)) => {
+                    // The rank's slice is read into packed staging and then scattered into the
+                    // strided places it belongs in the granted window.
+                    let (pages, row) = (grant.shape.page_count, grant.shape.row);
+                    if grant.shape.length != layout.slice_bytes(*rank, pages, row) {
+                        return Err(invalid("a rank window's length is not its slice's"));
+                    }
+                    let arena = inner
+                        .packed
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .ok_or_else(|| invalid("no packed staging for a rank's leg"))?;
+                    let packed = arena
+                        .allocate(grant.shape.length as usize)
+                        .ok_or_else(|| io::Error::other("packed staging is full"))?;
+                    let at = packed.offset() as u64;
+                    held.lock().unwrap().push(packed);
+                    channel.read(
+                        transfer,
+                        index,
+                        Region::Staging,
+                        at,
+                        grant.shape.length,
+                        Region::Staging,
+                        slot,
+                    )?;
+                    rdma_done(channel, transfer, index).await?;
+                    let packed = held.lock().unwrap().pop().expect("pushed above");
+                    // SAFETY: see `window_bytes`; the store leased this window to the put.
+                    let whole = unsafe {
+                        window_bytes(
+                            &*inner.regions,
+                            grant.region,
+                            grant.offset,
+                            layout.window_bytes(pages, row),
+                        )?
+                    };
+                    layout
+                        .scatter(*rank, whole, pages, row, packed.bytes())
+                        .map_err(|error| invalid(error.to_string()))?;
+                }
+            }
             inner.counters.add(1, grant.shape.length);
             let _ = inner.events.send(Event::Filled {
                 transfer,
@@ -1207,6 +1310,10 @@ mod tests {
         let (hub, mut events, address) = start(regions(), None);
         let (transfer, token) = hub.open(Kind::Get).unwrap();
         let _first = connect(&address, &token).await;
+        // Wait until the first connection has been attached, or the second could win the race.
+        while hub.handlers() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         // The token is spent: a second connection is closed without a byte.
         let mut second = connect(&address, &token).await;
         assert!(ToInstance::read(&mut second, 64).await.is_err());
@@ -1650,6 +1757,252 @@ mod tests {
             .is_err()
         );
         assert!(server_config(b"", one.signing_key.serialize_pem().as_bytes()).is_err());
+    }
+
+    /// An RDMA device that moves bytes between the manager's regions and a buffer standing in
+    /// for the instance's lent staging, so the gather and scatter around a rank's leg can be
+    /// tested without hardware.
+    mod fake_rdma {
+        use super::*;
+        use crate::data::channel::{Pair, Rdma};
+
+        pub struct Device {
+            pub remote: Arc<Mutex<Vec<u8>>>,
+            pub regions: Arc<LocalRegions>,
+        }
+
+        struct Queue {
+            remote: Arc<Mutex<Vec<u8>>>,
+            regions: Arc<LocalRegions>,
+            done: Vec<(u64, u32, io::Result<()>)>,
+        }
+
+        impl Rdma for Device {
+            fn pair(&self) -> io::Result<Box<dyn Pair>> {
+                Ok(Box::new(Queue {
+                    remote: self.remote.clone(),
+                    regions: self.regions.clone(),
+                    done: Vec::new(),
+                }))
+            }
+        }
+
+        impl Pair for Queue {
+            fn handshake(&self) -> Vec<u8> {
+                vec![7]
+            }
+            fn connect(self: Box<Self>, _: &[u8]) -> io::Result<Box<dyn DataChannel>> {
+                Ok(self)
+            }
+        }
+
+        impl DataChannel for Queue {
+            fn write(
+                &mut self,
+                transfer: u64,
+                index: u32,
+                region: Region,
+                offset: u64,
+                len: u64,
+                _: Region,
+                remote_offset: u64,
+            ) -> io::Result<()> {
+                let remote = self.remote.clone();
+                self.regions
+                    .with_read(region, offset, len as usize, &mut |bytes| {
+                        let at = remote_offset as usize;
+                        remote.lock().unwrap()[at..at + bytes.len()].copy_from_slice(bytes);
+                        Ok(())
+                    })?;
+                self.done.push((transfer, index, Ok(())));
+                Ok(())
+            }
+            fn read(
+                &mut self,
+                transfer: u64,
+                index: u32,
+                region: Region,
+                offset: u64,
+                len: u64,
+                _: Region,
+                remote_offset: u64,
+            ) -> io::Result<()> {
+                let remote = self.remote.clone();
+                self.regions
+                    .with_write(region, offset, len as usize, &mut |bytes| {
+                        let at = remote_offset as usize;
+                        bytes.copy_from_slice(&remote.lock().unwrap()[at..at + bytes.len()]);
+                        Ok(())
+                    })?;
+                self.done.push((transfer, index, Ok(())));
+                Ok(())
+            }
+            fn poll(&mut self, done: &mut Vec<(u64, u32, io::Result<()>)>) -> io::Result<()> {
+                done.append(&mut self.done);
+                Ok(())
+            }
+            fn close(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+    }
+
+    /// A hub with the fake device, and the staging arena it packs in.
+    fn start_fake_rdma() -> (
+        Hub,
+        mpsc::UnboundedReceiver<Event>,
+        String,
+        Arc<LocalRegions>,
+        Arena,
+        Arc<Mutex<Vec<u8>>>,
+    ) {
+        let staging = Arena::new(1 << 20).unwrap();
+        let regions = Arc::new(LocalRegions::new(
+            Arena::new(1 << 20).unwrap(),
+            staging.clone(),
+        ));
+        let remote = Arc::new(Mutex::new(vec![0u8; 1 << 20]));
+        let device = fake_rdma::Device {
+            remote: remote.clone(),
+            regions: regions.clone(),
+        };
+        let listener = StdListener::bind("127.0.0.1:0").unwrap();
+        let (hub, events) = Hub::start(
+            &Handle::current(),
+            listener,
+            regions.clone(),
+            None,
+            64,
+            Some(Arc::new(device)),
+        )
+        .unwrap();
+        hub.set_packed(staging.clone());
+        let address = hub.address().to_string();
+        (hub, events, address, regions, staging, remote)
+    }
+
+    async fn frame(conn: &mut (impl AsyncRead + Unpin)) -> ToInstance {
+        timeout(Duration::from_secs(5), ToInstance::read(conn, 64))
+            .await
+            .expect("a frame in time")
+            .unwrap()
+    }
+
+    async fn dial_rdma(address: &str, token: &[u8; TOKEN_BYTES]) -> Box<dyn Conn> {
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream.write_all(token).await.unwrap();
+        ToManager::Hello(Carrier::Rdma(vec![1]))
+            .write(&mut stream)
+            .await
+            .unwrap();
+        let ToInstance::Accept(_) = frame(&mut stream).await else {
+            panic!("expected the manager's end of the pair");
+        };
+        Box::new(stream)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ranks_slices_are_gathered_into_packed_staging_and_written_into_its_slot() {
+        let (hub, mut events, address, regions, staging, remote) = start_fake_rdma();
+        let layout = rank_layout(3);
+        let window: Vec<u8> = (0..layout.window_bytes(3, true) as usize)
+            .map(|i| (i % 239) as u8)
+            .collect();
+        fill(&regions, Region::Arena, 0, &window);
+        for rank in [0usize, 2] {
+            let (transfer, token) = hub.open_rank(Kind::Get, layout.clone(), rank).unwrap();
+            let mut conn = dial_rdma(&address, &token).await;
+            let slot = 32768u64;
+            ToManager::Credit {
+                offset: slot,
+                length: layout.slice_bytes(rank, 3, true),
+            }
+            .write(&mut conn)
+            .await
+            .unwrap();
+            hub.push_window(
+                transfer,
+                WindowOut {
+                    shape: rank_shape(&layout, rank, 0, 3, true),
+                    page_xxh3: vec![1, 2, 3],
+                    row_xxh3: 4,
+                    region: Region::Arena,
+                    offset: 0,
+                },
+            );
+            hub.finish(transfer);
+            let ToInstance::Window(got) = frame(&mut conn).await else {
+                panic!("expected a window");
+            };
+            assert_eq!(got.slot, slot, "named by the slot it was written into");
+            assert_eq!(got.shape, rank_shape(&layout, rank, 0, 3, true));
+            let mut expect = vec![0u8; got.shape.length as usize];
+            layout.gather(rank, &window, 3, true, &mut expect).unwrap();
+            assert_eq!(
+                &remote.lock().unwrap()[slot as usize..slot as usize + expect.len()],
+                &expect[..],
+                "rank {rank}'s slice landed in its slot"
+            );
+            assert_eq!(frame(&mut conn).await, ToInstance::End);
+            assert!(matches!(
+                next(&mut events).await,
+                Event::Sent { index: 0, .. }
+            ));
+            assert!(matches!(next(&mut events).await, Event::Closed { .. }));
+        }
+        assert_eq!(staging.used(), 0, "the packed staging came back");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ranks_slice_is_read_into_packed_staging_and_scattered_into_the_window() {
+        let (hub, mut events, address, regions, staging, remote) = start_fake_rdma();
+        let layout = rank_layout(2);
+        let truth: Vec<u8> = (0..layout.window_bytes(2, true) as usize)
+            .map(|i| (i % 227) as u8)
+            .collect();
+        for rank in [1usize, 0] {
+            let (transfer, token) = hub.open_rank(Kind::Put, layout.clone(), rank).unwrap();
+            let mut conn = dial_rdma(&address, &token).await;
+            hub.push_grant(
+                transfer,
+                GrantOut {
+                    shape: rank_shape(&layout, rank, 0, 2, true),
+                    region: Region::Arena,
+                    offset: 8192,
+                },
+            );
+            let ToInstance::Grant(granted) = frame(&mut conn).await else {
+                panic!("expected a grant");
+            };
+            let mut packed = vec![0u8; granted.length as usize];
+            layout.gather(rank, &truth, 2, true, &mut packed).unwrap();
+            let slot = 65536u64;
+            remote.lock().unwrap()[slot as usize..slot as usize + packed.len()]
+                .copy_from_slice(&packed);
+            ToManager::Filled {
+                index: 0,
+                row_xxh3: Some(3),
+                page_xxh3: vec![1, 2],
+                slot,
+            }
+            .write(&mut conn)
+            .await
+            .unwrap();
+            let Event::Filled { index, .. } = next(&mut events).await else {
+                panic!("expected Filled");
+            };
+            assert_eq!(index, 0);
+            assert_eq!(frame(&mut conn).await, ToInstance::Taken(0));
+            hub.stop(transfer);
+            assert!(matches!(next(&mut events).await, Event::Closed { .. }));
+        }
+        regions
+            .with_read(Region::Arena, 8192, truth.len(), &mut |window| {
+                assert_eq!(window, &truth[..], "both slices are in their places");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(staging.used(), 0, "the packed staging came back");
     }
 
     #[cfg(feature = "rdma")]
