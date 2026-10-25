@@ -46,6 +46,7 @@ pub trait PoolPort {
     fn poll(&mut self, events: &mut Vec<PoolEvent>) -> Result<()>;
     fn ranking(&self) -> crate::characterize::Ranking;
     fn set_ranking(&self, ranking: crate::characterize::Ranking);
+    fn observe_restore(&self, level: Level, pages: usize, elapsed: Duration);
     fn topology(&self) -> crate::characterize::Topology;
     fn saved(&self, entry: IndexEntry);
     fn evicted(&self, key: PrefixKey, tier: Tier, generation: u64, heir: Option<IndexEntry>);
@@ -76,6 +77,9 @@ impl PoolPort for PoolClient {
     }
     fn set_ranking(&self, ranking: crate::characterize::Ranking) {
         PoolClient::set_ranking(self, ranking)
+    }
+    fn observe_restore(&self, level: Level, pages: usize, elapsed: Duration) {
+        PoolClient::observe_restore(self, level, pages, elapsed)
     }
     fn topology(&self) -> crate::characterize::Topology {
         PoolClient::topology(self)
@@ -193,6 +197,7 @@ pub struct PooledStore<S: HostStore, P: PoolPort = PoolClient> {
     prefill_rate: f64,
     plans: HashMap<(PrefixKey, u64), Planned>,
     restores: HashMap<PrefixKey, Restore>,
+    local_timings: HashMap<PrefixKey, (Level, usize, Instant)>,
     skip: HashMap<(SourceRef, Tier), Instant>,
     inner_events: Vec<StoreEvent>,
     pool_events: Vec<PoolEvent>,
@@ -290,6 +295,7 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             prefill_rate: INITIAL_PREFILL_RATE,
             plans: HashMap::new(),
             restores: HashMap::new(),
+            local_timings: HashMap::new(),
             skip: HashMap::new(),
             inner_events: Vec::new(),
             pool_events: Vec::new(),
@@ -317,19 +323,16 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
         Ok(self)
     }
 
-    /// Whether the copy levels were last measured under another topology than
-    /// the pool has now (or never). The caller then runs [`PooledStore::characterize`]
-    /// when it has scratch ids to spare.
+    /// Whether the startup probe has not yet run.
     pub fn needs_characterization(&self) -> bool {
-        let now = PoolPort::topology(&self.pool);
-        self.characterized_for != Some(now)
+        self.characterized_for.is_none()
     }
 
     /// Measure the cost of each copy level end to end and rank them, if the
-    /// topology changed since the last time (or never measured). Blocks for
-    /// the time the transfers take, bounded: three repetitions at each of
-    /// [`PROBE_PAGES`] for each level this instance can time. The `scratch`
-    /// ids must be idle for the whole call and no transfer may be in flight;
+    /// startup probe has not run. Blocks for the time the transfers take,
+    /// bounded: three repetitions at each of [`PROBE_PAGES`] for each level
+    /// this instance can time. The `scratch` ids must be idle for the whole call
+    /// and no transfer may be in flight;
     /// call it before the scheduler admits requests. Returns the one log line
     /// naming the order in use, when it measured.
     pub fn characterize(&mut self, scratch: &Scratch) -> Result<Option<String>> {
@@ -583,6 +586,18 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
         })
     }
 
+    fn fetch_local(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()> {
+        let key = hit.key;
+        let level = match hit.tier {
+            Local::Memory => Level::HostDram,
+            Local::Disk => Level::HostNvme,
+        };
+        let timing = (level, ticket.pages.len(), Instant::now());
+        self.inner.fetch(hit, ticket)?;
+        self.local_timings.insert(key, timing);
+        Ok(())
+    }
+
     /// Start the pool parts of a plan; the ids it returns name the restore.
     fn start_pool(&mut self, endpoint: PrefixKey) -> Result<()> {
         let restore = self.restores.get(&endpoint).expect("registered");
@@ -820,7 +835,7 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
 
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()> {
         let Some(planned) = self.plans.remove(&(hit.key, hit.resident_tokens)) else {
-            return self.inner.fetch(hit, ticket);
+            return self.fetch_local(hit, ticket);
         };
         self.plans.retain(|(key, _), _| *key != hit.key);
         if ticket.key != hit.key || ticket.pages.len() != planned.plan.pages() {
@@ -849,7 +864,7 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
                     pages: ticket.pages[..a_pages].to_vec(),
                     slot: ticket.slot,
                 };
-                self.inner.fetch(local_hit, part_ticket)?;
+                self.fetch_local(local_hit, part_ticket)?;
                 self.restores.get_mut(&endpoint).expect("inserted").stage =
                     Stage::Local { local_key };
                 Ok(())
@@ -867,6 +882,12 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
         let mut inner_events = std::mem::take(&mut self.inner_events);
         let inner = self.inner.poll(&mut inner_events);
         for event in inner_events.drain(..) {
+            if let StoreEvent::Fetched { key, result } = &event
+                && let Some((level, pages, started)) = self.local_timings.remove(key)
+                && result.is_ok()
+            {
+                PoolPort::observe_restore(&self.pool, level, pages, started.elapsed());
+            }
             match event {
                 StoreEvent::Fetched { key, result }
                     if self.restores.values().any(
@@ -1281,6 +1302,11 @@ mod tests {
         fn set_ranking(&self, ranking: Ranking) {
             self.0.lock().unwrap().ranking = Some(ranking);
         }
+        fn observe_restore(&self, level: Level, pages: usize, elapsed: Duration) {
+            let mut ranking = self.ranking();
+            ranking.observe(level, pages, elapsed);
+            self.set_ranking(ranking);
+        }
         fn topology(&self) -> crate::characterize::Topology {
             crate::characterize::Topology(self.0.lock().unwrap().topology)
         }
@@ -1487,8 +1513,41 @@ mod tests {
     // ---- two sources ----
 
     #[test]
+    fn local_restores_observe_only_successful_transfers_at_their_own_level() {
+        for tier in [Local::Memory, Local::Disk] {
+            for succeeds in [false, true] {
+                let mut rig = rig();
+                rig.local_hit(800, tier);
+                let hit = rig.store.lookup(&rig.history, 0, u64::MAX).unwrap();
+                let ticket = rig.ticket(&hit);
+                let key = hit.key;
+                let before = rig.store.pool.ranking();
+                rig.store.fetch(hit, ticket).unwrap();
+                assert_eq!(rig.store.pool.ranking(), before);
+                rig.local
+                    .0
+                    .lock()
+                    .unwrap()
+                    .events
+                    .push(StoreEvent::Fetched {
+                        key,
+                        result: if succeeds {
+                            Ok(1)
+                        } else {
+                            Err("copy failed".into())
+                        },
+                    });
+                assert_eq!(fetched(&rig.poll()), [(key, succeeds)]);
+                assert_eq!(rig.store.pool.ranking() != before, succeeds);
+                assert!(rig.store.local_timings.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn local_first_part_then_pool_part_with_one_row_from_the_pool() {
         let mut rig = rig();
+        let ranking = rig.store.pool.ranking();
         rig.local_hit(800, Local::Memory);
         rig.answer(vec![rig.candidate(Level::HostNvme, 2, 800, 0, &[1600], 0)]);
         let hit = rig.lookup().unwrap();
@@ -1522,6 +1581,7 @@ mod tests {
             fetched(&rig.poll()).is_empty(),
             "A done is not the restore done"
         );
+        assert_ne!(rig.store.pool.ranking(), ranking);
         let fetch = rig.pool.lock().unwrap().fetches[0].clone();
         assert_eq!(fetch.parts.len(), 1);
         let part = &fetch.parts[0];
@@ -2000,8 +2060,7 @@ mod tests {
     }
 
     #[test]
-    fn levels_are_ranked_by_what_the_stores_and_the_manager_measure_and_only_when_the_topology_changes()
-     {
+    fn levels_are_probed_only_at_startup_even_when_the_topology_changes() {
         let mut rig = rig();
         rig.pool.lock().unwrap().topology = 5;
         // Own DRAM is slow here; the manager serves host NVMe quickly.
@@ -2026,10 +2085,10 @@ mod tests {
         // Nothing moved: nothing is measured again.
         assert!(!rig.store.needs_characterization());
         assert!(rig.store.characterize(&scratch()).unwrap().is_none());
-        // A different manager or link measures again.
+        // A different manager or link does not trigger another probe.
         rig.pool.lock().unwrap().topology = 6;
-        assert!(rig.store.needs_characterization());
-        assert!(rig.store.characterize(&scratch()).unwrap().is_some());
+        assert!(!rig.store.needs_characterization());
+        assert!(rig.store.characterize(&scratch()).unwrap().is_none());
         // The pool's events that were not the probe's are kept for the worker.
         assert!(rig.poll().is_empty());
     }

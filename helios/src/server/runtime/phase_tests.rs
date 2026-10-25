@@ -2037,20 +2037,19 @@ fn a_local_store_builds_no_lookup_and_a_failed_restore_starts_none() {
 }
 
 #[test]
-fn the_pool_is_characterized_once_with_idle_ids_that_come_back() {
+fn the_pool_is_characterized_before_admission_and_never_again() {
     let mut fixture = Fixture::new();
     fixture.config.limits.pages = 96;
-    let (_sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::channel();
     let mut worker = fixture.worker(receiver);
     let mut store = FakeStore::new(None);
     store.pooled = true;
     store.needs_characterization = true;
-    worker.attach_store(Some(Box::new(store)));
     let free = (
         worker.scheduler.free_page_count(),
         worker.scheduler.free_snapshot_count(),
     );
-    worker.characterize_pool();
+    worker.attach_store(Some(Box::new(store)));
     let seen = &fake_store(&mut worker).characterized;
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].pages.len(), CHARACTERIZATION_PAGES);
@@ -2061,39 +2060,26 @@ fn the_pool_is_characterized_once_with_idle_ids_that_come_back() {
         ),
         free
     );
-    // Once measured, and nothing changed, it is not measured again.
+    // A topology change during serving never lends scratch or probes again.
+    fake_store(&mut worker).needs_characterization = true;
+    worker.service_store().unwrap();
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+    sender.send(vec![incoming]).unwrap();
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    assert!(worker.active[0].is_some());
     worker.characterize_pool();
     assert_eq!(fake_store(&mut worker).characterized.len(), 1);
-    // A topology change asks again.
-    fake_store(&mut worker).needs_characterization = true;
-    worker.characterize_pool();
-    assert_eq!(fake_store(&mut worker).characterized.len(), 2);
 }
 
 #[test]
-fn characterization_waits_for_an_idle_worker_and_a_pooled_store() {
-    let mut fixture = Fixture::new();
-    fixture.config.limits.pages = 96;
-    let (sender, receiver) = mpsc::channel();
-    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
-    sender.send(vec![incoming]).unwrap();
+fn a_local_store_is_not_characterized() {
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
     let mut worker = fixture.worker(receiver);
     let mut store = FakeStore::new(None);
-    store.pooled = true;
     store.needs_characterization = true;
     worker.attach_store(Some(Box::new(store)));
-    worker.admit().unwrap();
-    assert!(worker.active[0].is_some());
-    worker.characterize_pool();
     assert!(fake_store(&mut worker).characterized.is_empty());
-
-    let (_sender, receiver) = mpsc::channel();
-    let mut local = fixture.worker(receiver);
-    let mut store = FakeStore::new(None);
-    store.needs_characterization = true;
-    local.attach_store(Some(Box::new(store)));
-    local.characterize_pool();
-    assert!(fake_store(&mut local).characterized.is_empty());
 }
 
 #[test]
@@ -2107,7 +2093,7 @@ fn too_few_idle_ids_skip_characterization_without_retrying() {
     worker.attach_store(Some(Box::new(store)));
     worker.characterize_pool();
     assert!(fake_store(&mut worker).characterized.is_empty());
-    assert!(worker.characterization_off);
+    assert!(worker.pool_characterized);
 }
 
 #[test]
