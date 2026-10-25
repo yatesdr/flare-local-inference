@@ -933,3 +933,73 @@ What the manager serves, and where it is narrower than the contract above.
   retried on `Room`, so the informational push has no consumer yet.
 - **Not served.** `Locate` and the v1 services no longer exist. Operator statistics are the
   metrics endpoint; pins, purges and quotas have no wire.
+
+## 13. Multi-process instances: rank agents
+
+An instance whose tensor-parallel ranks are separate processes is one instance of the pool.
+Rank 0 alone opens the `Session` (`OpenSession.rank_secret` set, `scope.geometry.ranks` one
+entry per rank, at least two); it announces, looks up, claims, puts and answers exports.
+Every other rank runs an agent that attaches with the `Rank` stream and moves only its own
+slice of each window. Records at rest are the ordinary composite records (one checksum per
+page, one for the row; the scope and its identity are those of a single-process instance of
+the same shape, so the two share records). Slices exist only in flight.
+
+**Slices.** A window holds whole page records then optionally the row record; within a record
+the ranks follow each other, each rank's planes padded to a block. Rank r's slice of page i of a
+window is contiguous at `i * page_record_bytes + (the sum of the padded sizes of ranks before
+r)`; its row slice likewise in the row record. `flare_selene::pool::SliceLayout` is the one
+implementation of that arithmetic.
+
+**Modes.** The manager decides each agent's mode when it attaches (`RankAttached.mode`):
+`RANK_SHARED` (the agent reads and writes the manager's shared windows in place; only when it
+is on the manager's host and rank 0 is in shared memory too, because window coordinates reach
+an agent only through rank 0) or `RANK_CHANNEL` (it has its own data channel per transfer, named
+in a `rank_channels` entry of `ClaimGranted`, `ExportRequest` or `PutAccept`; rank 0's own is the
+message's `channel`). A channel carries only that rank's slice: `Shape.length` is the slice's
+length, the frames are unchanged, and the channel is the stream carrier (an RDMA leg gathers and
+scatters through bounded packed staging, 13.5).
+
+**13.1 Attachment.** `RankAttach{manager_incarnation, instance_id, rank0_nonce, rank,
+agent_nonce, rank_secret, drain_only}`. The manager checks the incarnation (`RANK_STALE_MANAGER`),
+a live session of that instance run by that process (`RANK_NO_SESSION`: retry), the secret in
+constant time (`RANK_BAD_SECRET`), the rank (`RANK_BAD_RANK`), and that a channel-mode agent has a
+data listener to reach (`RANK_MIXED_MODE`). It assigns a generation from the session counter.
+Claims, exports and puts of the instance, and claims naming it as a source, are refused
+`RANKS_DETACHED` (put `PUT_NOT_READY`) unless every rank 1..W-1 is attached and not drain-only. A
+new attachment of a rank supersedes the live one, which stays a drain-only party; the same
+process reconnecting its session keeps its agents, another process taking the instance over does
+not.
+
+**13.2 Identity and fencing.** What an agent may still be touching is its own obligation under
+`(instance_id, agent_nonce)`, never "rank r": a replacement inherits nothing and clears
+nothing. Only the agent's own `RankFence{kind, id, DRAINED}` for the transfer, its own
+`RankGoodbye{quiesced}` or its process's exit discharges it. Stream loss, replacement, timeout
+and cancel are logical invalidation only. A channel leg is fenced by the manager's handler's
+exit, which proves the manager's memory quiet, never that a remote rank's GPU copies drained: that
+is the rank's own `Done` to rank 0, and rank 0 releases nothing and reports nothing before every
+rank's.
+
+**13.3 Drain-only attachments.** When rank 0's session ends its agents are not closed: they can
+be granted nothing, and an agent whose stream broke may attach again with `drain_only` and the
+old secret, against retained obligations only, to attest and say goodbye. After a manager
+restart all obligations are gone with the old regions.
+
+**13.4 Windows and checksums.** A multi-process source states, per rank, slice transfer
+checksums (`RankSums`): rank 0's `WindowFilled.rank_sums`/`PutFilled.rank_sums` for itself and
+its shared peers, each leg's frame for its rank. A window is whole only when every accessor
+has reported once (a bit per accessor, repeats are no vote). The manager then runs the
+**assembly pass** on the window (off the actor, over several threads): it verifies the stated
+slice checksums and computes the stored whole-page and row checksums for a single-process
+requester or a put's commit, or verifies the stored (or stated whole) checksums and computes
+each rank's slice transfer checksums for a multi-process requester (`WindowReady.rank_sums`,
+the leg frames). A window is released to the store or the requester's pool only after the
+pass is over, a window is free only when every reader has reported (the requester's session
+for rank 0 and its shared peers, one leg per channel rank), an exact `CopyResult{COPY_OK}` that
+arrives before a leg has finished reading is latched, and a put's `PutCommit` carries the
+record the manager rewrites with the checksums it computed.
+
+**13.5 RDMA.** A rank's leg may use the contiguous RDMA carrier: the manager gathers a window's
+slice into a packed buffer from a bounded registered pool, writes it into the rank's lent slot,
+and for a put reads the packed bytes and scatters them. A buffer returns to the pool only after
+the work request completed and the queue pair was quiesced or flushed, else it is quarantined
+with the leg.
