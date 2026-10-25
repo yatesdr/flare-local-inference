@@ -51,8 +51,6 @@ Options accept bytes with binary K/M/G/T suffixes, and durations with ms/s/m/h/d
 | `--listen-data` | the host of `--listen`, next port; where those instances copy bytes |
 | `--tls-cert`, `--tls-key` | none; TLS for `--listen` |
 | `--rdma` | off; experimental, needs the `rdma` feature, not with TLS |
-| `--source-wait` | 10s; wait for remembered instances before serving |
-| `--instance-retention` | 7d; forget instances not seen for this long |
 | `--metrics` | disabled; when set, HTTP `GET /metrics` |
 | `--config` | none; a TOML file with the same keys, flags override |
 

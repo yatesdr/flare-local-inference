@@ -63,7 +63,6 @@ impl Net {
         let mut store = Config::dram_only(socket.clone(), 8 * 1024 * 1024);
         let net_name = super::instance_name("net");
         store.name = net_name.clone();
-        store.pool.source_wait = Duration::ZERO;
         store_tweak(&mut store);
         let mut net = NetConfig::defaults();
         net.name = store.name.clone();

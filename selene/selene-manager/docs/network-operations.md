@@ -42,7 +42,7 @@ records are offered to it as level 5 (remote NVMe).
 
 ## The data channel
 
-Hello, sessions, notices, resync, lookup, and the readiness barrier work over the network
+Hello, sessions, notices, resync, lookup, and disk-recovery readiness work over the network
 listener exactly as on the Unix socket. An instance without shared memory moves record bytes on
 the **data channel**: a `Claim` or `PutBegin` in mode `DATA_CHANNEL` is granted a single-use token
 and the data listener's address instead of windows. The instance connects (with TLS when the

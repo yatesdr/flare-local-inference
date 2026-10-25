@@ -102,8 +102,6 @@ pub fn store_config(config: &crate::config::Config) -> Result<Config> {
     store.staging = usize::try_from(config.staging)
         .map_err(|_| invalid("--staging is too large for this host"))?;
     store.metrics = config.metrics.map(|address| address.to_string());
-    store.pool.source_wait = config.source_wait;
-    store.pool.instance_retention = config.instance_retention;
     Ok(store)
 }
 
@@ -182,7 +180,6 @@ pub fn serve(
     validate_tls(&config)?;
     let data_tls = data_tls(&config)?;
     let pool_settings = store_config.pool.clone();
-    let pool_root = store_config.root.clone();
     let store = Store::open(store_config)?;
     let regions = Arc::new(store.regions());
     let directory = config
@@ -237,9 +234,6 @@ pub fn serve(
     let pool_config = crate::pool::PoolConfig {
         limits: pool_settings.limits.clone(),
         reply_retention: pool_settings.reply_retention,
-        source_wait: pool_settings.source_wait,
-        instance_retention: pool_settings.instance_retention,
-        store_directory: pool_root,
         encryption: if config.tls_cert.is_some() {
             crate::proto::v2::Encryption::Tls
         } else {

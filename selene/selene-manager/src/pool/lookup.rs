@@ -39,13 +39,12 @@ impl Core {
             return Ok(());
         };
         if !self.ready() {
-            let retry = self.readiness_info().barrier_remaining_ms.clamp(50, 1000);
             self.lookup_reply(
                 sid,
                 request.lookup_id,
                 v2::LookupStatus::LookupNotReady,
                 vec![],
-                retry,
+                50,
             );
             return Ok(());
         }

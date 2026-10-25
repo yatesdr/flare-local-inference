@@ -30,10 +30,6 @@ pub struct PoolSettings {
     pub limits: Limits,
     /// How long a terminal claim's reply is kept to answer duplicates.
     pub reply_retention: Duration,
-    /// The expected-source barrier's bounded wait, from process start.
-    pub source_wait: Duration,
-    /// Instances not seen for this long are forgotten.
-    pub instance_retention: Duration,
 }
 
 impl Default for PoolSettings {
@@ -41,8 +37,6 @@ impl Default for PoolSettings {
         Self {
             limits: Limits::default(),
             reply_retention: Duration::from_secs(60),
-            source_wait: Duration::from_secs(10),
-            instance_retention: Duration::from_secs(7 * 86_400),
         }
     }
 }

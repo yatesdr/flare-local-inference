@@ -165,17 +165,11 @@ unchanged; changing either means restarting the instances too.
 
 ## Readiness and restarts
 
-The manager is `READY` (lookups, claims and puts are served) when disk recovery is complete and
-every instance it remembers has re-announced its holdings or the bounded wait has run out.
-Until then lookups, claims and puts answer `NOT_READY` and instances use their local tiers;
-sessions, notices and resyncs are accepted so sources can sync.
+The manager is `READY` when its own disk recovery completes. It serves lookups,
+claims and puts without waiting for previous instances to reconnect. Until recovery
+finishes, requests answer `NOT_READY`; sessions and announcements remain available.
+Sources reconnect and resnapshot independently, so their hints may temporarily miss.
 
-- The instance ids the manager served are kept in `<root>/instances` (replaced atomically).
-  Instance ids are stable across restarts of an instance, so one that restarts together with
-  the manager is satisfied as soon as it syncs.
-- `--source-wait` (default 10s, counted from process start) bounds the wait for an instance that
-  never returns. `--instance-retention` (default 7d) forgets instances not seen for that long.
-  A manager with no `--root` has nothing to remember and is ready immediately.
 - Records the manager held only in DRAM are lost with it; NVMe records are recovered and start in the
   disk tier. A put is complete (and the writer may drop its copy) only at `Stored`.
 - `SIGTERM` or `SIGINT` drains: new sessions, lookups, claims and puts are refused, claims in
@@ -223,9 +217,8 @@ the total; a nonzero value that does not fall means an instance is hung, not a l
 
 | Series | Meaning | Alert on |
 |---|---|---|
-| `selene_pool_state`, `selene_pool_ready` | 1 recovering, 2 awaiting sources, 3 ready, 4 draining; and 1 when ready. | Not ready for longer than `--source-wait`. |
+| `selene_pool_state`, `selene_pool_ready` | 1 recovering, 3 ready, 4 draining; and 1 when ready. | Recovery that does not finish. |
 | `selene_pool_sessions` | Live instance sessions. | Dropping to zero while instances serve. |
-| `selene_pool_sources_synced`, `selene_pool_sources_expected` | Sources with an installed snapshot; remembered ones still awaited. | `expected` that does not reach 0. |
 | `selene_pool_index_entries` | Entries announced to the index. | Unbounded growth. |
 | `selene_pool_claims_in_flight`, `selene_pool_claim_records`, `selene_pool_lookups_queued` | Work in flight and records kept for fences and replies. | Records that never fall. |
 | `selene_pool_claims_total{state,reason}`, `selene_pool_claims_refused_total{reason}`, `selene_pool_lookups_total{status}` | Outcomes. | `COPY_ERROR`, `CHECKSUM`, `NO_WINDOWS` rising. |
@@ -270,5 +263,4 @@ the old directory is safe to delete and cannot be reused by accident.
 | Manager exits at startup | Another manager on the same root or `--name`; a root that cannot do `O_DIRECT`; a certificate and key that do not match; `--rdma` with TLS. |
 | Instances run on local tiers only | The pool address, socket permissions, uid/gid equality, `/dev/shm/selene` mounted at the same path in both containers, `selene_pool_ready`. |
 | `NO_WINDOWS` | `--staging`; `selene_pool_quarantined_bytes`; many large exports at once. |
-| Sustained `NOT_READY` | `selene_pool_sources_expected`: a remembered instance is not coming back; it clears after `--source-wait`. |
 | Quarantined bytes do not fall | A hung instance (it will clear when the process exits). |

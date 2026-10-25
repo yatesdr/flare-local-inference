@@ -270,9 +270,7 @@ enum ReadinessState {
   READINESS_UNSPECIFIED = 0;
   // Disk recovery of the manager's own NVMe records is running.
   RECOVERING = 1;
-  // Recovery is done; the expected-source barrier is still open: some expected
-  // source has neither installed a snapshot nor used up its bounded wait.
-  AWAITING_SOURCES = 2;
+  reserved 2;
   // Lookups, claims and puts are served.
   READY = 3;
   // The manager is shutting down: new lookups, claims and puts are refused with
@@ -285,14 +283,7 @@ message ReadinessInfo {
   bool disk_recovered = 2;
   uint64 recovered_records = 3;
   uint32 sources_connected = 4;
-  // Connected sources whose current snapshot is installed.
-  uint32 sources_synced = 5;
-  // Time left in the expected-source barrier's bounded wait; 0 once it has
-  // elapsed or the barrier is satisfied.
-  uint32 barrier_remaining_ms = 6;
-  // Instances the manager remembered serving (persisted in its store directory,
-  // last-seen within the retention period) and still waits for.
-  uint32 sources_expected = 8;
+  reserved 5, 6, 8;
   // Bytes of staging and arena the manager will not reuse until a process exits
   // or the manager restarts (see quarantine in PROTOCOL.md). Exposed so
   // operators see degradation.

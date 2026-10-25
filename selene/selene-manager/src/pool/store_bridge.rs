@@ -255,7 +255,7 @@ impl Core {
         let descriptor: Descriptor = self.scopes.get(&scope)?.valid.descriptor.clone();
         let connection = self.new_store_connection()?;
         let namespace = descriptor.namespace_id();
-        let replica = super::barrier::hex(&process.0);
+        let replica = flare_selene::record::hex(&process.0);
         let generation = if pid == 0 {
             // A process on another host has no pid to watch. It never touches the
             // manager's memory: the manager's own data-channel handler does.

@@ -531,7 +531,7 @@ fn notices_follow_the_snapshot_in_order_and_the_manager_not_ready_stops_lookups_
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].notices.len(), 3);
     rig.send(In::Readiness(wire::ReadinessInfo {
-        state: wire::ReadinessState::AwaitingSources as i32,
+        state: wire::ReadinessState::Recovering as i32,
         ..Default::default()
     }));
     assert_eq!(rig.shared.status(), PoolStatus::NotReady);
