@@ -1158,14 +1158,11 @@ impl Agent {
             if sums.pages.len() != count || sums.has_row != row {
                 return self.fail(xfer, "window checksums do not match its pages".into());
             }
-            let mine = self.layout.rank(rank);
-            let bad = (0..count).any(|i| {
-                let at = self.layout.page_at(rank, i as u32) as usize;
-                checksum(&bytes[at..at + mine.page_len as usize]) != sums.pages[i]
-            }) || (row && {
-                let at = self.layout.row_at(rank, count as u32) as usize;
-                checksum(&bytes[at..at + mine.row_len as usize]) != sums.row
-            });
+            let mine = match self.layout.slice_sums(rank, bytes, count as u32, row) {
+                Ok(mine) => mine,
+                Err(why) => return self.fail(xfer, why.to_string()),
+            };
+            let bad = mine.pages != sums.pages || mine.row != sums.has_row.then_some(sums.row);
             if bad {
                 return self.fail(xfer, "a page or row failed its checksum".into());
             }
@@ -1610,17 +1607,9 @@ impl Agent {
                         row: persisted.row,
                     }
                 } else {
-                    SliceSums {
-                        pages: (0..count)
-                            .map(|i| {
-                                let at = self.layout.page_at(rank, i as u32) as usize;
-                                checksum(&bytes[at..at + mine.page_len as usize])
-                            })
-                            .collect(),
-                        row: row.then(|| {
-                            let at = self.layout.row_at(rank, count as u32) as usize;
-                            checksum(&bytes[at..at + mine.row_len as usize])
-                        }),
+                    match self.layout.slice_sums(rank, bytes, count as u32, row) {
+                        Ok(sums) => sums,
+                        Err(why) => return self.fail(xfer, why.to_string()),
                     }
                 };
                 self.end.send(Msg::WindowDone(link::WindowDone {
