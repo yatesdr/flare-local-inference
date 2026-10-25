@@ -43,17 +43,11 @@ pub struct RankLeg {
     pub ch: Channel,
 }
 
-/// What the pass produced for one window, held until its turn.
-pub struct Ready {
-    pub whole: Option<SliceSums>,
-    pub slices: Option<Vec<SliceSums>>,
-}
-
 /// Windows are delivered in index order whatever order their passes finish in.
 #[derive(Default)]
 pub struct Delivery {
     pub next: u32,
-    pub ready: BTreeMap<u32, Ready>,
+    pub ready: BTreeMap<u32, PassOut>,
 }
 
 /// What a source states about a window.
@@ -219,7 +213,6 @@ impl Core {
             .map(|side| side.layout.clone())
             .expect("a multi-process side");
         let (pages, row) = (window.plan.page_count, window.plan.row);
-        let requester_mp = claim.mp.req.is_some();
         let (stated_slices, stated_whole) = match stated {
             Stated::Ranks(slices) => (Some(slices), None),
             Stated::Whole(sums) => (None, Some(sums)),
@@ -233,8 +226,6 @@ impl Core {
             layout,
             stated_slices,
             stated_whole,
-            want_whole: !requester_mp,
-            want_slices: requester_mp,
         };
         claim.mp.passes += 1;
         let events = self.self_tx.clone();
@@ -306,13 +297,7 @@ impl Core {
         }
         match result {
             Ok(out) => {
-                claim.mp.deliver.ready.insert(
-                    index,
-                    Ready {
-                        whole: out.whole,
-                        slices: out.slices,
-                    },
-                );
+                claim.mp.deliver.ready.insert(index, out);
             }
             Err(PassError::Mismatch(why)) => {
                 eprintln!("selene: claim {}: {why}", key.2);
@@ -340,18 +325,16 @@ impl Core {
     }
 
     /// Hand a window that went through the pass to the requester.
-    fn deliver_ready(&mut self, key: ClaimKey, index: usize, ready: Ready) {
+    fn deliver_ready(&mut self, key: ClaimKey, index: usize, ready: PassOut) {
         let Some(claim) = self.claims.get_mut(&key) else {
             return;
         };
         let Some(side) = claim.mp.req.as_ref() else {
             // A single-process requester: whole sums, delivered as ever.
-            let sums = ready.whole.unwrap_or_default();
+            let sums = ready.whole;
             return self.deliver_window(key, index, sums.pages, sums.row.unwrap_or(0));
         };
-        let Some(slices) = ready.slices else {
-            return self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
-        };
+        let slices = ready.slices;
         let layout = side.layout.clone();
         let shared_ranks: Vec<u32> = std::iter::once(0)
             .chain(side.peers.iter().filter(|p| p.shared).map(|p| p.rank))
