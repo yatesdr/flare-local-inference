@@ -122,7 +122,7 @@ impl Manager {
     }
 
     /// A manager reached over TCP, with TLS when `tls`.
-    fn start_network(tls: bool) -> Self {
+    pub(super) fn start_network(tls: bool) -> Self {
         Self::start_network_with(tls, false)
     }
 
@@ -189,7 +189,7 @@ impl Manager {
     }
 
     /// Where an instance on another host reaches the manager, and the CA it trusts.
-    fn remote(&self) -> Option<(PoolAddress, Option<PathBuf>)> {
+    pub(super) fn remote(&self) -> Option<(PoolAddress, Option<PathBuf>)> {
         let network = self.network.as_ref()?;
         let port = network.config.listen.unwrap().port();
         let host = if network.ca.is_some() {

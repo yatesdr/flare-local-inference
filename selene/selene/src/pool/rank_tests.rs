@@ -44,8 +44,12 @@ fn scope(world: usize) -> Scope {
 }
 
 fn config(manager: &Manager, name: &str, world: usize, gpus: Vec<[u8; 16]>) -> PoolConfig {
+    config_at(PoolAddress::Unix(manager.socket.clone()), name, world, gpus)
+}
+
+fn config_at(address: PoolAddress, name: &str, world: usize, gpus: Vec<[u8; 16]>) -> PoolConfig {
     PoolConfig {
-        address: PoolAddress::Unix(manager.socket.clone()),
+        address,
         tenant: "t".into(),
         ca: None,
         scope: scope(world),
@@ -146,7 +150,26 @@ struct Instance {
     events: Vec<PoolEvent>,
 }
 
+/// How each rank of an instance reaches the manager: over its Unix socket (shared memory)
+/// or over the network (its own data channel).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    Local,
+    Network,
+}
+
 fn instance(manager: &Manager, world: usize) -> Instance {
+    instance_reaching(manager, world, &vec![Reach::Local; world])
+}
+
+fn address_for(manager: &Manager, reach: Reach) -> PoolAddress {
+    match reach {
+        Reach::Local => PoolAddress::Unix(manager.socket.clone()),
+        Reach::Network => manager.remote().expect("a network manager").0,
+    }
+}
+
+fn instance_reaching(manager: &Manager, world: usize, reach: &[Reach]) -> Instance {
     let mut links = Vec::new();
     let mut peer_ends = Vec::new();
     for _ in 1..world {
@@ -158,7 +181,12 @@ fn instance(manager: &Manager, world: usize) -> Instance {
     let mut gpus: Vec<[u8; 16]> = vec![[2; 16]];
     gpus.extend((1..world).map(|r| [2 + r as u8; 16]));
     let rank0 = PoolClient::start_ranked(
-        config(manager, "requester", world, gpus.clone()),
+        config_at(
+            address_for(manager, reach[0]),
+            "requester",
+            world,
+            gpus.clone(),
+        ),
         RankSet { links },
         copier,
         Arc::new(OkRegistrar),
@@ -172,7 +200,7 @@ fn instance(manager: &Manager, world: usize) -> Instance {
         memory.push(gpu);
         agents.push(
             RankAgent::start(AgentConfig {
-                address: PoolAddress::Unix(manager.socket.clone()),
+                address: address_for(manager, reach[rank]),
                 ca: None,
                 scope: scope(world),
                 rank,
@@ -328,14 +356,35 @@ fn offer(source: &Source, history: &TestHistory, world: usize, pages: usize) -> 
 
 #[test]
 fn a_two_rank_instance_restores_a_single_process_record_slice_by_slice() {
-    let manager = Manager::start();
-    let mut source = source(&manager, 2);
-    let mut requester = instance(&manager, 2);
+    restore_through(&Manager::start(), 2, &[Reach::Local, Reach::Local]);
+}
+
+#[test]
+fn a_peer_on_its_own_data_channel_gets_its_slices_while_rank_zero_reads_shared_memory() {
+    let manager = Manager::start_network(false);
+    restore_through(&manager, 2, &[Reach::Local, Reach::Network]);
+}
+
+#[test]
+fn every_rank_on_its_own_data_channel_restores_a_record() {
+    let manager = Manager::start_network(false);
+    restore_through(&manager, 2, &[Reach::Network, Reach::Network]);
+}
+
+#[test]
+fn three_ranks_mix_shared_memory_and_channels() {
+    let manager = Manager::start_network(false);
+    restore_through(&manager, 3, &[Reach::Local, Reach::Network, Reach::Local]);
+}
+
+fn restore_through(manager: &Manager, world: usize, reach: &[Reach]) {
+    let mut source = source(manager, world);
+    let mut requester = instance_reaching(manager, world, reach);
     wait("the source", || source.client.status() == PoolStatus::Ready);
     requester.ready();
     let history = history_of(4000);
     let pages = 4;
-    let key = offer(&source, &history, 2, pages);
+    let key = offer(&source, &history, world, pages);
     let scratch = [100, 101, 102, 103];
     wait("the offer to be indexed", || {
         let ticket = requester.rank0.begin_lookup(&history, Vec::new());
@@ -345,7 +394,7 @@ fn a_two_rank_instance_restores_a_single_process_record_slice_by_slice() {
         }
         matches!(ticket.state(), LookupState::Ready(a) if !a.candidates.is_empty())
     });
-    let fetch = fetch_for(&requester.rank0, 2, &history, pages, &scratch);
+    let fetch = fetch_for(&requester.rank0, world, &history, pages, &scratch);
     requester.rank0.fetch(fetch).unwrap();
     let export = loop {
         let mut events = Vec::new();
@@ -360,8 +409,8 @@ fn a_two_rank_instance_restores_a_single_process_record_slice_by_slice() {
     };
     source
         .client
-        .host_pinned(export.export, pin(2, key, 11, pages));
-    let (page, row) = whole(2);
+        .host_pinned(export.export, pin(world, key, 11, pages));
+    let (page, row) = whole(world);
     let result = requester.event("the restore", |e| match e {
         PoolEvent::Fetched { result, .. } => {
             Some(result.as_ref().map(|b| *b).map_err(|f| f.error.to_string()))
@@ -369,7 +418,7 @@ fn a_two_rank_instance_restores_a_single_process_record_slice_by_slice() {
         _ => None,
     });
     assert_eq!(result, Ok((pages * page + row) as u64));
-    assert_slices(&requester, 2, pages, &scratch);
+    assert_slices(&requester, world, pages, &scratch);
     requester.close();
     let _ = source.client.close();
 }

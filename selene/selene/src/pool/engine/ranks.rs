@@ -35,6 +35,8 @@ pub(crate) enum RankEvent {
         result: std::result::Result<(), String>,
         quarantined: bool,
     },
+    /// The rank attached to the manager.
+    Attached { rank: usize },
     /// The attachment of a rank changed or ended; its open transfers are cancelled by the
     /// agent and their `Done` follow.
     Detached { rank: usize },
@@ -301,6 +303,7 @@ impl Ranks {
                     generation: attached.generation,
                     mode,
                 };
+                events.push(RankEvent::Attached { rank });
             }
             Msg::Detached(_) => {
                 if !matches!(self.peers[index].state, State::Lost) {
