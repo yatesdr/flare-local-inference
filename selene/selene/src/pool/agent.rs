@@ -288,6 +288,7 @@ impl Agent {
             return Ok(());
         }
         let mut backoff = FIRST_BACKOFF;
+        let mut warned = false;
         loop {
             if self.stopping() || self.end.failed() {
                 return Ok(());
@@ -299,8 +300,17 @@ impl Agent {
                     self.set_status(PoolStatus::Disabled(why));
                     return Ok(());
                 }
-                Attempt::Retry => {}
+                Attempt::Retry(why) => {
+                    if !warned {
+                        warned = true;
+                        eprintln!(
+                            "warning: rank {}: cannot attach to the pool manager ({why}); will keep trying",
+                            self.rank
+                        );
+                    }
+                }
                 Attempt::Ended => {
+                    warned = false;
                     if started.elapsed() > MAX_BACKOFF {
                         backoff = FIRST_BACKOFF;
                     }
@@ -420,7 +430,7 @@ impl Agent {
         };
         let (channel, connected_with) = match conn::connect(&link).await {
             Ok(connected) => connected,
-            Err(conn::Unreachable::Retry(_)) => return Attempt::Retry,
+            Err(conn::Unreachable::Retry(why)) => return Attempt::Retry(why),
             Err(conn::Unreachable::Untrusted(why)) => {
                 return Attempt::Disabled(format!(
                     "cannot verify the pool manager over TLS ({why})"
@@ -439,7 +449,8 @@ impl Agent {
         .await;
         let hello = match hello {
             Ok(Ok(reply)) => reply.into_inner(),
-            _ => return Attempt::Retry,
+            Ok(Err(status)) => return Attempt::Retry(format!("Hello failed: {status}")),
+            Err(_) => return Attempt::Retry("Hello timed out".into()),
         };
         if let Err(why) = conn::check_hello(&hello, connected_with) {
             return Attempt::Disabled(why);
@@ -467,18 +478,23 @@ impl Agent {
             tokio::time::timeout(ATTACH_TIMEOUT, client.rank(ReceiverStream::new(rx))).await;
         let mut stream = match response {
             Ok(Ok(response)) => response.into_inner(),
-            _ => return Attempt::Retry,
+            Ok(Err(status)) => return Attempt::Retry(format!("attach failed: {status}")),
+            Err(_) => return Attempt::Retry("attaching timed out".into()),
         };
         let attached = match tokio::time::timeout(ATTACH_TIMEOUT, stream.message()).await {
             Ok(Ok(Some(wire::RankServerMessage {
                 m: Some(rs::M::Attached(attached)),
             }))) => attached,
-            _ => return Attempt::Retry,
+            Ok(Ok(other)) => return Attempt::Retry(format!("unexpected answer {other:?}")),
+            Ok(Err(status)) => return Attempt::Retry(format!("attach failed: {status}")),
+            Err(_) => return Attempt::Retry("the manager did not answer the attach".into()),
         };
         use wire::RankAttachStatus as S;
         match S::try_from(attached.status) {
             Ok(S::RankOk) => {}
-            Ok(S::RankNoSession | S::RankStaleManager) => return Attempt::Retry,
+            Ok(S::RankNoSession | S::RankStaleManager) => {
+                return Attempt::Retry("rank 0 has no session yet".into());
+            }
             Ok(S::RankMixedMode) => {
                 return Attempt::Disabled(
                     "the manager has no data listener this rank can reach".into(),
@@ -1370,7 +1386,7 @@ impl Agent {
 }
 
 enum Attempt {
-    Retry,
+    Retry(String),
     Disabled(String),
     Ended,
 }
