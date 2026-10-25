@@ -444,9 +444,6 @@ pub fn prepare_with_inputs(
         return Ok(Preparation::None("disabled".to_owned()));
     }
     let _ = package;
-    if options.pool.is_some() && shard.is_some() {
-        return Err("a multi-host package cannot share prefixes through a pool".into());
-    }
     let layout = Layout::new(&geometry)?;
     let fingerprint = match (shard, geometry.as_slice()) {
         (None, _) => geometry::fingerprint(&geometry),
@@ -456,6 +453,9 @@ pub fn prepare_with_inputs(
         }
     };
     let memory_bytes = options.memory_bytes.unwrap_or(0);
+    if shard.is_some() && memory_bytes != 0 {
+        return Err("a multi-host package keeps host prefix records on disk only; set --prefix-cache-memory 0".into());
+    }
     let minimum = slab::SlabPool::minimum_bytes(&layout);
     if memory_bytes != 0 && memory_bytes < minimum {
         return Err(format!(
@@ -914,23 +914,48 @@ mod tests {
     }
 
     #[test]
-    fn a_pool_is_refused_for_a_multi_host_package_before_anything_is_built() {
-        let options = PrefixCacheOffload {
+    fn a_pool_with_shards_keeps_one_local_rank_and_refuses_memory_and_direct() {
+        let mut options = PrefixCacheOffload {
             pool: Some(pool("unix:/run/selene.sock")),
             ..Default::default()
         };
-        let error = prepare_with_inputs(
-            &options,
-            std::path::Path::new("/missing/model.safetensors"),
-            [0; 32],
-            Vec::new(),
-            Vec::new(),
-            0,
-            Some((1, 2)),
-        )
-        .err()
-        .unwrap();
-        assert!(error.to_string().contains("multi-host"), "{error}");
+        let local = flare_selene::testing::geometry(64, &[("kv", 4096)], 4096);
+        let prepare = |options: &PrefixCacheOffload| {
+            prepare_with_inputs(
+                options,
+                std::path::Path::new("model.safetensors"),
+                [0; 32],
+                vec![local.clone()],
+                vec![(0, 0)],
+                0,
+                Some((1, 2)),
+            )
+        };
+        let Preparation::Store(prepared) = prepare(&options).unwrap() else {
+            panic!("no pool store")
+        };
+        assert_eq!(prepared.geometry.len(), 1);
+        assert_eq!(
+            prepared.fingerprint,
+            geometry::shard_fingerprint(&local, 1, 2)
+        );
+        options.memory_bytes = Some(1);
+        assert!(
+            prepare(&options)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("disk only")
+        );
+        options.memory_bytes = None;
+        options.transport = Some(Transport::Direct);
+        assert!(
+            prepare(&options)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("direct")
+        );
     }
 
     #[test]

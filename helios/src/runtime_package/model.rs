@@ -189,9 +189,31 @@ pub fn rank_ranges(
     archive.rank_ranges(index, rank)
 }
 
-/// Turns the continuation rows and KV pages this process can back into those it allocates. Ranks on
-/// separate hosts agree on the smallest any of them can back; it must not exceed what it is given.
-pub type CacheAgreement<'a> = &'a mut dyn FnMut((u64, u64)) -> Result<(u64, u64)>;
+/// Startup agreement between ranks: register and approve pool memory before choosing the
+/// smallest cache capacity every host can back.
+pub trait CacheAgreement {
+    fn caches(&mut self, local: (u64, u64)) -> Result<(u64, u64)>;
+
+    fn pool(
+        &mut self,
+        offer: crate::offload::shard::PoolOffer,
+    ) -> Result<Option<crate::offload::shard::PoolPeers>> {
+        if offer.tenant.is_some() {
+            return Err(invalid("a multi-host pool requires a rank rendezvous"));
+        }
+        Ok(None)
+    }
+
+    fn pool_approved(&mut self, approved: bool, _world: usize) -> Result<bool> {
+        Ok(approved)
+    }
+}
+
+impl<F: FnMut((u64, u64)) -> Result<(u64, u64)>> CacheAgreement for F {
+    fn caches(&mut self, local: (u64, u64)) -> Result<(u64, u64)> {
+        self(local)
+    }
+}
 
 impl NativeModel {
     /// # Safety
@@ -214,7 +236,7 @@ impl NativeModel {
         devices: &[i32],
         options: &LoadOptions,
         progress: &StartupProgress,
-        agree: CacheAgreement<'_>,
+        agree: &mut dyn CacheAgreement,
     ) -> Result<Self> {
         match package {
             super::ModelPackage::Legacy(authorized) => unsafe {
@@ -243,7 +265,7 @@ impl NativeModel {
         devices: &[i32],
         options: &LoadOptions,
         progress: &StartupProgress,
-        agree: CacheAgreement<'_>,
+        agree: &mut dyn CacheAgreement,
     ) -> Result<Self> {
         let device_labels = options.device_labels.as_deref().unwrap_or(devices);
         if device_labels.len() != devices.len() {
@@ -814,8 +836,11 @@ impl NativeModel {
             staging,
             shard,
         )?;
-        if let crate::offload::Preparation::Store(store) = &mut prepared {
-            store.pool = self.pool.take();
+        if let crate::offload::Preparation::Store(store) = &mut prepared
+            && let Some(mut pool) = self.pool.take()
+        {
+            pool.prepare_peer(store)?;
+            store.pool = Some(pool);
         }
         let summary = prepared.summary();
         self.offload = prepared.into_shared();

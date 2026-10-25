@@ -40,7 +40,7 @@ pub(crate) mod wire {
 }
 mod types;
 
-pub use agent::{AgentConfig, RankAgent};
+pub use agent::{AgentConfig, RankAgent, RankRecords};
 pub use announce::{Announcer, IndexEntry, Notice, Snapshot};
 pub use client::{PoolAddress, PoolClient, PoolConfig, STARTUP_WAIT};
 pub use exporter::{Checksums, HostChain, HostPin, HostRecord, HostWindow, PutBytes};

@@ -497,7 +497,7 @@ impl NativeModel {
         packages: &mut [Package],
         progress: &StartupProgress,
         active: usize,
-        agree: super::model::CacheAgreement<'_>,
+        agree: &mut dyn super::model::CacheAgreement,
         options: &LoadOptions,
         initial: &[MemorySnapshot],
         embedding_host_bytes: u64,
@@ -654,12 +654,43 @@ impl NativeModel {
             .as_u64()
             .ok_or_else(|| invalid("model requires a prepared context ceiling"))?;
         let ceiling = page_ceiling(options.kv_cache_limit, context, active as u64, &contract)?;
+        let geometry = if options.prefix_cache.pool.is_some() {
+            packages
+                .iter()
+                .map(|package| cache_geometry(package, contract.cache.page_tokens as u64, 1, 1))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let peers = if let Some(cluster) = self.cluster() {
+            agree.pool(crate::offload::shard::PoolOffer {
+                tenant: options
+                    .prefix_cache
+                    .pool
+                    .as_ref()
+                    .map(|pool| pool.tenant.clone()),
+                identity: if options.prefix_cache.pool.is_some() {
+                    super::model::offload_identity(&self.server_config)?
+                } else {
+                    [0; 32]
+                },
+                layout: if geometry.is_empty() {
+                    [0; 16]
+                } else {
+                    crate::offload::geometry::fingerprint(&geometry)
+                },
+                rank: cluster.rank,
+                world: cluster.world,
+                gpu_uuid: if options.prefix_cache.pool.is_some() {
+                    crate::cuda::device_uuid(self.ranks[0].device)?
+                } else {
+                    [0; 16]
+                },
+            })?
+        } else {
+            None
+        };
         if let Some(pool) = &options.prefix_cache.pool {
-            if self.cluster().is_some() {
-                return Err(invalid(
-                    "a multi-host package cannot share prefixes through a pool",
-                ));
-            }
             let minimum_pages = ceiling
                 .map_or(active as u64 * 8192u64.div_ceil(page_tokens), |limit| {
                     limit.minimum
@@ -693,10 +724,6 @@ impl NativeModel {
                     })
                     .collect(),
             };
-            let geometry = packages
-                .iter()
-                .map(|package| cache_geometry(package, contract.cache.page_tokens as u64, 1, 1))
-                .collect::<Result<Vec<_>>>()?;
             let uuids = self
                 .ranks
                 .iter()
@@ -710,7 +737,15 @@ impl NativeModel {
                 self.ranks[0].context as usize,
                 budget,
                 progress,
+                peers,
+                options.prefix_cache.disk.is_some() && options.prefix_cache.disk_limit != Some(0),
             )?;
+            let mut prepared = prepared;
+            if self.cluster().is_some()
+                && !agree.pool_approved(prepared.approved(), self.cluster().unwrap().world)?
+            {
+                prepared.close()?;
+            }
             for (available, charge) in available.iter_mut().zip(charges) {
                 *available = available.saturating_sub(charge);
             }
@@ -727,7 +762,7 @@ impl NativeModel {
         // Fewer pages only shrink KV, and fewer rows only the snapshot slots aliased into it, so
         // the smallest capacity any rank can back fits every rank. Snapshot rows need no
         // dedicated backing; the alias layout below rejects rows the agreed pages cannot back.
-        let (rows, pages) = agree((local_rows, local_pages))?;
+        let (rows, pages) = agree.caches((local_rows, local_pages))?;
         let virtual_pages = packages
             .iter()
             .flat_map(|p| &p.allocations)

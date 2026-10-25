@@ -958,8 +958,16 @@ pool claims; failed transfers and row-only restores do not update the ranking.
 The manager also refines source costs from completed claims, weighted by pages,
 and supplies those estimates to the restore planner.
 
-A pooled instance supports a single host. A multi-host package keeps disk-only
-retention, and startup refuses a pool for it.
+A pooled instance can span hosts. Rank zero owns the pool session and decisions;
+each peer runs an agent that moves only its own rank's bytes. The pool identity
+covers every rank's GPU UUID, and its layout matches single-process TP of the
+same width. Every rank approves and registers its pool memory before cache
+sizing; a refusal on any rank disables the pool for the whole instance.
+Multi-host local retention remains disk-only: peer agents read their shards
+under rank zero's holds, while the existing record links mirror writes and
+restores. The pool link shares the record listener's launch token and address
+checks; deployments must secure the cluster fabric, since these links carry
+session secrets and transfer tokens in plaintext.
 
 ## 3. Implementation sequence
 
