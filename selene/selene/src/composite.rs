@@ -39,6 +39,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::levels::Rate;
 use crate::{
     CheckpointId, Error, ExportRefusal, History, PrefixKey, Result,
     pool::{Announcer, HostPin, Tier as PoolTier},
@@ -54,23 +55,6 @@ use super::{
     memory::MemoryStore,
     record::Header,
 };
-
-/// Weight of the newest observation in the disk rate estimates.
-const RATE_WEIGHT: f64 = 0.2;
-
-/// Exponentially weighted bytes per second of completed disk jobs in one direction.
-#[derive(Clone, Copy)]
-struct Rate(f64);
-
-impl Rate {
-    fn observe(&mut self, bytes: u64, elapsed: Duration) {
-        let seconds = elapsed.as_secs_f64();
-        if bytes == 0 || seconds <= 0.0 {
-            return;
-        }
-        self.0 = (1.0 - RATE_WEIGHT) * self.0 + RATE_WEIGHT * (bytes as f64 / seconds);
-    }
-}
 
 /// A published checkpoint from its memory copy-out to the end of its disk write.
 struct Outbound {
@@ -221,8 +205,8 @@ impl CompositeStore {
             inbound: HashMap::new(),
             jobs: HashMap::new(),
             stale: Vec::new(),
-            disk_outbound_rate: Rate(INITIAL_STAGED_DISK_RATE),
-            disk_inbound_rate: Rate(INITIAL_STAGED_DISK_RATE),
+            disk_outbound_rate: Rate::new(INITIAL_STAGED_DISK_RATE),
+            disk_inbound_rate: Rate::new(INITIAL_STAGED_DISK_RATE),
             pooled: false,
             parked: HashMap::new(),
             memory_events: Vec::new(),

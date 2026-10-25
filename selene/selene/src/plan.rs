@@ -4,8 +4,8 @@
 //! sources. Part A is the longest prefix held at the closest level that has any
 //! of it. Part B is one source at a strictly farther level, starting exactly
 //! where A ends and reaching the endpoint, kept only if its pages are worth
-//! fetching against recomputing them. Part A is chosen longest first, with cost
-//! only breaking ties, so the least has to come from farther away. A part that
+//! fetching against recomputing them. Part A is chosen longest first, with source identity
+//! breaking ties, so the least has to come from farther away. A part that
 //! would supply no pages and no row is left out. The parts are disjoint and contiguous from
 //! the resident prefix, and the endpoint's continuation row comes from whichever
 //! part ends last.
@@ -57,8 +57,6 @@ pub struct Candidate {
     pub skip_pages: usize,
     /// Records from the one holding `begin_tokens` up to the endpoint, ascending.
     pub nodes: Vec<ChainNode>,
-    /// The source's measured microseconds per page; 0 when unknown.
-    pub us_per_page: u32,
 }
 
 /// What the plan is built for.
@@ -66,6 +64,8 @@ pub struct Request<'a> {
     pub history: &'a dyn History,
     pub identity: &'a Identity,
     pub page_tokens: u64,
+    pub page_bytes: u64,
+    pub row_bytes: u64,
     /// Tokens already in GPU memory.
     pub resident: u64,
     /// The endpoint must be strictly below this.
@@ -204,8 +204,6 @@ fn search(
         (
             request.ranking.rank(c.level),
             Reverse(c.key.consumed_tokens),
-            c.us_per_page == 0,
-            c.us_per_page,
             c.source.0,
         )
     });
@@ -258,30 +256,24 @@ impl Request<'_> {
     }
 }
 
-/// Among sources for B: closest level first, then the cheapest known source, then the longest match.
-fn preference(request: &Request, c: &Candidate) -> (usize, bool, u32, Reverse<u64>, u64) {
+fn preference(request: &Request, c: &Candidate) -> (usize, Reverse<u64>, u64) {
     (
         request.ranking.rank(c.level),
-        c.us_per_page == 0,
-        c.us_per_page,
         Reverse(c.key.consumed_tokens),
         c.source.0,
     )
 }
 
-/// Whether the part's pages beat recomputing the tokens they replace. A source
-/// whose cost is unknown, by its own estimate and by measurement, is not.
+/// Whether the transfer beats recomputing the tokens it replaces.
 fn worth(request: &Request, c: &Candidate, b: &Part, from: u64) -> bool {
-    request
-        .ranking
-        .part_seconds(c.level, b.pages, c.us_per_page)
-        .is_some_and(|seconds| {
-            worth_transfer(
-                c.key.consumed_tokens - from,
-                seconds,
-                request.prefill_tokens_per_second,
-            )
-        })
+    worth_transfer(
+        c.key.consumed_tokens - from,
+        request.ranking.part_seconds(
+            c.level,
+            b.pages as u64 * request.page_bytes + u64::from(b.row) * request.row_bytes,
+        ),
+        request.prefill_tokens_per_second,
+    )
 }
 
 /// The page where each node's tail starts, if the chain is consistent.
@@ -393,6 +385,8 @@ mod tests {
                 history: &self.history,
                 identity: &self.identity,
                 page_tokens: PT,
+                page_bytes: 4096,
+                row_bytes: 4096,
                 resident,
                 before: u64::MAX,
                 ranking: &self.ranking,
@@ -413,7 +407,7 @@ mod tests {
             begin: u64,
             first_start: usize,
             ends: &[u64],
-            us: u32,
+            _us: u32,
         ) -> Candidate {
             let mut previous = first_start;
             let nodes: Vec<ChainNode> = ends
@@ -436,7 +430,6 @@ mod tests {
                 begin_tokens: begin,
                 skip_pages: (begin / PT) as usize - first_start,
                 nodes,
-                us_per_page: us,
             }
         }
 
@@ -583,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn a_is_the_longest_match_at_its_level_and_b_the_cheapest() {
+    fn same_level_sources_share_a_cost_and_ties_use_source_id() {
         let f = Fixture::new();
         let slow = f.candidate(HostDram, 1, 0, 0, &[800], 50);
         let fast = f.candidate(HostDram, 2, 0, 0, &[400], 20);
@@ -592,7 +585,7 @@ mod tests {
             .plan(0, &[slow.clone(), fast.clone(), unknown.clone()])
             .unwrap();
         assert_eq!(plan.a.source, SourceId(3));
-        // Equal length: the cheapest known source, unknown last.
+        // Equal length at one level uses stable source identity.
         let twin = f.candidate(HostDram, 4, 0, 0, &[800], 20);
         let plan = f
             .plan(0, &[unknown.clone(), twin, slow.clone(), fast])
@@ -604,17 +597,17 @@ mod tests {
                 &[slow.clone(), f.candidate(HostDram, 4, 0, 0, &[800], 20)],
             )
             .unwrap();
-        assert_eq!(plan.a.source, SourceId(4));
+        assert_eq!(plan.a.source, SourceId(1));
         let plan = f
             .plan(0, &[f.candidate(HostDram, 5, 0, 0, &[800], 0), slow])
             .unwrap();
         assert_eq!(plan.a.source, SourceId(1));
-        // B takes the cheapest source, then the longest.
+        // B takes the longest match at its level.
         let dram = f.candidate(HostDram, 1, 0, 0, &[400], 0);
         let b_slow = f.candidate(RemoteNvme, 5, 400, 25, &[1600], 90);
         let b_fast = f.candidate(RemoteNvme, 6, 400, 25, &[1200], 30);
         let plan = f.plan(0, &[dram, b_slow, b_fast]).unwrap();
-        assert_eq!(plan.b.unwrap().source, SourceId(6));
+        assert_eq!(plan.b.unwrap().source, SourceId(5));
     }
 
     #[test]
@@ -633,38 +626,16 @@ mod tests {
     }
 
     #[test]
-    fn b_is_dropped_when_its_pages_are_not_worth_fetching() {
-        let f = Fixture::new();
-        let dram = f.candidate(HostDram, 1, 0, 0, &[800], 0);
-        // 50 pages at 2000 us is 0.1 s; half the prefill of 800 tokens is 0.05 s.
-        let dear = f.candidate(RemoteNvme, 2, 800, 50, &[1600], 2000);
-        let plan = f.plan(0, &[dram.clone(), dear]).unwrap();
-        assert!(plan.b.is_none() && plan.a.row);
-        assert_eq!(plan.endpoint(), f.key(800));
-        // A cheaper source of the same extension is taken instead.
-        let fair = f.candidate(RemoteNvme, 3, 800, 50, &[1600], 900);
-        let dear = f.candidate(RemoteNvme, 2, 800, 50, &[1600], 20);
-        let dearer = f.candidate(HostNvme, 4, 800, 50, &[1600], 2000);
-        let plan = f.plan(0, &[dram.clone(), dearer, fair, dear]).unwrap();
-        assert_eq!(plan.b.unwrap().source, SourceId(2));
-    }
-
-    #[test]
-    fn a_source_with_no_known_cost_is_not_worth_fetching() {
+    fn extension_cost_uses_the_level_bandwidth() {
         let mut f = Fixture::new();
+        f.ranking = Ranking::for_test(Level::DEFAULT_ORDER, &[(RemoteNvme, 2000.0)]);
+        let candidates = [
+            f.candidate(HostDram, 1, 0, 0, &[800], 0),
+            f.candidate(RemoteNvme, 2, 800, 50, &[1600], 0),
+        ];
+        assert!(f.plan(0, &candidates).unwrap().b.is_none());
         f.ranking = Ranking::default();
-        let dram = f.candidate(HostDram, 1, 0, 0, &[800], 0);
-        let remote = f.candidate(RemoteNvme, 2, 800, 50, &[1600], 0);
-        assert!(
-            f.plan(0, &[dram.clone(), remote.clone()])
-                .unwrap()
-                .b
-                .is_none()
-        );
-        // The source's own estimate is enough.
-        let mut known = remote;
-        known.us_per_page = 20;
-        assert!(f.plan(0, &[dram, known]).unwrap().b.is_some());
+        assert!(f.plan(0, &candidates).unwrap().b.is_some());
     }
 
     #[test]

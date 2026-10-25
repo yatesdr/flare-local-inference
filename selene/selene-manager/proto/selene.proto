@@ -708,9 +708,7 @@ message Candidate {
   repeated ChainNode nodes = 10;
   // Pages of nodes[0]'s tail that precede the physical start (Match.skip_pages).
   uint32 skip_pages = 11;
-  // The manager's running estimate of the source's per-page copy time from
-  // completed claims; 0 when unknown. Used only for ordering within a level.
-  uint32 est_us_per_page = 12;
+  reserved 12;
 }
 
 // A source is an instance (instance_id non-empty) or the manager's own store

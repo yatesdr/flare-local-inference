@@ -1872,17 +1872,6 @@ impl Core {
         claim.state = state;
         claim.reason = reason;
         claim.terminal_at = Some(now);
-        if state == v2::ClaimState::Copied {
-            // Update the source's cost estimate.
-            if let (Some(granted), pages) = (claim.granted_at, claim.total_pages) {
-                if pages > 0 {
-                    let micros = now.duration_since(granted).as_micros() as u64;
-                    let source = claim.source;
-                    let entry = self.estimates.entry(source).or_default();
-                    super::lookup::blend_estimate(entry, micros, pages);
-                }
-            }
-        }
         self.count(
             "claims_total",
             format!("state=\"{state:?}\",reason=\"{reason:?}\""),

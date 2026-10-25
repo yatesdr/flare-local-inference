@@ -454,6 +454,8 @@ fn fetch_for(
         history,
         identity: &identity(),
         page_tokens: PT,
+        page_bytes: PAGE as u64,
+        row_bytes: ROW as u64,
         resident: 0,
         before: u64::MAX,
         ranking: &ranking,

@@ -19,10 +19,10 @@ use std::{
 
 use crate::{
     Error, ExportChain, ExportId, ExportRefusal, History, HostHit, HostStore, InboundTicket,
-    PrefixKey, PublishedCheckpoint, Result, StoreEvent, StoreOutcome, StoreReason,
-    StoreStats, Tier as Local,
-    levels::Level,
+    PrefixKey, PublishedCheckpoint, Result, StoreEvent, StoreOutcome, StoreReason, StoreStats,
+    Tier as Local,
     index::Match,
+    levels::Level,
     plan::{self, Identity, Plan, Request, SourceId, Which},
     store::INITIAL_PREFILL_RATE,
 };
@@ -44,7 +44,7 @@ pub trait PoolPort {
     fn fetch(&mut self, fetch: PoolFetch) -> Result<u64>;
     fn poll(&mut self, events: &mut Vec<PoolEvent>) -> Result<()>;
     fn ranking(&self) -> crate::levels::Ranking;
-    fn observe_restore(&self, level: Level, pages: usize, elapsed: Duration);
+    fn observe_restore(&self, level: Level, bytes: u64, elapsed: Duration);
     fn saved(&self, entry: IndexEntry);
     fn evicted(&self, key: PrefixKey, tier: Tier, generation: u64, heir: Option<IndexEntry>);
     fn evictions_lost(&self);
@@ -72,8 +72,8 @@ impl PoolPort for PoolClient {
     fn ranking(&self) -> crate::levels::Ranking {
         PoolClient::ranking(self)
     }
-    fn observe_restore(&self, level: Level, pages: usize, elapsed: Duration) {
-        PoolClient::observe_restore(self, level, pages, elapsed)
+    fn observe_restore(&self, level: Level, bytes: u64, elapsed: Duration) {
+        PoolClient::observe_restore(self, level, bytes, elapsed)
     }
     fn saved(&self, entry: IndexEntry) {
         PoolClient::saved(self, entry)
@@ -321,11 +321,6 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             begin_tokens: hit.resident_tokens,
             skip_pages: hit.chain.skip_pages,
             nodes,
-            us_per_page: if hit.pages == 0 {
-                0
-            } else {
-                (hit.estimated_seconds * 1e6 / hit.pages as f64).ceil() as u32
-            },
         })
     }
 
@@ -346,6 +341,8 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             history,
             identity: &self.identity,
             page_tokens: self.page_tokens,
+            page_bytes: self.page_record_bytes,
+            row_bytes: self.row_record_bytes,
             resident,
             before,
             ranking,
@@ -357,7 +354,6 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
         &self,
         plan: &Plan,
         local: Option<&HostHit>,
-        pool: &[PoolCandidate],
         resident: u64,
         ranking: &crate::levels::Ranking,
     ) -> HostHit {
@@ -370,14 +366,11 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             seconds += if part.source == LOCAL {
                 local.map_or(0.0, |hit| hit.estimated_seconds)
             } else {
-                // With no estimate at all the cost is not held against the restore: the
-                // requester's own fetch policy decides.
-                pool.iter()
-                    .find(|c| c.plan.source == part.source && c.plan.generation == part.generation)
-                    .and_then(|c| {
-                        ranking.part_seconds(c.plan.level, part.pages, c.plan.us_per_page)
-                    })
-                    .unwrap_or(0.0)
+                ranking.part_seconds(
+                    part.level,
+                    part.pages as u64 * self.page_record_bytes
+                        + u64::from(part.row) * self.row_record_bytes,
+                )
             };
         }
         HostHit {
@@ -622,7 +615,7 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
                 }
             }
         }
-        let hit = self.hit_for(&plan, local.as_ref(), &pool, resident, &ranking);
+        let hit = self.hit_for(&plan, local.as_ref(), resident, &ranking);
         if self.plans.len() >= PLANS {
             self.plans.clear();
         }
@@ -733,8 +726,14 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
             if let StoreEvent::Fetched { key, result } = &event
                 && let Some((level, pages, started)) = self.local_timings.remove(key)
                 && result.is_ok()
+                && pages > 0
             {
-                PoolPort::observe_restore(&self.pool, level, pages, started.elapsed());
+                PoolPort::observe_restore(
+                    &self.pool,
+                    level,
+                    pages as u64 * self.page_record_bytes + self.row_record_bytes,
+                    started.elapsed(),
+                );
             }
             match event {
                 StoreEvent::Fetched { key, result }

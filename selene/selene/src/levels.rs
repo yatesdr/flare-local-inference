@@ -27,45 +27,61 @@ impl Level {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Topology(pub u64);
 
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Bytes per second, using the median of the last three completed transfers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Rate(pub f64, [f64; 3], usize, usize);
+impl Rate {
+    pub(crate) fn new(seed: f64) -> Self {
+        Self(seed, [0.0; 3], 0, 0)
+    }
+    pub(crate) fn observe(&mut self, bytes: u64, elapsed: Duration) {
+        if bytes == 0 || elapsed.is_zero() {
+            return;
+        }
+        self.1[self.3] = bytes as f64 / elapsed.as_secs_f64();
+        self.3 = (self.3 + 1) % 3;
+        self.2 = (self.2 + 1).min(3);
+        let mut values = self.1;
+        values[..self.2].sort_by(f64::total_cmp);
+        self.0 = values[self.2 / 2];
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Ranking {
-    observed: [Vec<f64>; 5],
+    rates: [Rate; 5],
+}
+impl Default for Ranking {
+    fn default() -> Self {
+        use crate::store::{INITIAL_MEMORY_RATE, INITIAL_STAGED_DISK_RATE};
+        Self {
+            rates: [
+                Rate::new(INITIAL_MEMORY_RATE),
+                Rate::new(INITIAL_MEMORY_RATE),
+                Rate::new(INITIAL_MEMORY_RATE),
+                Rate::new(INITIAL_STAGED_DISK_RATE),
+                Rate::new(400.0 * 1024.0 * 1024.0),
+            ],
+        }
+    }
 }
 impl Ranking {
-    pub fn order(&self) -> &[Level; 5] {
-        &Level::DEFAULT_ORDER
-    }
     pub fn rank(&self, level: Level) -> usize {
         level.index()
     }
-    pub(crate) fn observe(&mut self, level: Level, pages: usize, elapsed: Duration) {
-        if level == Level::ThisGpu || pages == 0 || elapsed.is_zero() {
-            return;
+    pub(crate) fn observe(&mut self, level: Level, bytes: u64, elapsed: Duration) {
+        if level != Level::ThisGpu {
+            self.rates[level.index()].observe(bytes, elapsed);
         }
-        let samples = &mut self.observed[level.index()];
-        if samples.len() == 3 {
-            samples.remove(0);
-        }
-        samples.push(elapsed.as_secs_f64() * 1e6 / pages as f64);
     }
-    pub fn us_per_page(&self, level: Level) -> Option<f64> {
-        let mut samples = self.observed[level.index()].clone();
-        samples.sort_by(f64::total_cmp);
-        samples.get(samples.len() / 2).copied()
-    }
-    pub fn part_seconds(&self, level: Level, pages: usize, reported: u32) -> Option<f64> {
-        let us = if reported == 0 {
-            self.us_per_page(level)?
-        } else {
-            f64::from(reported)
-        };
-        Some(pages as f64 * us / 1e6)
+    pub fn part_seconds(&self, level: Level, bytes: u64) -> f64 {
+        bytes as f64 / self.rates[level.index()].0
     }
     #[cfg(test)]
     pub(crate) fn for_test(_order: [Level; 5], costs: &[(Level, f64)]) -> Self {
         let mut ranking = Self::default();
         for (level, us) in costs {
-            ranking.observed[level.index()].push(*us);
+            ranking.rates[level.index()] = Rate::new(4096.0 * 1e6 / us);
         }
         ranking
     }
@@ -74,12 +90,23 @@ impl Ranking {
 mod tests {
     use super::*;
     #[test]
-    fn observations_refine_costs_without_changing_copy_priority() {
-        let mut rates = Ranking::default();
-        for us in [4, 1, 100, 2] {
-            rates.observe(Level::HostDram, 1, Duration::from_micros(us));
+    fn rates_use_recent_completed_transfers_and_ignore_empty_samples() {
+        let mut rate = Rate::new(1000.0);
+        rate.observe(0, Duration::from_secs(1));
+        rate.observe(500, Duration::ZERO);
+        assert_eq!(rate.0, 1000.0);
+        for bytes in [4000, 1000, 100000, 2000] {
+            rate.observe(bytes, Duration::from_secs(1));
         }
-        assert_eq!(rates.us_per_page(Level::HostDram), Some(2.0));
-        assert_eq!(rates.order(), &Level::DEFAULT_ORDER);
+        assert_eq!(rate.0, 2000.0);
+    }
+    #[test]
+    fn unmeasured_levels_use_the_seeded_bandwidth() {
+        let rates = Ranking::default();
+        assert_eq!(rates.part_seconds(Level::HostDram, 20_000), 1e-6);
+        assert_eq!(
+            rates.part_seconds(Level::RemoteNvme, 400 * 1024 * 1024),
+            1.0
+        );
     }
 }

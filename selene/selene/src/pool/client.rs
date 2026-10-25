@@ -326,8 +326,8 @@ impl PoolClient {
         crate::levels::Topology(self.shared.topology())
     }
 
-    pub fn observe_restore(&self, level: Level, pages: usize, elapsed: std::time::Duration) {
-        self.shared.observe_restore(level, pages, elapsed);
+    pub fn observe_restore(&self, level: Level, bytes: u64, elapsed: std::time::Duration) {
+        self.shared.observe_restore(level, bytes, elapsed);
     }
 
     /// Start a lookup for a queued request. Identical prefixes share one wire

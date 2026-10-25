@@ -12,35 +12,6 @@ use crate::{
 };
 use std::collections::VecDeque;
 
-/// A source's running cost: microseconds, pages and claims, each decayed by 7/8 per claim.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(super) struct Estimate {
-    micros: f64,
-    pages: f64,
-    claims: f64,
-}
-
-/// A source's estimate is given only once its claims average at least this many pages. Below
-/// that, as with the few-page claims of a characterization probe, the cost per page is mostly
-/// the fixed cost of a claim and says nothing about a long transfer.
-const MIN_AVERAGE_CLAIM_PAGES: f64 = 32.0;
-
-/// Add a finished claim to a source's running cost.
-pub(super) fn blend_estimate(estimate: &mut Estimate, micros: u64, pages: u64) {
-    estimate.micros = estimate.micros * 0.875 + micros as f64;
-    estimate.pages = estimate.pages * 0.875 + pages as f64;
-    estimate.claims = estimate.claims * 0.875 + 1.0;
-}
-
-/// The running cost per page, weighted by pages, or 0 when there is none to give: nothing is
-/// known, or the claims so far were too short to say what a long one costs.
-pub(super) fn estimate_us_per_page(estimate: Estimate) -> u32 {
-    if estimate.pages <= 0.0 || estimate.pages / estimate.claims < MIN_AVERAGE_CLAIM_PAGES {
-        return 0;
-    }
-    (estimate.micros / estimate.pages).clamp(1.0, f64::from(u32::MAX)) as u32
-}
-
 /// Entries scanned per lookup at most, so one lookup cannot hold the actor.
 const SCAN_BUDGET: usize = 65_536;
 /// Lookups answered per pass of the clock.
@@ -258,24 +229,18 @@ impl Core {
                 ) else {
                     continue;
                 };
-                let estimate = self
-                    .estimates
-                    .get(&source)
-                    .map_or(0, |e| estimate_us_per_page(*e));
                 found.push((
                     closer,
-                    estimate == 0,
-                    estimate,
                     std::cmp::Reverse(entry.key.consumed_tokens),
                     source,
                     tier,
-                    candidate(entry, level, source_ref, begin, &walk, geometry, estimate),
+                    candidate(entry, level, source_ref, begin, &walk, geometry),
                 ));
             }
         }
-        found.sort_by(|a, b| (a.0, a.1, a.2, a.3, a.4, a.5).cmp(&(b.0, b.1, b.2, b.3, b.4, b.5)));
+        found.sort_by(|a, b| (a.0, a.1, a.2, a.3).cmp(&(b.0, b.1, b.2, b.3)));
         found.truncate(max);
-        (S::LookupOk, found.into_iter().map(|item| item.6).collect())
+        (S::LookupOk, found.into_iter().map(|item| item.4).collect())
     }
 
     /// The level a source's entry has for a requester, and the reference a claim
@@ -341,7 +306,6 @@ fn candidate(
     begin: u64,
     walk: &super::index::ChainWalk,
     geometry: &super::ScopeGeometry,
-    estimate: u32,
 ) -> v2::Candidate {
     v2::Candidate {
         level: level as i32,
@@ -364,15 +328,13 @@ fn candidate(
             })
             .collect(),
         skip_pages: walk.skip_pages,
-        est_us_per_page: estimate,
+
     }
 }
 
-/// A candidate with its sort key: level rank, unknown cost, cost, longer first, source, tier.
+/// A candidate ordered by level, match length, source and tier.
 type Ranked = (
     i32,
-    bool,
-    u32,
     std::cmp::Reverse<u64>,
     SourceId,
     Tier,
@@ -380,26 +342,3 @@ type Ranked = (
 );
 
 pub(super) type LookupQueue = VecDeque<Queued>;
-
-#[cfg(test)]
-mod estimate_tests {
-    use super::*;
-
-    #[test]
-    fn short_claims_give_no_estimate_and_long_ones_outweigh_them() {
-        let mut estimate = Estimate::default();
-        assert_eq!(estimate_us_per_page(estimate), 0);
-        // Probe claims of 2, 16 and 64 pages, mostly fixed cost: no estimate to give.
-        for pages in [2u64, 16, 64, 2, 16, 64, 2, 16, 64] {
-            blend_estimate(&mut estimate, 8_000 + 300 * pages, pages);
-        }
-        assert_eq!(estimate_us_per_page(estimate), 0);
-        // Real restores of hundreds of pages at 0.9 ms a page: now it speaks, and the short
-        // claims weigh little in it.
-        for _ in 0..4 {
-            blend_estimate(&mut estimate, 470_000, 520);
-        }
-        let per_page = estimate_us_per_page(estimate);
-        assert!((850..=1_000).contains(&per_page), "{per_page}");
-    }
-}

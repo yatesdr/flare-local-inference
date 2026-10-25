@@ -310,8 +310,8 @@ impl Shared {
         self.ranking.lock().unwrap().clone()
     }
 
-    pub(crate) fn observe_restore(&self, level: Level, pages: usize, elapsed: std::time::Duration) {
-        self.ranking.lock().unwrap().observe(level, pages, elapsed);
+    pub(crate) fn observe_restore(&self, level: Level, bytes: u64, elapsed: std::time::Duration) {
+        self.ranking.lock().unwrap().observe(level, bytes, elapsed);
     }
 
     /// Identifies the manager and link the session runs over; 0 while no session

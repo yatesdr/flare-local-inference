@@ -74,9 +74,8 @@ the instance side (`flare-selene`, `selene::pool`) implements the other.
     manager returns under the same id and is satisfied as soon as its snapshot
     installs; the full wait is paid only by an instance that is really gone (a
     changed GPU set is a new id and the old one ages out).
-11. **Within a level, "cheapest"** means the lowest manager-measured
-    `est_us_per_page` from completed claims of that source (0 = unknown, ordered
-    last among known), then the longest match. Copy levels use the fixed default order.
+11. **Transfer cost** uses the requester's rolling bandwidth for each copy level,
+    seeded until a restore completes. The manager does not report per-source estimates.
 12. **Logical split versus physical page offset.** `Claim.begin_tokens`
     is the exact logical split (the resident prefix end, or for part B exactly
     A's endpoint `consumed_tokens`) and need not be page-aligned. The source
