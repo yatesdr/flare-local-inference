@@ -15,9 +15,8 @@
 //! builds describes every host's directory.
 
 mod pool;
-mod records;
 pub use pool::{PoolOffer, PoolPeers, pool_peer, pool_rank_zero};
-pub(crate) use records::DeferredRecords;
+pub(crate) use flare_selene::pool::DeferredRecords;
 
 use std::{
     collections::HashMap,
