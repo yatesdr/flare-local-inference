@@ -33,7 +33,7 @@ use super::{
     Engine, Owner,
     coverage::Coverage,
     hostfill::{FillJob, FillOwner},
-    ranks::{PeerPart, PeerWindow},
+    ranks::{PeerPart, PeerSet, PeerWindow},
     requester::ExpectedRecord,
 };
 
@@ -89,9 +89,7 @@ struct Put {
     /// Filled windows the channel has not yet written out.
     sends_outstanding: u32,
     /// The peer ranks' parts of this put.
-    peers: Vec<PeerPart>,
-    /// Shared-memory peers that have not yet drained their slice of a window.
-    peer_windows: HashMap<u32, PeerWindow>,
+    peers: PeerSet,
     /// Windows whose rank-0 host read is running, and the persisted checksums of those
     /// that finished before their peers did.
     host_filling: HashSet<u32>,
@@ -156,38 +154,28 @@ impl State {
     pub(super) fn peers_left(&self, put: u64, window: u32) -> bool {
         self.puts
             .get(&put)
-            .and_then(|p| p.peer_windows.get(&window))
+            .and_then(|p| p.peers.windows.get(&window))
             .is_some_and(|w| !w.left.is_empty())
     }
 
     /// A shared peer reported one window. `false` when it was not expected.
     pub(super) fn peer_window_done(
         &mut self,
-        put: u64,
+        id: u64,
         rank: usize,
         index: u32,
         result: std::result::Result<(), String>,
         sums: Option<crate::pool::SliceSums>,
     ) -> bool {
-        let Some(p) = self.puts.get_mut(&put) else {
+        let Some(p) = self.puts.get_mut(&id) else {
             return false;
         };
-        let Some(window) = p.peer_windows.get_mut(&index) else {
+        let Some(result) = p.peers.window_done(index, rank, result, sums) else {
             return false;
         };
-        if !window.left.remove(&rank) {
-            return false;
-        }
-        match (result, sums) {
-            (Ok(()), Some(sums)) => window.sums.push((rank, sums)),
-            (Err(why), _) => {
-                p.failed
-                    .get_or_insert(Error::new(format!("rank {rank}: {why}")));
-            }
-            (Ok(()), None) => {
-                p.failed
-                    .get_or_insert(Error::new(format!("rank {rank} stated no checksums")));
-            }
+        if let Err(why) = result {
+            p.failed
+                .get_or_insert(Error::new(format!("rank {rank}: {why}")));
         }
         true
     }
@@ -202,14 +190,7 @@ impl State {
         let Some(p) = self.puts.get_mut(&put) else {
             return;
         };
-        if let Some(peer) = p
-            .peers
-            .iter_mut()
-            .find(|peer| peer.rank == rank && peer.done.is_none())
-        {
-            peer.done = Some(result.clone());
-            peer.quarantined = quarantined;
-        }
+        p.peers.done(rank, &result, quarantined);
         if let Err(why) = result {
             p.failed
                 .get_or_insert(Error::new(format!("rank {rank}: {why}")));
@@ -218,23 +199,14 @@ impl State {
 
     pub(super) fn set_peers(&mut self, put: u64, peers: Vec<PeerPart>) {
         if let Some(p) = self.puts.get_mut(&put) {
-            p.peers = peers;
+            p.peers.parts = peers;
         }
     }
 
     pub(super) fn take_uncancelled(&mut self, put: u64) -> Vec<u64> {
         self.puts
             .get_mut(&put)
-            .map(|p| {
-                p.peers
-                    .iter_mut()
-                    .filter(|peer| peer.done.is_none() && !peer.cancelled)
-                    .map(|peer| {
-                        peer.cancelled = true;
-                        peer.xfer
-                    })
-                    .collect()
-            })
+            .map(|p| p.peers.take_uncancelled())
             .unwrap_or_default()
     }
 
@@ -333,8 +305,7 @@ impl Engine {
                 channel_open: false,
                 slots: HashMap::new(),
                 sends_outstanding: 0,
-                peers: Vec::new(),
-                peer_windows: HashMap::new(),
+                peers: PeerSet::default(),
                 host_filling: HashSet::new(),
                 host_sums: HashMap::new(),
             },
@@ -534,12 +505,13 @@ impl Engine {
         // The shared-memory peers write their own slices of this window in step.
         let shared: Vec<(usize, u64)> = put
             .peers
+            .parts
             .iter()
             .filter(|p| p.shared && p.done.is_none())
             .map(|p| (p.rank, p.xfer))
             .collect();
         if slot.is_none() && !shared.is_empty() {
-            put.peer_windows.insert(
+            put.peers.windows.insert(
                 spec.index,
                 PeerWindow {
                     left: shared.iter().map(|(rank, _)| *rank).collect(),
@@ -841,7 +813,7 @@ impl Engine {
                 .writer
                 .puts
                 .get_mut(&id)
-                .and_then(|put| put.peer_windows.remove(&window));
+                .and_then(|put| put.peers.windows.remove(&window));
             let mut rank_sums = vec![wire::RankSums {
                 rank: 0,
                 page_xxh3: sums.pages,
@@ -944,7 +916,7 @@ impl Engine {
             let ready = put.phase == Phase::Accepted
                 && put.coverage.as_ref().is_some_and(|c| c.complete())
                 && put.windows.is_empty()
-                && put.peer_windows.is_empty()
+                && put.peers.windows.is_empty()
                 && put.jobs_outstanding == 0
                 && put.sends_outstanding == 0;
             if ready {
@@ -963,7 +935,7 @@ impl Engine {
         // The peer ranks end their parts too: after their copies drained.
         self.cancel_put_peers_if_over(id);
         let put = self.writer.puts.get_mut(&id).expect("present");
-        if put.peers.iter().any(|peer| peer.done.is_none()) {
+        if put.peers.parts.iter().any(|peer| peer.done.is_none()) {
             return;
         }
         let fenced = put.stored.is_some() || put.phase == Phase::Begun || put.fence_sent;
