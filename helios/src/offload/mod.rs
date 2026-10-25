@@ -61,34 +61,63 @@ pub struct PrefixCacheOffload {
 /// scopes what it may see.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolOptions {
-    /// `unix:PATH` for a manager on this host, or `HOST:PORT`.
+    /// `unix:PATH`, TLS `HOST:PORT`, or plaintext `plain:HOST:PORT`.
     pub address: String,
     pub tenant: String,
-    /// The CA certificate the manager's TLS certificate must chain to. Set, the connection
-    /// must be TLS; unset, it is plaintext. Only a `HOST:PORT` manager can use one.
+    /// The CA certificate the manager's TLS certificate must chain to. Without
+    /// one, TLS uses the host's trust store. Only a TLS `HOST:PORT` manager can use one.
     pub ca: Option<std::path::PathBuf>,
 }
 
 /// The tenant of an instance that names none: the protocol requires a nonempty one.
 pub const DEFAULT_POOL_TENANT: &str = "default";
 
-/// Accept `unix:PATH` or `HOST:PORT` as the pool address.
+/// Accept a Unix socket, TLS address, or explicitly plaintext address.
 pub fn parse_pool_address(text: &str) -> std::result::Result<String, String> {
-    let invalid = || format!("invalid pool address '{text}': use unix:PATH or HOST:PORT");
+    pool_address(text).map(|_| text.to_owned())
+}
+
+fn pool_address(text: &str) -> std::result::Result<flare_selene::pool::PoolAddress, String> {
+    use flare_selene::pool::PoolAddress;
+    let invalid =
+        || format!("invalid pool address '{text}': use unix:PATH, HOST:PORT or plain:HOST:PORT");
     if let Some(path) = text.strip_prefix("unix:") {
-        return if path.is_empty() {
+        return if path.is_empty() || path.chars().any(char::is_control) {
             Err(invalid())
         } else {
-            Ok(text.to_owned())
+            Ok(PoolAddress::Unix(path.into()))
         };
     }
-    match text.rsplit_once(':') {
+    let address = text.strip_prefix("plain:").unwrap_or(text);
+    let host_valid = |host: &str| {
+        if let Some(ip) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            return ip.parse::<std::net::Ipv6Addr>().is_ok();
+        }
+        !host.is_empty()
+            && host
+                .strip_suffix('.')
+                .unwrap_or(host)
+                .split('.')
+                .all(|label| {
+                    !label.is_empty()
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+                })
+    };
+    match address.rsplit_once(':') {
         Some((host, port))
-            if !host.is_empty()
-                && !host.contains(char::is_whitespace)
+            if host_valid(host)
+                && port.bytes().all(|c| c.is_ascii_digit())
                 && port.parse::<u16>().is_ok_and(|port| port != 0) =>
         {
-            Ok(text.to_owned())
+            Ok(if text.starts_with("plain:") {
+                PoolAddress::TcpPlaintext(address.to_owned())
+            } else {
+                PoolAddress::Tcp(address.to_owned())
+            })
         }
         _ => Err(invalid()),
     }
@@ -752,11 +781,8 @@ fn attach_pool(
     gpu_uuids: Vec<[u8; 16]>,
     registration_context: usize,
 ) -> Result<Box<dyn PrefixStore>> {
-    use flare_selene::pool::{PoolAddress, PoolConfig, PooledStore};
-    let address = match pool.address.strip_prefix("unix:") {
-        Some(path) => PoolAddress::Unix(path.into()),
-        None => PoolAddress::Tcp(pool.address.clone()),
-    };
+    use flare_selene::pool::{PoolConfig, PooledStore};
+    let address = pool_address(&pool.address)?;
     let config = PoolConfig {
         address,
         tenant: pool.tenant.clone(),
@@ -935,6 +961,25 @@ mod tests {
             address: address.into(),
             tenant: DEFAULT_POOL_TENANT.into(),
             ca: None,
+        }
+    }
+
+    #[test]
+    fn pool_addresses_select_the_explicit_transport() {
+        use flare_selene::pool::PoolAddress;
+        assert_eq!(
+            pool_address("unix:/run/selene.sock").unwrap(),
+            PoolAddress::Unix("/run/selene.sock".into())
+        );
+        for address in ["cache.example:7000", "[::1]:7000"] {
+            assert_eq!(
+                pool_address(address).unwrap(),
+                PoolAddress::Tcp(address.into())
+            );
+            assert_eq!(
+                pool_address(&format!("plain:{address}")).unwrap(),
+                PoolAddress::TcpPlaintext(address.into())
+            );
         }
     }
 

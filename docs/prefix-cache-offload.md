@@ -792,7 +792,9 @@ memory its transfers may still use.
 ### 2.15 Sharing through a pool
 
 `--prefix-cache-pool ADDRESS` and `--prefix-cache-pool-tenant NAME` attach the
-instance to a pool manager, at `unix:PATH` on this host or `HOST:PORT`. The
+instance to a pool manager, at `unix:PATH` on this host, TLS `HOST:PORT`, or
+explicit plaintext `plain:HOST:PORT`. Network ports must be from 1 through
+65535; IPv6 hosts use brackets (`[::1]:7000`, `plain:[::1]:7000`). The
 tenant requires the pool and defaults to `default`; it scopes
 what the manager shares, so nothing crosses tenants. Without the pool flag none
 of the sharing code below runs: the worker builds no pool lookup history and
@@ -904,8 +906,12 @@ left. Such an instance is also a source: the manager grants an export's windows 
 channel the instance dials after pinning, the instance copies each into a slot and writes
 it with its checksums, and the manager relays it to the requester, so instances on
 different hosts (or on and off the manager's host) share their GPU and host caches
-through the manager. The connection is TLS exactly when `--prefix-cache-pool-ca` names the manager's CA,
-and a manager that declares the other setting disables the pool for the process. With the
+through the manager.
+A `HOST:PORT` connection uses TLS and verifies the manager against the host's
+trust store, or the CA supplied by `--prefix-cache-pool-ca`. Only
+`plain:HOST:PORT` selects network plaintext; a CA is refused for plaintext or
+Unix sockets. A manager that declares the other encryption setting disables
+the pool for the process. With the
 `rdma` cargo feature, a manager started with `--rdma` is reached by RDMA instead: the
 manager writes into slots the instance lends and reads the slots a put fills; an instance
 without a device, or after one failed RDMA transfer, uses the stream. The remote level is
