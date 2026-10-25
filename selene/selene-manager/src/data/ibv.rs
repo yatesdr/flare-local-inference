@@ -67,7 +67,6 @@ pub struct Device {
     gid: [u8; 16],
     /// The index of `gid` in the port's table, the source GID of every pair.
     gid_index: u32,
-    bases: (u64, u64),
 }
 
 // SAFETY: libibverbs objects may be used from any thread; the handles are never changed after
@@ -118,9 +117,7 @@ impl Device {
         if pd.is_null() {
             return Err(io::Error::last_os_error());
         }
-        let access = (ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
-            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
-            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0) as i32;
+        let access = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0 as i32;
         // SAFETY: both ranges are mapped by `regions`, which this value retains.
         let arena_mr = unsafe { ffi::ibv_reg_mr(pd, arena.0.cast(), arena.1, access) };
         if arena_mr.is_null() {
@@ -153,7 +150,6 @@ impl Device {
             lid,
             gid,
             gid_index,
-            bases: (arena.0 as u64, staging.0 as u64),
         })
     }
 
@@ -285,9 +281,6 @@ impl IbvVerbs {
         if cq.is_null() {
             return Err(io::Error::last_os_error());
         }
-        let access = (ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
-            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
-            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0) as i32;
         let mut init = ffi::ibv_qp_init_attr {
             send_cq: cq,
             recv_cq: cq,
@@ -313,7 +306,7 @@ impl IbvVerbs {
             qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
             pkey_index: 0,
             port_num: PORT,
-            qp_access_flags: access as u32,
+            qp_access_flags: 0,
             ..Default::default()
         };
         let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE.0
@@ -336,10 +329,10 @@ impl IbvVerbs {
                 psn: PSN,
                 gid: device.gid,
                 lid: device.lid,
-                rkey_arena: unsafe { (*device.arena).rkey },
-                rkey_staging: unsafe { (*device.staging).rkey },
-                arena_base: device.bases.0,
-                staging_base: device.bases.1,
+                rkey_arena: 0,
+                rkey_staging: 0,
+                arena_base: 0,
+                staging_base: 0,
             },
             transfers: HashMap::new(),
             outstanding: HashMap::new(),
@@ -755,7 +748,7 @@ mod tests {
     fn a_loopback_pair_moves_bytes_both_ways() {
         let regions_a = TestRegions::new();
         let regions_b = TestRegions::new();
-        let Ok(local_a) = LocalRdma::open(regions_a.clone()) else {
+        let Ok(device_a) = Device::open(regions_a.clone()) else {
             assert!(
                 std::env::var_os("SELENE_RDMA_REQUIRED").is_none(),
                 "no active RDMA device"
@@ -763,14 +756,22 @@ mod tests {
             eprintln!("skipping: no active RDMA device");
             return;
         };
-        let local_b = LocalRdma::open(regions_b.clone()).unwrap();
+        let local_a = device_a.pair().unwrap();
+        // SAFETY: this private destination stays mapped until the pair and device are dropped.
+        let device_b =
+            unsafe { flare_selene::pool::rdma::Device::open(regions_b.staging.pointer(), BYTES) }
+                .unwrap();
+        let b = flare_selene::pool::rdma::Pair::new(&device_b).unwrap();
         let handshake_a = local_a.handshake();
-        let handshake_b = local_b.handshake();
+        assert_eq!((handshake_a.rkey_arena, handshake_a.rkey_staging), (0, 0));
+        assert_eq!((handshake_a.arena_base, handshake_a.staging_base), (0, 0));
         let mut a = local_a
-            .connect(handshake_b, (BYTES as u64, BYTES as u64))
+            .connect(
+                Handshake::decode(&b.handshake().encode()).unwrap(),
+                (0, BYTES as u64),
+            )
             .unwrap();
-        let _b = local_b
-            .connect(handshake_a, (BYTES as u64, BYTES as u64))
+        b.connect(&flare_selene::pool::rdma::Handshake::decode(&handshake_a.encode()).unwrap())
             .unwrap();
         // SAFETY: the test owns both allocations.
         unsafe {
@@ -778,11 +779,11 @@ mod tests {
                 *regions_a.arena.pointer().add(index) = (index % 251) as u8;
             }
         }
-        a.write(1, 0, Region::Arena, 0, 4096, Region::Arena, 0)
+        a.write(1, 0, Region::Arena, 0, 4096, Region::Staging, 0)
             .unwrap();
         wait(&mut a, 1, 0);
         assert_eq!(
-            &regions_b.arena.bytes()[..4096],
+            &regions_b.staging.bytes()[..4096],
             &regions_a.arena.bytes()[..4096]
         );
         // A multi-piece write exercises splitting and completion aggregation on the device.
@@ -792,24 +793,24 @@ mod tests {
                 *regions_a.arena.pointer().add(index) = (index % 251) as u8;
             }
         }
-        a.write(3, 0, Region::Arena, 0, len as u64, Region::Arena, 0)
+        a.write(3, 0, Region::Arena, 0, len as u64, Region::Staging, 0)
             .unwrap();
         wait(&mut a, 3, 0);
         assert_eq!(
-            &regions_b.arena.bytes()[..len],
+            &regions_b.staging.bytes()[..len],
             &regions_a.arena.bytes()[..len]
         );
         unsafe {
             for index in 4096..8192 {
-                *regions_b.arena.pointer().add(index) = (index % 241) as u8;
+                *regions_b.staging.pointer().add(index) = (index % 241) as u8;
             }
         }
-        a.read(2, 0, Region::Arena, 4096, 4096, Region::Arena, 4096)
+        a.read(2, 0, Region::Arena, 4096, 4096, Region::Staging, 4096)
             .unwrap();
         wait(&mut a, 2, 0);
         assert_eq!(
             &regions_a.arena.bytes()[4096..8192],
-            &regions_b.arena.bytes()[4096..8192]
+            &regions_b.staging.bytes()[4096..8192]
         );
     }
 

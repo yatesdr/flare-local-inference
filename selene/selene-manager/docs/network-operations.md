@@ -95,7 +95,9 @@ The default build and image never link libibverbs. Build with `--features rdma` 
 **refuses to start** with `--rdma` and TLS together and says why; choose one. RDMA is never listed
 in `Hello.data_transports` when the manager is TLS. The container needs
 `--device /dev/infiniband` and `--ulimit memlock=-1:-1`. The manager opens the first device with
-an active port and registers its regions once; `--rdma` on a host with none refuses to start.
+an active port and registers its regions once for local access only; `--rdma` on a host with none
+refuses to start. The manager advertises no memory keys or region addresses. The instance lends
+only its private transfer staging, so it cannot use RDMA to address the manager arena.
 
 The manager does every RDMA transfer, one-sided, on a queue pair made for the transfer: it writes
 a claim's windows into slots the instance lends (`CREDIT`) and reads a put's windows out of the
