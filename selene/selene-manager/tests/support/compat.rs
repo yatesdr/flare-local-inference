@@ -514,6 +514,7 @@ impl Client {
                         page_xxh3: page_hashes,
                         row_xxh3: row_hash.unwrap_or(0),
                         has_row: window.row,
+                        ..Default::default()
                     }))
                     .await;
                 self.fills.push(Instant::now());

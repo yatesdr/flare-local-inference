@@ -559,6 +559,7 @@ impl Core {
                 session_incarnation: source_sid,
                 reserved_bytes: reserved,
                 channel: source_channel_ref,
+                rank_channels: Vec::new(),
             }),
         );
         Ok(())
@@ -750,6 +751,7 @@ impl Core {
                     channel,
                     window_credits: self.cfg.limits.window_credits,
                     retained: false,
+                    rank_channels: Vec::new(),
                 };
                 let sid = claim.requester_sid;
                 self.send(sid, M::ClaimGranted(granted));
@@ -872,6 +874,7 @@ impl Core {
                         page_xxh3,
                         row_xxh3,
                         has_row: grant.row,
+                        rank_sums: Vec::new(),
                     }),
                 );
             }
@@ -1088,6 +1091,7 @@ impl Core {
             channel,
             window_credits: limits.window_credits,
             retained: claim.retained,
+            rank_channels: Vec::new(),
         };
         claim.state = v2::ClaimState::Granted;
         self.send(requester_sid, M::ClaimGranted(granted));
@@ -1305,6 +1309,7 @@ impl Core {
                 page_xxh3,
                 row_xxh3,
                 has_row,
+                rank_sums: Vec::new(),
             }),
         );
     }

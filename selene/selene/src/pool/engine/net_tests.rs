@@ -176,6 +176,7 @@ fn granted(
         channel,
         window_credits: 2,
         retained: false,
+        ..Default::default()
     })
 }
 
@@ -417,6 +418,7 @@ fn put_accept(put: u64, record_bytes: u64, channel: Option<wire::DataChannelRef>
         parent: None,
         record_bytes,
         channel,
+        ..Default::default()
     })
 }
 
