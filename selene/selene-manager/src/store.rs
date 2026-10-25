@@ -1297,7 +1297,7 @@ impl Store {
             self.reject_put(&events, proto::Reason::Invalid as u8);
             return;
         };
-        let child_header = match Header::new(
+        let child_header = match crate::record::new_header(
             &descriptor,
             request.key,
             initial_parent,
@@ -1310,7 +1310,7 @@ impl Store {
                 return;
             }
         };
-        let root_header = match Header::new(
+        let root_header = match crate::record::new_header(
             &descriptor,
             request.key,
             None,
@@ -5754,7 +5754,7 @@ impl Store {
 }
 
 fn validate_commit(put: &mut Put, descriptor: &Descriptor) -> Result<()> {
-    let header = Header::decode(&put.commit_bytes[..4096])?;
+    let header = Header::decode(&put.commit_bytes[..4096]).map_err(|e| invalid(e.to_string()))?;
     let planned = &put.header;
     let row_ok = match put.windows.row {
         Some(hash) => header.row_checksum == hash,
@@ -5768,7 +5768,7 @@ fn validate_commit(put: &mut Put, descriptor: &Descriptor) -> Result<()> {
         || header.row_segment != planned.row_segment
         || header.flags != 0
         || !row_ok
-        || !header.matches(descriptor)
+        || !descriptor.matches(&header)
     {
         return Err(invalid("commit header disagrees with accept"));
     }
@@ -5868,7 +5868,7 @@ mod tests {
             consumed_tokens: tokens,
             digest: [0; 16],
         };
-        let one_page = Header::new(&value, key(64), None, [0; 16], 1).unwrap();
+        let one_page = crate::record::new_header(&value, key(64), None, [0; 16], 1).unwrap();
         // 16 KiB arena: the 16 KiB extent plus envelope is 20 KiB, not the
         // 28 KiB max of the arena and streaming paths.
         let arena = store.put_requirement(&one_page, 16 * 1024);
@@ -5879,7 +5879,7 @@ mod tests {
         assert_eq!(arena.unit, 16 * 1024);
         // 128 pages and a 4 KiB row: 528 KiB of disk record plus a fixed
         // hold of two 512 KiB windows.
-        let many = Header::new(&value, key(128 * 64), None, [0; 16], 128).unwrap();
+        let many = crate::record::new_header(&value, key(128 * 64), None, [0; 16], 128).unwrap();
         let stream = store.put_requirement(&many, 0);
         assert!(stream.streaming);
         assert_eq!(stream.reservation, 528 * 1024);
@@ -5899,7 +5899,7 @@ mod tests {
         tail: u32,
         extent: Extent,
     ) {
-        let header = Header::new(value, key, parent, [0; 16], tail).unwrap();
+        let header = crate::record::new_header(value, key, parent, [0; 16], tail).unwrap();
         let bytes = record_charge(&header, true);
         store.charged += bytes;
         store
@@ -6013,7 +6013,7 @@ mod tests {
         parent: Option<Key>,
         tail: u32,
     ) {
-        let header = Header::new(value, key, parent, [0; 16], tail).unwrap();
+        let header = crate::record::new_header(value, key, parent, [0; 16], tail).unwrap();
         store
             .namespaces
             .get_mut(&id)
@@ -6175,7 +6175,7 @@ mod tests {
                 consumed_tokens: (index + 1) * 64,
                 digest: (index as u128).to_le_bytes(),
             };
-            let header = Header::new(&value, key, parent, [0; 16], 1).unwrap();
+            let header = crate::record::new_header(&value, key, parent, [0; 16], 1).unwrap();
             store
                 .namespaces
                 .get_mut(&id)
@@ -6364,7 +6364,7 @@ mod tests {
             consumed_tokens: 64,
             digest: [6; 16],
         };
-        let header = Header::new(&value, key, None, [0; 16], 1).unwrap();
+        let header = crate::record::new_header(&value, key, None, [0; 16], 1).unwrap();
         let extent = Arc::new(
             store
                 .memory
@@ -6453,7 +6453,7 @@ mod tests {
             consumed_tokens: 64,
             digest: [12; 16],
         };
-        let header = Header::new(&value, key, None, [0; 16], 1).unwrap();
+        let header = crate::record::new_header(&value, key, None, [0; 16], 1).unwrap();
         let extent = Arc::new(
             store
                 .memory
@@ -6688,8 +6688,8 @@ mod tests {
             consumed_tokens: 128,
             digest: [3; 16],
         };
-        let root_header = Header::new(&value, root_key, None, [0; 16], 1).unwrap();
-        let child_header = Header::new(&value, child_key, Some(root_key), [0; 16], 1).unwrap();
+        let root_header = crate::record::new_header(&value, root_key, None, [0; 16], 1).unwrap();
+        let child_header = crate::record::new_header(&value, child_key, Some(root_key), [0; 16], 1).unwrap();
         for header in [&root_header, &child_header] {
             let extent = Arc::new(store.memory.allocate(4096).unwrap());
             let bytes = record_charge(header, true);
