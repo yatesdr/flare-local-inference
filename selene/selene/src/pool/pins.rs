@@ -3,7 +3,10 @@
 
 use std::{fs::File, path::PathBuf, sync::Arc};
 
-use crate::{Error, PrefixKey, Result, os::FileReadAt, record::Header};
+use crate::{
+    Error, PrefixKey, Result, disk::ReadAhead, geometry::BLOCK_BYTES, os::FileReadAt,
+    record::Header,
+};
 
 use super::{
     exporter::{Checksums, HostChain, HostPin, HostRecord, HostWindow},
@@ -151,11 +154,37 @@ impl Drop for MemoryPin {
 pub(crate) struct FileSpan {
     pub path: PathBuf,
     pub header: Header,
+    open: Option<OpenSpan>,
+}
+
+impl FileSpan {
+    pub(crate) fn new(path: PathBuf, header: Header) -> Self {
+        Self {
+            path,
+            header,
+            open: None,
+        }
+    }
+}
+
+/// A span's file as the export reads it.
+struct OpenSpan {
+    /// Page-cache reads, for the checksums, the row and whatever cannot be read directly.
+    file: File,
+    /// The pages read ahead from the file past the page cache, if the filesystem allows it
+    /// and the record's layout is aligned for it.
+    ahead: Option<ReadAhead>,
 }
 
 /// A chain of record files, held in place by pins that the store releases once
 /// this is dropped. Pages are read from the files and the checksums served are
 /// the ones the files persist.
+///
+/// A cold record read through the page cache a window at a time runs at a fraction of the
+/// device's rate: readahead is a few requests deep, and each window waits for the device
+/// before the next is asked for. The pages of a record are therefore read ahead directly
+/// from the device, the same way the disk tier restores them, with several blocks in flight
+/// while earlier windows are copied out.
 pub struct FilePin {
     pub(crate) chain: HostChain,
     pub(crate) spans: Vec<FileSpan>,
@@ -172,21 +201,54 @@ impl HostPin for FilePin {
 
     fn read(&mut self, window: &HostWindow, dst: &mut [u8]) -> Result<Checksums> {
         check_window(&self.chain, window, dst, self.page_bytes, self.row_bytes)?;
-        let span = &self.spans[window.record as usize];
-        let io = |what: &str, e: std::io::Error| {
-            Error::caused_by(format!("{what} {}", span.path.display()), e)
+        let (record_first, record_pages) = {
+            let record = &self.chain.records[window.record as usize];
+            (record.first_page, record.pages)
         };
-        let file = File::open(&span.path).map_err(|e| io("cannot open", e))?;
+        let span = &mut self.spans[window.record as usize];
+        let path = span.path.clone();
+        let io = |what: &str, e: std::io::Error| {
+            Error::caused_by(format!("{what} {}", path.display()), e)
+        };
+        if span.open.is_none() {
+            let file = File::open(&span.path).map_err(|e| io("cannot open", e))?;
+            span.open = Some(OpenSpan { file, ahead: None });
+        }
+        let page_bytes = self.page_bytes;
         let count = window.page_count as usize;
-        let pages_bytes = count * self.page_bytes as usize;
+        let pages_bytes = count * page_bytes as usize;
         let first = u64::from(window.first_page);
-        file.read_exact_at(
-            &mut dst[..pages_bytes],
-            span.header.page_segment + first * self.page_bytes,
-        )
-        .map_err(|e| io("cannot read pages of", e))?;
+        let pages_at = span.header.page_segment + first * page_bytes;
+        let header = span.header.clone();
+        let open = span.open.as_mut().expect("opened");
+        if count > 0 {
+            let ahead_ok = (page_bytes.is_multiple_of(BLOCK_BYTES)
+                && pages_at.is_multiple_of(BLOCK_BYTES))
+            .then_some(());
+            // Reading ahead starts at the first window read of the record and runs to the end
+            // of the pages this export takes. A window that does not follow the last (or a
+            // filesystem that refuses direct I/O) is read through the cache.
+            if open.ahead.is_none() && ahead_ok.is_some() {
+                let end = header.page_segment + u64::from(record_first + record_pages) * page_bytes;
+                open.ahead = crate::os::direct_file(&span.path, false)
+                    .ok()
+                    .and_then(|direct| ReadAhead::start(direct, pages_at, end).ok());
+            }
+            match open.ahead.as_mut().filter(|ahead| ahead.at(pages_at)) {
+                Some(ahead) => ahead.read(&mut dst[..pages_bytes]).map_err(|e| {
+                    io("cannot read pages of", std::io::Error::other(e.to_string()))
+                })?,
+                None => {
+                    open.ahead = None;
+                    open.file
+                        .read_exact_at(&mut dst[..pages_bytes], pages_at)
+                        .map_err(|e| io("cannot read pages of", e))?;
+                }
+            }
+        }
+        let file = &open.file;
         let mut stored = vec![0u8; count * 8];
-        file.read_exact_at(&mut stored, span.header.checksum_segment() + first * 8)
+        file.read_exact_at(&mut stored, header.checksum_segment() + first * 8)
             .map_err(|e| io("cannot read checksums of", e))?;
         let pages = stored
             .chunks_exact(8)
@@ -195,7 +257,7 @@ impl HostPin for FilePin {
         let row = if window.row {
             file.read_exact_at(
                 &mut dst[pages_bytes..pages_bytes + self.row_bytes as usize],
-                span.header.row_segment,
+                header.row_segment,
             )
             .map_err(|e| io("cannot read the row of", e))?;
             // The persisted row checksum is in the file's own header.
@@ -332,5 +394,221 @@ mod tests {
         assert!(pin.read(&window, &mut [0u8; 5]).is_err());
         drop(pin);
         assert_eq!(releases.drain(), [key(48, 1)]);
+    }
+
+    #[test]
+    fn a_file_pin_serves_windows_in_order_and_out_of_order_with_the_persisted_checksums() {
+        use crate::testing::geometry;
+        let base = std::env::var_os("FLARE_OFFLOAD_TEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let directory = base.join(format!("flare-file-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let geometry = [geometry(16, &[("k", 4096), ("v", 4096)], 4096)];
+        let pages = 40u32;
+        let mut header = Header::new(
+            &geometry,
+            [1; 32],
+            [2; 16],
+            key(16 * u64::from(pages), 9),
+            None,
+            [3; 16],
+            pages,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        let page = 8192usize;
+        let pattern =
+            |p: u32| -> Vec<u8> { (0..page).map(|i| (i as u32 * 3 + p * 11) as u8).collect() };
+        let stored_row = vec![5u8; 4096];
+        header.row_checksum = crate::record::checksum(&stored_row);
+        let mut file = vec![0u8; header.length_with_row() as usize];
+        file[..crate::record::HEADER_BYTES].copy_from_slice(&header.encode().unwrap());
+        for p in 0..pages {
+            let at = header.page_segment as usize + p as usize * page;
+            file[at..at + page].copy_from_slice(&pattern(p));
+            let sum = header.checksum_segment() as usize + p as usize * 8;
+            file[sum..sum + 8].copy_from_slice(&crate::record::checksum(&pattern(p)).to_le_bytes());
+        }
+        let at = header.row_segment as usize;
+        file[at..at + 4096].copy_from_slice(&stored_row);
+        let path = directory.join("record");
+        std::fs::write(&path, &file).unwrap();
+        // The export starts at page 4 and takes the row.
+        let nodes = [(header.key, 1, pages as usize)];
+        let mut pin = FilePin {
+            chain: host_chain(16, 4 * 16, true, &nodes),
+            spans: vec![FileSpan::new(path, header.clone())],
+            page_bytes: page as u64,
+            row_bytes: 4096,
+            keys: vec![header.key],
+            releases: Releases::default(),
+        };
+        // Windows of 5 pages in order, a window skipped (read later), then the tail.
+        let mut check = |first: u32, count: u32, row: bool| {
+            let mut dst = vec![0u8; count as usize * page + if row { 4096 } else { 0 }];
+            let window = HostWindow {
+                record: 0,
+                first_page: first,
+                page_count: count,
+                row,
+            };
+            let sums = pin.read(&window, &mut dst).unwrap();
+            for i in 0..count {
+                let at = i as usize * page;
+                assert_eq!(
+                    dst[at..at + page],
+                    pattern(first + i)[..],
+                    "page {}",
+                    first + i
+                );
+                assert_eq!(
+                    sums.pages[i as usize],
+                    crate::record::checksum(&pattern(first + i))
+                );
+            }
+            if row {
+                assert_eq!(dst[count as usize * page..], stored_row[..]);
+                assert_eq!(sums.row, Some(crate::record::checksum(&stored_row)));
+            }
+        };
+        check(4, 5, false);
+        check(9, 5, false);
+        check(19, 5, false);
+        check(14, 5, false);
+        check(24, 16, true);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Cold-file export rate of a `FilePin`: `bench_make` writes a record file, the caller
+    /// drops the page cache, `bench_read` reads it back window by window the way the
+    /// export fill thread does. Run by hand with `-- --ignored --nocapture`, with
+    /// `SELENE_PIN_BENCH_DIR` naming a directory on the disk under test and
+    /// `SELENE_PIN_BENCH_MIB` the record size.
+    fn bench_shape() -> (std::path::PathBuf, u32, Header, u64) {
+        use crate::testing::geometry;
+        let directory = std::path::PathBuf::from(
+            std::env::var("SELENE_PIN_BENCH_DIR").expect("SELENE_PIN_BENCH_DIR"),
+        );
+        let mib: u64 = std::env::var("SELENE_PIN_BENCH_MIB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024);
+        let pages = mib as u32;
+        let geometry = [geometry(16, &[("k", 512 * 1024), ("v", 512 * 1024)], 4096)];
+        let header = Header::new(
+            &geometry,
+            [1; 32],
+            [2; 16],
+            key(16 * u64::from(pages), 9),
+            None,
+            [3; 16],
+            pages,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        (directory.join("bench.rec"), pages, header, 1 << 20)
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_make() {
+        use std::io::Write;
+        let (path, pages, mut header, page) = bench_shape();
+        let row = vec![7u8; 4096];
+        header.row_checksum = crate::record::checksum(&row);
+        let mut file = std::io::BufWriter::new(File::create(&path).unwrap());
+        file.write_all(&header.encode().unwrap()).unwrap();
+        let sums_at = header.checksum_segment();
+        file.write_all(&vec![0u8; (sums_at as usize) - crate::record::HEADER_BYTES])
+            .unwrap();
+        let mut sums = Vec::new();
+        let mut data = vec![0u8; page as usize];
+        for p in 0..pages {
+            data.iter_mut()
+                .enumerate()
+                .for_each(|(i, b)| *b = (i as u32).wrapping_mul(31).wrapping_add(p) as u8);
+            sums.extend_from_slice(&crate::record::checksum(&data).to_le_bytes());
+        }
+        file.write_all(&sums).unwrap();
+        let pad = header.page_segment - (sums_at + sums.len() as u64);
+        file.write_all(&vec![0u8; pad as usize]).unwrap();
+        for p in 0..pages {
+            data.iter_mut()
+                .enumerate()
+                .for_each(|(i, b)| *b = (i as u32).wrapping_mul(31).wrapping_add(p) as u8);
+            file.write_all(&data).unwrap();
+        }
+        file.write_all(&row).unwrap();
+        file.flush().unwrap();
+        file.get_ref().sync_all().unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_read() {
+        let (path, pages, header, page) = bench_shape();
+        let nodes = [(header.key, 1, pages as usize)];
+        let mut pin = FilePin {
+            chain: host_chain(16, 0, true, &nodes),
+            spans: vec![FileSpan::new(path, header.clone())],
+            page_bytes: page,
+            row_bytes: 4096,
+            keys: vec![header.key],
+            releases: Releases::default(),
+        };
+        let per = 4u32;
+        let address = crate::os::allocate_aligned(((per as u64) * page + 4096) as usize).unwrap();
+        let started = std::time::Instant::now();
+        let mut first = 0;
+        let mut bytes = 0u64;
+        while first < pages {
+            let count = per.min(pages - first);
+            let row = first + count == pages;
+            let length = (u64::from(count) * page + if row { 4096 } else { 0 }) as usize;
+            let dst = unsafe { std::slice::from_raw_parts_mut(address as *mut u8, length) };
+            let window = HostWindow {
+                record: 0,
+                first_page: first,
+                page_count: count,
+                row,
+            };
+            let sums = if std::env::var("SELENE_PIN_BENCH_OLD").is_ok() {
+                // The read as it was: one cold buffered pread per window.
+                let file = File::open(&pin.spans[0].path).unwrap();
+                let at = header.page_segment + u64::from(first) * page;
+                let pages_len = count as usize * page as usize;
+                file.read_exact_at(&mut dst[..pages_len], at).unwrap();
+                let mut stored = vec![0u8; count as usize * 8];
+                file.read_exact_at(
+                    &mut stored,
+                    header.checksum_segment() + u64::from(first) * 8,
+                )
+                .unwrap();
+                Checksums {
+                    pages: stored
+                        .chunks_exact(8)
+                        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                        .collect(),
+                    row: None,
+                }
+            } else {
+                pin.read(&window, dst).unwrap()
+            };
+            if first == 0 {
+                for (i, sum) in sums.pages.iter().enumerate() {
+                    let at = i * page as usize;
+                    assert_eq!(*sum, crate::record::checksum(&dst[at..at + page as usize]));
+                }
+            }
+            bytes += length as u64;
+            first += count;
+        }
+        let seconds = started.elapsed().as_secs_f64();
+        println!(
+            "pin_read bytes={bytes} seconds={seconds:.3} gb_per_s={:.2}",
+            bytes as f64 / seconds / 1e9
+        );
     }
 }

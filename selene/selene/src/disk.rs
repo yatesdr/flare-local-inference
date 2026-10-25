@@ -1137,6 +1137,170 @@ impl Drop for AlignedBuffer {
     }
 }
 
+/// Bytes of one block a [`ReadAhead`] reads at a time.
+const AHEAD_BLOCK_BYTES: usize = 4 << 20;
+/// Blocks one ring transfer carries, and so the reads the device has in flight.
+const AHEAD_BATCH: usize = 4;
+/// Blocks a [`ReadAhead`] owns: the batch being read and the ones waiting to be consumed.
+const AHEAD_BLOCKS: usize = 3 * AHEAD_BATCH;
+
+/// A block read ahead: where in the file it came from and how much of the buffer is valid.
+struct AheadBlock {
+    buffer: AlignedBuffer,
+    offset: u64,
+    length: usize,
+}
+
+/// Sequential reads of one file range past the page cache, with the device kept busy: a
+/// thread reads the range ahead of the consumer in [`AHEAD_BLOCK_BYTES`] blocks, several in
+/// flight through the same ring the disk thread moves records with, while the consumer copies
+/// what was read out. A consumer that reads the range window by window, each read waiting for
+/// the device, leaves the device idle between windows and keeps one request in flight; this
+/// keeps [`AHEAD_BATCH`] and is not slowed by the consumer's own work.
+pub struct ReadAhead {
+    blocks: Receiver<Result<AheadBlock>>,
+    free: Option<mpsc::Sender<AlignedBuffer>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    current: Option<AheadBlock>,
+    /// The file offset the next byte handed out comes from.
+    next: u64,
+    end: u64,
+}
+
+impl ReadAhead {
+    /// Read `start..end` of `file`, which must have been opened for direct I/O. `start` and
+    /// `end` are multiples of [`BLOCK_BYTES`].
+    pub fn start(file: File, start: u64, end: u64) -> Result<Self> {
+        if !aligned(start) || !aligned(end) || end < start {
+            return Err(invalid("read-ahead range is not block aligned"));
+        }
+        let ring = Ring::new()?;
+        let (free, recycled) = mpsc::channel::<AlignedBuffer>();
+        let (sender, blocks) = mpsc::channel::<Result<AheadBlock>>();
+        let count = AHEAD_BLOCKS.min(((end - start) as usize).div_ceil(AHEAD_BLOCK_BYTES).max(1));
+        for _ in 0..count {
+            let _ = free.send(AlignedBuffer::new(AHEAD_BLOCK_BYTES)?);
+        }
+        let thread = std::thread::Builder::new()
+            .name("selene-read-ahead".into())
+            .spawn(move || read_ahead(ring, file, start, end, recycled, sender))
+            .map_err(|error| io_failure("spawn the read-ahead thread", error))?;
+        Ok(Self {
+            blocks,
+            free: Some(free),
+            thread: Some(thread),
+            current: None,
+            next: start,
+            end,
+        })
+    }
+
+    /// Whether the next byte this hands out is the one at `offset`.
+    pub fn at(&self, offset: u64) -> bool {
+        self.next == offset
+    }
+
+    /// Copy the next `dst.len()` bytes of the range into `dst`.
+    pub fn read(&mut self, dst: &mut [u8]) -> Result<()> {
+        if self.next + dst.len() as u64 > self.end {
+            return Err(invalid("read-ahead read runs past its range"));
+        }
+        let mut done = 0;
+        while done < dst.len() {
+            if self.current.is_none() {
+                self.current = Some(
+                    self.blocks
+                        .recv()
+                        .map_err(|_| invalid("the read-ahead thread stopped"))??,
+                );
+            }
+            let block = self.current.as_ref().expect("a block");
+            let at = (self.next - block.offset) as usize;
+            let take = (block.length - at).min(dst.len() - done);
+            dst[done..done + take].copy_from_slice(&block.buffer.as_slice()[at..at + take]);
+            done += take;
+            self.next += take as u64;
+            if at + take == block.length {
+                let block = self.current.take().expect("a block");
+                if let Some(free) = &self.free {
+                    let _ = free.send(block.buffer);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ReadAhead {
+    fn drop(&mut self) {
+        // The thread waits for buffers; with the sender gone it ends after the transfer it
+        // may be in the middle of, which is the last thing to touch its buffers.
+        self.free.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn read_ahead(
+    mut ring: Ring,
+    file: File,
+    start: u64,
+    end: u64,
+    recycled: Receiver<AlignedBuffer>,
+    blocks: mpsc::Sender<Result<AheadBlock>>,
+) {
+    let mut offset = start;
+    while offset < end {
+        // Take what buffers are free, at least one, up to a batch.
+        let Ok(first) = recycled.recv() else { return };
+        let mut batch = vec![first];
+        while batch.len() < AHEAD_BATCH {
+            match recycled.try_recv() {
+                Ok(buffer) => batch.push(buffer),
+                Err(_) => break,
+            }
+        }
+        let mut spans = Vec::with_capacity(batch.len());
+        let mut lengths = Vec::with_capacity(batch.len());
+        let mut at = offset;
+        for buffer in &batch {
+            let length = (end - at).min(AHEAD_BLOCK_BYTES as u64) as usize;
+            if length == 0 {
+                break;
+            }
+            spans.push(Span {
+                address: buffer.address(),
+                offset: at,
+                length,
+            });
+            lengths.push((at, length));
+            at += length as u64;
+        }
+        batch.truncate(spans.len());
+        let result = ring.transfer(&file, &spans, false);
+        match result {
+            Ok(_) => {
+                for (buffer, (block_offset, length)) in batch.into_iter().zip(lengths) {
+                    let block = AheadBlock {
+                        buffer,
+                        offset: block_offset,
+                        length,
+                    };
+                    if blocks.send(Ok(block)).is_err() {
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = blocks.send(Err(error));
+                return;
+            }
+        }
+        offset = at;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2170,5 +2334,52 @@ mod tests {
         assert!(aligned(0));
         assert!(aligned(8192));
         assert!(!aligned(8193));
+    }
+
+    #[test]
+    fn a_read_ahead_hands_out_a_file_range_in_any_window_sizes_and_can_be_dropped_early() {
+        let Some(directory) = test_directory("read-ahead") else {
+            return;
+        };
+        let path = directory.join("range");
+        let length = 3 * AHEAD_BLOCK_BYTES + 5 * 4096;
+        let bytes: Vec<u8> = (0..length).map(|i| (i * 7 + i / 4096) as u8).collect();
+        fs::write(&path, &bytes).unwrap();
+        let start = 4096u64;
+        let end = (length - 4096) as u64;
+        let mut ahead =
+            ReadAhead::start(crate::os::direct_file(&path, false).unwrap(), start, end).unwrap();
+        assert!(ahead.at(start) && !ahead.at(0));
+        let mut at = start as usize;
+        for size in [4096, 1 << 20, 3 * 4096, AHEAD_BLOCK_BYTES + 4096, 8192] {
+            let mut got = vec![0u8; size];
+            ahead.read(&mut got).unwrap();
+            assert_eq!(got, bytes[at..at + size]);
+            at += size;
+            assert!(ahead.at(at as u64));
+        }
+        // The rest of the range, then nothing more.
+        let mut rest = vec![0u8; end as usize - at];
+        ahead.read(&mut rest).unwrap();
+        assert_eq!(rest, bytes[at..end as usize]);
+        assert!(ahead.read(&mut [0u8; 4096]).is_err());
+        // A reader dropped with most of its range unread stops cleanly.
+        let mut early = ReadAhead::start(
+            crate::os::direct_file(&path, false).unwrap(),
+            0,
+            length as u64,
+        )
+        .unwrap();
+        let mut first = vec![0u8; 4096];
+        early.read(&mut first).unwrap();
+        assert_eq!(first, bytes[..4096]);
+        drop(early);
+        // A range of one block.
+        let mut small =
+            ReadAhead::start(crate::os::direct_file(&path, false).unwrap(), 8192, 16384).unwrap();
+        let mut got = vec![0u8; 8192];
+        small.read(&mut got).unwrap();
+        assert_eq!(got, bytes[8192..16384]);
+        fs::remove_dir_all(&directory).unwrap();
     }
 }

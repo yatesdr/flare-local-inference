@@ -1802,10 +1802,10 @@ impl DiskStore {
             }
             keys.push(cursor);
             nodes.push((cursor, held, node.tail_pages));
-            spans.push(FileSpan {
-                path: node.location.path.clone(),
-                header: node.location.header.clone(),
-            });
+            spans.push(FileSpan::new(
+                node.location.path.clone(),
+                node.location.header.clone(),
+            ));
             let start =
                 (cursor.consumed_tokens / page_tokens).saturating_sub(node.tail_pages as u64);
             if start <= start_page {
