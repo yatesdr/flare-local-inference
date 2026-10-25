@@ -1223,6 +1223,7 @@ fn fatal_broadcast_preserves_first_failure_and_reaches_pending_and_ingress() {
 
 /// A host store that answers lookups from a script and reports completions on demand.
 struct FakeStore {
+    copies: std::collections::HashSet<crate::cache::PrefixKey>,
     hit: Option<crate::offload::HostHit>,
     reject_fetch: bool,
     write_back_outcomes: VecDeque<crate::offload::StoreOutcome>,
@@ -1263,6 +1264,7 @@ impl FakeStore {
     fn new(hit: Option<crate::offload::HostHit>) -> Self {
         Self {
             hit,
+            copies: Default::default(),
             reject_fetch: false,
             write_back_outcomes: VecDeque::new(),
             write_backs: Vec::new(),
@@ -1291,6 +1293,10 @@ impl FakeStore {
 }
 
 impl crate::offload::PrefixStore for FakeStore {
+    fn has_copy(&self, key: crate::cache::PrefixKey) -> bool {
+        self.copies.contains(&key)
+    }
+
     fn write_back_reserve(&self, largest_pages: usize, _: f64) -> usize {
         // Lifecycle fixtures use a fixed reservoir; Selene tests exercise its sizing.
         largest_pages.max(128)
@@ -1383,12 +1389,16 @@ impl crate::offload::PrefixStore for FakeStore {
         checkpoint: &crate::offload::PublishedCheckpoint,
     ) -> flare_selene::Result<crate::offload::StoreOutcome> {
         self.write_backs.push(checkpoint.clone());
-        Ok(self
+        let outcome = self
             .write_back_outcomes
             .pop_front()
             .unwrap_or(crate::offload::StoreOutcome::Retry(
                 crate::offload::StoreReason::Queue,
-            )))
+            ));
+        if outcome == crate::offload::StoreOutcome::Present {
+            self.copies.insert(checkpoint.key);
+        }
+        Ok(outcome)
     }
     fn fetch(
         &mut self,
@@ -1405,7 +1415,12 @@ impl crate::offload::PrefixStore for FakeStore {
         if let Some(error) = &self.poll_error {
             return Err(error.clone().into());
         }
-        events.extend(self.events.drain(..));
+        for event in self.events.drain(..) {
+            if let crate::offload::StoreEvent::Stored { key, result: Ok(_), .. } = &event {
+                self.copies.insert(*key);
+            }
+            events.push(event);
+        }
         Ok(())
     }
     fn stats(&self) -> crate::offload::StoreStats {
@@ -3581,14 +3596,7 @@ fn publications_remain_dirty_without_pins_or_copies_when_there_is_room() {
         let id = unpinned_checkpoint(&mut worker, 0, 64);
         worker.service_store().unwrap();
         assert_eq!(pins(&worker, id), 0);
-        assert!(
-            !worker
-                .scheduler
-                .cache()
-                .checkpoint(id)
-                .unwrap()
-                .host_clean()
-        );
+        assert!(!has_copy(&mut worker, id));
         assert_eq!(fake_store(&mut worker).stored.len(), 1);
         assert!(!worker.service_store().unwrap());
         assert!(fake_store(&mut worker).write_backs.is_empty());
@@ -3608,24 +3616,12 @@ fn queued_write_backs_release_one_pin_and_only_success_marks_them_clean() {
         let id = unpinned_checkpoint(&mut worker, 0, 64);
         worker.service_store().unwrap();
         assert_eq!(pins(&worker, id), 1);
-        assert!(
-            !worker
-                .scheduler
-                .cache()
-                .checkpoint(id)
-                .unwrap()
-                .host_clean()
-        );
+        assert!(!has_copy(&mut worker, id));
         complete_store(&mut worker, id, success);
         worker.service_store().unwrap();
         assert_eq!(pins(&worker, id), 0);
         assert_eq!(
-            worker
-                .scheduler
-                .cache()
-                .checkpoint(id)
-                .unwrap()
-                .host_clean(),
+            has_copy(&mut worker, id),
             success
         );
         worker.service_store().unwrap();
@@ -3674,8 +3670,8 @@ fn pressure_writes_cold_dirty_checkpoints_and_retry_stops_each_round() {
                 .collect::<Vec<_>>(),
             [a, b, b, c]
         );
-        assert!(worker.scheduler.cache().checkpoint(b).unwrap().host_clean());
-        assert!(!worker.scheduler.cache().checkpoint(a).unwrap().host_clean());
+        assert!(has_copy(&mut worker, b));
+        assert!(!has_copy(&mut worker, a));
         complete_store(&mut worker, a, true);
         complete_store(&mut worker, c, true);
         worker.service_store().unwrap();
@@ -3771,14 +3767,7 @@ fn write_back_and_export_release_their_own_pins_in_either_completion_order() {
         fake_store(&mut worker).events.push_back(export_ended(1));
         worker.service_store().unwrap();
         assert_eq!(pins(&worker, id), 0);
-        assert!(
-            worker
-                .scheduler
-                .cache()
-                .checkpoint(id)
-                .unwrap()
-                .host_clean()
-        );
+        assert!(has_copy(&mut worker, id));
         assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
     }
 }
@@ -3796,7 +3785,8 @@ fn write_back_pins_survive_ancestor_compaction() {
     let a = unpinned_checkpoint(&mut worker, 0, 64);
     let b = unpinned_checkpoint(&mut worker, 0, 128);
     // Commit the ancestor's host copy so pressure selects the dirty child.
-    worker.scheduler.stored_checkpoint(a).unwrap();
+    let key = worker.scheduler.cache().checkpoint(a).unwrap().prefix();
+    fake_store(&mut worker).copies.insert(key);
     fake_store(&mut worker)
         .write_back_outcomes
         .push_back(Queued);
@@ -3859,9 +3849,9 @@ fn present_stops_write_back_when_clean_reclamation_covers_the_watermark() {
     assert_eq!(worker.scheduler.free_page_count(), 127);
     worker.service_store().unwrap();
     assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
-    assert!(worker.scheduler.cache().checkpoint(a).unwrap().host_clean());
-    assert!(!worker.scheduler.cache().checkpoint(b).unwrap().host_clean());
-    assert!(!worker.scheduler.cache().checkpoint(c).unwrap().host_clean());
+    assert!(has_copy(&mut worker, a));
+    assert!(!has_copy(&mut worker, b));
+    assert!(!has_copy(&mut worker, c));
     assert!(!worker.service_store().unwrap());
     assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
 }
@@ -3879,13 +3869,35 @@ fn a_present_write_back_marks_clean_without_a_pin() {
     let id = unpinned_checkpoint(&mut worker, 0, 64);
     worker.service_store().unwrap();
     assert_eq!(pins(&worker, id), 0);
-    assert!(
-        worker
-            .scheduler
-            .cache()
-            .checkpoint(id)
-            .unwrap()
-            .host_clean()
-    );
+    assert!(has_copy(&mut worker, id));
     assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
+}
+
+fn has_copy(worker: &mut Worker<'_>, id: crate::cache::CheckpointId) -> bool {
+    let key = worker.scheduler.cache().checkpoint(id).unwrap().prefix();
+    fake_store(worker).copies.contains(&key)
+}
+
+#[test]
+fn losing_a_host_copy_makes_the_gpu_checkpoint_a_write_back_candidate_again() {
+    use crate::offload::StoreOutcome;
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.write_back_outcomes.push_back(StoreOutcome::Present);
+    worker.attach_store(Some(Box::new(store)));
+    let id = unpinned_checkpoint(&mut worker, 0, 64);
+    worker.service_store().unwrap();
+    assert!(has_copy(&mut worker, id));
+    let store = fake_store(&mut worker);
+    store.copies.clear();
+    store.write_back_outcomes.push_back(StoreOutcome::Queued);
+    worker.service_store().unwrap();
+    assert_eq!(fake_store(&mut worker).write_backs.len(), 2);
+    assert_eq!(pins(&worker, id), 1);
+    complete_store(&mut worker, id, true);
+    worker.service_store().unwrap();
+    assert!(has_copy(&mut worker, id));
+    assert_eq!(pins(&worker, id), 0);
 }

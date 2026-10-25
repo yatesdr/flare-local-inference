@@ -313,6 +313,8 @@ impl<S: crate::store::TierStore, P: PoolPort> PooledStore<S, P> {
 }
 
 impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
+    fn has_copy(&self, key: PrefixKey) -> bool { self.inner.has_copy(key) }
+
     fn write_back_reserve(&self, largest_pages: usize, prefill_rate: f64) -> usize {
         self.inner.write_back_reserve(largest_pages, prefill_rate)
     }

@@ -33,6 +33,7 @@ pub mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 mod vocab;
+pub mod writeback;
 
 pub use copier::{CLOSE_TIMEOUT, Direction, Job, PageCopier, QUEUE_DEPTH, Reply, SharedCopier};
 pub use error::{Error, Result};

@@ -946,6 +946,8 @@ impl CompositeStore {
 }
 
 impl HostStore for CompositeStore {
+    fn has_copy(&self, key: PrefixKey) -> bool { self.disk.index().complete_with(&key, &|node| node.ready || self.resident(&node.key, node.tail_pages, node.key == key)) }
+
     fn write_back_reserve(&self, largest_pages: usize, prefill_rate: f64) -> usize {
         self.memory.write_back_reserve(largest_pages, prefill_rate)
     }

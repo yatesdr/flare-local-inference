@@ -1961,7 +1961,7 @@ impl<'a> Worker<'a> {
         let Some(store) = self.store.as_mut() else {
             return Ok(false);
         };
-        use crate::offload::{StoreEvent, StoreOutcome};
+        use crate::offload::StoreEvent;
         let mut events = Vec::new();
         store.poll(&mut events)?;
         let mut progress = !events.is_empty();
@@ -1970,11 +1970,8 @@ impl<'a> Worker<'a> {
         for event in events {
             match event {
                 StoreEvent::Stored {
-                    checkpoint, result, ..
+                    checkpoint, ..
                 } => {
-                    if result.is_ok() {
-                        self.scheduler.stored_checkpoint(checkpoint)?;
-                    }
                     self.scheduler.unpin_checkpoint(checkpoint)?;
                     released = true;
                 }
@@ -2029,31 +2026,9 @@ impl<'a> Worker<'a> {
             store.published(&publication)?;
         }
         let next = next_admission(&self.scheduler, &self.parked, &self.pending);
-        let reserve = store.write_back_reserve(
-            self.scheduler.largest_admission_pages(), self.prefill_rate,
-        );
-        for id in self.scheduler.write_back_candidates(next, reserve) {
-            // Like exports, copy-outs must leave the next admission and decode room.
-            if !self.scheduler.export_fits(id, next) {
-                continue;
-            }
-            let Some(publication) = self.scheduler.publication(id) else {
-                continue;
-            };
-            if let Ok(outcome) = store.write_back(&publication) {
-                self.metrics.host_store_outcome(outcome);
-                self.scheduler.store_outcome(id, outcome)?;
-                if matches!(outcome, StoreOutcome::Retry(_)) {
-                    break;
-                }
-                progress |= matches!(outcome, StoreOutcome::Queued | StoreOutcome::Present);
-                if outcome == StoreOutcome::Present
-                    && self.scheduler.write_back_candidates(next, reserve).is_empty()
-                {
-                    break;
-                }
-            }
-        }
+        progress |= flare_selene::writeback::pump(store.as_mut(),
+            &mut crate::scheduler::WriteBackCache { scheduler: &mut self.scheduler, next },
+            self.prefill_rate, |outcome| self.metrics.host_store_outcome(outcome))?;
         // Store gauges change without events, so they are refreshed every pass.
         self.metrics.store(store.stats());
         for handle in requeued {

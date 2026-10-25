@@ -209,6 +209,11 @@ pub enum Retirement {
 /// `poll` and stops producing events. The worker then stops, so ids and pins
 /// held by transfers it cannot account for are never reused or released.
 pub trait HostStore {
+    /// A complete committed checkpoint, including its continuation row, is retained now.
+    fn has_copy(&self, _key: PrefixKey) -> bool {
+        false
+    }
+
     /// Deepest record chain extending `resident` and strictly below `before`.
     fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit>;
     /// Announce a GPU publication. Copying it is a separate write-back request.
