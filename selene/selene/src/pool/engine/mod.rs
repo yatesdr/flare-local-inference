@@ -768,7 +768,7 @@ impl Engine {
                         None => {}
                     }
                 }
-                RankEvent::Detached { .. } => {}
+                RankEvent::Attached { .. } | RankEvent::Detached { .. } => {}
                 RankEvent::Lost { rank, reason } => self.rank_lost(rank, &reason),
             }
         }
