@@ -7,7 +7,7 @@ fn roots(manager: &Manager) -> Roots {
 }
 
 fn other_roots() -> Roots {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = selene_manager::testing::certificate();
     Roots::Fixed(vec![cert.cert.der().clone()])
 }
 
@@ -92,7 +92,7 @@ fn a_client_with_a_ca_never_downgrades_to_plaintext() {
         panic!()
     };
     config.address = PoolAddress::Tcp(address);
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = selene_manager::testing::certificate();
     let ca = manager.base.join("client-ca.pem");
     std::fs::write(&ca, cert.cert.pem()).unwrap();
     config.ca = Some(ca);
