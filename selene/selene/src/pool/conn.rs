@@ -43,7 +43,8 @@ pub(crate) struct Link {
 const HELLO_TIMEOUT: Duration = Duration::from_secs(3);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const FIRST_BACKOFF: Duration = Duration::from_millis(100);
-pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(5);
+/// Reconnect promptly so a restarted manager can release the previous run's region hold.
+pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(1);
 pub(crate) const BUSY_TICK: Duration = Duration::from_millis(1);
 pub(crate) const IDLE_TICK: Duration = Duration::from_millis(20);
 const OUTBOUND: usize = 4096;
