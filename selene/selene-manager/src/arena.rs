@@ -142,6 +142,19 @@ impl Arena {
         })
     }
 
+    /// Takes everything that is free, so nothing can be allocated until the extents drop.
+    pub fn reserve_all(&self) -> Vec<Extent> {
+        let mut held = Vec::new();
+        let mut size = 1usize << (usize::BITS - 1 - self.0.length.leading_zeros());
+        while size >= 4096 {
+            while let Some(extent) = self.allocate(size) {
+                held.push(extent);
+            }
+            size /= 2;
+        }
+        held
+    }
+
     /// Whether an allocation of `length` bytes could be served without freeing anything.
     pub fn can_allocate(&self, length: usize) -> bool {
         let Some(capacity) = length.max(4096).checked_next_power_of_two() else {

@@ -246,14 +246,22 @@ message Limits {
   uint32 resync_timeout_ms = 18;        // ResyncBegin to installed; default 5000
 }
 
-// Mapped MAP_SHARED by the client at these paths. Region file names embed the
-// manager incarnation, so a mapping from a dead incarnation can never alias a
-// new window. The client must not create, truncate or unlink these files.
+// Mapped MAP_SHARED by the client at these paths. The files persist across
+// manager restarts: a restarted manager with the same configured sizes reopens
+// the same files, so their paths, sizes and offsets are unchanged and
+// `regions_generation` is unchanged. When it has to recreate them (a size
+// changed, or a file was unusable) it chooses a new generation. A client maps
+// and registers the regions once, at startup, and keeps them for the life of the
+// process; a different generation on a later Hello means its mappings are of
+// files that no longer back the pool, so it uses the pool no more until it is
+// restarted. The client must not create, truncate or unlink these files.
 message SharedMemory {
   string arena_path = 1;
   uint64 arena_bytes = 2;
   string staging_path = 3;
   uint64 staging_bytes = 4;
+  // Nonzero. Identifies this set of region files; see above.
+  uint64 regions_generation = 5;
 }
 
 enum ReadinessState {

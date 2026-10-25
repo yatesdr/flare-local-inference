@@ -257,7 +257,30 @@ pub struct Local {
     staging_size: u64,
     max_window_bytes: u64,
     connections: HashMap<u64, Connection>,
+    /// Identifies this set of region files. It changes exactly when the files are recreated, so
+    /// a process that registered the old files can tell the new ones are different.
+    regions_generation: u64,
+    /// Processes of the previous run that may still access the reused regions.
+    prior: Option<Prior>,
 }
+
+/// The reused regions' previous run: nothing in them is granted until every process that held
+/// a session then has reconnected (so it has drained) or exited. See PROTOCOL.md section 8.2.
+struct Prior {
+    /// Pid to a descriptor that reports its exit; `None` when the process cannot be watched,
+    /// which holds until it reconnects.
+    holders: HashMap<u32, Option<OwnedFd>>,
+    /// The whole of both regions, so no grant or store allocation can land in them.
+    _extents: Vec<Extent>,
+}
+
+/// File names inside an instance directory. They are fixed so that a restart finds the files it
+/// left; everything else in the directory is debris.
+const ARENA_FILE: &str = "arena";
+const STAGING_FILE: &str = "staging";
+const GENERATION_FILE: &str = "generation";
+const HOLDERS_FILE: &str = "holders";
+const LOCK_FILE: &str = "lock";
 
 /// Names the startup step and path an error came from.
 fn step_error(step: &str, path: &Path, error: io::Error) -> io::Error {
@@ -265,9 +288,10 @@ fn step_error(step: &str, path: &Path, error: io::Error) -> io::Error {
 }
 
 impl Local {
-    /// Owns `/dev/shm/selene/<instance>`: takes the exclusive lock, reclaims
-    /// everything a crashed owner left behind and creates fresh, preallocated
-    /// regions.
+    /// Owns `/dev/shm/selene/<instance>`: takes the exclusive lock, reclaims the debris a
+    /// crashed owner left behind and reuses its arena and staging files when they have the
+    /// configured sizes (same files, inodes and offsets), else creates fresh, preallocated
+    /// ones under a new generation.
     pub fn open(
         instance: &str,
         arena_bytes: usize,
@@ -281,7 +305,7 @@ impl Local {
         create_private_directory(&directory)
             .map_err(|error| step_error("create", &directory, error))?;
 
-        let lock_path = directory.join("lock");
+        let lock_path = directory.join(LOCK_FILE);
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -314,15 +338,57 @@ impl Local {
         }
 
         let boot_nonce = boot_nonce()?;
-        let (arena_path, arena_size) = create_region(&directory, "arena", &boot_nonce, arena_bytes)
-            .map_err(|error| step_error("create the arena in", &directory, error))?;
-        let (staging_path, staging_size) =
-            create_region(&directory, "staging", &boot_nonce, staging_bytes)
-                .map_err(|error| step_error("create staging in", &directory, error))?;
+        let arena_size = region_size_of(ARENA_FILE, arena_bytes)?;
+        let staging_size = region_size_of(STAGING_FILE, staging_bytes)?;
+        let arena_path = directory.join(ARENA_FILE);
+        let staging_path = directory.join(STAGING_FILE);
+        let reused = match reusable(&directory, arena_size, staging_size) {
+            Ok(generation) => Some(generation),
+            Err(reason) => {
+                let existed = arena_path.exists() || staging_path.exists();
+                for name in [ARENA_FILE, STAGING_FILE, GENERATION_FILE, HOLDERS_FILE] {
+                    let _ = fs::remove_file(directory.join(name));
+                }
+                if existed {
+                    eprintln!(
+                        "selene: instance '{instance}' recreated its shared regions ({reason}); \
+                         running instances must restart to use the pool"
+                    );
+                }
+                None
+            }
+        };
+        let regions_generation = match reused {
+            Some(generation) => generation,
+            None => {
+                create_region(&directory, ARENA_FILE, arena_size)
+                    .map_err(|error| step_error("create the arena in", &directory, error))?;
+                create_region(&directory, STAGING_FILE, staging_size)
+                    .map_err(|error| step_error("create staging in", &directory, error))?;
+                let generation = new_generation()?;
+                write_atomically(
+                    &directory.join(GENERATION_FILE),
+                    format!("{generation:016x}\n").as_bytes(),
+                )
+                .map_err(|error| step_error("write the generation in", &directory, error))?;
+                generation
+            }
+        };
         let arena = Arena::open(&arena_path, arena_size)?;
         let staging = Arena::open(&staging_path, staging_size)?;
+        if reused.is_some() {
+            eprintln!(
+                "selene: instance '{instance}' reused its shared regions (generation \
+                 {regions_generation:016x})"
+            );
+        }
+        let prior = if reused.is_some() {
+            Prior::read(&directory, &arena, &staging, instance)
+        } else {
+            None
+        };
 
-        Ok(Self {
+        let local = Self {
             instance: instance.to_owned(),
             directory,
             boot_nonce,
@@ -335,7 +401,60 @@ impl Local {
             staging_size: staging_size as u64,
             max_window_bytes,
             connections: HashMap::new(),
-        })
+            regions_generation,
+            prior,
+        };
+        local.persist_holders();
+        Ok(local)
+    }
+
+    /// Identifies the region files. Equal values mean the same files at the same offsets; a
+    /// process that mapped and registered them can keep using them.
+    pub fn regions_generation(&self) -> u64 {
+        self.regions_generation
+    }
+
+    /// Whether the regions are still held for processes of the previous run.
+    pub fn held_for_previous_run(&self) -> bool {
+        self.prior.is_some()
+    }
+
+    /// Writes the pids with a live local session, and the previous run's still-unresolved
+    /// holders, so a restart after a crash knows whose copies could still be in flight.
+    fn persist_holders(&self) {
+        let mut pids: Vec<u32> = self
+            .connections
+            .values()
+            .filter(|record| !record.exited)
+            .filter_map(|record| record.pid)
+            .collect();
+        if let Some(prior) = &self.prior {
+            pids.extend(prior.holders.keys());
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        let mut text = String::new();
+        for pid in pids {
+            if let Some(start) = process_start(pid) {
+                text.push_str(&format!("{pid} {start}\n"));
+            }
+        }
+        let _ = write_atomically(&self.directory.join(HOLDERS_FILE), text.as_bytes());
+    }
+
+    /// Releases the previous run's hold once none of its processes can still be copying.
+    fn settle_prior(&mut self) {
+        if self
+            .prior
+            .as_ref()
+            .is_some_and(|prior| prior.holders.is_empty())
+        {
+            self.prior = None;
+            eprintln!(
+                "selene: instance '{}' released the shared regions held for the previous run",
+                self.instance
+            );
+        }
     }
 
     pub fn instance(&self) -> &str {
@@ -431,6 +550,13 @@ impl Local {
                 armed: 0,
             },
         );
+        // A process of the previous run that reconnects has drained what it did under the
+        // dead manager before it did (PROTOCOL.md section 8.1), so its hold is over.
+        if let (SessionKind::Local { pid }, Some(prior)) = (kind, &mut self.prior) {
+            prior.holders.remove(&pid);
+            self.settle_prior();
+        }
+        self.persist_holders();
         Ok(())
     }
 
@@ -447,6 +573,7 @@ impl Local {
         }
         self.connections
             .retain(|_, record| !(record.closed && record.exited && record.reported));
+        self.persist_holders();
     }
 
     /// Non-blocking pidfd poll. Each exit is reported once. Windows are reclaimed
@@ -468,6 +595,16 @@ impl Local {
         }
         self.connections
             .retain(|_, record| !(record.closed && record.exited && record.reported));
+        if let Some(prior) = &mut self.prior {
+            let before = prior.holders.len();
+            prior
+                .holders
+                .retain(|_, pidfd| !pidfd.as_ref().is_some_and(pidfd_exited));
+            if prior.holders.len() != before {
+                self.settle_prior();
+                self.persist_holders();
+            }
+        }
     }
 
     /// Grants an exclusive writable Put window from `region`.
@@ -978,14 +1115,24 @@ fn boot_nonce() -> Result<String> {
 /// Removes every stale entry a crashed owner left in the instance directory.
 ///
 /// Ownership is the held flock, never the directory's existence: by the time
-/// this runs the lock is held, so anything except the lock file itself is
-/// debris from a manager that died without cleaning up. Directories are left
+/// this runs the lock is held, so no other manager of this instance is running. Anything but
+/// the lock and the files a restart reuses (the two regions, their generation and the holders
+/// list) is debris from a manager that died without cleaning up. Only this instance's own
+/// directory is read, so another instance's files are never touched. Directories are left
 /// alone; this instance's directory only ever holds the lock and region files.
 fn reclaim_stale(directory: &Path) -> Result<usize> {
     let mut removed = 0;
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
-        if entry.file_name() == "lock" || entry.file_type()?.is_dir() {
+        let name = entry.file_name();
+        let kept = [
+            LOCK_FILE,
+            ARENA_FILE,
+            STAGING_FILE,
+            GENERATION_FILE,
+            HOLDERS_FILE,
+        ];
+        if kept.iter().any(|kept| name == *kept) || entry.file_type()?.is_dir() {
             continue;
         }
         match fs::remove_file(entry.path()) {
@@ -997,20 +1144,20 @@ fn reclaim_stale(directory: &Path) -> Result<usize> {
     Ok(removed)
 }
 
-/// Creates a fresh region file, sets 0660 and `fallocate`s it to its full size.
-fn create_region(
-    directory: &Path,
-    prefix: &str,
-    nonce: &str,
-    bytes: usize,
-) -> Result<(PathBuf, usize)> {
+/// A region's size: the configured bytes rounded down to a page.
+fn region_size_of(name: &str, bytes: usize) -> Result<usize> {
     let size = bytes / PAGE_BYTES as usize * PAGE_BYTES as usize;
     if size == 0 {
         return Err(invalid(format!(
-            "{prefix} region must hold at least {PAGE_BYTES} bytes"
+            "{name} region must hold at least {PAGE_BYTES} bytes"
         )));
     }
-    let path = directory.join(format!("{prefix}-{nonce}"));
+    Ok(size)
+}
+
+/// Creates a fresh region file, sets 0660 and `fallocate`s it to its full size.
+fn create_region(directory: &Path, name: &str, size: usize) -> Result<PathBuf> {
+    let path = directory.join(name);
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1026,7 +1173,127 @@ fn create_region(
         let _ = fs::remove_file(&path);
         return Err(error);
     }
-    Ok((path, size))
+    Ok(path)
+}
+
+/// The generation of the region files a previous run left, if they can be used as they are:
+/// regular files of this user, exactly the configured sizes, with their memory reserved, and a
+/// readable generation. Otherwise why not.
+fn reusable(
+    directory: &Path,
+    arena_size: usize,
+    staging_size: usize,
+) -> std::result::Result<u64, String> {
+    use std::os::unix::fs::MetadataExt;
+    for (name, size) in [(ARENA_FILE, arena_size), (STAGING_FILE, staging_size)] {
+        let path = directory.join(name);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(format!("no {name} file"));
+            }
+            Err(error) => return Err(format!("{name}: {error}")),
+        };
+        if !metadata.is_file() {
+            return Err(format!("{name} is not a regular file"));
+        }
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(format!("{name} belongs to another user"));
+        }
+        if metadata.len() != size as u64 {
+            return Err(format!(
+                "{name} is {} bytes and {size} are configured",
+                metadata.len()
+            ));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .map_err(|error| format!("{name}: {error}"))?;
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o660) } != 0 {
+            return Err(format!("{name}: {}", io::Error::last_os_error()));
+        }
+        if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size as libc::off_t) } != 0 {
+            return Err(format!("{name}: {}", io::Error::last_os_error()));
+        }
+    }
+    let text = fs::read_to_string(directory.join(GENERATION_FILE))
+        .map_err(|error| format!("generation: {error}"))?;
+    match u64::from_str_radix(text.trim(), 16) {
+        Ok(generation) if generation != 0 => Ok(generation),
+        _ => Err("the generation file is unreadable".to_owned()),
+    }
+}
+
+/// A random nonzero 64-bit identity for a new set of region files.
+fn new_generation() -> Result<u64> {
+    loop {
+        let mut bytes = [0u8; 8];
+        File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        let value = u64::from_le_bytes(bytes);
+        if value != 0 {
+            return Ok(value);
+        }
+    }
+}
+
+/// Replaces `path` with `contents` in one step, so a crash leaves the old file or the new one.
+fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, contents)?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o660))?;
+    fs::rename(&temporary, path)
+}
+
+/// When a process started, in clock ticks since boot: with its pid it names one process, so a
+/// recycled pid is not mistaken for the one that held a session.
+fn process_start(pid: u32) -> Option<u64> {
+    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The name may contain spaces and parentheses; everything after the last ')' is plain.
+    let rest = &text[text.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+impl Prior {
+    /// The processes the last run recorded that are still the same live processes. `None` when
+    /// there are none, so nothing needs holding.
+    fn read(directory: &Path, arena: &Arena, staging: &Arena, instance: &str) -> Option<Self> {
+        let text = fs::read_to_string(directory.join(HOLDERS_FILE)).ok()?;
+        let mut holders = HashMap::new();
+        for line in text.lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(pid), Some(start)) = (
+                fields.next().and_then(|field| field.parse::<u32>().ok()),
+                fields.next().and_then(|field| field.parse::<u64>().ok()),
+            ) else {
+                continue;
+            };
+            if process_start(pid) != Some(start) {
+                continue;
+            }
+            match open_pidfd(pid) {
+                Pidfd::Open(fd) => holders.insert(pid, Some(fd)),
+                Pidfd::Unknown => holders.insert(pid, None),
+                Pidfd::Exited => None,
+            };
+        }
+        if holders.is_empty() {
+            return None;
+        }
+        eprintln!(
+            "selene: instance '{instance}' holds its shared regions until {} process(es) of the \
+             previous run reconnect or exit",
+            holders.len()
+        );
+        let mut extents = arena.reserve_all();
+        extents.extend(staging.reserve_all());
+        Some(Self {
+            holders,
+            _extents: extents,
+        })
+    }
 }
 
 pub(crate) enum Pidfd {
@@ -1096,9 +1363,13 @@ mod tests {
     /// the lock descriptor and keeps the flock until its exec closes it (CLOEXEC). Retry that
     /// window instead of assuming close and release are the same instant.
     fn reopen(name: &str) -> Local {
+        reopen_sized(name, 64 * 1024, 64 * 1024)
+    }
+
+    fn reopen_sized(name: &str, arena: usize, staging: usize) -> Local {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            match Local::open(name, 64 * 1024, 64 * 1024, 4 * 1024 * 1024) {
+            match Local::open(name, arena, staging, 4 * 1024 * 1024) {
                 Ok(local) => return local,
                 Err(error)
                     if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
@@ -1245,6 +1516,206 @@ mod tests {
             error.contains(&directory.display().to_string()) && error.contains("uid"),
             "{error}"
         );
+    }
+
+    fn inode(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).unwrap().ino()
+    }
+
+    #[test]
+    fn a_restart_reuses_the_same_files_and_offsets() {
+        let name = instance("reuse");
+        let (first, cleanup) = local(&name, 64 * 1024, 64 * 1024);
+        let mut first = first;
+        first.accept(1, std::process::id()).unwrap();
+        let grant = first
+            .grant_put(1, 1, 0, Region::Staging, shape(1, false))
+            .unwrap();
+        let (arena, staging) = (
+            first.arena_path().to_path_buf(),
+            first.staging_path().to_path_buf(),
+        );
+        let (generation, inodes) = (first.regions_generation(), (inode(&arena), inode(&staging)));
+        assert_ne!(generation, 0);
+        // The window is still granted when the manager goes away.
+        drop(first);
+
+        let mut second = reopen(&name);
+        assert_eq!(second.arena_path(), arena);
+        assert_eq!(second.staging_path(), staging);
+        assert_eq!(
+            (inode(&arena), inode(&staging)),
+            inodes,
+            "the files were reused"
+        );
+        assert_eq!(second.regions_generation(), generation);
+        // The test process is the holder that was recorded, so it is held until it reconnects.
+        assert!(second.held_for_previous_run());
+        second.accept(1, std::process::id()).unwrap();
+        assert!(!second.held_for_previous_run());
+        let again = second
+            .grant_put(1, 1, 0, Region::Staging, shape(1, false))
+            .unwrap();
+        assert_eq!(again.offset, grant.offset, "windows name the same offsets");
+        drop(cleanup);
+    }
+
+    #[test]
+    fn a_changed_size_recreates_the_files_under_a_new_generation() {
+        let name = instance("resize");
+        let (first, cleanup) = local(&name, 64 * 1024, 64 * 1024);
+        let generation = first.regions_generation();
+        let directory = first.directory().to_path_buf();
+        drop(first);
+
+        let second = reopen_sized(&name, 64 * 1024, 128 * 1024);
+        let resized = second.regions_generation();
+        assert_ne!(resized, generation);
+        assert_eq!(second.staging_size(), 128 * 1024);
+        assert_eq!(
+            fs::metadata(second.staging_path()).unwrap().len(),
+            128 * 1024
+        );
+        assert_eq!(
+            fs::read_to_string(directory.join("generation"))
+                .unwrap()
+                .trim(),
+            format!("{:016x}", second.regions_generation())
+        );
+        assert!(
+            !second.held_for_previous_run(),
+            "new files have no previous holders"
+        );
+        drop(second);
+        // The same size again is a plain reuse.
+        let third = reopen_sized(&name, 64 * 1024, 128 * 1024);
+        assert_eq!(third.regions_generation(), resized);
+        drop(cleanup);
+    }
+
+    #[test]
+    fn an_unusable_file_is_recreated_under_a_new_generation() {
+        let name = instance("unusable");
+        let (first, cleanup) = local(&name, 64 * 1024, 64 * 1024);
+        let generation = first.regions_generation();
+        let staging = first.staging_path().to_path_buf();
+        drop(first);
+        // Truncated behind the manager's back.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&staging)
+            .unwrap()
+            .set_len(4096)
+            .unwrap();
+        let second = reopen(&name);
+        assert_ne!(second.regions_generation(), generation);
+        assert_eq!(fs::metadata(&staging).unwrap().len(), 64 * 1024);
+        drop(second);
+
+        // A generation nobody can read is as unusable as a missing file.
+        let directory = cleanup.0.clone();
+        let second_generation = fs::read_to_string(directory.join("generation")).unwrap();
+        fs::write(directory.join("generation"), b"not a number").unwrap();
+        let third = reopen(&name);
+        assert_ne!(
+            format!("{:016x}\n", third.regions_generation()),
+            second_generation
+        );
+        drop(third);
+        fs::remove_file(directory.join("generation")).unwrap();
+        let fourth = reopen(&name);
+        assert!(directory.join("generation").exists());
+        drop(fourth);
+    }
+
+    #[test]
+    fn cleanup_never_removes_reused_or_live_or_another_instances_files() {
+        let name = instance("clean-a");
+        let other = instance("clean-b");
+        let (first, cleanup) = local(&name, 64 * 1024, 64 * 1024);
+        let (neighbour, other_cleanup) = local(&other, 64 * 1024, 64 * 1024);
+        let directory = first.directory().to_path_buf();
+        let (arena, staging) = (
+            first.arena_path().to_path_buf(),
+            first.staging_path().to_path_buf(),
+        );
+        let inodes = (inode(&arena), inode(&staging));
+
+        // A second manager of the same instance is refused and touches nothing.
+        fs::write(directory.join("debris"), b"x").unwrap();
+        let refused = Local::open(&name, 64 * 1024, 64 * 1024, 4 * 1024 * 1024)
+            .err()
+            .unwrap();
+        assert!(refused.to_string().contains("already in use"));
+        assert!(
+            directory.join("debris").exists(),
+            "a live instance is not reclaimed"
+        );
+        assert_eq!((inode(&arena), inode(&staging)), inodes);
+
+        // After it stops, the debris goes and the reused files stay.
+        drop(first);
+        let second = reopen(&name);
+        assert!(!directory.join("debris").exists());
+        assert_eq!((inode(&arena), inode(&staging)), inodes);
+        // The neighbour, live throughout, kept every file.
+        for file in ["arena", "staging", "generation", "lock"] {
+            assert!(neighbour.directory().join(file).exists(), "{file}");
+        }
+        drop(second);
+        drop(neighbour);
+        drop(cleanup);
+        drop(other_cleanup);
+    }
+
+    #[test]
+    fn a_previous_runs_live_holder_keeps_the_regions_until_it_reconnects_or_exits() {
+        let mut gone = spawn_sleeper();
+        let mut back = spawn_sleeper();
+        let name = instance("prior");
+        let (mut first, cleanup) = local(&name, 64 * 1024, 64 * 1024);
+        first.accept(1, gone.0.id()).unwrap();
+        first.accept(2, back.0.id()).unwrap();
+        first
+            .grant_put(1, 1, 0, Region::Staging, shape(1, false))
+            .unwrap();
+        // The manager dies without closing anything.
+        drop(first);
+
+        let mut second = reopen(&name);
+        assert!(second.held_for_previous_run());
+        second.accept(9, std::process::id()).unwrap();
+        for region in [Region::Staging, Region::Arena] {
+            assert_eq!(
+                second.grant_put(9, 1, 0, region, shape(1, false)),
+                Err(GrantError::Budget),
+                "{region:?} is held for the previous run"
+            );
+            assert!(!second.can_allocate(region, 4096));
+        }
+        // One holder reconnects: it drained before it did, but the other has not been heard from.
+        second.accept(3, back.0.id()).unwrap();
+        assert!(second.held_for_previous_run());
+        // The other exits.
+        gone.0.kill().unwrap();
+        gone.0.wait().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while second.held_for_previous_run() {
+            second.poll_exits(&mut Vec::new());
+            assert!(Instant::now() < deadline, "the exit was never seen");
+            thread::sleep(Duration::from_millis(2));
+        }
+        second
+            .grant_put(9, 1, 0, Region::Staging, shape(1, false))
+            .unwrap();
+        second
+            .grant_put(9, 2, 0, Region::Arena, shape(1, false))
+            .unwrap();
+        drop(second);
+        let _ = back.0.kill();
+        let _ = back.0.wait();
+        drop(cleanup);
     }
 
     #[test]
