@@ -87,6 +87,11 @@ message Open {
   selene.v2.DataChannelRef channel = 11;   // set: channel mode; unset: shared windows
   uint64 page_bytes = 12;             // whole page record bytes (window arithmetic)
   uint64 row_bytes = 13;
+  // The transfer's bytes are not GPU pages but this rank's record files: `pages` and `slot`
+  // are empty, the agent reads (an export) or fills (a put) its slices through its
+  // RankRecords, and `records` name the records.
+  bool host = 14;
+  uint64 chain_first = 15;            // a host put: its first page in the chain being published
 }
 
 message SliceSums {

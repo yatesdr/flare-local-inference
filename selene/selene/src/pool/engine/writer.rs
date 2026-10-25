@@ -10,7 +10,7 @@
 //! fence acknowledgment that follows a refusal, a cancel or a failure.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
@@ -92,6 +92,10 @@ struct Put {
     peers: Vec<PeerPart>,
     /// Shared-memory peers that have not yet drained their slice of a window.
     peer_windows: HashMap<u32, PeerWindow>,
+    /// Windows whose rank-0 host read is running, and the persisted checksums of those
+    /// that finished before their peers did.
+    host_filling: HashSet<u32>,
+    host_sums: HashMap<u32, Checksums>,
 }
 
 #[derive(Default)]
@@ -105,14 +109,33 @@ pub(super) struct PeerSetup {
     pub pages: Vec<u32>,
     pub row: bool,
     pub slot: u32,
+    /// A host-tier put: the peers read their own record files from `chain_first`.
+    pub host: bool,
+    pub chain_first: u64,
 }
 
 impl State {
     /// The record and pages a put's peers are opened with, for a GPU put.
     pub(super) fn peer_setup(&self, put: u64, pages: u32) -> Option<PeerSetup> {
         let p = self.puts.get(&put)?;
-        let Source::Gpu { pages: chain, slot } = &p.source else {
-            return None;
+        let (chain, slot) = match &p.source {
+            Source::Gpu { pages: chain, slot } => (chain, slot),
+            Source::Host(_) => {
+                return Some(PeerSetup {
+                    record: wire::Record {
+                        key: Some(codec::key_to(p.key)),
+                        generation: 0,
+                        first_page: 0,
+                        pages,
+                        row: p.row,
+                    },
+                    pages: Vec::new(),
+                    row: p.row,
+                    slot: 0,
+                    host: true,
+                    chain_first: p.first_page,
+                });
+            }
         };
         let from = p.first_page as usize;
         let mine = chain.get(from..from + pages as usize)?;
@@ -127,6 +150,8 @@ impl State {
             pages: mine.iter().map(|page| page.0).collect(),
             row: p.row,
             slot: slot.0,
+            host: false,
+            chain_first: 0,
         })
     }
 
@@ -313,6 +338,8 @@ impl Engine {
                 sends_outstanding: 0,
                 peers: Vec::new(),
                 peer_windows: HashMap::new(),
+                host_filling: HashSet::new(),
+                host_sums: HashMap::new(),
             },
         );
     }
@@ -573,28 +600,62 @@ impl Engine {
                     }
                 }
             }
-            Source::Host(_) if self.ranks.is_some() => {
-                self.fail_put(
-                    id,
-                    Error::new("a multi-process instance writes GPU pages only"),
-                );
-                return true;
-            }
             Source::Host(bytes) => {
                 let bytes = bytes.clone();
                 put.jobs_outstanding += 1;
                 let (row, count) = (spec.row, spec.page_count);
+                // Rank 0 reads its own slices; in a shared window they are scattered into
+                // place beside the peers' (a channel's slot holds them packed).
+                let scatter = self
+                    .ranks
+                    .as_ref()
+                    .filter(|_| slot.is_none())
+                    .map(|ranks| ranks.layout.clone());
+                if self.ranks.is_some() {
+                    put.host_filling.insert(spec.index);
+                }
+                let work: Box<dyn FnOnce(&mut [u8]) -> crate::Result<Checksums> + Send> =
+                    match scatter {
+                        Some(layout) => Box::new(move |dst| {
+                            let mut packed = vec![0u8; layout.slice_bytes(0, count, row) as usize];
+                            let sums =
+                                bytes.lock().unwrap().fill(first, count, row, &mut packed)?;
+                            layout.scatter(0, dst, count, row, &packed)?;
+                            Ok(sums)
+                        }),
+                        None => {
+                            Box::new(move |dst| bytes.lock().unwrap().fill(first, count, row, dst))
+                        }
+                    };
                 let job = FillJob {
                     owner: FillOwner::Put(id),
                     window: spec.index,
                     address,
                     length: spec.length as usize,
-                    work: Box::new(move |dst| bytes.lock().unwrap().fill(first, count, row, dst)),
+                    work,
                 };
                 if !self.submit_fill(job) {
                     let put = self.writer.puts.get_mut(&id).expect("present");
                     put.jobs_outstanding -= 1;
+                    put.host_filling.remove(&spec.index);
                     self.fail_put(id, Error::new("the host copy thread cannot start"));
+                    return true;
+                }
+                for (rank, xfer) in shared {
+                    let sent = self.ranks.as_ref().is_some_and(|ranks| {
+                        ranks.send_window(
+                            rank,
+                            super::super::rank::link::Window {
+                                xfer,
+                                spec: Some(spec),
+                                sums: None,
+                            },
+                        )
+                    });
+                    if !sent {
+                        self.fail_put(id, Error::new(format!("rank {rank}'s link is down")));
+                        break;
+                    }
                 }
             }
         }
@@ -619,10 +680,21 @@ impl Engine {
         {
             let running = {
                 let owner_is = |o: &Owner| matches!(o, Owner::Put { put: a, window: b } if *a == id && *b == window);
-                self.jobs.values().any(owner_is) || self.pending.iter().any(|(_, o)| owner_is(o))
+                self.jobs.values().any(owner_is)
+                    || self.pending.iter().any(|(_, o)| owner_is(o))
+                    || self
+                        .writer
+                        .puts
+                        .get(&id)
+                        .is_some_and(|put| put.host_filling.contains(&window))
             };
             if !running {
-                self.window_filled(id, window, None);
+                let supplied = self
+                    .writer
+                    .puts
+                    .get_mut(&id)
+                    .and_then(|put| put.host_sums.remove(&window));
+                self.window_filled(id, window, supplied);
             }
         }
         self.drive_put(id);
@@ -670,9 +742,19 @@ impl Engine {
             return;
         };
         put.jobs_outstanding = put.jobs_outstanding.saturating_sub(1);
+        put.host_filling.remove(&window);
         match result {
             Err(error) => self.fail_put(id, error),
-            Ok(sums) => self.window_filled(id, window, Some(sums)),
+            Ok(sums) => {
+                if self.put_peers_left(id, window) {
+                    // The peers' slices are not all in; the last of them completes the window.
+                    if let Some(put) = self.writer.puts.get_mut(&id) {
+                        put.host_sums.insert(window, sums);
+                    }
+                } else {
+                    self.window_filled(id, window, Some(sums));
+                }
+            }
         }
         self.drive_put(id);
     }
