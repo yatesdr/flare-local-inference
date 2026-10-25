@@ -182,12 +182,12 @@ refusal as a normal outcome and move to another candidate, another tier, or reco
 
 | Reason | Meaning | Operator action |
 |---|---|---|
-| `NOT_READY` | The manager is recovering, waiting for sources, or draining. | None; check `selene_pool_state`. |
+| `NOT_READY` | The manager is recovering or draining. | None; check `selene_pool_state`. |
 | `CLAIM_LIMIT` | The requester already has its claim slots in flight (default 2). | None; limits do not scale with concurrency. |
 | `SOURCE_LIMIT` / `SOURCE_BUSY` | The source already serves its export slots (default 2). | None. |
 | `UNKNOWN_SOURCE` / `STALE_SOURCE` | The named source or entry is gone, or the source reconnected. | None; the index catches up. |
 | `NO_WINDOWS` | Staging cannot hold the export, or too much of it is quarantined. | Raise `--staging`; look at `selene_pool_quarantined_bytes`. |
-| `NOT_FOUND`, `GENERATION_CHANGED`, `CHAIN_GAP`, `NO_HEADROOM` | The source no longer has it, or has no room to pin it. | None. |
+| `NOT_FOUND`, `CHAIN_GAP`, `NO_HEADROOM` | The source no longer has it, or has no room to pin it. | None. |
 | `SOURCE_TIMEOUT` | The source did not answer within `pin_deadline_ms` (default 250). | Look at the source's load. |
 | `SOURCE_LOST` / `REQUESTER_LOST` | The other side's stream ended. | Look at the instance that went. |
 | `RANKS_DETACHED` / `RANK_LOST` | A rank of a multi-process instance is not attached, or its attachment ended during the transfer. | Look at that rank's process. |
@@ -250,7 +250,7 @@ their traffic. The protocol version must match the instances: a manager that doe
 instance's version answers `Hello` with `VERSION_MISMATCH` and the instance runs on its local tiers
 until restarted. `--name`, `--socket`, `--listen`, `--listen-data` and the TLS files are restart-only.
 
-The root holds one opaque 64-hex directory per scope plus `.lock` and `instances`. Remove a scope
+The root holds one opaque 64-hex directory per scope plus `.lock`. Remove a scope
 directory to drop that model's durable records, or all of them to clear the pool, only while the
 manager is stopped. A changed model identity, layout fingerprint or pool name is a different scope, so
 the old directory is safe to delete and cannot be reused by accident.

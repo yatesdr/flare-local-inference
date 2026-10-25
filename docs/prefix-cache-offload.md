@@ -122,13 +122,13 @@ one package.
 
 ### 2.2 Store interface
 
-The worker uses Selene's `HostStore`, re-exported by Helios as `PrefixStore`.
+The worker uses Selene's `HostStore` directly.
 Its core operations are:
 
 ```rust
 pub trait HostStore {
     fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit>;
-    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
+    fn published(&mut self, checkpoint: &PublishedCheckpoint) -> Result<()>;
     fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()>;
     fn poll(&mut self, events: &mut Vec<StoreEvent>) -> Result<()>;
@@ -137,21 +137,19 @@ pub trait HostStore {
 }
 ```
 
-The worker calls `store` for every publication. `Noted` records it without a
-copy, a pin, or a later event; the checkpoint remains dirty. Under pressure the
-worker calls `write_back` on cold dirty eviction candidates. Both calls can
-answer `Queued`, which holds one GPU pin until `Stored` or `Deferred`, or
-`Present`, which marks the checkpoint clean immediately. Successful `Stored`
-marks it clean before releasing the pin; a failed copy leaves it dirty.
-`Retry` accepts no copy and stops a write-back round. Publish-time `Queued`
-retains its existing immediate-copy behavior. `fetch` copies a looked-up chain
-into the ticket's page ids and state slot. Every submission returns without
-waiting; `poll` drains completions and failures. A `PublishedCheckpoint` names
+The worker calls `published` to announce each checkpoint without copying or pinning it.
+Under pressure, Selene selects cold eviction candidates whose complete bytes are not
+currently retained by a host tier and calls `write_back`. `Queued` holds one GPU pin
+until `Stored`; `Present` requires a committed local copy. `Retry` accepts no copy and
+stops the round. A successful copy releases its pin; later tier eviction makes the
+checkpoint eligible for write-back again. GPU eviction uses the existing LRU, leaf and
+compaction rules. `fetch` copies a looked-up chain into the ticket's page ids and state
+slot. Submissions never wait; `poll` drains completions and failures. A `PublishedCheckpoint` names
 the GPU checkpoint, its key, its parent's key, its bucket digest, every page of
 its chain from the root with the count that belongs to the checkpoint itself,
 and the state slot of its row. `MemoryStore`, `DiskStore`, and `CompositeStore`
 implement the trait for serving, and a test double implements it for worker tests. The
-worker holds `Option<Box<dyn PrefixStore>>`.
+worker holds `Option<Box<dyn HostStore>>`.
 
 Three components are shared by the implementations:
 
@@ -507,8 +505,7 @@ after `allocate_caches`, the `Prepare host prefix cache` phase derives the
 storage namespace from the selected serving configuration, resolves settings,
 locks the record directory, maps and registers slab pools with rank zero's
 context current, or creates a memory-only store's split pool with each rank's
-context current, and scans the directory. Direct transport selection fails
-explicitly. `manifests` attaches a `Binding` to each rank's
+context current, and scans the directory. `manifests` attaches a `Binding` to each rank's
 `ExecutionManifest`; the binding shares one prepared bundle, holding every
 rank's geometry and context, which the model worker takes once to construct
 the store and its transfer threads.
@@ -517,28 +514,23 @@ the store and its transfer threads.
 
 Policy:
 
-- Outbound: publication calls `store`; a `Noted` outcome defers copying until
-  pressure. The high-water mark is the next eligible admission's reservation
-  from `admission_pages`, plus the next-step growth of running decodes, plus
-  `WINDOW_PAGES * max(IN_FLIGHT_WINDOWS, WINDOWS_IN_FLIGHT)`: currently
-  64 pages times two windows, or 128 pages of headroom. There is no new flag.
-  Free pages, retirement backing, and pages reclaimable from clean checkpoints
-  cover the mark without copying. Snapshot aliases are counted once through
-  the scheduler's existing backing calculation. Below it, dirty candidates
-  are offered coldest first, using the cache's leaf and compaction rules.
-  `Retry` stops submissions for that round; `Present` can end pressure at once.
-  Before each write-back pin, the export headroom check preserves decode growth
-  and the next admission's pages and restore row. A candidate that would consume
-  that capacity is skipped. Admission never waits for write-back: it prefers
-  the coldest clean eligible checkpoint, then drops the coldest dirty one if
-  no clean candidate is eligible. Existing pins and retirement fences apply.
-  With no host store configured, publication and write-back do nothing.
+- Outbound: publication announces availability; pressure-driven write-back copies
+  selected checkpoints in both local and pool modes. The reserve covers the largest
+  admission the scheduler can make, plus the pages prefill can produce during the
+  estimated copy of that admission and its state row. Copy time uses the existing
+  rolling outbound rate. Current decode growth and the next admission are also
+  preserved. Free pages, retirement backing and checkpoints with complete committed
+  host copies cover pressure without new copies; snapshot aliases count once.
+  `Retry` stops a round. Before each pin, the export headroom check preserves decode
+  growth, the next admission and its restore row. Admission proceeds without waiting
+  for write-back, using ordinary cache eviction and existing pin and retirement fences.
+  A GPU-resident hit refreshes the matching host record's recency.
 - Inbound: fetch when the estimated transfer time is below half the estimated
   prefill time of the tokens gained. Transfer time is record bytes divided by
   the tier rate; prefill time is tokens gained divided by prefill throughput.
-  Initial constants are 20 GB/s for memory, 3 GB/s for staged disk, 10 GB/s
-  for direct disk, and 8,000 tokens per second; the store replaces the
-  transfer rates with measured values after its first transfers and the
+  Initial rates are 20 GB/s for memory, 3 GB/s for disk, 400 MiB/s for a
+  remote level, and 8,000 tokens per second for prefill. Transfer rates use
+  the median of the last three completed transfers at that level; the
   worker supplies measured prefill throughput from metrics.
 - Eviction: the tree policy of section 2.3 under each store's evictability
   rule.
@@ -885,9 +877,9 @@ same completion events the store produces.
   record at once; a failed write is tried once more the next time the tier
   needs room, and the second failure drops it. None of this waits on the
   model worker: moves are queued, and the coldest waiting record is dropped
-  when the queue is full. GPU publication still calls `store`, so dirty GPU
+  when the queue is full. GPU publication calls `published`, so GPU
   checkpoints are announced and remain claimable through export before a host
-  copy exists. `Noted` starts no copy; pressure-driven `write_back` copies into
+  copy exists. Pressure-driven `write_back` copies into
   the first host tier, using the same policy in local and pool modes. A dirty
   GPU eviction drops the checkpoint and sends the existing eviction notice;
   it never waits for a host copy.
@@ -1023,11 +1015,10 @@ on the file format fixed in step 5.
 
 8. **Memory store and disk store.** `selene/selene/src/memory.rs` and
    `selene/selene/src/disk_store.rs`, each implementing `HostStore` from
-   `selene/selene/src/store.rs` over the components above, which the
-   runtime re-exports directly as `PrefixStore`; the disk store
+   `selene/selene/src/store.rs` over the components above; the disk store
    behind the `DiskTransport` trait with the `Staged` implementation, its
    staging pool, `write_from`, and `read_into`. Acceptance: the step 7 GPU
-   test repeated through each store's `store` and `fetch`, and CPU tests of
+   test repeated through each store's `write_back` and `fetch`, and CPU tests of
    each store's event sequencing with a transfer stub.
 
 9. **Composite store.** `selene/selene/src/composite.rs`: write-through,
