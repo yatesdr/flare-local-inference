@@ -17,31 +17,6 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-fn key_to_proto(key: &Key) -> proto::Key {
-    proto::Key {
-        consumed_tokens: key.consumed_tokens,
-        digest: key.digest.to_vec(),
-    }
-}
-
-fn entry_to_proto(entry: &EntryData) -> proto::CatalogEntry {
-    proto::CatalogEntry {
-        key: Some(key_to_proto(&entry.key)),
-        parent: entry.parent.map(|parent| key_to_proto(&parent)),
-        has_parent: entry.parent.is_some(),
-        bucket: entry.bucket.to_vec(),
-        tail_pages: u64::from(entry.tail_pages),
-        row: entry.row,
-        tier: match entry.tier {
-            0 => proto::Tier::Dram as i32,
-            _ => proto::Tier::Nvme as i32,
-        },
-        durable: entry.durable,
-        bytes: entry.bytes,
-        unreadable: entry.unreadable,
-    }
-}
-
 /// Store connections: one per instance process, plus one catalog link per scope.
 pub const MAX_CONNECTIONS: usize = 1024;
 pub const OPEN_PUTS: usize = flare_selene::pool::MAX_OPEN_PUTS as usize;
@@ -392,7 +367,6 @@ enum LiveEvent {
 struct Subscription {
     namespace: NamespaceId,
     sender: tokio::sync::mpsc::Sender<proto::CatalogEvent>,
-    sequence: u64,
     seq0: u64,
     snapshot: Option<VecDeque<EntryData>>,
     begin_pending: bool,
@@ -1876,15 +1850,7 @@ impl Store {
             } else {
                 put.hold_slots.iter().position(Option::is_none)
             };
-            (
-                index,
-                plan,
-                header,
-                memory,
-                hold,
-                hold_unit,
-                slot,
-            )
+            (index, plan, header, memory, hold, hold_unit, slot)
         };
         let (index, plan, header, memory, hold, hold_unit, slot) = prepared;
         if memory.is_none() && slot.is_none() {
@@ -4905,9 +4871,7 @@ impl Store {
             let Some(subscription) = self.subscriptions.get_mut(&connection) else {
                 return;
             };
-            let sequence = subscription.sequence;
-            if let Some(value) = live_event(&live, sequence) {
-                subscription.sequence += 1;
+            if let Some(value) = live_event(&live) {
                 if subscription.sender.try_send(value).is_err() {
                     remove = true;
                 }
@@ -4931,7 +4895,6 @@ impl Store {
         };
         if let Some(subscription) = self.subscriptions.get_mut(&connection) {
             subscription.seq0 = seq0;
-            subscription.sequence = seq0 + 1;
             subscription.snapshot = Some(entries.into());
             subscription.begin_pending = true;
             subscription.buffered.clear();
@@ -4949,17 +4912,9 @@ impl Store {
                 };
                 let mut blocked = false;
                 if subscription.begin_pending {
-                    let value = proto::CatalogEvent {
-                        sequence: subscription.sequence,
-                        event: Some(proto::catalog_event::Event::SnapshotBegin(
-                            proto::SnapshotBegin {
-                                seq0: subscription.seq0,
-                            },
-                        )),
-                    };
+                    let value = proto::CatalogEvent::SnapshotBegin;
                     match subscription.sender.try_send(value) {
                         Ok(()) => {
-                            subscription.sequence += 1;
                             subscription.begin_pending = false;
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => blocked = true,
@@ -4969,14 +4924,9 @@ impl Store {
                 if !blocked {
                     if let Some(queue) = &mut subscription.snapshot {
                         while let Some(entry) = queue.pop_front() {
-                            let value = proto::CatalogEvent {
-                                sequence: subscription.sequence,
-                                event: Some(proto::catalog_event::Event::Entry(entry_to_proto(
-                                    &entry,
-                                ))),
-                            };
+                            let value = proto::CatalogEvent::Entry(entry.clone());
                             match subscription.sender.try_send(value) {
-                                Ok(()) => subscription.sequence += 1,
+                                Ok(()) => {}
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                     queue.push_front(entry);
                                     blocked = true;
@@ -4989,15 +4939,9 @@ impl Store {
                             }
                         }
                         if !blocked && queue.is_empty() {
-                            let value = proto::CatalogEvent {
-                                sequence: subscription.sequence,
-                                event: Some(proto::catalog_event::Event::SnapshotEnd(
-                                    proto::SnapshotEnd {},
-                                )),
-                            };
+                            let value = proto::CatalogEvent::SnapshotEnd;
                             match subscription.sender.try_send(value) {
                                 Ok(()) => {
-                                    subscription.sequence += 1;
                                     subscription.snapshot = None;
                                 }
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -5012,11 +4956,11 @@ impl Store {
                 }
                 if !blocked && !remove {
                     while let Some(live) = subscription.buffered.pop_front() {
-                        let Some(value) = live_event(&live, subscription.sequence) else {
+                        let Some(value) = live_event(&live) else {
                             continue;
                         };
                         match subscription.sender.try_send(value) {
-                            Ok(()) => subscription.sequence += 1,
+                            Ok(()) => {}
                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                                 subscription.buffered.push_front(live);
                                 break;
@@ -5094,7 +5038,6 @@ impl Store {
             Subscription {
                 namespace,
                 sender,
-                sequence: seq0 + 1,
                 seq0,
                 snapshot: Some(entries.into()),
                 begin_pending: true,
@@ -5377,28 +5320,15 @@ pub enum StoreCommand {
     Shutdown,
 }
 
-fn live_event(live: &LiveEvent, sequence: u64) -> Option<proto::CatalogEvent> {
-    match live {
-        LiveEvent::Catalog {
-            kind, key, entry, ..
-        } => {
-            let event = if *kind == 2 {
-                proto::catalog_event::Event::Removed(key_to_proto(key))
-            } else {
-                let entry = entry.as_ref()?;
-                let proto = entry_to_proto(entry);
-                if *kind == 0 {
-                    proto::catalog_event::Event::Added(proto)
-                } else {
-                    proto::catalog_event::Event::Changed(proto)
-                }
-            };
-            Some(proto::CatalogEvent {
-                sequence,
-                event: Some(event),
-            })
-        }
-    }
+fn live_event(live: &LiveEvent) -> Option<proto::CatalogEvent> {
+    let LiveEvent::Catalog {
+        kind, key, entry, ..
+    } = live;
+    Some(match *kind {
+        2 => proto::CatalogEvent::Removed(*key),
+        0 => proto::CatalogEvent::Added(entry.as_ref()?.clone()),
+        _ => proto::CatalogEvent::Changed(entry.as_ref()?.clone()),
+    })
 }
 
 fn region_wire(region: Region) -> i32 {
@@ -6070,10 +6000,10 @@ mod tests {
         while !ended {
             store.pump_subscriptions();
             while let Ok(event) = receiver.try_recv() {
-                match event.event.unwrap() {
-                    proto::catalog_event::Event::Entry(_) => entries += 1,
-                    proto::catalog_event::Event::Added(_) => added += 1,
-                    proto::catalog_event::Event::SnapshotEnd(_) => ended = true,
+                match event {
+                    proto::CatalogEvent::Entry(_) => entries += 1,
+                    proto::CatalogEvent::Added(_) => added += 1,
+                    proto::CatalogEvent::SnapshotEnd => ended = true,
                     _ => {}
                 }
             }
@@ -6118,12 +6048,10 @@ mod tests {
         store.delta(id, 1, second);
         store.flush_events();
         let mut events = Vec::new();
-        while !events.iter().any(|event: &proto::CatalogEvent| {
-            matches!(
-                event.event,
-                Some(proto::catalog_event::Event::SnapshotEnd(_))
-            )
-        }) {
+        while !events
+            .iter()
+            .any(|event: &proto::CatalogEvent| matches!(event, proto::CatalogEvent::SnapshotEnd))
+        {
             store.pump_subscriptions();
             while let Ok(event) = receiver.try_recv() {
                 events.push(event);
@@ -6148,19 +6076,12 @@ mod tests {
         }
         let live: Vec<u64> = events
             .iter()
-            .filter_map(|event| match &event.event {
-                Some(proto::catalog_event::Event::Changed(entry)) => {
-                    Some(entry.key.as_ref().unwrap().consumed_tokens)
-                }
+            .filter_map(|event| match event {
+                proto::CatalogEvent::Changed(entry) => Some(entry.key.consumed_tokens),
                 _ => None,
             })
             .collect();
         assert_eq!(live, vec![64, 128, 192]);
-        let mut sequence = 0;
-        for event in &events {
-            assert_eq!(event.sequence, sequence + 1);
-            sequence = event.sequence;
-        }
         drop(store);
         let _ = fs::remove_dir_all(directory);
     }
@@ -6217,16 +6138,13 @@ mod tests {
         let mut begin = 0;
         let mut entries = 0;
         let mut end = 0;
-        let mut sequence = 0;
         while end == 0 {
             store.pump_subscriptions();
             while let Ok(event) = receiver.try_recv() {
-                assert_eq!(event.sequence, sequence + 1);
-                sequence = event.sequence;
-                match event.event.unwrap() {
-                    proto::catalog_event::Event::SnapshotBegin(_) => begin += 1,
-                    proto::catalog_event::Event::Entry(_) => entries += 1,
-                    proto::catalog_event::Event::SnapshotEnd(_) => end += 1,
+                match event {
+                    proto::CatalogEvent::SnapshotBegin => begin += 1,
+                    proto::CatalogEvent::Entry(_) => entries += 1,
+                    proto::CatalogEvent::SnapshotEnd => end += 1,
                     _ => {}
                 }
             }
@@ -6234,12 +6152,12 @@ mod tests {
         assert_eq!(begin, 1);
         assert_eq!(entries, total as usize);
         assert_eq!(end, 1);
-        // A live event after SnapshotEnd continues the sequence.
+        // Live changes continue after SnapshotEnd.
         store.delta(id, 0, parent.unwrap());
         store.flush_events();
         store.pump_subscriptions();
         let live = receiver.try_recv().unwrap();
-        assert_eq!(live.sequence, sequence + 1);
+        assert!(matches!(live, proto::CatalogEvent::Added(entry) if Some(entry.key) == parent));
 
         // More mutations than the buffer can hold restart the snapshot at a new
         // boundary rather than dropping events.
@@ -6260,9 +6178,9 @@ mod tests {
         while end == 0 {
             store.pump_subscriptions();
             while let Ok(event) = receiver.try_recv() {
-                match event.event.unwrap() {
-                    proto::catalog_event::Event::Entry(_) => entries += 1,
-                    proto::catalog_event::Event::SnapshotEnd(_) => end += 1,
+                match event {
+                    proto::CatalogEvent::Entry(_) => entries += 1,
+                    proto::CatalogEvent::SnapshotEnd => end += 1,
                     _ => {}
                 }
             }
@@ -6618,12 +6536,7 @@ mod tests {
             loop {
                 store.pump_subscriptions();
                 match receiver.try_recv() {
-                    Ok(event)
-                        if matches!(
-                            event.event,
-                            Some(proto::catalog_event::Event::SnapshotEnd(_))
-                        ) =>
-                    {
+                    Ok(event) if matches!(event, proto::CatalogEvent::SnapshotEnd) => {
                         break;
                     }
                     Ok(_) => {}
@@ -7247,5 +7160,4 @@ mod tests {
         let _ = fs::remove_dir_all(base);
         let _ = fs::remove_dir_all(PathBuf::from("/dev/shm/selene").join(name));
     }
-
 }
