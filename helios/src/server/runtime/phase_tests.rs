@@ -192,7 +192,6 @@ impl Fixture {
                 prompt_scored: 0,
                 blocked: None,
                 pool_lookup: None,
-                pool_lookup_ns: 0,
             },
             Generation {
                 events: receiver,
@@ -2058,7 +2057,7 @@ fn a_local_store_builds_no_lookup_and_a_failed_restore_starts_none() {
 }
 
 #[test]
-fn a_request_waits_a_moment_for_its_pool_lookup_and_then_goes_on_without_it() {
+fn a_pending_pool_lookup_does_not_delay_admission() {
     let fixture = Fixture::new();
     let (sender, receiver) = mpsc::channel();
     let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
@@ -2069,14 +2068,6 @@ fn a_request_waits_a_moment_for_its_pool_lookup_and_then_goes_on_without_it() {
     store.pending_tickets = true;
     let withdrawn = store.withdrawn.clone();
     worker.attach_store(Some(Box::new(store)));
-    // The lookup is still on the wire: the request is held, the worker is not.
-    worker.admit().unwrap();
-    assert!(worker.active.iter().all(Option::is_none));
-    assert_eq!(worker.pending.len(), 1);
-    assert_eq!(withdrawn.load(Ordering::Relaxed), 0);
-    // Once the grace has passed it is admitted with the local answer and the lookup is withdrawn.
-    let grace = std::time::Duration::from_nanos(POOL_LOOKUP_GRACE_NS);
-    thread::sleep(grace + std::time::Duration::from_millis(5));
     worker.admit().unwrap();
     assert!(worker.active[0].is_some());
     assert!(worker.pending.is_empty());

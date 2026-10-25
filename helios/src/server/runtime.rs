@@ -134,13 +134,6 @@ impl Drop for Generation {
     }
 }
 
-/// The longest a request waits for its pool lookup before it is admitted with what it has.
-/// The manager answers a lookup on receipt: over a Unix socket the round trip measured p50
-/// 0.43 ms, p99 0.55 ms and at worst 0.81 ms in 2000 lookups against a 5000-entry index
-/// (`a_lookup_is_answered_in_well_under_a_millisecond_over_a_unix_socket`). The hold is
-/// set just above that p99, with room for a loaded host.
-const POOL_LOOKUP_GRACE_NS: u64 = 2_000_000;
-
 struct Incoming {
     _capacity: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     arrival_ns: u64,
@@ -165,23 +158,8 @@ struct Incoming {
     /// it when the request is admitted, which withdraws a lookup still on the
     /// wire; a cancelled or failed request drops it with the `Incoming`.
     pool_lookup: Option<crate::offload::LookupTicket>,
-    /// When that lookup started, on the observation clock, so a request waits for its
-    /// answer for a bounded time only.
-    pool_lookup_ns: u64,
 }
 impl Incoming {
-    /// Whether the request is still giving its pool lookup a short head start. A lookup
-    /// is asked when the request arrives, and an idle worker would otherwise admit the
-    /// request before any answer could come back, so no pool source could ever be used.
-    /// Only this request waits, for at most POOL_LOOKUP_GRACE_NS, and only while the lookup
-    /// is pending; an answer, no answer, or the end of the grace admits it.
-    fn awaits_pool(&self, now_ns: u64) -> bool {
-        self.pool_lookup.as_ref().is_some_and(|ticket| {
-            matches!(ticket.state(), flare_selene::pool::LookupState::Pending)
-                && now_ns.saturating_sub(self.pool_lookup_ns) < POOL_LOOKUP_GRACE_NS
-        })
-    }
-
     fn prompt_score_range(&self, start: usize, tokens: usize) -> std::ops::Range<usize> {
         let first = (if start == 0 { 0 } else { start + 1 }).max(self.prompt_scored);
         first..(start + tokens + 1).min(self.prompt_score_end)
@@ -724,7 +702,6 @@ impl ModelRuntime {
                 readmitted: false,
                 blocked: None,
                 pool_lookup: None,
-                pool_lookup_ns: 0,
             };
             let enqueue_ns = observation
                 .filter(|timestamps| *timestamps)
@@ -963,13 +940,7 @@ impl<'a> Worker<'a> {
                     thread::yield_now();
                 } else {
                     self.scheduler.idle()?;
-                    // A request holding for its pool lookup is retried well within the hold.
-                    let now_ns = super::observation::monotonic_ns();
-                    let wait = if self.pending.iter().any(|i| i.awaits_pool(now_ns)) {
-                        std::time::Duration::from_micros(100)
-                    } else {
-                        std::time::Duration::from_millis(2)
-                    };
+                    let wait = std::time::Duration::from_millis(2);
                     match self.receiver.recv_timeout(wait) {
                         Ok(request) => self.enqueue(request),
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1011,7 +982,6 @@ impl<'a> Worker<'a> {
                 .is_ok()
             {
                 incoming.pool_lookup = store.begin_lookup(&history);
-                incoming.pool_lookup_ns = super::observation::monotonic_ns();
             }
         }
     }
@@ -1136,10 +1106,7 @@ impl<'a> Worker<'a> {
                 stats.free_snapshots,
                 stats.free_slots,
             );
-            let now_ns = super::observation::monotonic_ns();
-            let eligible = |incoming: &Incoming| {
-                incoming.blocked != Some(resources) && !incoming.awaits_pool(now_ns)
-            };
+            let eligible = |incoming: &Incoming| incoming.blocked != Some(resources);
             let parked = self
                 .parked
                 .iter()
@@ -2674,7 +2641,6 @@ mod tests {
             prompt_scored: 0,
             blocked: None,
             pool_lookup: None,
-            pool_lookup_ns: 0,
         };
         (
             incoming,

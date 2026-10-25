@@ -314,7 +314,7 @@ impl PoolClient {
         crate::levels::Topology(self.shared.topology())
     }
 
-    /// Start a lookup for a queued request. Identical prefixes share one wire
+    /// Start a lookup for a queued request. Each ticket owns one wire
     /// lookup. The ticket has no answer when the pool is not ready.
     pub fn begin_lookup(&self, history: &dyn History, resident: u64) -> LookupTicket {
         let mut boundaries: Vec<_> = history.key_at(0).into_iter().collect();

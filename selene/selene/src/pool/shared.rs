@@ -201,24 +201,10 @@ pub(crate) enum Command {
     },
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct CoalesceKey {
-    last: PrefixKey,
-    before: u64,
-    resident: u64,
-}
-
-struct Entry {
-    key: CoalesceKey,
-    waiters: Vec<(u64, Arc<TicketInner>)>,
-}
-
 #[derive(Default)]
 struct Registry {
     next_wire: u64,
-    next_waiter: u64,
-    by_key: HashMap<CoalesceKey, u64>,
-    entries: HashMap<u64, Entry>,
+    entries: HashMap<u64, Arc<TicketInner>>,
 }
 
 pub(crate) struct Shared {
@@ -327,7 +313,7 @@ impl Shared {
         *self.paused_until.lock().unwrap() = Some(until);
     }
 
-    /// Start a lookup, or join an identical one already on the wire. The ticket
+    /// Start one wire lookup for this ticket. The ticket
     /// has no answer when the pool is not ready, lookups are paused or full.
     pub(crate) fn begin_lookup(
         self: &Arc<Self>,
@@ -336,9 +322,9 @@ impl Shared {
         before: u64,
         resident: u64,
     ) -> LookupTicket {
-        let Some(last) = boundaries.last().copied() else {
+        if boundaries.is_empty() {
             return LookupTicket::none();
-        };
+        }
         if self.status() != PoolStatus::Ready
             || self
                 .paused_until
@@ -348,92 +334,50 @@ impl Shared {
         {
             return LookupTicket::none();
         }
-        let key = CoalesceKey {
-            last,
-            before,
-            resident,
-        };
         let inner = TicketInner::new(LookupState::Pending);
         let mut registry = self.registry.lock().unwrap();
-        registry.next_waiter += 1;
-        let waiter = registry.next_waiter;
-        let existing = registry.by_key.get(&key).copied();
-        let wire = match existing {
-            Some(wire) => {
-                registry
-                    .entries
-                    .get_mut(&wire)
-                    .expect("indexed entry")
-                    .waiters
-                    .push((waiter, inner.clone()));
-                wire
-            }
-            None => {
-                let limit = self.max_lookups.load(Ordering::Relaxed).max(1) as usize;
-                if registry.entries.len() >= limit {
-                    return LookupTicket::none();
-                }
-                registry.next_wire += 1;
-                let wire = registry.next_wire;
-                let sent = self.push_command(
-                    Command::Lookup(LookupSend {
-                        id: wire,
-                        boundaries,
-                        before,
-                        resident,
-                    }),
-                    false,
-                );
-                if !sent {
-                    return LookupTicket::none();
-                }
-                registry.by_key.insert(key.clone(), wire);
-                registry.entries.insert(
-                    wire,
-                    Entry {
-                        key,
-                        waiters: vec![(waiter, inner.clone())],
-                    },
-                );
-                wire
-            }
-        };
+        let limit = self.max_lookups.load(Ordering::Relaxed).max(1) as usize;
+        if registry.entries.len() >= limit {
+            return LookupTicket::none();
+        }
+        registry.next_wire += 1;
+        let wire = registry.next_wire;
+        if !self.push_command(
+            Command::Lookup(LookupSend {
+                id: wire,
+                boundaries,
+                before,
+                resident,
+            }),
+            false,
+        ) {
+            return LookupTicket::none();
+        }
+        registry.entries.insert(wire, inner.clone());
         drop(registry);
         let shared = self.clone();
-        LookupTicket::new(
-            inner,
-            Box::new(move || shared.withdraw_lookup(wire, waiter)),
-        )
+        LookupTicket::new(inner, Box::new(move || shared.withdraw_lookup(wire)))
     }
 
-    fn withdraw_lookup(&self, wire: u64, waiter: u64) {
-        let mut registry = self.registry.lock().unwrap();
-        let Some(entry) = registry.entries.get_mut(&wire) else {
-            return;
-        };
-        entry.waiters.retain(|(id, _)| *id != waiter);
-        if entry.waiters.is_empty() {
-            let entry = registry.entries.remove(&wire).expect("present");
-            registry.by_key.remove(&entry.key);
-            drop(registry);
+    fn withdraw_lookup(&self, wire: u64) {
+        if self
+            .registry
+            .lock()
+            .unwrap()
+            .entries
+            .remove(&wire)
+            .is_some()
+        {
             self.push_command(Command::CancelLookup(wire), true);
         }
     }
 
-    /// The lookup finished: every waiter sees the answer, or none.
     pub(crate) fn complete_lookup(&self, wire: u64, candidates: Option<Vec<PoolCandidate>>) {
-        let mut registry = self.registry.lock().unwrap();
-        let Some(entry) = registry.entries.remove(&wire) else {
-            return;
-        };
-        registry.by_key.remove(&entry.key);
-        drop(registry);
-        let state = match candidates {
-            Some(candidates) => LookupState::Ready(Arc::new(Answer { candidates })),
-            None => LookupState::None,
-        };
-        for (_, ticket) in entry.waiters {
-            ticket.set(state.clone());
+        if let Some(ticket) = self.registry.lock().unwrap().entries.remove(&wire) {
+            ticket.set(match candidates {
+                Some(candidates) => LookupState::Ready(Arc::new(Answer { candidates })),
+                None => LookupState::None,
+            });
         }
     }
 
@@ -505,18 +449,21 @@ mod tests {
     }
 
     #[test]
-    fn identical_prefixes_share_one_wire_lookup_and_dropping_one_keeps_the_other() {
+    fn identical_prefixes_have_independent_lookups_and_cancellation() {
         let shared = ready();
         let a = lookup(&shared, 3);
         let b = lookup(&shared, 3);
         let commands = shared.take_commands();
-        assert_eq!(commands.len(), 1, "one wire lookup");
+        assert_eq!(commands.len(), 2);
         let Command::Lookup(sent) = &commands[0] else {
             panic!("expected a lookup")
         };
         drop(a);
-        assert!(shared.take_commands().is_empty(), "the other still waits");
-        shared.complete_lookup(sent.id, Some(Vec::new()));
+        assert!(matches!(shared.take_commands()[..], [Command::CancelLookup(id)] if id == sent.id));
+        let Command::Lookup(other) = &commands[1] else {
+            panic!()
+        };
+        shared.complete_lookup(other.id, Some(Vec::new()));
         assert!(matches!(b.state(), LookupState::Ready(_)));
         assert_eq!(shared.live_lookups(), 0);
     }
