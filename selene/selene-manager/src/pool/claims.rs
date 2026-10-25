@@ -100,7 +100,6 @@ pub struct Claim {
     pub block: Option<Extent>,
     pub windows: Vec<Win>,
     pub requester_fence: Party,
-    pub source_fence: Party,
     pub granted_at: Option<Instant>,
     pub page_bytes: u64,
     pub row_bytes: u64,
@@ -160,6 +159,14 @@ pub struct ManagerGet {
 impl Claim {
     pub fn is_terminal(&self) -> bool {
         matches!(self.state, v2::ClaimState::Copied | v2::ClaimState::Failed)
+    }
+
+    fn source_fence(&self) -> Party {
+        match self.export {
+            ExportState::None => Party::Drained,
+            ExportState::Requested | ExportState::Pinned => Party::Pending,
+            ExportState::Ended(party) => party,
+        }
     }
 
     fn holds_export_slot(&self, source_exited: bool) -> bool {
@@ -307,7 +314,7 @@ impl Core {
                     continue;
                 }
                 let (party, proc) = match window.phase {
-                    Phase::SourceWrite => (claim.source_fence, claim.source_proc),
+                    Phase::SourceWrite => (claim.source_fence(), claim.source_proc),
                     Phase::RequesterRead => {
                         (claim.requester_fence, Some((claim.key.0, claim.key.1)))
                     }
@@ -603,7 +610,6 @@ impl Core {
             block,
             windows: Vec::new(),
             requester_fence: Party::Drained,
-            source_fence: Party::Pending,
             granted_at: None,
             page_bytes: geometry.page_bytes,
             row_bytes: geometry.row_bytes,
@@ -789,7 +795,6 @@ impl Core {
             block: None,
             windows: Vec::new(),
             requester_fence: Party::Drained,
-            source_fence: Party::Drained,
             granted_at: None,
             page_bytes: geometry.page_bytes,
             row_bytes: geometry.row_bytes,
@@ -1091,7 +1096,6 @@ impl Core {
             block: None,
             windows: Vec::new(),
             requester_fence: Party::Drained,
-            source_fence: Party::Drained,
             granted_at: None,
             page_bytes: 0,
             row_bytes: 0,
@@ -1126,7 +1130,6 @@ impl Core {
         match result {
             v2::PinResult::Refused => {
                 claim.export = ExportState::None;
-                claim.source_fence = Party::Drained;
                 let reason = refusal_reason(ack.refusal);
                 self.finish(key, v2::ClaimState::Failed, reason);
             }
@@ -1134,7 +1137,6 @@ impl Core {
                 claim.export = ExportState::Pinned;
                 if claim.is_terminal() {
                     // A late pin: release it.
-                    claim.source_fence = Party::Pending;
                     self.cancel_export(key, claim_reason_cancelled());
                     return Ok(());
                 }
@@ -1742,9 +1744,7 @@ impl Core {
             Some(v2::fence_ack::Subject::ClaimId(claim_id)) => {
                 let key = (instance, nonce, claim_id);
                 if let Some(claim) = self.claims.get_mut(&key) {
-                    if claim.requester_fence == Party::Pending
-                        || claim.requester_fence == Party::Quarantined && party == Party::Drained
-                    {
+                    if claim.requester_fence == Party::Pending {
                         claim.requester_fence = party;
                     }
                     self.reclaim(key);
@@ -1782,11 +1782,9 @@ impl Core {
         };
         match claim.export {
             ExportState::Requested | ExportState::Pinned => {}
-            ExportState::Ended(Party::Quarantined) if party == Party::Drained => {}
             _ => return Ok(()),
         }
         claim.export = ExportState::Ended(party);
-        claim.source_fence = party;
         if !claim.is_terminal() {
             let status =
                 v2::ExportEndStatus::try_from(m.status).unwrap_or(v2::ExportEndStatus::Unspecified);
@@ -1842,7 +1840,6 @@ impl Core {
         }
         if source_gone && matches!(claim.export, ExportState::Requested | ExportState::Pinned) {
             claim.export = ExportState::Ended(Party::Drained);
-            claim.source_fence = Party::Drained;
         }
         self.settle_peers(key);
         let message = self.terminal_message(self.claims.get(&key).expect("claim exists"));
@@ -2194,7 +2191,7 @@ impl Core {
         // manager's handler, so that handler's exit is its fence.
         let source_ok = match &claim.source_channel {
             Some(leg) => leg.exited,
-            None => matches!(claim.source_fence, Party::Drained) || source_gone,
+            None => matches!(claim.source_fence(), Party::Drained) || source_gone,
         };
         // On the data channel the requester never touches the claim's windows: the
         // manager's handler does, and its exit is the fence.
@@ -2325,7 +2322,7 @@ impl Core {
                     && !matches!(claim.export, ExportState::Ended(Party::Quarantined))
                     && (claim.channel.is_some()
                         || !matches!(claim.requester_fence, Party::Pending | Party::Quarantined))
-                    && !matches!(claim.source_fence, Party::Pending);
+                    && !matches!(claim.source_fence(), Party::Pending);
                 let source_gone = claim
                     .source_proc
                     .as_ref()
@@ -2413,9 +2410,7 @@ impl Core {
             .flatten()
         {
             for peer in side.peers.iter_mut().filter(|p| p.proc == agent) {
-                if peer.fence == Party::Pending
-                    || peer.fence == Party::Quarantined && party == Party::Drained
-                {
+                if peer.fence == Party::Pending {
                     peer.fence = party;
                     touched = true;
                 }
@@ -2464,9 +2459,6 @@ impl Core {
                 if matches!(claim.export, ExportState::Ended(Party::Quarantined)) {
                     claim.export = ExportState::Ended(Party::Drained);
                 }
-                if matches!(claim.source_fence, Party::Pending | Party::Quarantined) {
-                    claim.source_fence = Party::Drained;
-                }
                 touched = true;
             }
             for side in [claim.mp.req.as_mut(), claim.mp.src.as_mut()]
@@ -2499,10 +2491,6 @@ impl Core {
                 touched = true;
             }
             if claim.source_proc == Some(process) {
-                if claim.source_fence == Party::Pending {
-                    claim.source_fence = Party::Drained;
-                    touched = true;
-                }
                 if matches!(claim.export, ExportState::Requested | ExportState::Pinned) {
                     claim.export = ExportState::Ended(Party::Drained);
                     touched = true;
@@ -2550,7 +2538,6 @@ impl Core {
                 if let Some(claim) = self.claims.get_mut(&key) {
                     if claim.source_channel.is_some() {
                         claim.export = ExportState::Ended(Party::Drained);
-                        claim.source_fence = Party::Drained;
                     }
                 }
             }
@@ -2714,7 +2701,6 @@ mod tests {
                     arrived: false,
                 }],
                 requester_fence: Party::Pending,
-                source_fence: Party::Drained,
                 granted_at: Some(now),
                 page_bytes: 4096,
                 row_bytes: 4096,
@@ -3091,6 +3077,13 @@ mod tests {
         core.reclaim(key);
         assert_eq!(core.claims[&key].windows[0].phase, Phase::RequesterRead);
         assert_eq!(core.quarantined_bytes(), 6 * 4096);
+        core.agent_fence(
+            AGENT_1,
+            v2::rank_fence::Kind::Claim as i32,
+            1,
+            Party::Drained,
+        );
+        assert_eq!(core.claims[&key].windows[0].phase, Phase::RequesterRead);
         core.proc_exited(AGENT_1);
         assert_eq!(core.claims[&key].windows[0].phase, Phase::Free);
         assert_eq!(core.quarantined_bytes(), 0);
