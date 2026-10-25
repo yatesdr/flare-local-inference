@@ -1148,8 +1148,8 @@ enum RankAttachStatus {
   RANK_NO_SESSION = 3;            // rank 0 has not opened (or was superseded): retry with backoff.
   RANK_BAD_SECRET = 4;
   RANK_BAD_RANK = 5;              // out of range, or held by another live agent.
-  RANK_MIXED_MODE = 6;            // channel mode is required but the manager serves no data listener.
-  RANK_DRAIN_ONLY_REFUSED = 7;    // a drain-only attach names no retained obligation.
+  RANK_NO_DATA_LISTENER = 6;            // channel mode is required but the manager serves no data listener.
+  reserved 7;
 }
 
 message RankClientMessage {
@@ -1167,9 +1167,7 @@ message RankAttach {
   uint32 rank = 4;             // 1 .. ranks-1.
   bytes agent_nonce = 5;       // 16 random bytes, fresh per agent process.
   bytes rank_secret = 6;
-  // Reconnect after rank 0's session ended, to discharge retained obligations only:
-  // no transfer is ever granted to a drain-only attachment.
-  bool drain_only = 7;
+  reserved 7;
   string name = 8;             // log only.
 }
 

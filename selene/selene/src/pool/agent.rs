@@ -786,7 +786,6 @@ impl Agent {
             rank: self.rank as u32,
             agent_nonce: self.agent_nonce.to_vec(),
             rank_secret: bound.secret.clone(),
-            drain_only: false,
             name: self.name.clone(),
         };
         let _ = tx
@@ -815,7 +814,7 @@ impl Agent {
             Ok(S::RankNoSession | S::RankStaleManager) => {
                 return Attempt::Retry("rank 0 has no session yet".into());
             }
-            Ok(S::RankMixedMode) => {
+            Ok(S::RankNoDataListener) => {
                 return Attempt::Disabled(
                     "the manager has no data listener this rank can reach".into(),
                 );
