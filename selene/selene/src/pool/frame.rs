@@ -21,7 +21,6 @@
 //! manager -> instance, a put (the instance answers each GRANT with FILLED):
 //!   GRANT   0x04  index u32, record u32, first_page u32, page_count u32,
 //!                 row u8, length u64
-//!   TAKEN   0x08  index u32: the manager has read a filled window out of its slot
 //! instance -> manager, a put:
 //!   FILLED  0x05  index u32, row u8, row_xxh3 u64, slot u64, page_count u32,
 //!                 page_xxh3 u64 * page_count
@@ -33,9 +32,8 @@
 //! On the stream carrier a WINDOW's payload follows it on the connection (`slot`
 //! is `NO_SLOT`) and so does a FILLED's. On the RDMA carrier the payload does not
 //! travel on the connection: the manager writes a claim's window into a slot the
-//! instance credited and then sends WINDOW naming that slot's offset, and a put's
-//! FILLED names the instance's slot, which the manager reads and then releases with
-//! TAKEN. Windows arrive in index order and only the transfer's own windows are
+//! instance credited and then sends WINDOW naming that slot's offset. Puts use
+//! the stream carrier. Windows arrive in index order and only the transfer's own windows are
 //! ever named, so a reader needs no state beyond the grant's plan to check them.
 
 use std::io;
@@ -55,7 +53,6 @@ const GRANT: u8 = 0x04;
 const FILLED: u8 = 0x05;
 const CREDIT: u8 = 0x06;
 const ACCEPT: u8 = 0x07;
-const TAKEN: u8 = 0x08;
 
 /// The `slot` of a window whose payload follows it on the connection.
 pub const NO_SLOT: u64 = u64::MAX;
@@ -103,8 +100,6 @@ pub enum ToInstance {
     Grant(Shape),
     /// The manager's end of the queue pair, in answer to an RDMA hello.
     Accept(Vec<u8>),
-    /// The manager has read a put's filled window out of its slot (RDMA).
-    Taken(u32),
 }
 
 /// A frame the instance sends.
@@ -224,10 +219,6 @@ impl ToInstance {
                 out.push(ACCEPT);
                 put_handshake(&mut out, handshake);
             }
-            ToInstance::Taken(index) => {
-                out.push(TAKEN);
-                out.extend_from_slice(&index.to_le_bytes());
-            }
         }
         out
     }
@@ -290,7 +281,6 @@ impl ToInstance {
                 Ok(ToInstance::Grant(parse_shape(&shape)?))
             }
             ACCEPT => Ok(ToInstance::Accept(read_handshake(reader).await?)),
-            TAKEN => Ok(ToInstance::Taken(reader.read_u32_le().await?)),
             other => Err(invalid(format!("unknown manager frame {other:#x}"))),
         }
     }
@@ -440,7 +430,6 @@ mod tests {
                 slot: 8192,
             }),
             ToInstance::Accept(vec![1, 2, 3]),
-            ToInstance::Taken(4),
             ToInstance::End,
             ToInstance::Abort("the claim ended".into()),
             ToInstance::Grant(shape()),

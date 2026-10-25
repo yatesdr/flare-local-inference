@@ -39,7 +39,8 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 
 use super::{DataChannel, Region, RegionAccess, invalid};
-use crate::arena::{Arena, Extent};
+#[cfg(test)]
+use crate::arena::Arena;
 
 /// A connection that has not presented its token by then is dropped.
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -168,9 +169,6 @@ struct Inner {
     state: Mutex<State>,
     next: AtomicU64,
     handle: Handle,
-    /// The registered region a rank's leg gathers its packed slices in before they cross the
-    /// network, and scatters them from after.
-    packed: Mutex<Option<Arena>>,
     /// Tests hold back `Closed` to play a handler whose exit cannot be observed.
     #[cfg(test)]
     closed_delay: Mutex<Duration>,
@@ -224,7 +222,6 @@ impl Hub {
             }),
             next: AtomicU64::new(1),
             handle: handle.clone(),
-            packed: Mutex::new(None),
             #[cfg(test)]
             closed_delay: Mutex::new(Duration::ZERO),
         });
@@ -237,16 +234,20 @@ impl Hub {
         Ok((Hub { inner, closing }, receiver))
     }
 
-    /// Give rank legs on RDMA the registered arena to pack their slices in. Without one, a
-    /// rank's leg that asks for RDMA is refused and uses the stream.
-    pub fn set_packed(&self, arena: Arena) {
-        *self.inner.packed.lock().unwrap() = Some(arena);
-    }
-
     /// The `host:port` clients are told to connect to. A host that is the
     /// unspecified address means "the host you reached me by".
     pub fn address(&self) -> &str {
         &self.inner.address
+    }
+
+    pub fn rdma_transfer(&self, token: &[u8]) -> bool {
+        let state = self.inner.state.lock().unwrap();
+        self.offers_rdma()
+            && state
+                .tokens
+                .get(token)
+                .and_then(|id| state.transfers.get(id))
+                .is_some_and(|entry| entry.kind == Kind::Get && entry.slicing.is_none())
     }
 
     /// Whether instances may ask for the RDMA carrier.
@@ -506,10 +507,8 @@ async fn serve(inner: Arc<Inner>, stream: TcpStream) {
     // An RDMA transfer's channel lives here, outside the handler, so it can be fenced
     // properly whichever way the handler ends.
     let mut rdma: Option<Box<dyn DataChannel>> = None;
-    // Packed staging a work request may still touch: freed only after the queue pair is fenced.
-    let held: Mutex<Vec<Extent>> = Mutex::new(Vec::new());
     let result = tokio::select! {
-        result = run(&inner, transfer, &entry, &mut conn, &mut rdma, &held) => result,
+        result = run(&inner, transfer, &entry, &mut conn, &mut rdma) => result,
         _ = async { let _ = stopped.wait_for(|stop| *stop).await; } => End::Stopped,
     };
     // Fence the queue pair: it moves to the error state, its requests are flushed and it is
@@ -522,8 +521,6 @@ async fn serve(inner: Arc<Inner>, stream: TcpStream) {
         })
         .await;
     }
-    // Nothing is in flight any more, so the packed staging goes back.
-    held.lock().unwrap().clear();
     // Say goodbye if the peer will listen (a TLS peer needs the close notice to tell an
     // end from a cut), then drop the connection: only now is the transfer's memory quiet.
     let _ = timeout(GOODBYE, conn.shutdown()).await;
@@ -546,7 +543,6 @@ async fn run(
     entry: &Transfer,
     conn: &mut Box<dyn Conn>,
     rdma: &mut Option<Box<dyn DataChannel>>,
-    held: &Mutex<Vec<Extent>>,
 ) -> End {
     let hello = match timeout(IO_TIMEOUT, ToManager::read(&mut *conn, inner.max_pages)).await {
         Ok(Ok(frame)) => frame,
@@ -555,31 +551,28 @@ async fn run(
     };
     match hello {
         ToManager::Hello(Carrier::Stream) => {}
-        ToManager::Hello(Carrier::Rdma(peer)) => match open_rdma(inner, conn, &peer).await {
-            Ok(channel) => *rdma = Some(channel),
-            Err(error) => {
-                // Say why before the connection closes, so the instance falls back.
-                let _ = ToInstance::Abort(error.to_string()).write(conn).await;
-                return failure(error);
+        ToManager::Hello(Carrier::Rdma(peer))
+            if entry.kind == Kind::Get && entry.slicing.is_none() =>
+        {
+            match open_rdma(inner, conn, &peer).await {
+                Ok(channel) => *rdma = Some(channel),
+                Err(error) => {
+                    // Say why before the connection closes, so the instance falls back.
+                    let _ = ToInstance::Abort(error.to_string()).write(conn).await;
+                    return failure(error);
+                }
             }
-        },
+        }
+        ToManager::Hello(Carrier::Rdma(_)) => {
+            let message = "RDMA carries only unsliced claim windows";
+            let _ = ToInstance::Abort(message.into()).write(conn).await;
+            return End::Failed(message.into());
+        }
         _ => return End::Failed("the instance did not open with a hello".into()),
     }
-    if rdma.is_some() && entry.slicing.is_some() && inner.packed.lock().unwrap().is_none() {
-        let _ = ToInstance::Abort("this manager has no packed staging for a rank's leg".into())
-            .write(conn)
-            .await;
-        return End::Failed("a rank's leg asked for RDMA without packed staging".into());
-    }
-    let result = match (entry.kind, rdma.as_mut()) {
-        (Kind::Get, None) => send_windows(inner, transfer, entry, conn).await,
-        (Kind::Put, None) => receive_windows(inner, transfer, entry, conn).await,
-        (Kind::Get, Some(channel)) => {
-            send_windows_rdma(inner, transfer, entry, conn, channel, held).await
-        }
-        (Kind::Put, Some(channel)) => {
-            receive_windows_rdma(inner, transfer, entry, conn, channel, held).await
-        }
+    let result = match entry.kind {
+        Kind::Get => send_windows(inner, transfer, entry, conn, rdma.as_mut()).await,
+        Kind::Put => receive_windows(inner, transfer, entry, conn).await,
     };
     match result {
         Ok(()) => End::Done,
@@ -637,6 +630,7 @@ async fn send_windows(
     transfer: u64,
     entry: &Transfer,
     conn: &mut Box<dyn Conn>,
+    mut rdma: Option<&mut Box<dyn DataChannel>>,
 ) -> io::Result<()> {
     loop {
         let next = {
@@ -663,44 +657,75 @@ async fn send_windows(
             let _ = timeout(GOODBYE, conn.shutdown()).await;
             return Ok(());
         };
+        let slot = if let Some(channel) = rdma.as_mut() {
+            let ToManager::Credit { offset, length } =
+                timeout(IO_TIMEOUT, ToManager::read(conn, inner.max_pages))
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "the instance lent no slot")
+                    })??
+            else {
+                return Err(invalid("a claim's instance sends only credits"));
+            };
+            if window.shape.length > length || !offset.is_multiple_of(4096) {
+                return Err(invalid("a window does not fit the slot the instance lent"));
+            }
+            channel.write(
+                transfer,
+                window.shape.index,
+                window.region,
+                window.offset,
+                window.shape.length,
+                Region::Staging,
+                offset,
+            )?;
+            rdma_done(channel, transfer, window.shape.index).await?;
+            offset
+        } else {
+            NO_SLOT
+        };
         // SAFETY: see `window_bytes`; the slice is only read.
         let packed;
-        let payload: &[u8] = match &entry.slicing {
-            None => unsafe {
-                window_bytes(
-                    &*inner.regions,
-                    window.region,
-                    window.offset,
-                    window.shape.length,
-                )?
-            },
-            Some((layout, rank)) => {
-                let (pages, row) = (window.shape.page_count, window.shape.row);
-                if window.shape.length != layout.slice_bytes(*rank, pages, row) {
-                    return Err(invalid("a rank window's length is not its slice's"));
-                }
-                // SAFETY: as above, over the whole window the slice lies in.
-                let whole = unsafe {
+        let payload: &[u8] = if slot != NO_SLOT {
+            &[]
+        } else {
+            match &entry.slicing {
+                None => unsafe {
                     window_bytes(
                         &*inner.regions,
                         window.region,
                         window.offset,
-                        layout.window_bytes(pages, row),
+                        window.shape.length,
                     )?
-                };
-                let mut bytes = vec![0u8; window.shape.length as usize];
-                layout
-                    .gather(*rank, whole, pages, row, &mut bytes)
-                    .map_err(|error| invalid(error.to_string()))?;
-                packed = bytes;
-                &packed
+                },
+                Some((layout, rank)) => {
+                    let (pages, row) = (window.shape.page_count, window.shape.row);
+                    if window.shape.length != layout.slice_bytes(*rank, pages, row) {
+                        return Err(invalid("a rank window's length is not its slice's"));
+                    }
+                    // SAFETY: as above, over the whole window the slice lies in.
+                    let whole = unsafe {
+                        window_bytes(
+                            &*inner.regions,
+                            window.region,
+                            window.offset,
+                            layout.window_bytes(pages, row),
+                        )?
+                    };
+                    let mut bytes = vec![0u8; window.shape.length as usize];
+                    layout
+                        .gather(*rank, whole, pages, row, &mut bytes)
+                        .map_err(|error| invalid(error.to_string()))?;
+                    packed = bytes;
+                    &packed
+                }
             }
         };
         let frame = ToInstance::Window(Window {
             shape: window.shape,
             page_xxh3: window.page_xxh3,
             row_xxh3: window.row_xxh3,
-            slot: NO_SLOT,
+            slot,
         });
         timeout(IO_TIMEOUT, async {
             frame.write(conn).await?;
@@ -709,7 +734,9 @@ async fn send_windows(
         })
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the instance stopped reading"))??;
-        inner.counters.add(0, window.shape.length);
+        inner
+            .counters
+            .add(usize::from(rdma.is_some()), window.shape.length);
         let _ = inner.events.send(Event::Sent {
             transfer,
             index: window.shape.index,
@@ -749,287 +776,6 @@ async fn rdma_done(
         } else {
             tokio::time::sleep(Duration::from_micros(200)).await;
         }
-    }
-}
-
-/// A claim over RDMA: each window is written into a slot the instance lent, and named in
-/// a WINDOW frame once the write has completed.
-async fn send_windows_rdma(
-    inner: &Inner,
-    transfer: u64,
-    entry: &Transfer,
-    conn: &mut Box<dyn Conn>,
-    channel: &mut Box<dyn DataChannel>,
-    held: &Mutex<Vec<Extent>>,
-) -> io::Result<()> {
-    let (mut reader, mut writer) = tokio::io::split(conn);
-    let (lend, mut lent) = mpsc::unbounded_channel::<(u64, u64)>();
-    let reading = async {
-        loop {
-            match ToManager::read_or_end(&mut reader, inner.max_pages).await? {
-                Some(ToManager::Credit { offset, length }) => {
-                    let _ = lend.send((offset, length));
-                }
-                Some(_) => return Err(invalid("a claim's instance sends only credits")),
-                None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "the instance closed the connection",
-                    ));
-                }
-            }
-        }
-        #[allow(unreachable_code)]
-        Ok::<(), io::Error>(())
-    };
-    let writing = async {
-        loop {
-            let next = {
-                let mut queues = entry.queues.lock().unwrap();
-                match queues.windows.pop_front() {
-                    Some(window) => Some(Some(window)),
-                    None if queues.finished => Some(None),
-                    None => None,
-                }
-            };
-            let Some(next) = next else {
-                entry.wake.notified().await;
-                continue;
-            };
-            let Some(window) = next else {
-                timeout(IO_TIMEOUT, async {
-                    ToInstance::End.write(&mut writer).await?;
-                    writer.flush().await
-                })
-                .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "the instance stopped reading")
-                })??;
-                return Ok(());
-            };
-            let length = window.shape.length;
-            let (offset, lent_bytes) = timeout(IO_TIMEOUT, lent.recv())
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the instance lent no slot"))?
-                .ok_or_else(|| invalid("the instance closed the connection"))?;
-            if length > lent_bytes || !offset.is_multiple_of(4096) {
-                return Err(invalid("a window does not fit the slot the instance lent"));
-            }
-            // A rank's slices are strided in the window: gathered into packed staging first,
-            // and that buffer is what crosses the network.
-            let (from_region, from_offset) = match &entry.slicing {
-                None => (window.region, window.offset),
-                Some((layout, rank)) => {
-                    let (pages, row) = (window.shape.page_count, window.shape.row);
-                    if length != layout.slice_bytes(*rank, pages, row) {
-                        return Err(invalid("a rank window's length is not its slice's"));
-                    }
-                    let arena = inner
-                        .packed
-                        .lock()
-                        .unwrap()
-                        .clone()
-                        .ok_or_else(|| invalid("no packed staging for a rank's leg"))?;
-                    let mut packed = arena
-                        .allocate(length as usize)
-                        .ok_or_else(|| io::Error::other("packed staging is full"))?;
-                    // SAFETY: see `window_bytes`; the window is only read.
-                    let whole = unsafe {
-                        window_bytes(
-                            &*inner.regions,
-                            window.region,
-                            window.offset,
-                            layout.window_bytes(pages, row),
-                        )?
-                    };
-                    layout
-                        .gather(*rank, whole, pages, row, packed.bytes_mut())
-                        .map_err(|error| invalid(error.to_string()))?;
-                    let at = packed.offset() as u64;
-                    held.lock().unwrap().push(packed);
-                    (Region::Staging, at)
-                }
-            };
-            channel.write(
-                transfer,
-                window.shape.index,
-                from_region,
-                from_offset,
-                length,
-                Region::Staging,
-                offset,
-            )?;
-            rdma_done(channel, transfer, window.shape.index).await?;
-            if entry.slicing.is_some() {
-                // The write completed: the packed buffer is no longer read.
-                held.lock().unwrap().pop();
-            }
-            let frame = ToInstance::Window(Window {
-                shape: window.shape,
-                page_xxh3: window.page_xxh3,
-                row_xxh3: window.row_xxh3,
-                slot: offset,
-            });
-            timeout(IO_TIMEOUT, async {
-                frame.write(&mut writer).await?;
-                writer.flush().await
-            })
-            .await
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "the instance stopped reading")
-            })??;
-            inner.counters.add(1, length);
-            let _ = inner.events.send(Event::Sent {
-                transfer,
-                index: window.shape.index,
-            });
-        }
-    };
-    tokio::select! {
-        result = writing => result,
-        result = reading => result,
-    }
-}
-
-/// A put over RDMA: the instance names the slot it filled and the manager reads it into the
-/// granted window, then releases the slot with TAKEN.
-async fn receive_windows_rdma(
-    inner: &Inner,
-    transfer: u64,
-    entry: &Transfer,
-    conn: &mut Box<dyn Conn>,
-    channel: &mut Box<dyn DataChannel>,
-    held: &Mutex<Vec<Extent>>,
-) -> io::Result<()> {
-    let (mut reader, mut writer) = tokio::io::split(conn);
-    let (expect, mut expected) = mpsc::unbounded_channel::<GrantOut>();
-    let (took, mut taken) = mpsc::unbounded_channel::<u32>();
-    let writing = async {
-        loop {
-            let grants: Vec<GrantOut> = entry.queues.lock().unwrap().grants.drain(..).collect();
-            for grant in grants {
-                // Tell the reader first: the instance may answer before this write returns.
-                let _ = expect.send(grant);
-                timeout(IO_TIMEOUT, async {
-                    ToInstance::Grant(grant.shape).write(&mut writer).await?;
-                    writer.flush().await
-                })
-                .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "the instance stopped reading")
-                })??;
-            }
-            tokio::select! {
-                _ = entry.wake.notified() => {}
-                index = taken.recv() => {
-                    let Some(index) = index else { return Ok::<(), io::Error>(()) };
-                    timeout(IO_TIMEOUT, async {
-                        ToInstance::Taken(index).write(&mut writer).await?;
-                        writer.flush().await
-                    })
-                    .await
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::TimedOut, "the instance stopped reading")
-                    })??;
-                }
-            }
-        }
-    };
-    let reading = async {
-        while let Some(grant) = expected.recv().await {
-            let frame = timeout(IO_TIMEOUT, ToManager::read(&mut reader, inner.max_pages))
-                .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "the instance sent nothing")
-                })??;
-            let ToManager::Filled {
-                index,
-                row_xxh3,
-                page_xxh3,
-                slot,
-            } = frame
-            else {
-                return Err(invalid("the instance sent a frame a put does not take"));
-            };
-            if slot == NO_SLOT || !slot.is_multiple_of(4096) {
-                return Err(invalid("a filled window names no usable slot"));
-            }
-            if index != grant.shape.index
-                || page_xxh3.len() != grant.shape.page_count as usize
-                || row_xxh3.is_some() != grant.shape.row
-            {
-                return Err(invalid("a filled window does not match its grant"));
-            }
-            match &entry.slicing {
-                None => {
-                    channel.read(
-                        transfer,
-                        index,
-                        grant.region,
-                        grant.offset,
-                        grant.shape.length,
-                        Region::Staging,
-                        slot,
-                    )?;
-                    rdma_done(channel, transfer, index).await?;
-                }
-                Some((layout, rank)) => {
-                    // The rank's slice is read into packed staging and then scattered into the
-                    // strided places it belongs in the granted window.
-                    let (pages, row) = (grant.shape.page_count, grant.shape.row);
-                    if grant.shape.length != layout.slice_bytes(*rank, pages, row) {
-                        return Err(invalid("a rank window's length is not its slice's"));
-                    }
-                    let arena = inner
-                        .packed
-                        .lock()
-                        .unwrap()
-                        .clone()
-                        .ok_or_else(|| invalid("no packed staging for a rank's leg"))?;
-                    let packed = arena
-                        .allocate(grant.shape.length as usize)
-                        .ok_or_else(|| io::Error::other("packed staging is full"))?;
-                    let at = packed.offset() as u64;
-                    held.lock().unwrap().push(packed);
-                    channel.read(
-                        transfer,
-                        index,
-                        Region::Staging,
-                        at,
-                        grant.shape.length,
-                        Region::Staging,
-                        slot,
-                    )?;
-                    rdma_done(channel, transfer, index).await?;
-                    let packed = held.lock().unwrap().pop().expect("pushed above");
-                    // SAFETY: see `window_bytes`; the store leased this window to the put.
-                    let whole = unsafe {
-                        window_bytes(
-                            &*inner.regions,
-                            grant.region,
-                            grant.offset,
-                            layout.window_bytes(pages, row),
-                        )?
-                    };
-                    layout
-                        .scatter(*rank, whole, pages, row, packed.bytes())
-                        .map_err(|error| invalid(error.to_string()))?;
-                }
-            }
-            inner.counters.add(1, grant.shape.length);
-            let _ = inner.events.send(Event::Filled {
-                transfer,
-                index,
-                row_xxh3,
-                page_xxh3,
-            });
-            let _ = took.send(index);
-        }
-        Ok(())
-    };
-    tokio::select! {
-        result = writing => result,
-        result = reading => result,
     }
 }
 
@@ -1804,9 +1550,7 @@ mod tests {
         assert!(server_config(b"", one.signing_key.serialize_pem().as_bytes()).is_err());
     }
 
-    /// An RDMA device that moves bytes between the manager's regions and a buffer standing in
-    /// for the instance's lent staging, so the gather and scatter around a rank's leg can be
-    /// tested without hardware.
+    /// An RDMA WRITE device backed by ordinary memory for CPU tests.
     mod fake_rdma {
         use super::*;
         use crate::data::channel::{Pair, Rdma};
@@ -1862,26 +1606,6 @@ mod tests {
                 self.done.push((transfer, index, Ok(())));
                 Ok(())
             }
-            fn read(
-                &mut self,
-                transfer: u64,
-                index: u32,
-                region: Region,
-                offset: u64,
-                len: u64,
-                _: Region,
-                remote_offset: u64,
-            ) -> io::Result<()> {
-                let remote = self.remote.clone();
-                self.regions
-                    .with_write(region, offset, len as usize, &mut |bytes| {
-                        let at = remote_offset as usize;
-                        bytes.copy_from_slice(&remote.lock().unwrap()[at..at + bytes.len()]);
-                        Ok(())
-                    })?;
-                self.done.push((transfer, index, Ok(())));
-                Ok(())
-            }
             fn poll(&mut self, done: &mut Vec<(u64, u32, io::Result<()>)>) -> io::Result<()> {
                 done.append(&mut self.done);
                 Ok(())
@@ -1892,7 +1616,7 @@ mod tests {
         }
     }
 
-    /// A hub with the fake device, and the staging arena it packs in.
+    /// A hub with the fake WRITE device.
     fn start_fake_rdma() -> (
         Hub,
         mpsc::UnboundedReceiver<Event>,
@@ -1921,7 +1645,6 @@ mod tests {
             Some(Arc::new(device)),
         )
         .unwrap();
-        hub.set_packed(staging.clone());
         let address = hub.address().to_string();
         (hub, events, address, regions, staging, remote)
     }
@@ -1947,111 +1670,44 @@ mod tests {
     }
 
     #[test]
-    fn a_ranks_slices_are_gathered_into_packed_staging_and_written_into_its_slot() {
+    fn writes_land_before_the_window_is_named_and_only_scalar_claims_offer_rdma() {
         bounded(async {
-            let (hub, mut events, address, regions, staging, remote) = start_fake_rdma();
-            let layout = rank_layout(3);
-            let window: Vec<u8> = (0..layout.window_bytes(3, true) as usize)
-                .map(|i| (i % 239) as u8)
-                .collect();
-            fill(&regions, Region::Arena, 0, &window);
-            for rank in [0usize, 2] {
-                let (transfer, token) = hub.open_rank(Kind::Get, layout.clone(), rank).unwrap();
-                let mut conn = dial_rdma(&address, &token).await;
-                let slot = 32768u64;
-                ToManager::Credit {
-                    offset: slot,
-                    length: layout.slice_bytes(rank, 3, true),
-                }
-                .write(&mut conn)
-                .await
-                .unwrap();
-                hub.push_window(
-                    transfer,
-                    WindowOut {
-                        shape: rank_shape(&layout, rank, 0, 3, true),
-                        page_xxh3: vec![1, 2, 3],
-                        row_xxh3: 4,
-                        region: Region::Arena,
-                        offset: 0,
-                    },
-                );
-                hub.finish(transfer);
-                let ToInstance::Window(got) = frame(&mut conn).await else {
-                    panic!("expected a window");
-                };
-                assert_eq!(got.slot, slot, "named by the slot it was written into");
-                assert_eq!(got.shape, rank_shape(&layout, rank, 0, 3, true));
-                let mut expect = vec![0u8; got.shape.length as usize];
-                layout.gather(rank, &window, 3, true, &mut expect).unwrap();
-                assert_eq!(
-                    &remote.lock().unwrap()[slot as usize..slot as usize + expect.len()],
-                    &expect[..],
-                    "rank {rank}'s slice landed in its slot"
-                );
-                assert_eq!(frame(&mut conn).await, ToInstance::End);
-                assert!(matches!(
-                    next(&mut events).await,
-                    Event::Sent { index: 0, .. }
-                ));
-                assert!(matches!(next(&mut events).await, Event::Closed { .. }));
+            let (hub, mut events, address, regions, _, remote) = start_fake_rdma();
+            let (transfer, token) = hub.open(Kind::Get).unwrap();
+            assert!(hub.rdma_transfer(&token));
+            let (_, put_token) = hub.open(Kind::Put).unwrap();
+            assert!(!hub.rdma_transfer(&put_token));
+            let (_, rank_token) = hub.open_rank(Kind::Get, rank_layout(2), 1).unwrap();
+            assert!(!hub.rdma_transfer(&rank_token));
+            let mut conn = dial_rdma(&address, &token).await;
+            ToManager::Credit {
+                offset: 4096,
+                length: PAGE as u64,
             }
-            assert_eq!(staging.used(), 0, "the packed staging came back");
-        })
-    }
-
-    #[test]
-    fn a_ranks_slice_is_read_into_packed_staging_and_scattered_into_the_window() {
-        bounded(async {
-            let (hub, mut events, address, regions, staging, remote) = start_fake_rdma();
-            let layout = rank_layout(2);
-            let truth: Vec<u8> = (0..layout.window_bytes(2, true) as usize)
-                .map(|i| (i % 227) as u8)
-                .collect();
-            for rank in [1usize, 0] {
-                let (transfer, token) = hub.open_rank(Kind::Put, layout.clone(), rank).unwrap();
-                let mut conn = dial_rdma(&address, &token).await;
-                hub.push_grant(
-                    transfer,
-                    GrantOut {
-                        shape: rank_shape(&layout, rank, 0, 2, true),
-                        region: Region::Arena,
-                        offset: 8192,
-                    },
-                );
-                let ToInstance::Grant(granted) = frame(&mut conn).await else {
-                    panic!("expected a grant");
-                };
-                let mut packed = vec![0u8; granted.length as usize];
-                layout.gather(rank, &truth, 2, true, &mut packed).unwrap();
-                let slot = 65536u64;
-                remote.lock().unwrap()[slot as usize..slot as usize + packed.len()]
-                    .copy_from_slice(&packed);
-                ToManager::Filled {
-                    index: 0,
-                    row_xxh3: Some(3),
-                    page_xxh3: vec![1, 2],
-                    slot,
-                }
-                .write(&mut conn)
-                .await
-                .unwrap();
-                let Event::Filled { index, .. } = next(&mut events).await else {
-                    panic!("expected Filled");
-                };
-                assert_eq!(index, 0);
-                assert_eq!(frame(&mut conn).await, ToInstance::Taken(0));
-                hub.stop(transfer);
-                assert!(matches!(next(&mut events).await, Event::Closed { .. }));
-            }
-            regions
-                .with_read(Region::Arena, 8192, truth.len(), &mut |window| {
-                    assert_eq!(window, &truth[..], "both slices are in their places");
-                    Ok(())
-                })
-                .unwrap();
-            assert_eq!(staging.used(), 0, "the packed staging came back");
-        })
+            .write(&mut conn)
+            .await
+            .unwrap();
+            fill(&regions, Region::Arena, 0, &vec![9; PAGE]);
+            hub.push_window(
+                transfer,
+                WindowOut {
+                    shape: shape(0, 1, false),
+                    page_xxh3: vec![1],
+                    row_xxh3: 0,
+                    region: Region::Arena,
+                    offset: 0,
+                },
+            );
+            hub.finish(transfer);
+            let ToInstance::Window(window) = frame(&mut conn).await else {
+                panic!("window missing")
+            };
+            assert_eq!(window.slot, 4096);
+            assert_eq!(&remote.lock().unwrap()[4096..4096 + PAGE], &vec![9; PAGE]);
+            assert_eq!(frame(&mut conn).await, ToInstance::End);
+            assert!(matches!(next(&mut events).await, Event::Sent { .. }));
+            assert!(matches!(next(&mut events).await, Event::Closed { .. }));
+        });
     }
 
     #[cfg(feature = "rdma")]
@@ -2228,62 +1884,6 @@ mod tests {
                 assert!(matches!(next(&mut events).await, Event::Failed { .. }));
                 assert!(matches!(next(&mut events).await, Event::Closed { .. }));
                 assert!(instance.bytes(0, PAGE).iter().all(|byte| *byte == 0));
-            })
-        }
-
-        #[test]
-        fn a_puts_slot_is_read_into_the_window_and_released() {
-            bounded(async {
-                let regions = regions();
-                let (hub, mut events, address) = start_rdma(regions.clone());
-                let instance = Instance::new();
-                let (transfer, token) = hub.open(Kind::Put).unwrap();
-                let (mut stream, _pair) = instance.dial(&address, &token).await;
-                hub.push_grant(
-                    transfer,
-                    GrantOut {
-                        shape: shape(0, 2, true),
-                        region: Region::Staging,
-                        offset: 4096,
-                    },
-                );
-                let ToInstance::Grant(granted) = ToInstance::read(&mut stream, 64).await.unwrap()
-                else {
-                    panic!("expected a grant");
-                };
-                assert_eq!(granted, shape(0, 2, true));
-                let bytes: Vec<u8> = (0..3 * PAGE).map(|i| (i % 13) as u8).collect();
-                instance
-                    .bytes(2 * PAGE, bytes.len())
-                    .copy_from_slice(&bytes);
-                ToManager::Filled {
-                    index: 0,
-                    row_xxh3: Some(3),
-                    page_xxh3: vec![1, 2],
-                    slot: 2 * PAGE as u64,
-                }
-                .write(&mut stream)
-                .await
-                .unwrap();
-                let Event::Filled {
-                    index, page_xxh3, ..
-                } = next(&mut events).await
-                else {
-                    panic!("expected Filled");
-                };
-                assert_eq!((index, page_xxh3), (0, vec![1, 2]));
-                regions
-                    .with_read(Region::Staging, 4096, bytes.len(), &mut |src| {
-                        assert_eq!(src, &bytes[..]);
-                        Ok(())
-                    })
-                    .unwrap();
-                assert_eq!(
-                    ToInstance::read(&mut stream, 64).await.unwrap(),
-                    ToInstance::Taken(0)
-                );
-                hub.stop(transfer);
-                assert!(matches!(next(&mut events).await, Event::Closed { .. }));
             })
         }
 

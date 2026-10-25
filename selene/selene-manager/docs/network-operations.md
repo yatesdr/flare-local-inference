@@ -100,8 +100,8 @@ refuses to start. The manager advertises no memory keys or region addresses. The
 only its private transfer staging, so it cannot use RDMA to address the manager arena.
 
 The manager does every RDMA transfer, one-sided, on a queue pair made for the transfer: it writes
-a claim's windows into slots the instance lends (`CREDIT`) and reads a put's windows out of the
-slots the instance fills (`FILLED`, released with `TAKEN`). The instance must be built with the
+unsliced claim windows into private slots the instance lends (`CREDIT`). Puts and rank legs
+use TCP. The instance must be built with the
 `rdma` feature and have a device; otherwise, or after one RDMA transfer fails, it asks for the
 stream carrier on its connection, so a mixed pool works. Each end advertises a RoCE v2 GID, preferring
 a routable (IPv4-mapped or global) one over a link-local one, because two ends must use the same RoCE

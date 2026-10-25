@@ -32,7 +32,7 @@ pub use self::service::PoolService;
 /// carrier the manager prefers (the instance may still ask for the stream).
 pub(crate) fn channel_ref(hub: &crate::data::channel::Hub, token: &[u8]) -> v2::DataChannelRef {
     v2::DataChannelRef {
-        transport: if hub.offers_rdma() {
+        transport: if hub.rdma_transfer(token) {
             v2::DataTransport::Rdma
         } else {
             v2::DataTransport::Tcp

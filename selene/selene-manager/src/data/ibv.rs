@@ -3,7 +3,7 @@
 //! A [`Device`] registers both region files once on the first active device. Each transfer
 //! takes a [`LocalRdma`] from it: an RC queue pair in INIT, with its own completion queue.
 //! After the two ends exchange handshakes, `connect` moves the pair through RTR and RTS, and
-//! the resulting `RdmaChannel` posts one-sided RDMA writes and reads. Dropping the channel
+//! the resulting `RdmaChannel` posts one-sided RDMA writes. Dropping the channel
 //! moves the pair to the error state and destroys it; the registered regions stay.
 //!
 //! The unsafe surface is limited to the libibverbs calls; each block has a safety comment.
@@ -31,13 +31,6 @@ pub struct LocalRdma {
 }
 
 impl LocalRdma {
-    /// Open the first device whose port is active, register both mapped regions and make
-    /// one queue pair. For a manager that serves many transfers, open a [`Device`] once
-    /// and take a pair from it per transfer.
-    pub fn open(regions: Arc<dyn RegionAccess>) -> io::Result<Self> {
-        Device::open(regions)?.pair()
-    }
-
     pub fn handshake(&self) -> Handshake {
         self.verbs.handshake
     }
@@ -412,7 +405,6 @@ impl IbvVerbs {
         local_offset: u64,
         len: usize,
         remote: Remote,
-        read: bool,
     ) -> io::Result<()> {
         let mr = if unsafe { (*self.device.arena).lkey } == local_key {
             self.device.arena
@@ -432,11 +424,7 @@ impl IbvVerbs {
         wr.wr_id = id;
         wr.sg_list = &mut sge;
         wr.num_sge = 1;
-        wr.opcode = if read {
-            ffi::ibv_wr_opcode::IBV_WR_RDMA_READ
-        } else {
-            ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE
-        };
+        wr.opcode = ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE;
         wr.send_flags = ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
         wr.wr.rdma = ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
             remote_addr: remote.address,
@@ -520,19 +508,7 @@ impl Verbs for IbvVerbs {
         len: usize,
         remote: Remote,
     ) -> io::Result<()> {
-        self.post(transfer, id, local_key, local_offset, len, remote, false)
-    }
-
-    fn post_read(
-        &mut self,
-        transfer: u64,
-        id: u64,
-        local_key: u32,
-        local_offset: u64,
-        len: usize,
-        remote: Remote,
-    ) -> io::Result<()> {
-        self.post(transfer, id, local_key, local_offset, len, remote, true)
+        self.post(transfer, id, local_key, local_offset, len, remote)
     }
 
     fn poll(&mut self, done: &mut Vec<(u64, io::Result<()>)>) -> io::Result<()> {
@@ -745,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn a_loopback_pair_moves_bytes_both_ways() {
+    fn a_loopback_pair_writes_only_the_private_destination() {
         let regions_a = TestRegions::new();
         let regions_b = TestRegions::new();
         let Ok(device_a) = Device::open(regions_a.clone()) else {
@@ -799,18 +775,6 @@ mod tests {
         assert_eq!(
             &regions_b.staging.bytes()[..len],
             &regions_a.arena.bytes()[..len]
-        );
-        unsafe {
-            for index in 4096..8192 {
-                *regions_b.staging.pointer().add(index) = (index % 241) as u8;
-            }
-        }
-        a.read(2, 0, Region::Arena, 4096, 4096, Region::Staging, 4096)
-            .unwrap();
-        wait(&mut a, 2, 0);
-        assert_eq!(
-            &regions_a.arena.bytes()[4096..8192],
-            &regions_b.staging.bytes()[4096..8192]
         );
     }
 

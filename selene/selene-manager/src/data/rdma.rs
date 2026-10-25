@@ -2,8 +2,7 @@
 //!
 //! The queue-pair description exchanged in the data channel's hello, and the piece-wise channel
 //! over a mockable verbs layer. The ibverbs implementation (feature `rdma`, `ibv.rs`) registers
-//! each region file and uses one-sided `IBV_WR_RDMA_WRITE` / `IBV_WR_RDMA_READ` with the keys
-//! below.
+//! each local region and posts one-sided `IBV_WR_RDMA_WRITE` into private peer staging.
 
 use super::{
     DataChannel, GrantKey, PIECE_BYTES, Region, checked_range, invalid, piece_len, pieces,
@@ -102,29 +101,13 @@ pub struct Remote {
 ///
 /// Completion contract: a completion for a write means the sender's queue pair observed the
 /// operation finish, and on RC that means the bytes were placed in the peer's registered memory.
-/// `RdmaChannel` reports a window filled only once every one of its pieces has a completion, so
-/// the peer client cannot send `WindowFilled` before the receiver's bytes are visible.
-///
-/// Plain `RDMA_WRITE` produces no completion on the responder's queue pair, so the receiver's
-/// acknowledgment is the control-path one: the peer client sends `WindowFilled` only after these
-/// local completions, and the window is not reusable (its grant is withdrawn) until the store
-/// has accepted that message. A `WRITE_WITH_IMM` variant would add a responder CQ event but
-/// would not replace that acknowledgment. Reads need no such distinction: their payload is
-/// local.
+/// `RdmaChannel` reports completion only after every piece completes. The manager then sends
+/// the WINDOW frame naming the peer's slot; the peer releases that slot after its copy drains.
 pub trait Verbs: Send {
     fn memory_key(&self, region: Region) -> io::Result<u32>;
     /// The registered length of a region; bounds are always taken from registration.
     fn local_size(&self, region: Region) -> u64;
     fn post_write(
-        &mut self,
-        transfer: u64,
-        id: u64,
-        local_key: u32,
-        local_offset: u64,
-        len: usize,
-        remote: Remote,
-    ) -> io::Result<()>;
-    fn post_read(
         &mut self,
         transfer: u64,
         id: u64,
@@ -287,7 +270,6 @@ impl<V: Verbs> RdmaChannel<V> {
         &mut self,
         key: GrantKey,
         piece: u32,
-        read: bool,
         local_region: Region,
         local_offset: u64,
         len: usize,
@@ -311,13 +293,8 @@ impl<V: Verbs> RdmaChannel<V> {
             .checked_add(1)
             .ok_or_else(|| invalid("RDMA operation ids exhausted"))?;
         let local_key = self.local_key(local_region);
-        if read {
-            self.verbs
-                .post_read(key.transfer, id, local_key, local_offset, len, remote)?;
-        } else {
-            self.verbs
-                .post_write(key.transfer, id, local_key, local_offset, len, remote)?;
-        }
+        self.verbs
+            .post_write(key.transfer, id, local_key, local_offset, len, remote)?;
         self.ids.insert(id, (key, piece));
         Ok(())
     }
@@ -350,7 +327,6 @@ impl<V: Verbs> RdmaChannel<V> {
     #[allow(clippy::too_many_arguments)]
     fn start(
         &mut self,
-        read: bool,
         transfer: u64,
         index: u32,
         region: Region,
@@ -407,16 +383,8 @@ impl<V: Verbs> RdmaChannel<V> {
             let remote = remote_offset
                 .checked_add(delta)
                 .ok_or_else(|| invalid("remote offset overflow"))?;
-            if let Err(error) = self.post(
-                key,
-                piece,
-                read,
-                region,
-                local,
-                length,
-                remote_region,
-                remote,
-            ) {
+            if let Err(error) = self.post(key, piece, region, local, length, remote_region, remote)
+            {
                 self.windows.remove(&key);
                 self.fail(key, error);
                 return Ok(());
@@ -439,29 +407,6 @@ impl<V: Verbs> DataChannel for RdmaChannel<V> {
         remote_offset: u64,
     ) -> io::Result<()> {
         self.start(
-            false,
-            transfer,
-            index,
-            region,
-            offset,
-            len,
-            remote_region,
-            remote_offset,
-        )
-    }
-
-    fn read(
-        &mut self,
-        transfer: u64,
-        index: u32,
-        region: Region,
-        offset: u64,
-        len: u64,
-        remote_region: Region,
-        remote_offset: u64,
-    ) -> io::Result<()> {
-        self.start(
-            true,
             transfer,
             index,
             region,
@@ -524,10 +469,6 @@ impl<V: Verbs> DataChannel for RdmaChannel<V> {
         }
         self.ids.clear();
         Ok(())
-    }
-
-    fn is_rdma(&self) -> bool {
-        true
     }
 }
 
@@ -628,7 +569,6 @@ mod tests {
 
     #[derive(Debug, PartialEq, Eq)]
     struct Post {
-        read: bool,
         id: u64,
         local_key: u32,
         local_offset: u64,
@@ -676,31 +616,6 @@ mod tests {
         ) -> io::Result<()> {
             let mut state = self.state.lock().unwrap();
             state.posts.push(Post {
-                read: false,
-                id,
-                local_key,
-                local_offset,
-                len,
-                remote,
-            });
-            if state.auto_complete {
-                state.completions.push_back((id, Ok(())));
-            }
-            Ok(())
-        }
-
-        fn post_read(
-            &mut self,
-            _transfer: u64,
-            id: u64,
-            local_key: u32,
-            local_offset: u64,
-            len: usize,
-            remote: Remote,
-        ) -> io::Result<()> {
-            let mut state = self.state.lock().unwrap();
-            state.posts.push(Post {
-                read: true,
                 id,
                 local_key,
                 local_offset,
@@ -793,7 +708,6 @@ mod tests {
                 state.posts[1].remote.address,
                 0x1000_0000 + 4096 + PIECE_BYTES as u64
             );
-            assert!(state.posts.iter().all(|post| !post.read));
             state.posts.iter().map(|post| post.id).collect()
         };
         for id in ids {
@@ -908,21 +822,6 @@ mod tests {
         let mut done = Vec::new();
         channel.poll(&mut done).unwrap();
         assert!(done.is_empty());
-    }
-
-    #[test]
-    fn read_posts_the_remote_source_and_local_destination() {
-        let (mut channel, state) = mock();
-        channel
-            .read(6, 1, Region::Arena, 0, 4096, Region::Staging, 8192)
-            .unwrap();
-        let state = state.lock().unwrap();
-        assert_eq!(state.posts.len(), 1);
-        assert!(state.posts[0].read);
-        assert_eq!(state.posts[0].local_key, 1);
-        assert_eq!(state.posts[0].local_offset, 0);
-        assert_eq!(state.posts[0].remote.rkey, 12);
-        assert_eq!(state.posts[0].remote.address, 0x2000_0000 + 8192);
     }
 
     #[test]
