@@ -771,6 +771,68 @@ fn announcements_survive_a_manager_restart_and_the_instances_reconnect() {
     requester.client.close().unwrap();
 }
 
+#[test]
+fn a_restore_through_the_real_manager_still_works_after_the_manager_restarts() {
+    let mut manager = Manager::start();
+    let mut source = instance(&manager, "source", 1);
+    let mut requester = instance(&manager, "requester", 2);
+    source.ready();
+    requester.ready();
+    let history = history();
+    let pages = 4usize;
+    let key = history.key_at(pages as u64 * PT).unwrap();
+    source.client.saved(IndexEntry {
+        key,
+        parent: None,
+        bucket: history.bucket_at(key.consumed_tokens).unwrap(),
+        tail_pages: pages as u32,
+        row: true,
+        tier: Tier::Dram,
+        generation: 11,
+        bytes: (pages * PAGE + ROW) as u64,
+    });
+    let offered = |requester: &Instance| {
+        let ticket = requester.client.begin_lookup(&history, Vec::new());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while matches!(ticket.state(), LookupState::Pending) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        matches!(ticket.state(), LookupState::Ready(a) if !a.candidates.is_empty())
+    };
+    wait("the record to be offered", || offered(&requester));
+    manager.restart();
+    let restarted = Instant::now();
+    wait("the instances to reconnect", || {
+        source.client.status() == PoolStatus::Ready
+            && requester.client.status() == PoolStatus::Ready
+    });
+    assert!(
+        restarted.elapsed() < Duration::from_secs(4),
+        "reconnected {:?} after the restart",
+        restarted.elapsed()
+    );
+    wait("the record to be offered again", || offered(&requester));
+    // Round after round, the restore copies through the regions the restart reused.
+    for round in 0..3u32 {
+        let scratch = [100 + round * 10, 101 + round * 10, 102 + round * 10, 103 + round * 10];
+        let pin = pin_for(key, 11, pages);
+        let fetch = fetch_for(&mut requester, &history, pages, &scratch);
+        requester.client.fetch(fetch).unwrap();
+        let export = source.event("an export request", |e| match e {
+            PoolEvent::Export(request) => Some(request.export),
+            _ => None,
+        });
+        source.client.host_pinned(export, pin);
+        let result = requester.event("the restore", |e| match e {
+            PoolEvent::Fetched { result, .. } => {
+                Some(result.as_ref().map(|b| *b).map_err(|f| f.error.to_string()))
+            }
+            _ => None,
+        });
+        assert_eq!(result, Ok((pages * PAGE + ROW) as u64), "round {round}");
+    }
+}
+
 /// Counts what is registered, and refuses nothing.
 #[derive(Default)]
 pub(crate) struct CountingRegistrar {

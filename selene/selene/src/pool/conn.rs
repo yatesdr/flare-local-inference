@@ -43,7 +43,9 @@ pub(crate) struct Link {
 const HELLO_TIMEOUT: Duration = Duration::from_secs(3);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRST_BACKOFF: Duration = Duration::from_millis(100);
-const MAX_BACKOFF: Duration = Duration::from_secs(5);
+/// A lost manager is tried again at least this often: a restarted one holds its shared memory
+/// until the instances that used it have reconnected, so a slow backoff would stall every one.
+const MAX_BACKOFF: Duration = Duration::from_secs(1);
 const BUSY_TICK: Duration = Duration::from_millis(1);
 const IDLE_TICK: Duration = Duration::from_millis(20);
 const OUTBOUND: usize = 4096;
