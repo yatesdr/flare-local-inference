@@ -945,6 +945,10 @@ impl CompositeStore {
 }
 
 impl HostStore for CompositeStore {
+    fn write_back_reserve(&self, largest_pages: usize, prefill_rate: f64) -> usize {
+        self.memory.write_back_reserve(largest_pages, prefill_rate)
+    }
+
     fn reused(&mut self, key: PrefixKey) {
         self.memory.reused(key);
         self.disk.reused(key);

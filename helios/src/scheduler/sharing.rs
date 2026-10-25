@@ -153,16 +153,21 @@ impl RequestScheduler {
             .sum()
     }
 
-    pub(crate) fn write_back_candidates(&self, next: Option<NextAdmission>) -> Vec<CheckpointId> {
+    pub(crate) fn largest_admission_pages(&self) -> usize {
+        self.admission_pages(self.limits.max_sequence_tokens - 1, 1, true, 0)
+            .min(self.limits.pages as usize)
+    }
+
+    pub(crate) fn write_back_candidates(
+        &self,
+        next: Option<NextAdmission>,
+        reserve: usize,
+    ) -> Vec<CheckpointId> {
         let demand = self.decode_growth_pages()
             + next.map_or(0, |next| {
                 self.admission_pages(next.prompt_tokens, next.max_new_tokens, next.growable, 0)
             });
-        // Keep two copy windows ahead of admission and decode growth.
-        let headroom = crate::offload::slab::WINDOW_PAGES
-            * flare_selene::memory::IN_FLIGHT_WINDOWS
-                .max(crate::offload::disk_store::WINDOWS_IN_FLIGHT);
-        if self.free_pages.len() >= demand + headroom {
+        if self.free_pages.len() >= demand.saturating_add(reserve) {
             return Vec::new();
         }
         let candidates = self.cache.dirty_eviction_candidates();
@@ -170,7 +175,7 @@ impl RequestScheduler {
             return candidates;
         }
         let (backing, _) = self.pending_backing(&self.cache.clean_reclaimable());
-        if backing.into_iter().filter(|free| *free).count() >= demand + headroom {
+        if backing.into_iter().filter(|free| *free).count() >= demand.saturating_add(reserve) {
             return Vec::new();
         }
         candidates

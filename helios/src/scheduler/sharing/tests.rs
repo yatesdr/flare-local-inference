@@ -352,26 +352,26 @@ fn headroom_reserves_the_next_decode_step_of_running_requests() {
 fn pressure_counts_next_admission_decode_growth_and_clean_pages() {
     let mut s = scheduler(2, 129, 4);
     let a = publish(&mut s, &history(1), None, 64, &[128], 0);
-    assert!(s.write_back_candidates(None).is_empty());
+    assert!(s.write_back_candidates(None, 128).is_empty());
     let next = NextAdmission {
         prompt_tokens: 64,
         max_new_tokens: 1,
         growable: true,
     };
-    assert_eq!(s.write_back_candidates(Some(next)), [a]);
+    assert_eq!(s.write_back_candidates(Some(next), 128), [a]);
     s.stored_checkpoint(a).unwrap();
-    assert!(s.write_back_candidates(None).is_empty());
+    assert!(s.write_back_candidates(None, 128).is_empty());
 
     let mut s = scheduler(2, 131, 4);
     let a = publish(&mut s, &history(1), None, 64, &[130], 0);
     let mut request = spec(60, 400);
     request.growable_output = true;
     let handle = s.admit(request).unwrap();
-    assert!(s.write_back_candidates(None).is_empty());
+    assert!(s.write_back_candidates(None, 128).is_empty());
     let request = s.request_mut(handle).unwrap();
     request.phase = RequestPhase::Decode;
     request.scheduled_consumed = 127;
-    assert_eq!(s.write_back_candidates(None), [a]);
+    assert_eq!(s.write_back_candidates(None, 128), [a]);
 }
 
 #[test]
@@ -407,15 +407,15 @@ fn pressure_counts_snapshot_backing_and_retirement_once() {
     // Two clean pages and four shared backing pages cover the watermark only
     // after both rows can be reclaimed.
     s.stored_checkpoint(a).unwrap();
-    assert_eq!(s.write_back_candidates(None), [b, c]);
+    assert_eq!(s.write_back_candidates(None, 128), [b, c]);
     s.stored_checkpoint(b).unwrap();
-    assert!(s.write_back_candidates(None).is_empty());
+    assert!(s.write_back_candidates(None, 128).is_empty());
     s.cache.mark_used(b, Fence(7)).unwrap();
     s.evict(EvictionTarget {
         pages: 0,
         snapshots: 2,
     });
-    assert!(s.write_back_candidates(None).is_empty());
+    assert!(s.write_back_candidates(None, 128).is_empty());
 }
 
 #[test]
@@ -436,4 +436,19 @@ fn a_key_republished_under_a_new_checkpoint_id_can_be_pinned() {
     s.pin_checkpoint(current).unwrap();
     assert!(s.export_chain(current, 0, true).is_some());
     s.unpin_checkpoint(current).unwrap();
+}
+
+#[test]
+fn the_reservoir_covers_the_largest_admissible_request_instead_of_copy_windows() {
+    let mut s = scheduler(2, 1024, 4);
+    s.limits.max_sequence_tokens = 65_536;
+    let largest = s.largest_admission_pages();
+    assert_eq!(largest, 1024);
+    let a = publish(&mut s, &history(1), None, 64, &[0], 0);
+    // More than 128 free pages still leave a whole admissible prompt uncovered.
+    assert_eq!(s.write_back_candidates(None, largest), [a]);
+    s.stored_checkpoint(a).unwrap();
+    assert!(s.write_back_candidates(None, largest).is_empty());
+    s.limits.max_sequence_tokens = 4096;
+    assert_eq!(s.largest_admission_pages(), 64);
 }

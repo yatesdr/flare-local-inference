@@ -1291,6 +1291,11 @@ impl FakeStore {
 }
 
 impl crate::offload::PrefixStore for FakeStore {
+    fn write_back_reserve(&self, largest_pages: usize, _: f64) -> usize {
+        // Lifecycle fixtures use a fixed reservoir; Selene tests exercise its sizing.
+        largest_pages.max(128)
+    }
+
     fn reused(&mut self, key: crate::cache::PrefixKey) {
         self.reused.push(key);
     }

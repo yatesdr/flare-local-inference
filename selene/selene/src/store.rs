@@ -218,6 +218,11 @@ pub trait HostStore {
     /// Copy a checkpoint selected for eviction. Queued retains its GPU pin until
     /// Stored; Present means a committed copy exists; Retry means no room now.
     fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
+    /// Clean pages to keep ahead of pressure, including the largest admission
+    /// and pages consumed while its checkpoint copies out.
+    fn write_back_reserve(&self, largest_pages: usize, _prefill_rate: f64) -> usize {
+        largest_pages
+    }
     /// A request reused this GPU checkpoint: refresh any retained host record.
     fn reused(&mut self, _key: PrefixKey) {}
     /// Copy a looked-up chain into the ticket's ids. An error means no event follows.
@@ -303,6 +308,19 @@ pub trait HostStore {
     }
 }
 
+pub(crate) fn write_back_reserve(
+    largest_pages: usize,
+    layout: &crate::Layout,
+    copy_rate: f64,
+    prefill_rate: f64,
+) -> usize {
+    let bytes =
+        largest_pages as f64 * layout.page_record_bytes as f64 + layout.row_record_bytes as f64;
+    let seconds = bytes / copy_rate.max(1.0);
+    let lead = (seconds * prefill_rate / layout.page_tokens as f64).ceil() as usize;
+    largest_pages.saturating_add(lead)
+}
+
 /// Bytes per second assumed for a tier before its first transfers are measured.
 pub const INITIAL_MEMORY_RATE: f64 = 20e9;
 pub const INITIAL_STAGED_DISK_RATE: f64 = 3e9;
@@ -330,6 +348,18 @@ pub fn worth_transfer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_reserve_covers_admission_and_measured_copy_lead_including_rows() {
+        let layout =
+            crate::Layout::new(&[crate::testing::geometry(64, &[("kv", 4096)], 4096)]).unwrap();
+        // Ten pages and one row take eleven seconds at this measured rate.
+        assert_eq!(write_back_reserve(10, &layout, 4096.0, 128.0), 32);
+        assert_eq!(write_back_reserve(10, &layout, 8192.0, 128.0), 21);
+        assert_eq!(write_back_reserve(10, &layout, 4096.0, 256.0), 54);
+        assert_eq!(write_back_reserve(0, &layout, 4096.0, 128.0), 2);
+        assert_eq!(write_back_reserve(1024, &layout, 1e12, 128.0), 1025);
+    }
 
     #[test]
     fn fetch_policy_compares_transfer_time_with_half_the_prefill_time() {

@@ -2306,6 +2306,15 @@ impl DiskStore {
 }
 
 impl HostStore for DiskStore {
+    fn write_back_reserve(&self, largest_pages: usize, prefill_rate: f64) -> usize {
+        crate::store::write_back_reserve(
+            largest_pages,
+            &self.layout,
+            self.outbound_rate.0,
+            prefill_rate,
+        )
+    }
+
     fn reused(&mut self, key: PrefixKey) {
         self.index.touch(&key);
     }
