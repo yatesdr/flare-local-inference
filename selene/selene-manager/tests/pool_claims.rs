@@ -18,8 +18,8 @@ const GENERATION: u64 = 5;
 
 fn host() -> Host {
     let mut host = Host::dram_only(2 * 1024 * 1024);
-    host.config.pool.limits.pin_deadline_ms = 300;
-    host.config.pool.limits.progress_timeout_ms = 600;
+    host.config.limits.pin_deadline_ms = 300;
+    host.config.limits.progress_timeout_ms = 600;
     host
 }
 
@@ -256,7 +256,7 @@ async fn c1_a_gpu_chain_is_copied_through_retained_windows() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn c1b_small_windows_cut_records_and_carry_the_row_last() {
     let mut w = world_with(v2::Tier::Gpu, &[1024, 2048], |host| {
-        host.config.pool.limits.max_window_bytes = 5 * PAGE_BYTES;
+        host.config.limits.max_window_bytes = 5 * PAGE_BYTES;
     })
     .await;
     w.claim(1, 2048, 0, true).await;
@@ -337,8 +337,8 @@ async fn c2_a_host_tier_claim_larger_than_staging_streams_with_credits() {
     let tokens = [2100 * PAGE_TOKENS];
     let mut w = world_with(v2::Tier::Dram, &tokens, |host| {
         host.config.staging = 8 * 1024 * 1024;
-        host.config.pool.limits.max_window_bytes = 1024 * 1024;
-        host.config.pool.limits.progress_timeout_ms = 5000;
+        host.config.limits.max_window_bytes = 1024 * 1024;
+        host.config.limits.progress_timeout_ms = 5000;
     })
     .await;
     w.claim(1, tokens[0], 0, true).await;
@@ -731,8 +731,8 @@ async fn c17_a_failed_fill_fails_the_claim() {
 async fn a6_a_premature_or_partial_copy_ok_is_refused() {
     let mut w = world_with(v2::Tier::Dram, &[2100 * PAGE_TOKENS], |host| {
         host.config.staging = 8 * 1024 * 1024;
-        host.config.pool.limits.max_window_bytes = 1024 * 1024;
-        host.config.pool.limits.progress_timeout_ms = 5000;
+        host.config.limits.max_window_bytes = 1024 * 1024;
+        host.config.limits.progress_timeout_ms = 5000;
     })
     .await;
     w.claim(1, 2100 * PAGE_TOKENS, 0, true).await;
@@ -773,7 +773,7 @@ async fn granted(w: &mut World, id: u64, upto: u64) -> Partial {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn f1_the_window_order_is_enforced() {
     let mut w = world_with(v2::Tier::Gpu, &[1024], |host| {
-        host.config.pool.limits.max_window_bytes = 4 * PAGE_BYTES;
+        host.config.limits.max_window_bytes = 4 * PAGE_BYTES;
     })
     .await;
     let partial = granted(&mut w, 1, 1024).await;
@@ -1253,8 +1253,8 @@ async fn r10_a_killed_source_fails_its_claims_and_frees_its_windows() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn x5_a_deadline_is_clamped_to_the_managers_limit() {
     let mut w = world_with(v2::Tier::Gpu, &[1024], |host| {
-        host.config.pool.limits.max_claim_deadline_ms = 400;
-        host.config.pool.limits.pin_deadline_ms = 10_000;
+        host.config.limits.max_claim_deadline_ms = 400;
+        host.config.limits.pin_deadline_ms = 10_000;
     })
     .await;
     let candidate = w.candidate(1, 1024).await;

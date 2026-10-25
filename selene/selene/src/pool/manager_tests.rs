@@ -62,7 +62,6 @@ impl HostRegistrar for OkRegistrar {
 
 /// A manager that also listens for instances on other hosts, on loopback.
 struct Network {
-    config: selene_manager::config::Config,
     /// The certificate to trust, when the manager serves TLS.
     ca: Option<PathBuf>,
 }
@@ -131,12 +130,7 @@ impl Manager {
         manager.stop();
         let _ = std::fs::remove_file(&manager.socket);
         let free = free_address;
-        let mut net = selene_manager::config::Config::defaults();
-        net.name = manager.config.name.clone();
-        net.socket = manager.socket.clone();
-        net.socket_explicit = true;
-        net.memory = 16 << 20;
-        net.staging = 8 << 20;
+        let net = &mut manager.config;
         net.listen = Some(free());
         net.listen_data = Some(free());
         net.metrics = Some(free());
@@ -155,7 +149,7 @@ impl Manager {
             net.tls_key = Some(key);
             ca = Some(cert);
         }
-        manager.network = Some(Network { config: net, ca });
+        manager.network = Some(Network { ca });
         manager.run();
         manager
     }
@@ -164,7 +158,7 @@ impl Manager {
     /// manager's metrics.
     fn moved(&self, carrier: &str) -> (u64, u64) {
         use std::io::{Read, Write};
-        let address = self.network.as_ref().unwrap().config.metrics.unwrap();
+        let address = self.config.metrics.unwrap();
         let mut stream = std::net::TcpStream::connect(address).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
@@ -190,7 +184,7 @@ impl Manager {
     /// Where an instance on another host reaches the manager, and the CA it trusts.
     pub(super) fn remote(&self) -> Option<(PoolAddress, Option<PathBuf>)> {
         let network = self.network.as_ref()?;
-        let port = network.config.listen.unwrap().port();
+        let port = self.config.listen.unwrap().port();
         let host = if network.ca.is_some() {
             "localhost"
         } else {
@@ -210,12 +204,8 @@ impl Manager {
     fn run(&mut self) {
         self.stop.store(false, Ordering::Release);
         let (config, stop) = (self.config.clone(), self.stop.clone());
-        let network = self.network.as_ref().map(|n| n.config.clone());
         self.thread = Some(thread::spawn(move || {
-            let result = match network {
-                Some(net) => control::serve(net, config, stop),
-                None => control::run(config, stop),
-            };
+            let result = control::serve(config, stop);
             if let Err(error) = result {
                 eprintln!("manager exited: {error}");
             }

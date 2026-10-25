@@ -165,8 +165,8 @@ impl Host {
         let name = instance_name("host");
         let mut config = Config::new(base.join("records"), base.join("run/m.sock"), memory, nvme);
         config.name = name;
-        config.staging = TEST_STAGING;
-        config.metrics = Some(free_metrics_address());
+        config.staging = TEST_STAGING as u64;
+        config.metrics = Some(free_metrics_address().parse().unwrap());
         Self {
             base,
             config,
@@ -181,9 +181,9 @@ impl Host {
         let name = instance_name("host");
         let mut config = Config::dram_only(base.join("run/m.sock"), memory);
         config.name = name;
-        config.staging = TEST_STAGING;
+        config.staging = TEST_STAGING as u64;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        config.metrics = Some(listener.local_addr().unwrap().to_string());
+        config.metrics = Some(listener.local_addr().unwrap());
         drop(listener);
         Self {
             base,
@@ -196,7 +196,7 @@ impl Host {
 
     pub fn open_config(mut config: Config) -> Self {
         if config.metrics.is_none() {
-            config.metrics = Some(free_metrics_address());
+            config.metrics = Some(free_metrics_address().parse().unwrap());
         }
         let base = config
             .root
@@ -230,7 +230,7 @@ impl Host {
         for attempt in 0..4 {
             if attempt > 0 {
                 // A failed attempt may have lost its metrics port after the probe.
-                self.config.metrics = Some(free_metrics_address());
+                self.config.metrics = Some(free_metrics_address().parse().unwrap());
             }
             match self.try_start() {
                 Ok(()) => {

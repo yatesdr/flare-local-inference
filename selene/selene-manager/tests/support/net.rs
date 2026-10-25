@@ -64,12 +64,7 @@ impl Net {
         let net_name = super::instance_name("net");
         store.name = net_name.clone();
         store_tweak(&mut store);
-        let mut net = NetConfig::defaults();
-        net.name = store.name.clone();
-        net.socket = socket.clone();
-        net.socket_explicit = true;
-        net.memory = 8 * 1024 * 1024;
-        net.staging = 8 << 20;
+        let mut net = store;
         net.listen = Some(address);
         net.listen_data = Some(data);
         tweak(&mut net);
@@ -77,7 +72,7 @@ impl Net {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let thread = thread::spawn(move || {
-            if let Err(error) = control::serve(net, store, flag) {
+            if let Err(error) = control::serve(net, flag) {
                 eprintln!("manager exited: {error}");
             }
         });

@@ -13,7 +13,7 @@ pub const MIN_NVME: u64 = 8192;
 pub const MAX_NAME: usize = 64;
 pub const MAX_SOCKET: usize = 107;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Config {
     pub name: String,
     pub socket: PathBuf,
@@ -35,6 +35,10 @@ pub struct Config {
     /// cannot be combined with TLS.
     pub rdma: bool,
     pub metrics: Option<SocketAddr>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub faults: crate::disk::Faults,
+    #[cfg(any(test, feature = "test-support"))]
+    pub limits: crate::pool::limits::Limits,
 }
 
 impl Default for Config {
@@ -44,6 +48,27 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn new(root: PathBuf, socket: PathBuf, memory: usize, nvme: u64) -> Self {
+        Self {
+            root: Some(root),
+            socket,
+            socket_explicit: true,
+            memory: memory as u64,
+            nvme,
+            staging: crate::store::EMBEDDED_STAGING as u64,
+            ..Self::defaults()
+        }
+    }
+    pub fn dram_only(socket: PathBuf, memory: usize) -> Self {
+        Self {
+            socket,
+            socket_explicit: true,
+            memory: memory as u64,
+            staging: crate::store::EMBEDDED_STAGING as u64,
+            ..Self::defaults()
+        }
+    }
+
     pub fn defaults() -> Self {
         Self {
             name: DEFAULT_NAME.into(),
@@ -59,6 +84,10 @@ impl Config {
             tls_key: None,
             rdma: false,
             metrics: None,
+            #[cfg(any(test, feature = "test-support"))]
+            faults: Default::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            limits: Default::default(),
         }
     }
 

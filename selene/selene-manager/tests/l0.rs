@@ -1678,7 +1678,7 @@ fn streaming_host(staging: usize) -> Host {
         64 * 1024 * 1024,
     );
     config.name = instance_name("staging-oversize");
-    config.staging = staging;
+    config.staging = staging as u64;
     Host::open_config(config)
 }
 
@@ -1979,7 +1979,7 @@ fn l0_67_a_failed_start_releases_the_instance_and_root() {
     config.name = instance_name("failed-start");
     let squatter = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut failed = config.clone();
-    failed.metrics = Some(squatter.local_addr().unwrap().to_string());
+    failed.metrics = Some(squatter.local_addr().unwrap());
     let error = control::run(failed, Arc::new(AtomicBool::new(false)))
         .expect_err("a taken metrics port must fail the start");
     assert_eq!(
@@ -2015,9 +2015,7 @@ fn l0_68_a_tls_error_starts_nothing() {
     local.tls_cert = Some(base.join("missing-cert.pem"));
     local.tls_key = Some(base.join("missing-key.pem"));
     local.listen = Some("127.0.0.1:0".parse().unwrap());
-    let mut store = Config::new(base.join("records"), socket.clone(), 65536, 64 << 20);
-    store.name = local.name.clone();
-    let error = control::serve(local, store, Arc::new(AtomicBool::new(false)))
+    let error = control::serve(local, Arc::new(AtomicBool::new(false)))
         .expect_err("a missing certificate must fail the start");
     assert_eq!(
         error.kind(),
@@ -2044,9 +2042,7 @@ fn l0_68_a_tls_error_starts_nothing() {
     local.tls_cert = Some(cert);
     local.tls_key = Some(key);
     local.listen = Some("127.0.0.1:0".parse().unwrap());
-    let mut store = Config::new(base.join("records"), socket.clone(), 65536, 64 << 20);
-    store.name = local.name.clone();
-    let error = control::serve(local, store, Arc::new(AtomicBool::new(false)))
+    let error = control::serve(local, Arc::new(AtomicBool::new(false)))
         .expect_err("a key that does not match the certificate must fail the start");
     assert!(
         error.to_string().contains("TLS"),

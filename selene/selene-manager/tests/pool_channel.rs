@@ -26,7 +26,7 @@ fn net() -> Net {
     Net::start_with(
         |_| {},
         |store| {
-            store.pool.limits.progress_timeout_ms = 600;
+            store.limits.progress_timeout_ms = 600;
         },
     )
 }
@@ -554,7 +554,7 @@ mod over_rdma {
     fn rdma_net() -> Net {
         Net::start_with(
             |config| config.rdma = true,
-            |store| store.pool.limits.progress_timeout_ms = 600,
+            |store| store.limits.progress_timeout_ms = 600,
         )
     }
 

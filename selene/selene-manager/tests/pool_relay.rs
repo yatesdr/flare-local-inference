@@ -28,9 +28,9 @@ fn net() -> Net {
     Net::start_with(
         |_| {},
         |store| {
-            store.pool.limits.pin_deadline_ms = 600;
-            store.pool.limits.progress_timeout_ms = 600;
-            store.pool.limits.max_window_bytes = 8 * PAGE_BYTES;
+            store.limits.pin_deadline_ms = 600;
+            store.limits.progress_timeout_ms = 600;
+            store.limits.max_window_bytes = 8 * PAGE_BYTES;
         },
     )
 }

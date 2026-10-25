@@ -18,8 +18,7 @@ fn start() -> std::io::Result<()> {
             Ok(())
         }
         Parsed::Run(config) => {
-            let store = control::store_config(&config)?;
-            control::serve(config, store, Arc::new(AtomicBool::new(false)))
+            control::serve(config, Arc::new(AtomicBool::new(false)))
         }
     }
 }

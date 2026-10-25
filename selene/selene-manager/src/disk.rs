@@ -108,7 +108,7 @@ impl Drop for DiskExtent {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Faults {
     pub pause_at: Option<String>,
     pub signal: Option<PathBuf>,
