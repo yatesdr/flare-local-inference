@@ -352,6 +352,7 @@ version = "0.1.0"
 dependencies = [
  "blake2",
  "flare-selene",
+ "flare-selene-manager",
  "hyper-util",
  "ibverbs-sys",
  "libc",

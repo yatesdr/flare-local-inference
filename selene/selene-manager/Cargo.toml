@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [features]
 default = []
+test-support = []
 rdma = ["dep:ibverbs-sys", "flare-selene/rdma"]
 
 [dependencies]
@@ -36,6 +37,7 @@ prost-build = "0.14"
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
+flare-selene-manager = { path = ".", features = ["test-support"] }
 rcgen = { version = "0.14", features = ["pem"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 
