@@ -270,6 +270,7 @@ impl Pool {
                 process_nonce: ident.nonce.to_vec(),
                 export_slots: ident.export_slots,
                 claim_slots: ident.claim_slots,
+                ..Default::default()
             })),
         })
         .await
@@ -703,6 +704,7 @@ impl Session {
             page_xxh3,
             row_xxh3,
             has_row,
+            ..Default::default()
         }))
         .await;
     }
@@ -936,6 +938,7 @@ impl Session {
                 page_xxh3: hashes,
                 row_xxh3: row_hash.unwrap_or(0),
                 has_row: window.row,
+                ..Default::default()
             }))
             .await;
             covered += window.length;

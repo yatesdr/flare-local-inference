@@ -728,6 +728,7 @@ async fn c17_a_failed_fill_fails_the_claim() {
             page_xxh3: vec![],
             row_xxh3: 0,
             has_row: false,
+            ..Default::default()
         }))
         .await;
     let terminal = w.requester.claim_terminal(1).await;

@@ -362,6 +362,7 @@ impl Engine {
             page_xxh3: window.page_xxh3,
             row_xxh3: window.row_xxh3,
             has_row: shape.row,
+            rank_sums: Vec::new(),
         };
         self.window_ready(ready, Some(slot));
     }

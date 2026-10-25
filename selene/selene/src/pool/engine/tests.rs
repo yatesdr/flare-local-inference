@@ -452,6 +452,7 @@ fn ready(rig: &Rig, claim: u64, spec: wire::WindowSpec, seed: u8) -> wire::Windo
         page_xxh3: pages,
         row_xxh3: row.unwrap_or(0),
         has_row: row.is_some(),
+        ..Default::default()
     }
 }
 
@@ -464,6 +465,7 @@ fn granted(claim: u64, fetch: &PoolFetch) -> In {
         channel: None,
         window_credits: 2,
         retained: true,
+        ..Default::default()
     })
 }
 
@@ -844,6 +846,7 @@ fn records_that_do_not_match_the_plan_are_abandoned_after_nothing_was_copied() {
         channel: None,
         window_credits: 2,
         retained: true,
+        ..Default::default()
     }));
     let verdict = pick!(out, CopyResult);
     assert_eq!(verdict[0].outcome, wire::CopyOutcome::CopyAbandoned as i32);
@@ -1050,6 +1053,7 @@ fn grant(claim: u64, records: Vec<wire::Record>, pages: u64, row: bool) -> In {
         channel: None,
         window_credits: 2,
         retained: true,
+        ..Default::default()
     })
 }
 
@@ -1292,6 +1296,7 @@ pub(super) fn export_request(id: u64, reserved: u64) -> In {
         session_incarnation: SESSION,
         reserved_bytes: reserved,
         channel: None,
+        ..Default::default()
     })
 }
 
@@ -1794,6 +1799,7 @@ fn accept(put: u64, first_page: u64, record_bytes: u64) -> In {
         parent: None,
         record_bytes,
         channel: None,
+        ..Default::default()
     })
 }
 
@@ -2037,6 +2043,7 @@ fn a_record_the_manager_sizes_differently_or_a_window_out_of_order_fails_the_put
         parent: Some(super::super::codec::key_to(key(64, 7))),
         record_bytes: record_len(2),
         channel: None,
+        ..Default::default()
     }));
     rig.send(grant_put(8, window(0, 0, 0, 2, true, 0)));
     let jobs = rig.copier.lock().unwrap().submitted.clone();

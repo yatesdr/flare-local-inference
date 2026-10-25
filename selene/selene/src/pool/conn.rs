@@ -492,6 +492,7 @@ async fn establish(engine: &mut Engine, link: &Link) -> std::result::Result<Esta
         instance_name: st.name.clone(),
         scope: Some(super::codec::scope_to(&st.scope)),
         process_nonce: st.nonce.to_vec(),
+        rank_secret: Vec::new(),
         export_slots: if regions.is_some() || dial.is_some() {
             st.export_slots
         } else {

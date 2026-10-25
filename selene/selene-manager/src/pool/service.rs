@@ -14,6 +14,7 @@ use tonic::{Request, Response, Status, Streaming};
 const OUTBOUND: usize = 4096;
 
 type SessionStream = Pin<Box<dyn Stream<Item = Result<ServerMessage, Status>> + Send>>;
+type RankStream = Pin<Box<dyn Stream<Item = Result<v2::RankServerMessage, Status>> + Send>>;
 
 #[derive(Clone)]
 pub struct PoolService {
@@ -29,6 +30,14 @@ impl PoolService {
 #[tonic::async_trait]
 impl Pool for PoolService {
     type SessionStream = SessionStream;
+    type RankStream = RankStream;
+
+    async fn rank(
+        &self,
+        _request: Request<Streaming<v2::RankClientMessage>>,
+    ) -> Result<Response<Self::RankStream>, Status> {
+        Err(Status::unimplemented("rank agents are not attached yet"))
+    }
 
     async fn hello(&self, request: Request<HelloRequest>) -> Result<Response<HelloReply>, Status> {
         let shared = &self.handle.shared;
