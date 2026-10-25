@@ -651,6 +651,11 @@ impl Store {
         )
     }
 
+    /// True while the shared regions are held for the previous run's processes.
+    pub fn held_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.local.held_flag()
+    }
+
     pub fn shm_directory(&self) -> PathBuf {
         self.local.directory().to_path_buf()
     }

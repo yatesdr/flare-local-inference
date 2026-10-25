@@ -211,6 +211,7 @@ pub fn serve(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
         transports: pool_transports(&config),
         channel,
         regions: Some(regions.clone()),
+        held: store.held_flag(),
     };
     let (pool_core, pool_handle, pool_events) = crate::pool::Core::new(
         pool_config,
