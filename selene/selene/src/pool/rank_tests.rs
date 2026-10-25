@@ -71,34 +71,7 @@ fn bytes_of(world: usize, pages: usize) -> Vec<u8> {
         .collect()
 }
 
-/// A host pin over known whole-record bytes, serving the whole-page checksums persisted with
-/// a composite record.
-struct Pin {
-    chain: HostChain,
-    data: Vec<u8>,
-    page: usize,
-    row: usize,
-    sums: Vec<u64>,
-    row_sum: u64,
-}
-
-impl HostPin for Pin {
-    fn chain(&self) -> &HostChain {
-        &self.chain
-    }
-    fn read(&mut self, window: &HostWindow, dst: &mut [u8]) -> Result<Checksums> {
-        let from = window.first_page as usize * self.page;
-        let n = window.page_count as usize * self.page;
-        dst[..n].copy_from_slice(&self.data[from..from + n]);
-        if window.row {
-            dst[n..].copy_from_slice(&self.data[self.data.len() - self.row..]);
-        }
-        Ok(Checksums {
-            pages: self.sums[window.first_page as usize..][..window.page_count as usize].to_vec(),
-            row: window.row.then_some(self.row_sum),
-        })
-    }
-}
+use crate::testing::{BytesPin as Pin, RecordBytes};
 
 fn pin(world: usize, key: PrefixKey, generation: u64, pages: usize) -> Box<dyn HostPin> {
     let (page, row) = whole(world);
@@ -118,11 +91,7 @@ fn pin(world: usize, key: PrefixKey, generation: u64, pages: usize) -> Box<dyn H
             total_pages: pages as u64,
             row: true,
         },
-        data,
-        page,
-        row,
-        sums,
-        row_sum,
+        bytes: RecordBytes { data, sums, row: row_sum, page_bytes: page, row_bytes: row },
     })
 }
 

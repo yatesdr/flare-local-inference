@@ -1371,9 +1371,6 @@ async fn l0_51_rootless_child_that_cannot_fit_beside_its_parent_waits() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l0_52_hold_slots_stay_busy_until_writes_drain() {
-    // With a slow writer, a third window can only be granted after one of
-    // the first two writes completes: the hold slots, not copied buffers,
-    // carry the in-flight windows.
     let base = base("hold-drain");
     let mut config = Config::new(
         base.join("records"),
@@ -1382,20 +1379,89 @@ async fn l0_52_hold_slots_stay_busy_until_writes_drain() {
         4 * 1024 * 1024,
     );
     config.name = instance_name("hold-drain");
-    config.faults.delay_ms = 300;
+    let (gate, entered, release) = selene_manager::disk::IoGate::new();
+    config.faults.io_gate = Some(gate);
     let mut host = Host::open_config(config);
     host.start();
     let mut client = host.client().await;
     let record = key(192 * 64);
-    let data = client.store(record, None).await;
-    assert_eq!(client.grants.len(), 3);
-    assert_eq!(client.fills.len(), 3);
-    assert!(
-        client.grants[2].duration_since(client.fills[1]) >= Duration::from_millis(150),
-        "the third window was granted before a slow write drained"
-    );
+    let (id, start) = client.start_put(record, None).await;
+    let PutStart::Accepted(accept) = start else {
+        panic!("put refused")
+    };
+    let first = accept.first_page as u32;
+    let (header, bytes, _) = content_for(&client.descriptor, record, None, first);
+    let page_bytes = header.page_record_bytes() as usize;
+    for grant in 0..3 {
+        let window = client
+            .session
+            .take(|m| match m {
+                M::PutGrant(g) if g.put_id == id => g.window,
+                _ => None,
+            })
+            .await;
+        let start =
+            header.page_segment as usize + (window.first_page - first) as usize * page_bytes;
+        client
+            .session
+            .shm
+            .as_ref()
+            .unwrap()
+            .write(&window, &bytes[start..start + window.length as usize]);
+        let pages = (window.first_page - first) as usize;
+        let page_xxh3 = (pages..pages + window.page_count as usize)
+            .map(|page| {
+                let at = header.page_segment as usize + page * page_bytes;
+                selene_manager::record::checksum(&bytes[at..at + page_bytes])
+            })
+            .collect();
+        client
+            .session
+            .send(c::M::PutFilled(v2::PutFilled {
+                put_id: id,
+                index: window.index,
+                page_xxh3,
+                row_xxh3: if window.row {
+                    selene_manager::record::checksum(&bytes[header.row_segment as usize..])
+                } else {
+                    0
+                },
+                has_row: window.row,
+                ..Default::default()
+            }))
+            .await;
+        if grant == 1 {
+            // The actor has processed both fills while the first write still owns its slot.
+            client.session.barrier().await;
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(
+                !client
+                    .session
+                    .backlog
+                    .iter()
+                    .any(|m| matches!(m, M::PutGrant(g) if g.put_id == id)),
+                "a third window was granted before a write drained"
+            );
+            release.send(()).unwrap();
+        }
+    }
+    client
+        .session
+        .send(c::M::PutCommit(v2::PutCommit {
+            put_id: id,
+            metadata_offset: 0,
+            metadata: bytes[..header.page_segment as usize].to_vec(),
+        }))
+        .await;
+    client
+        .session
+        .take(|m| match m {
+            M::Stored(stored) if stored.put_id == id => Some(()),
+            _ => None,
+        })
+        .await;
     let fetched = client.fetch(&[record], 0, 192).await;
-    assert_eq!(fetched[0], data);
+    assert_eq!(fetched[0], bytes[header.page_segment as usize..]);
     host.wait(|host| host.gauge("open_ops") == 0);
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2042,8 +2108,8 @@ fn l0_68_a_tls_error_starts_nothing() {
     assert!(!socket.exists(), "nothing was created");
     // A key that does not belong to the certificate is only caught by building the full
     // server configuration, which now happens before anything starts.
-    let good = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let other = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let good = selene_manager::testing::certificate();
+    let other = selene_manager::testing::certificate();
     let cert = base.join("cert.pem");
     let key = base.join("key.pem");
     fs::write(&cert, good.cert.pem()).unwrap();

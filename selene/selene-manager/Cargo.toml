@@ -15,10 +15,11 @@ path = "src/main.rs"
 
 [features]
 default = []
-test-support = []
+test-support = ["dep:rcgen"]
 rdma = ["dep:ibverbs-sys", "flare-selene/rdma"]
 
 [dependencies]
+rcgen = { version = "0.14", features = ["pem"], optional = true }
 flare-selene = { path = "../selene" }
 blake2 = "0.10"
 ibverbs-sys = { version = "0.3.2", optional = true }
