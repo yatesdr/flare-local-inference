@@ -663,6 +663,7 @@ impl Store {
                     header.bucket,
                     header.tail_pages as usize,
                     row,
+                    true,
                     Location {
                         header,
                         memory: None,
@@ -673,7 +674,8 @@ impl Store {
                         retry: Instant::now(),
                         bytes,
                     },
-                )?;
+                )
+                .map_err(|e| invalid(e.to_string()))?;
                 store.charged += bytes;
             }
             store.namespaces.insert(id, namespace);
@@ -2981,6 +2983,7 @@ impl Store {
                         header.bucket,
                         header.tail_pages as usize,
                         true,
+                        true,
                         location,
                     )
                     .is_ok()
@@ -3909,6 +3912,7 @@ impl Store {
                         header.parent,
                         header.bucket,
                         header.tail_pages as usize,
+                        true,
                         true,
                         location,
                     )
@@ -5913,6 +5917,7 @@ mod tests {
                 [0; 16],
                 tail as usize,
                 true,
+                true,
                 Location {
                     header,
                     memory: Some(Arc::new(extent)),
@@ -6024,6 +6029,7 @@ mod tests {
                 parent,
                 [0; 16],
                 tail as usize,
+                true,
                 true,
                 Location {
                     header,
@@ -6186,6 +6192,7 @@ mod tests {
                     parent,
                     [0; 16],
                     1,
+                    true,
                     true,
                     Location {
                         header,
@@ -6383,6 +6390,7 @@ mod tests {
                 [0; 16],
                 1,
                 true,
+                true,
                 Location {
                     header: header.clone(),
                     memory: Some(extent),
@@ -6471,6 +6479,7 @@ mod tests {
                 None,
                 [0; 16],
                 1,
+                true,
                 true,
                 Location {
                     header,
@@ -6704,6 +6713,7 @@ mod tests {
                     header.parent,
                     [0; 16],
                     1,
+                    true,
                     true,
                     Location {
                         header: header.clone(),
