@@ -928,16 +928,18 @@ disabled unless configured. The memory setting includes registered checkpoint
 slabs and ordinary retained CPU inputs; bounded transfer, preprocessing, and
 decoded-source windows are accounted for separately at startup.
 
-`--prefix-cache-pool ADDRESS` (`unix:PATH` or `HOST:PORT`),
-`--prefix-cache-pool-tenant NAME` and `--prefix-cache-pool-ca FILE` share
-checkpoints with other instances through a pool manager. The tenant is optional
-and defaults to `default`. The CA file makes the connection to a `HOST:PORT`
-manager TLS and is the certificate authority the manager's certificate must chain
-to; without it the connection is plaintext, and a manager that declares the other
-setting disables the pool for the process. The tenant and the CA require the pool
-flag. None affects an instance that omits them. They are command-line
-options, forwarded to every rank like the other prefix cache settings, with no
-configuration-file key. See [the pool section](prefix-cache-offload.md#215-sharing-through-a-pool).
+`--prefix-cache-pool ADDRESS` accepts `unix:PATH` for a local socket,
+`HOST:PORT` for TLS, or `plain:HOST:PORT` for explicit plaintext. Network
+addresses require a nonempty host and a port from 1 through 65535; IPv6
+addresses use brackets, for example `[::1]:7000` or `plain:[::1]:7000`.
+`--prefix-cache-pool-tenant NAME` scopes shared checkpoints and defaults to
+`default`. `--prefix-cache-pool-ca FILE` supplies the CA for a TLS manager;
+without it, TLS verifies the manager against the host's trust store. A CA
+cannot be used with a Unix socket or plaintext address. A manager declaring
+a different encryption setting disables the pool for the process. The tenant
+and CA require the pool flag. These command-line options are forwarded to
+every rank and have no configuration-file key. See
+[the pool section](prefix-cache-offload.md#215-sharing-through-a-pool).
 
 ## 4. Derived settings
 
