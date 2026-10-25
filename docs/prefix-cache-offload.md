@@ -912,18 +912,21 @@ without a device, or after one failed RDMA transfer, uses the stream. The remote
 timed by the same probe as the others, through a real put and claim on the manager, and
 ranks by that measurement.
 
-The store measures what each copy level costs, end to end, before ranking them.
-The worker runs that probe only when nothing is running: once at startup,
-before any request is admitted, and again later if the store reports that the
-topology changed (a manager joined or left) and the worker is idle. It lends the
-probe 64 idle page ids and one state slot from the free lists and takes them back
-afterwards, so it allocates nothing on the GPU. The probe blocks the worker for
-a bounded time, which the log line reports; a request that arrives meanwhile
-waits for it. A probe never stops serving. Too few free ids skip the
-measurement, and a failed one leaves the default order; neither is retried.
-If the pool's copier still has copies in flight a second after the probe, the
-ids and the state slot are never returned to the free lists, are counted as
-quarantined capacity in the scheduler's statistics, and the log says how many.
+The store probes each copy level once, after opening and before admission opens.
+It borrows 64 free page ids and one state slot and returns them after the
+probe, allocating nothing on the GPU. Too few free ids skip measurement; a
+failed probe leaves the default order. Neither is retried. If copies have not
+drained a second after the probe, the ids and state slot remain quarantined
+and are counted in scheduler statistics. Startup logs the order and any failure
+or quarantined capacity.
+
+Serving never runs another probe, including after topology changes. Successful
+restores refine each level's order using the median of its last three durations
+per page. A difference within the larger measurement spread keeps the default
+order, and a pinned order always wins. Local parts are timed separately from
+pool claims; failed transfers and row-only restores do not update the ranking.
+The manager also refines source costs from completed claims, weighted by pages,
+and supplies those estimates to the restore planner.
 
 A pooled instance supports a single host. A multi-host package keeps disk-only
 retention, and startup refuses a pool for it.

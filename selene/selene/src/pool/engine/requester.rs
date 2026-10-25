@@ -110,6 +110,7 @@ struct Window {
 }
 
 struct Claim {
+    started: Instant,
     restore: u64,
     part: usize,
     peers: Vec<PeerPart>,
@@ -254,7 +255,6 @@ impl Engine {
     }
 
     fn claim_part(&mut self, now: Instant, restore: u64, index: usize) {
-        let _ = now;
         let Some(run) = self.requester.restores.get_mut(&restore) else {
             return;
         };
@@ -295,6 +295,7 @@ impl Engine {
         self.requester.claims.insert(
             id,
             Claim {
+                started: now,
                 restore,
                 part: index,
                 peers: Vec::new(),
@@ -1054,6 +1055,14 @@ impl Engine {
         if gone {
             // Slots of windows that never reached a release go back with the claim.
             if let Some(mut claim) = self.requester.claims.remove(&id) {
+                if claim.verdict_ok
+                    && let Some(run) = self.requester.restores.get(&restore)
+                    && run.parts[claim.part].copied
+                {
+                    let part = &run.parts[claim.part].fetch.part;
+                    self.shared
+                        .observe_restore(part.level, part.pages, claim.started.elapsed());
+                }
                 for window in claim.windows.values_mut() {
                     if let Some(slot) = window.slot.take() {
                         self.free_slot(slot);

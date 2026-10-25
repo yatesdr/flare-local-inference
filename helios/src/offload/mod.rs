@@ -888,7 +888,7 @@ pub trait PrefixStore {
     fn copies_drained(&self) -> bool {
         true
     }
-    /// Whether the pool's copy levels should be measured (again).
+    /// Whether the pool's startup copy-level probe has not run.
     fn needs_characterization(&self) -> bool {
         false
     }

@@ -346,6 +346,10 @@ impl PoolClient {
         self.shared.set_ranking(ranking);
     }
 
+    pub fn observe_restore(&self, level: Level, pages: usize, elapsed: std::time::Duration) {
+        self.shared.observe_restore(level, pages, elapsed);
+    }
+
     /// Start a lookup for a queued request. Identical prefixes share one wire
     /// lookup. The ticket has no answer when the pool is not ready.
     pub fn begin_lookup(&self, history: &dyn History, held: Vec<HeldRange>) -> LookupTicket {

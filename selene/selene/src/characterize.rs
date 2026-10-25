@@ -1,12 +1,11 @@
 //! The order in which restore sources are preferred.
 //!
 //! The default order is this GPU, a neighbour's GPU, host DRAM, host NVMe, remote
-//! NVMe. At pool startup, and again only when the topology changes, each copy
-//! level is timed end to end through a [`Probe`] at three sizes: three repetitions
-//! each, the median kept, NVMe read cold. The levels are ranked by the time per
-//! page at the typical size. A near tie keeps the default order, a level whose
-//! measurement failed keeps its default position, and an operator-pinned order
-//! overrides the ranking.
+//! NVMe. At pool startup, each copy level is timed end to end through a [`Probe`]
+//! at three sizes: three repetitions each, the median kept, NVMe read cold.
+//! Levels rank by time per page at the typical size. A near tie keeps the
+//! default order. Failed measurements keep their default positions, and a pinned
+//! order wins. Completed restores refine the order without probes.
 //!
 //! This GPU is not a copy and is not measured: unless an operator pins another
 //! order it stays first.
@@ -125,6 +124,8 @@ pub struct Ranking {
     pinned: bool,
     /// How many pages each measured size moved.
     pages: Pages,
+    /// The last three successful restore costs per level, in microseconds per page.
+    observed: [Vec<f64>; 5],
 }
 
 impl Default for Ranking {
@@ -139,11 +140,39 @@ impl Default for Ranking {
                 typical: 16,
                 long: 64,
             },
+            observed: Default::default(),
         }
     }
 }
 
 impl Ranking {
+    /// Refine the order from real restores, preserving the startup cost fits.
+    pub(crate) fn observe(&mut self, level: Level, pages: usize, elapsed: Duration) {
+        if level == Level::ThisGpu || pages == 0 || elapsed.is_zero() {
+            return;
+        }
+        let samples = &mut self.observed[level.index()];
+        if samples.len() == REPETITIONS {
+            samples.remove(0);
+        }
+        samples.push(elapsed.as_secs_f64() * 1e6 / pages as f64);
+        if self.pinned {
+            return;
+        }
+        let mut measured = self.measured;
+        for (index, samples) in self.observed.iter().enumerate() {
+            if samples.len() == REPETITIONS {
+                let mut times = samples.clone();
+                times.sort_by(f64::total_cmp);
+                measured[index].typical = Some(Cost {
+                    us_per_page: times[REPETITIONS / 2],
+                    spread: times[REPETITIONS - 1] - times[0],
+                });
+            }
+        }
+        self.order = rank(&measured);
+    }
+
     /// An order with typical-size costs, for tests of code that consumes a ranking.
     #[cfg(test)]
     pub(crate) fn for_test(order: [Level; 5], us_per_page: &[(Level, f64)]) -> Self {
@@ -290,7 +319,7 @@ fn join(levels: &[Level]) -> String {
     names.join(" > ")
 }
 
-/// Measures the levels and keeps the order until the topology changes.
+/// Measures the levels once at startup.
 pub struct Characterizer {
     pages: Pages,
     pinned: Option<[Level; 5]>,
@@ -320,11 +349,10 @@ impl Characterizer {
         &self.ranking
     }
 
-    /// Measure and rank if this is the first call or `topology` differs from the
-    /// last measured one. Returns whether it measured; the caller then logs
+    /// Measure and rank on the first call only. Returns whether it measured; the caller logs
     /// [`Ranking::log_line`].
     pub fn update(&mut self, topology: Topology, probe: &mut dyn Probe) -> bool {
-        if self.topology == Some(topology) {
+        if self.topology.is_some() {
             return false;
         }
         let mut measured = [Measured::default(); 5];
@@ -336,6 +364,7 @@ impl Characterizer {
             measured,
             pinned: self.pinned.is_some(),
             pages: self.pages,
+            observed: Default::default(),
         };
         self.topology = Some(topology);
         true
@@ -539,6 +568,63 @@ mod tests {
     use Level::*;
 
     #[test]
+    fn observed_restores_rank_by_a_rolling_median_per_page_without_replacing_cost_fits() {
+        let mut ranking = sized(HostDram, [10.0; 3]);
+        let fit = ranking.cost_line(HostDram);
+        for (pages, per_page) in [(2, 30), (16, 10), (64, 12)] {
+            ranking.observe(
+                NeighbourGpu,
+                pages,
+                Duration::from_micros(pages as u64 * per_page),
+            );
+        }
+        // Median 12, spread 20: default order wins the near tie with DRAM at 10.
+        assert_eq!(ranking.order(), &Level::DEFAULT_ORDER);
+        for _ in 0..3 {
+            ranking.observe(NeighbourGpu, 16, Duration::from_micros(16 * 50));
+        }
+        assert_eq!(ranking.order()[1], HostDram);
+        assert_eq!(ranking.cost_line(HostDram), fit);
+        assert_eq!(ranking.observed[NeighbourGpu.index()], [50.0; 3]);
+        // New observations replace the previous window and can reverse the ranking.
+        for _ in 0..3 {
+            ranking.observe(NeighbourGpu, 16, Duration::from_micros(16));
+        }
+        assert_eq!(ranking.order(), &Level::DEFAULT_ORDER);
+    }
+
+    #[test]
+    fn observed_medians_ignore_an_outlier_and_rank_previously_unmeasured_levels() {
+        let mut ranking = Ranking::default();
+        for per_page in [100, 100, 100] {
+            ranking.observe(NeighbourGpu, 2, Duration::from_micros(2 * per_page));
+        }
+        for per_page in [90, 1, 2] {
+            ranking.observe(HostDram, 16, Duration::from_micros(16 * per_page));
+        }
+        // Median 2 and spread 89 are clearly below 100; the mean would not reorder.
+        assert_eq!(ranking.order()[1], HostDram);
+    }
+
+    #[test]
+    fn observations_keep_a_pinned_order_and_ignore_row_only_restores() {
+        let order = vec![ThisGpu, RemoteNvme, HostNvme, HostDram, NeighbourGpu];
+        let mut ranking = Characterizer::new(PAGES, Some(order.clone()))
+            .unwrap()
+            .ranking;
+        for _ in 0..3 {
+            ranking.observe(NeighbourGpu, 16, Duration::from_micros(16));
+            ranking.observe(RemoteNvme, 16, Duration::from_micros(1600));
+        }
+        assert_eq!(ranking.order().to_vec(), order);
+        let before = ranking.clone();
+        ranking.observe(HostDram, 0, Duration::from_micros(1));
+        ranking.observe(HostDram, 16, Duration::ZERO);
+        ranking.observe(ThisGpu, 16, Duration::from_micros(1));
+        assert_eq!(ranking, before);
+    }
+
+    #[test]
     fn ranks_by_the_typical_size() {
         let mut script = Script::fixed(&[
             (NeighbourGpu, 50.0),
@@ -711,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn measures_again_only_when_the_topology_changes() {
+    fn measures_once_even_when_the_topology_changes() {
         let mut script = Script::fixed(&[
             (NeighbourGpu, 1.0),
             (HostDram, 1.0),
@@ -723,8 +809,8 @@ mod tests {
         let calls = script.calls.len();
         assert!(!characterizer.update(Topology(1), &mut script));
         assert_eq!(script.calls.len(), calls);
-        assert!(characterizer.update(Topology(2), &mut script));
-        assert_eq!(script.calls.len(), 2 * calls);
+        assert!(!characterizer.update(Topology(2), &mut script));
+        assert_eq!(script.calls.len(), calls);
     }
 
     #[test]
