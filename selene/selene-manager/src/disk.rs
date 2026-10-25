@@ -108,8 +108,46 @@ impl Drop for DiskExtent {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+pub struct IoGate {
+    armed: AtomicBool,
+    entered: SyncSender<()>,
+    release: std::sync::Mutex<Receiver<()>>,
+}
+#[cfg(any(test, feature = "test-support"))]
+impl IoGate {
+    pub fn new() -> (Arc<Self>, Receiver<()>, SyncSender<()>) {
+        let (entered, ready) = mpsc::sync_channel(1);
+        let (release, proceed) = mpsc::sync_channel(1);
+        (
+            Arc::new(Self {
+                armed: AtomicBool::new(true),
+                entered,
+                release: std::sync::Mutex::new(proceed),
+            }),
+            ready,
+            release,
+        )
+    }
+    fn wait(&self) -> Result<()> {
+        if self.armed.swap(false, Ordering::AcqRel) {
+            self.entered
+                .send(())
+                .map_err(|_| invalid("disk gate observer dropped"))?;
+            self.release
+                .lock()
+                .unwrap()
+                .recv()
+                .map_err(|_| invalid("disk gate released without a signal"))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug, Default)]
 pub struct Faults {
+    pub io_gate: Option<Arc<IoGate>>,
     pub pause_at: Option<String>,
     pub signal: Option<PathBuf>,
     pub disk_full: Option<PathBuf>,
@@ -137,6 +175,9 @@ impl Faults {
         }
     }
     fn before_io(&self) -> Result<()> {
+        if let Some(gate) = &self.io_gate {
+            gate.wait()?;
+        }
         if self.delay_ms > 0 {
             thread::sleep(Duration::from_millis(self.delay_ms));
         }
@@ -873,8 +914,9 @@ mod tests {
         fs::create_dir_all(&base).unwrap();
         let lock = Arc::new(RootLock::acquire(&base.join("root")).unwrap());
         let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (gate, entered, release) = IoGate::new();
         let faults = Faults {
-            delay_ms: 10,
+            io_gate: Some(gate),
             trace: Some(trace.clone()),
             ..Faults::default()
         };
@@ -903,21 +945,32 @@ mod tests {
                     data: ExtentSlice::new(Arc::new(extent), 0, 4096),
                 })
                 .unwrap();
+            if index == 0 {
+                entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
         }
         let mut readers = Vec::new();
         for _ in 0..8 {
-            let reader = reader.clone();
-            let file = file.clone();
-            let extent = arena.allocate(4096).unwrap();
-            readers.push(std::thread::spawn(move || {
-                reader.read(&file, 0, extent).unwrap();
-            }));
+            let (ack, done) = mpsc::sync_channel(1);
+            reader
+                .sender
+                .send(ReadTask {
+                    file: file.clone(),
+                    offset: 0,
+                    buffer: arena.allocate(4096).unwrap(),
+                    ack,
+                })
+                .unwrap();
+            readers.push(done);
         }
+        release.send(()).unwrap();
         for _ in 0..4 {
             worker.receiver.recv().unwrap();
         }
-        for reader in readers {
-            reader.join().unwrap();
+        for done in readers {
+            let (result, buffer) = done.recv_timeout(Duration::from_secs(5)).unwrap();
+            result.unwrap();
+            assert_eq!(buffer.bytes(), bytes.as_slice());
         }
         // The worker records its own service order, so the observation cannot be
         // reordered by reader or completion-receiver scheduling.
@@ -946,10 +999,10 @@ mod tests {
         let base = base("read-priority");
         fs::create_dir_all(&base).unwrap();
         let lock = Arc::new(RootLock::acquire(&base.join("root")).unwrap());
-        // Long enough that enqueueing the read cannot race the first write completing.
+        let (gate, entered, release) = IoGate::new();
         let worker = Worker::start(
             Faults {
-                delay_ms: 2000,
+                io_gate: Some(gate),
                 ..Faults::default()
             },
             lock,
@@ -973,6 +1026,9 @@ mod tests {
                     data: ExtentSlice::new(Arc::new(extent), 0, 4096),
                 })
                 .unwrap();
+            if index == 0 {
+                entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
         }
         worker
             .read_sender
@@ -983,6 +1039,7 @@ mod tests {
                 buffer: arena.allocate(4096).unwrap(),
             })
             .unwrap();
+        release.send(()).unwrap();
         // The write channel holds all eight writes, so the read is enqueued while at most the
         // first write is in flight; it must be the next completion.
         let mut writes_ahead = 0;
