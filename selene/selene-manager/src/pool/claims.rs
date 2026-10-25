@@ -122,23 +122,7 @@ pub struct Channel {
     pub token: [u8; flare_selene::pool::frame::TOKEN_BYTES],
     /// The handler has exited (or never ran) and its connection is closed.
     pub exited: bool,
-    /// When the transfer was stopped, to bound the wait for the handler.
-    pub stopped_at: Option<Instant>,
-    /// The handler did not exit in time: its windows are never reused.
-    pub quarantined: bool,
 }
-
-/// Which of a claim's legs did not exit.
-#[derive(Clone, Copy)]
-enum Which {
-    /// The requester's (false) or the source's (true).
-    Edge(bool),
-    /// A peer rank's, by index into the claim's `mp.legs`.
-    Rank(usize),
-}
-
-/// How long a stopped handler may take to exit before its windows are quarantined.
-const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// What a claim on the manager's store tracks beyond the common state.
 pub struct ManagerGet {
@@ -271,21 +255,17 @@ impl Core {
     pub(super) fn quarantined_bytes(&self) -> u64 {
         let mut total = 0;
         for claim in self.claims.values().filter(|claim| claim.is_terminal()) {
-            let stuck = claim.channel.as_ref().is_some_and(|open| open.quarantined);
+            let stuck = claim.channel.as_ref().is_some_and(|open| !open.exited);
             let stuck_source = claim
                 .source_channel
                 .as_ref()
-                .is_some_and(|open| open.quarantined);
+                .is_some_and(|open| !open.exited);
             let stuck_rank = claim
                 .mp
                 .legs
                 .iter()
-                .any(|leg| !leg.source && leg.ch.quarantined);
-            let stuck_source_rank = claim
-                .mp
-                .legs
-                .iter()
-                .any(|leg| leg.source && leg.ch.quarantined);
+                .any(|leg| !leg.source && !leg.ch.exited);
+            let stuck_source_rank = claim.mp.legs.iter().any(|leg| leg.source && !leg.ch.exited);
             let stuck_source_peer = claim.mp.src.as_ref().is_some_and(|side| {
                 side.peers.iter().any(|peer| {
                     peer.shared
@@ -663,8 +643,6 @@ impl Core {
                 transfer,
                 token,
                 exited: false,
-                stopped_at: None,
-                quarantined: false,
             }),
             Err(error) => {
                 eprintln!("selene: no data-channel token for a claim: {error}");
@@ -817,8 +795,6 @@ impl Core {
                 transfer,
                 token,
                 exited: false,
-                stopped_at: None,
-                quarantined: false,
             }),
             source_channel: None,
             mp: MpState {
@@ -1881,7 +1857,6 @@ impl Core {
             if leg.exited {
                 continue;
             }
-            leg.stopped_at.get_or_insert_with(Instant::now);
             if hub.stop(leg.transfer) {
                 leg.exited = true;
                 quiet.push(leg.transfer);
@@ -2012,7 +1987,6 @@ impl Core {
                             .and_then(|claim| claim.mp.legs.get_mut(leg))
                         {
                             open.ch.exited = true;
-                            open.ch.quarantined = false;
                         }
                         // A leg that ends before the claim is over, with windows it never
                         // read or wrote, fails the claim; one that finished is simply done.
@@ -2044,7 +2018,6 @@ impl Core {
                             .and_then(|claim| claim.channel.as_mut())
                         {
                             open.exited = true;
-                            open.quarantined = false;
                         }
                         self.reclaim(key);
                     }
@@ -2055,7 +2028,6 @@ impl Core {
                             .and_then(|claim| claim.source_channel.as_mut())
                         {
                             open.exited = true;
-                            open.quarantined = false;
                         }
                         // A source that closes its channel before the claim is over has
                         // given up the windows it owed.
@@ -2079,7 +2051,6 @@ impl Core {
                             .and_then(|mp| mp.legs.get_mut(leg))
                         {
                             open.ch.exited = true;
-                            open.ch.quarantined = false;
                         }
                         self.puts_resettle(key);
                     }
@@ -2271,32 +2242,8 @@ impl Core {
         let progress = self.cfg.limits.progress_timeout();
         let mut expire = Vec::new();
         let mut forget = Vec::new();
-        let mut quarantine: Vec<(ClaimKey, Which)> = Vec::new();
         for (key, claim) in &self.claims {
             if claim.is_terminal() {
-                for (leg, source) in [(&claim.channel, false), (&claim.source_channel, true)] {
-                    if let Some(open) = leg {
-                        if !open.exited
-                            && !open.quarantined
-                            && open
-                                .stopped_at
-                                .is_some_and(|at| now.duration_since(at) >= DRAIN_GRACE)
-                        {
-                            quarantine.push((*key, Which::Edge(source)));
-                        }
-                    }
-                }
-                for (index, leg) in claim.mp.legs.iter().enumerate() {
-                    if !leg.ch.exited
-                        && !leg.ch.quarantined
-                        && leg
-                            .ch
-                            .stopped_at
-                            .is_some_and(|at| now.duration_since(at) >= DRAIN_GRACE)
-                    {
-                        quarantine.push((*key, Which::Rank(index)));
-                    }
-                }
                 let peers_settled = claim.mp.passes == 0
                     && claim.mp.legs.iter().all(|leg| leg.ch.exited)
                     && [&claim.mp.req, &claim.mp.src]
@@ -2344,22 +2291,6 @@ impl Core {
             {
                 expire.push((*key, v2::ClaimReason::NoProgress));
             }
-        }
-        for (key, which) in quarantine {
-            // The handler did not exit: it may still touch the claim's windows, so they
-            // stay out of service until the manager exits.
-            if let Some(open) = self.claims.get_mut(&key).and_then(|claim| match which {
-                Which::Edge(true) => claim.source_channel.as_mut(),
-                Which::Edge(false) => claim.channel.as_mut(),
-                Which::Rank(index) => claim.mp.legs.get_mut(index).map(|leg| &mut leg.ch),
-            }) {
-                open.quarantined = true;
-                eprintln!(
-                    "selene: claim {} windows quarantined: its data handler did not exit",
-                    key.2
-                );
-            }
-            self.count("quarantined_total", "kind=\"channel\"");
         }
         for (key, reason) in expire {
             self.finish(key, v2::ClaimState::Failed, reason);
@@ -2777,7 +2708,7 @@ mod tests {
     }
 
     /// A handler whose exit is never seen: the claim's windows stay out of service, are
-    /// counted as quarantined once the grace passes, and return only when the exit is seen.
+    /// counted as quarantined while the handler remains live, and return only when the exit is seen.
     #[tokio::test(flavor = "multi_thread")]
     async fn windows_of_a_handler_that_cannot_be_seen_to_exit_are_quarantined() {
         use crate::{arena::Arena, data::channel::Hub, regions::LocalRegions};
@@ -2821,8 +2752,6 @@ mod tests {
             transfer,
             token,
             exited: false,
-            stopped_at: None,
-            quarantined: false,
         });
         core.channels.insert(transfer, ChanOwner::Claim(key));
         core.finish(key, v2::ClaimState::Failed, v2::ClaimReason::Cancelled);
@@ -2833,19 +2762,6 @@ mod tests {
             Phase::RequesterRead,
             "the handler may still read the window"
         );
-        assert_eq!(
-            core.quarantined_bytes(),
-            0,
-            "not yet: it may still be exiting"
-        );
-        // The grace passes with no exit seen.
-        core.claims
-            .get_mut(&key)
-            .unwrap()
-            .channel
-            .as_mut()
-            .unwrap()
-            .stopped_at = Some(Instant::now() - DRAIN_GRACE - Duration::from_secs(1));
         core.claim_timers(Instant::now());
         assert_eq!(core.quarantined_bytes(), 6 * 4096);
         assert_eq!(core.claims[&key].windows[0].phase, Phase::RequesterRead);
@@ -2899,8 +2815,6 @@ mod tests {
             transfer,
             token,
             exited: false,
-            stopped_at: None,
-            quarantined: false,
         });
         core.channels.insert(transfer, ChanOwner::Source(key));
         core.finish(key, v2::ClaimState::Failed, v2::ClaimReason::Cancelled);
@@ -2909,14 +2823,6 @@ mod tests {
             Phase::SourceWrite,
             "the handler may still write the window"
         );
-        assert_eq!(core.quarantined_bytes(), 0);
-        core.claims
-            .get_mut(&key)
-            .unwrap()
-            .source_channel
-            .as_mut()
-            .unwrap()
-            .stopped_at = Some(Instant::now() - DRAIN_GRACE - Duration::from_secs(1));
         core.claim_timers(Instant::now());
         assert_eq!(core.quarantined_bytes(), 6 * 4096);
         assert_eq!(core.claims[&key].windows[0].phase, Phase::SourceWrite);
@@ -2995,8 +2901,6 @@ mod tests {
                 transfer: 99,
                 token: [0; flare_selene::pool::frame::TOKEN_BYTES],
                 exited: false,
-                stopped_at: None,
-                quarantined: false,
             },
         }];
         claim.manager.as_mut().unwrap().done = true;

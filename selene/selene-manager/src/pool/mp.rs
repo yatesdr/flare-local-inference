@@ -140,8 +140,6 @@ impl Core {
                                 transfer,
                                 token,
                                 exited: false,
-                                stopped_at: None,
-                                quarantined: false,
                             },
                         });
                     }
