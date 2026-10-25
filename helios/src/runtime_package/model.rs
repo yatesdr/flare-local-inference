@@ -198,7 +198,7 @@ pub trait CacheAgreement {
         &mut self,
         offer: crate::offload::shard::PoolOffer,
     ) -> Result<Option<crate::offload::shard::PoolPeers>> {
-        if offer.tenant.is_some() {
+        if offer.enabled {
             return Err(invalid("a multi-host pool requires a rank rendezvous"));
         }
         Ok(None)

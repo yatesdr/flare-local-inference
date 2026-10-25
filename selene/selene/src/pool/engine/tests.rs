@@ -167,10 +167,11 @@ pub(super) fn key(tokens: u64, salt: u8) -> PrefixKey {
 
 fn settings(export_slots: u32) -> Arc<Settings> {
     Arc::new(Settings {
+        pool_name: None,
+        gpu_uuids: vec![[7; 16]],
         instance_id: [9; 16],
         nonce: [5; 16],
         scope: Scope {
-            tenant: "t".into(),
             model_identity: [1; 32],
             layout_fingerprint: [2; 16],
             geometry: Geometry {
@@ -1945,4 +1946,19 @@ fn mutations_after_a_snapshot_cut_follow_its_last_chunk() {
         .unwrap();
     assert!(end < notice);
     assert_eq!(pick!(out, ResyncChunk)[0].entries.len(), 1);
+}
+
+#[test]
+fn pool_names_salt_scope_and_instance_ids_and_cannot_change_on_reconnect() {
+    let mut a = (*settings(2)).clone();
+    let mut b = a.clone();
+    a.bind_pool("one").unwrap();
+    b.bind_pool("two").unwrap();
+    assert_ne!(a.scope_id, b.scope_id);
+    assert_ne!(a.instance_id, b.instance_id);
+    let bound = (a.scope_id, a.instance_id);
+    a.bind_pool("one").unwrap();
+    assert_eq!((a.scope_id, a.instance_id), bound);
+    assert!(a.bind_pool("two").is_err());
+    assert_eq!((a.scope_id, a.instance_id), bound);
 }

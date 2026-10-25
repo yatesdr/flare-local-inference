@@ -5,7 +5,7 @@ pub fn pool_rank_zero(offer: PoolOffer, peers: &mut [RankStream]) -> Result<Opti
     use crate::execution::rendezvous;
     let records = rendezvous::share_records(peers, offer.encode())?;
     // Disabled ranks do not need TCP addresses or a pool connection.
-    let addresses = if offer.tenant.is_some() {
+    let addresses = if offer.enabled {
         peers
             .iter()
             .map(|peer| match peer {

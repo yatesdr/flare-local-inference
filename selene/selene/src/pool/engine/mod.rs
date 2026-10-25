@@ -47,7 +47,10 @@ pub const CLAIM_DEADLINE_MS: u32 = 10_000;
 pub const RESTORE_DEADLINE: Duration = Duration::from_secs(12);
 
 /// What identifies and bounds this process's sessions.
+#[derive(Clone)]
 pub(crate) struct Settings {
+    pub pool_name: Option<String>,
+    pub gpu_uuids: Vec<[u8; 16]>,
     pub instance_id: [u8; 16],
     pub nonce: [u8; 16],
     pub scope: Scope,
@@ -61,6 +64,31 @@ pub(crate) struct Settings {
 }
 
 impl Settings {
+    pub(crate) fn bind_pool(&mut self, name: &str) -> crate::Result<()> {
+        if let Some(bound) = &self.pool_name {
+            if bound != name {
+                return Err(crate::Error::new(
+                    "the manager's pool name changed; restart this instance",
+                ));
+            }
+            return Ok(());
+        }
+        self.scope_id = super::identity::scope_id(
+            name,
+            &self.scope.model_identity,
+            &self.scope.layout_fingerprint,
+            &self.scope.geometry,
+        )?;
+        self.instance_id = super::identity::instance_id(
+            name,
+            &self.scope.model_identity,
+            &self.scope.layout_fingerprint,
+            &self.gpu_uuids,
+        );
+        self.pool_name = Some(name.into());
+        Ok(())
+    }
+
     pub(crate) fn page_record_bytes(&self) -> u64 {
         self.scope.geometry.page_record_bytes
     }

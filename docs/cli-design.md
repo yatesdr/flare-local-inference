@@ -1049,12 +1049,12 @@ decoded-source windows are accounted for separately at startup.
 `HOST:PORT` for TLS, or `plain:HOST:PORT` for explicit plaintext. Network
 addresses require a nonempty host and a port from 1 through 65535; IPv6
 addresses use brackets, for example `[::1]:7000` or `plain:[::1]:7000`.
-`--prefix-cache-pool-tenant NAME` scopes shared checkpoints and defaults to
-`default`. `--prefix-cache-pool-ca FILE` supplies the CA for a TLS manager;
+The manager's `--name` supplies the pool salt for scope and instance identities.
+`--prefix-cache-pool-ca FILE` supplies the CA for a TLS manager;
 without it, TLS verifies the manager against the host's trust store. A CA
 cannot be used with a Unix socket or plaintext address. A manager declaring
-a different encryption setting disables the pool for the process. The tenant
-and CA require the pool flag. These command-line options are forwarded to
+a different encryption setting disables the pool for the process. The CA
+requires the pool flag. These command-line options are forwarded to
 every rank and have no configuration-file key. See
 [the pool section](prefix-cache-offload.md#215-sharing-through-a-pool).
 

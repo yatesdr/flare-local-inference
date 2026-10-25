@@ -90,7 +90,6 @@ impl Manager {
     fn options(&self) -> PoolOptions {
         PoolOptions {
             address: format!("unix:{}", self.config.socket.display()),
-            tenant: "default".into(),
             ca: None,
         }
     }
@@ -326,7 +325,7 @@ fn peer_registration_budget_disables_the_whole_ranked_instance() {
         let peer_registrar = Arc::new(Registrar::default());
         let registered = peer_registrar.clone();
         let offer = |rank| PoolOffer {
-            tenant: Some("default".into()),
+            enabled: true,
             identity: [3; 32],
             layout: [4; 16],
             rank,

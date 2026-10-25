@@ -53,15 +53,13 @@ impl PoolBuilder<'_> {
         } else {
             geometry.to_vec()
         };
-        let scope = pool_scope(&options.tenant, identity, &all_ranks)?;
+        let scope = pool_scope(identity, &all_ranks)?;
         let identity = crate::plan::Identity {
-            tenant: scope.tenant.clone(),
             model: scope.model_identity,
             layout: scope.layout_fingerprint,
         };
         let config = PoolConfig {
             address: pool_address(&options.address)?,
-            tenant: options.tenant.clone(),
             ca: options.ca.clone(),
             scope,
             gpu_uuids: peers

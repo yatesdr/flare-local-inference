@@ -66,6 +66,7 @@ mod staging_tests {
 }
 
 pub struct PoolConfig {
+    pub name: String,
     pub limits: Limits,
     pub encryption: v2::Encryption,
     pub transports: Vec<v2::DataTransport>,
@@ -79,6 +80,7 @@ pub struct PoolConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
+            name: "default".into(),
             limits: Limits::default(),
             encryption: v2::Encryption::Plaintext,
             transports: vec![v2::DataTransport::Tcp],
@@ -90,6 +92,7 @@ impl Default for PoolConfig {
 
 /// What `Hello` reads without asking the actor.
 pub struct Shared {
+    pub name: String,
     pub incarnation: u64,
     pub limits: Limits,
     pub readiness: Mutex<v2::ReadinessInfo>,
@@ -309,6 +312,7 @@ impl Core {
         let euid = unsafe { libc::geteuid() };
         let egid = unsafe { libc::getegid() };
         let shared = Arc::new(Shared {
+            name: cfg.name.clone(),
             incarnation,
             limits: cfg.limits.clone(),
             readiness: Mutex::new(v2::ReadinessInfo::default()),
@@ -537,7 +541,7 @@ impl Core {
         if open.manager_incarnation != self.incarnation {
             return refuse(v2::OpenStatus::StaleManager, self);
         }
-        let Some(scope) = validate_scope(open.scope.as_ref()) else {
+        let Some(scope) = validate_scope(open.scope.as_ref(), &self.cfg.name) else {
             return refuse(v2::OpenStatus::InvalidScope, self);
         };
         let (Ok(instance), Ok(nonce)) = (

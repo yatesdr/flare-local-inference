@@ -172,7 +172,7 @@ fn run_record_job(records: &mut dyn RankRecords, job: &RecordJob) -> Result<Chec
     }
 }
 
-/// What a peer rank's agent is built from. The pool address, CA and tenant are this
+/// What a peer rank's agent is built from. The pool address and CA are this
 /// process's own flags; `scope` is the instance's, identical to rank 0's.
 pub struct AgentConfig {
     pub address: PoolAddress,

@@ -103,7 +103,6 @@ pub(crate) fn notice_to(notice: &Notice) -> wire::Notice {
 
 pub(crate) fn scope_to(scope: &Scope) -> wire::Scope {
     wire::Scope {
-        tenant: scope.tenant.clone(),
         model_identity: scope.model_identity.to_vec(),
         layout_fingerprint: scope.layout_fingerprint.to_vec(),
         geometry: Some(wire::Geometry {

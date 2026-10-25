@@ -112,6 +112,7 @@ impl Pool for PoolService {
         let readiness = *shared.readiness.lock().unwrap();
         Ok(Response::new(HelloReply {
             status: v2::HelloStatus::HelloOk as i32,
+            pool_name: shared.name.clone(),
             protocol: 2,
             manager_incarnation: shared.incarnation,
             encryption: shared.encryption as i32,

@@ -43,7 +43,7 @@ fn whole(world: usize) -> (usize, usize) {
 
 fn scope(world: usize) -> Scope {
     let geometry = ranks(world);
-    Scope::new("t", [7; 32], fingerprint(&geometry), &geometry).unwrap()
+    Scope::new([7; 32], fingerprint(&geometry), &geometry).unwrap()
 }
 
 fn config(manager: &Manager, name: &str, world: usize, gpus: Vec<[u8; 16]>) -> PoolConfig {
@@ -53,7 +53,6 @@ fn config(manager: &Manager, name: &str, world: usize, gpus: Vec<[u8; 16]>) -> P
 fn config_at(address: PoolAddress, name: &str, world: usize, gpus: Vec<[u8; 16]>) -> PoolConfig {
     PoolConfig {
         address,
-        tenant: "t".into(),
         ca: None,
         scope: scope(world),
         gpu_uuids: gpus,
@@ -393,7 +392,6 @@ impl Instance {
 
 fn identity(world: usize) -> Identity {
     Identity {
-        tenant: "t".into(),
         model: [7; 32],
         layout: fingerprint(&ranks(world)),
     }

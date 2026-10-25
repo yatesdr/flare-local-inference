@@ -27,7 +27,6 @@ fn history() -> TestHistory {
 
 fn identity() -> Identity {
     Identity {
-        tenant: "t".into(),
         model: [7; 32],
         layout: [1; 16],
     }

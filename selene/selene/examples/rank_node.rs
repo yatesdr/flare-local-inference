@@ -150,7 +150,7 @@ fn ranks(world: usize) -> Vec<CacheGeometry> {
 
 fn scope(world: usize) -> Scope {
     let g = ranks(world);
-    Scope::new("t", [7; 32], fingerprint(&g), &g).unwrap()
+    Scope::new([7; 32], fingerprint(&g), &g).unwrap()
 }
 
 fn whole(world: usize) -> (usize, usize) {
@@ -302,7 +302,6 @@ fn gpus(world: usize) -> Vec<[u8; 16]> {
 fn config(args: &Args, name: &str, gpus: Vec<[u8; 16]>) -> PoolConfig {
     PoolConfig {
         address: PoolAddress::Unix(args.socket.clone()),
-        tenant: "t".into(),
         ca: None,
         scope: scope(args.world),
         gpu_uuids: gpus,
@@ -439,7 +438,6 @@ fn restore(client: &mut PoolClient, world: usize, history: &TestHistory) {
     }
     let g = ranks(world);
     let identity = Identity {
-        tenant: "t".into(),
         model: [7; 32],
         layout: fingerprint(&g),
     };

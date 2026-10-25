@@ -19,7 +19,7 @@ const POOL: u8 = 11;
 /// Pool agreement before any rank sizes its cache. Disk agreement happens later.
 #[derive(Clone)]
 pub struct PoolOffer {
-    pub tenant: Option<String>,
+    pub enabled: bool,
     pub identity: [u8; 32],
     pub layout: [u8; 16],
     pub rank: usize,
@@ -38,10 +38,9 @@ pub struct PoolPeers {
 impl PoolOffer {
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new(POOL);
-        writer.u8(self.tenant.is_some() as u8);
-        if let Some(tenant) = &self.tenant {
+        writer.u8(self.enabled as u8);
+        if self.enabled {
             writer
-                .text(tenant)
                 .bytes(&self.identity)
                 .bytes(&self.layout)
                 .u32(self.rank as u32)
@@ -59,27 +58,26 @@ impl PoolOffer {
         for (rank, record) in records.iter().enumerate() {
             let mut reader = Reader(record);
             let enabled = reader.u8()?;
-            if enabled > 1 || (enabled == 1) != self.tenant.is_some() {
+            if enabled > 1 || (enabled == 1) != self.enabled {
                 return Err(invalid(format!(
                     "rank {rank} selected different prefix pool settings; configure a pool on every rank or none"
                 )));
             }
             if enabled == 1 {
-                if Some(reader.text()?) != self.tenant.as_deref()
-                    || reader.take(32)? != self.identity
+                if reader.take(32)? != self.identity
                     || reader.take(16)? != self.layout
                     || reader.u32()? as usize != rank
                     || reader.u32()? as usize != self.world
                 {
                     return Err(invalid(format!(
-                        "rank {rank} describes a different pool tenant, identity, cache layout or rank binding"
+                        "rank {rank} describes a different pool identity, cache layout or rank binding"
                     )));
                 }
                 uuids.push(reader.take(16)?.try_into().unwrap());
             }
             reader.end()?;
         }
-        Ok(self.tenant.as_ref().map(|_| uuids))
+        Ok(self.enabled.then_some(uuids))
     }
 }
 

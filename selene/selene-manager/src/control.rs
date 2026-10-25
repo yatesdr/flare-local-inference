@@ -232,6 +232,7 @@ pub fn serve(
     // The pool actor runs on the runtime; its sessions arrive through the gRPC service.
     let (shm, staging_arena, recovered_records) = store.pool_view();
     let pool_config = crate::pool::PoolConfig {
+        name: config.name.clone(),
         limits: pool_settings.limits.clone(),
         encryption: if config.tls_cert.is_some() {
             crate::proto::v2::Encryption::Tls

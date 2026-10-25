@@ -13,7 +13,7 @@ pub struct Descriptor {
     pub fingerprint: [u8; 16],
     pub page_tokens: u64,
     pub ranks: Vec<RankSizes>,
-    pub tenant: String,
+    pub pool_name: String,
 }
 impl Descriptor {
     pub fn matches(&self, header: &Header) -> bool {
@@ -31,13 +31,13 @@ impl Descriptor {
             [0; 16],
             1,
         )?;
-        if self.tenant.len() > 255 {
-            return Err(invalid("tenant exceeds 255 bytes"));
+        if self.pool_name.len() > 255 {
+            return Err(invalid("pool name exceeds 255 bytes"));
         }
         Ok(())
     }
     pub fn namespace_id(&self) -> NamespaceId {
-        namespace_id(&self.identity, &self.fingerprint, &self.tenant)
+        namespace_id(&self.identity, &self.fingerprint, &self.pool_name)
     }
     pub fn name(&self) -> String {
         hex(&self.namespace_id())
@@ -70,13 +70,13 @@ pub fn new_header(
     .map_err(|e| invalid(e.to_string()))
 }
 
-pub fn namespace_id(identity: &[u8; 32], fingerprint: &[u8; 16], tenant: &str) -> NamespaceId {
+pub fn namespace_id(identity: &[u8; 32], fingerprint: &[u8; 16], pool_name: &str) -> NamespaceId {
     let mut hasher = Blake2bVar::new(32).unwrap();
     hasher.update(b"selene-ns-v1");
     hasher.update(identity);
     hasher.update(fingerprint);
-    hasher.update(&[tenant.len() as u8]);
-    hasher.update(tenant.as_bytes());
+    hasher.update(&[pool_name.len() as u8]);
+    hasher.update(pool_name.as_bytes());
     let mut id = [0; 32];
     hasher.finalize_variable(&mut id).unwrap();
     id
@@ -129,7 +129,7 @@ mod tests {
                 planes: vec![4000],
                 row_bytes: 1000,
             }],
-            tenant: "tenant".into(),
+            pool_name: "tenant".into(),
         }
     }
     #[test]

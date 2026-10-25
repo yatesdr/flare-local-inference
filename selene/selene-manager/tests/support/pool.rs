@@ -52,9 +52,8 @@ pub fn boundaries(tokens: u64) -> Vec<v2::PrefixKey> {
     (0..=tokens / 1024).map(|n| pkey(n * 1024)).collect()
 }
 
-pub fn scope_for(tenant: &str, model: u8) -> v2::Scope {
+pub fn scope_for(model: u8) -> v2::Scope {
     v2::Scope {
-        tenant: tenant.into(),
         model_identity: vec![model; 32],
         layout_fingerprint: vec![3; 16],
         geometry: Some(v2::Geometry {
@@ -70,7 +69,7 @@ pub fn scope_for(tenant: &str, model: u8) -> v2::Scope {
 }
 
 pub fn scope() -> v2::Scope {
-    scope_for("tenant", 7)
+    scope_for(7)
 }
 
 pub fn entry(

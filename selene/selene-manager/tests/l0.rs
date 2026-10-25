@@ -313,8 +313,11 @@ fn l0_06_multiprocess_kill_recovery() {
             "{point}"
         );
         assert!(
-            fs::read_dir(config.root.as_ref().unwrap().join(descriptor().name()))
+            fs::read_dir(config.root.as_ref().unwrap())
                 .unwrap()
+                .map(|namespace| namespace.unwrap().path())
+                .filter(|path| path.is_dir())
+                .flat_map(|path| fs::read_dir(path).unwrap())
                 .all(|entry| !entry
                     .unwrap()
                     .file_name()
@@ -1693,7 +1696,7 @@ async fn l0_59_refuses_a_streamed_record_whose_staging_hold_cannot_fit() {
             planes: vec![4000],
             row_bytes: 8 * 1024 * 1024,
         }],
-        tenant: "tenant".into(),
+        pool_name: "tenant".into(),
     };
     let mut host = streaming_host(8 * 1024 * 1024);
     host.start();

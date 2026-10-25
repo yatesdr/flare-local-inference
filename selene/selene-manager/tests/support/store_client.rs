@@ -32,7 +32,6 @@ pub const BUCKET: [u8; 16] = [4; 16];
 
 pub fn scope_of(descriptor: &Descriptor) -> v2::Scope {
     v2::Scope {
-        tenant: descriptor.tenant.clone(),
         model_identity: descriptor.identity.to_vec(),
         layout_fingerprint: descriptor.fingerprint.to_vec(),
         geometry: Some(v2::Geometry {
@@ -209,10 +208,11 @@ pub fn expected_bytes(granted: &v2::ClaimGranted, page_bytes: u64, row_bytes: u6
 impl Client {
     pub async fn connect(
         config: &Config,
-        descriptor: Descriptor,
+        mut descriptor: Descriptor,
     ) -> std::result::Result<Self, String> {
         let serial = CLIENTS.fetch_add(1, Ordering::Relaxed) + 1;
         let mut pool = Pool::connect(&config.socket).await;
+        descriptor.pool_name = pool.hello.pool_name.clone();
         let mut ident = Ident::new(&format!("l0-{serial}"));
         let mut id = [0u8; 16];
         id[..4].copy_from_slice(&std::process::id().to_le_bytes());

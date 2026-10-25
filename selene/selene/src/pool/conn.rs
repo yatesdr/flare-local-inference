@@ -76,6 +76,12 @@ pub(crate) fn check_hello(
             wire::Encryption::try_from(reply.encryption)
         ));
     }
+    if reply.pool_name.is_empty()
+        || reply.pool_name.len() > 255
+        || reply.pool_name.chars().any(char::is_control)
+    {
+        return Err("the manager returned an invalid pool name".into());
+    }
     super::limits::validate(reply.limits)?;
     Ok(())
 }
@@ -455,6 +461,12 @@ async fn establish(engine: &mut Engine, link: &Link) -> std::result::Result<Esta
     if let Err(reason) = check_hello(&hello, connected_with) {
         return Err(Attempt::Disabled(reason));
     }
+    Arc::make_mut(&mut engine.st)
+        .bind_pool(&hello.pool_name)
+        .map_err(|error| Attempt::Disabled(error.to_string()))?;
+    if let Some(ranks) = &mut engine.ranks {
+        ranks.bind(engine.st.instance_id);
+    }
     let (regions, dial) = match attach(engine, link, &hello) {
         Ok(memory) => memory,
         Err(attempt) => return Err(attempt),
@@ -815,11 +827,25 @@ mod tests {
         encryption: wire::Encryption,
     ) -> wire::HelloReply {
         wire::HelloReply {
+            pool_name: "test".into(),
             limits: Some(super::super::limits::wire_defaults()),
             status: status as i32,
             protocol,
             encryption: encryption as i32,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hello_requires_a_valid_pool_name() {
+        let mut hello = reply(
+            wire::HelloStatus::HelloOk,
+            PROTOCOL,
+            wire::Encryption::Plaintext,
+        );
+        for name in [String::new(), "x".repeat(256), "bad\nname".into()] {
+            hello.pool_name = name;
+            assert!(check_hello(&hello, wire::Encryption::Plaintext).is_err());
         }
     }
 

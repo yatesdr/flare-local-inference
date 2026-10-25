@@ -32,7 +32,6 @@ pub struct Geometry {
 /// What a session may share. Records are shared only between identical scopes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Scope {
-    pub tenant: String,
     pub model_identity: [u8; 32],
     pub layout_fingerprint: [u8; 16],
     pub geometry: Geometry,
@@ -43,14 +42,12 @@ impl Scope {
     /// element per rank, under `layout_fingerprint` (see
     /// [`crate::geometry::fingerprint`] and `shard_fingerprint`).
     pub fn new(
-        tenant: impl Into<String>,
         model_identity: [u8; 32],
         layout_fingerprint: [u8; 16],
         geometry: &[CacheGeometry],
     ) -> Result<Self> {
         let layout = Layout::new(geometry)?;
         Ok(Self {
-            tenant: tenant.into(),
             model_identity,
             layout_fingerprint,
             geometry: Geometry {
@@ -121,33 +118,33 @@ impl Geometry {
 }
 
 /// The scope id: BLAKE2b-256 over `"selene-scope-v2"`, the model identity (32
-/// bytes), the layout fingerprint (16 bytes), the tenant as one length byte
-/// then its bytes, and [`Geometry::canonical`]. Fails for a tenant longer
+/// bytes), the layout fingerprint (16 bytes), the pool name as one length byte
+/// then its bytes, and [`Geometry::canonical`]. Fails for a pool name longer
 /// than 255 bytes.
 pub fn scope_id(
-    tenant: &str,
+    pool_name: &str,
     model_identity: &[u8; 32],
     layout_fingerprint: &[u8; 16],
     geometry: &Geometry,
 ) -> Result<[u8; 32]> {
     let length =
-        u8::try_from(tenant.len()).map_err(|_| Error::new("tenant longer than 255 bytes"))?;
+        u8::try_from(pool_name.len()).map_err(|_| Error::new("pool name longer than 255 bytes"))?;
     let mut hash = Blake2b::<U32>::new();
     hash.update(b"selene-scope-v2");
     hash.update(model_identity);
     hash.update(layout_fingerprint);
     hash.update([length]);
-    hash.update(tenant.as_bytes());
+    hash.update(pool_name.as_bytes());
     hash.update(geometry.canonical());
     Ok(hash.finalize().into())
 }
 
 /// The instance id: BLAKE2b-128 over `"selene-instance-v2"`, then each of the
-/// tenant, the model identity, the layout fingerprint and the GPU UUIDs in
+/// pool_name, the model identity, the layout fingerprint and the GPU UUIDs in
 /// ascending byte order, every one preceded by its length as `u32`. Stable
 /// across restarts; the order the UUIDs are given in does not matter.
 pub fn instance_id(
-    tenant: &str,
+    pool_name: &str,
     model_identity: &[u8; 32],
     layout_fingerprint: &[u8; 16],
     gpu_uuids: &[[u8; 16]],
@@ -158,7 +155,7 @@ pub fn instance_id(
         hash.update((bytes.len() as u32).to_le_bytes());
         hash.update(bytes);
     };
-    field(tenant.as_bytes());
+    field(pool_name.as_bytes());
     field(model_identity);
     field(layout_fingerprint);
     let mut uuids = gpu_uuids.to_vec();
@@ -252,7 +249,7 @@ mod tests {
             geometry(64, &[("k", 8192), ("v", 100)], 5000),
             geometry(64, &[("k", 8192), ("v", 100)], 5000),
         ];
-        let scope = Scope::new("t", [1; 32], fingerprint(&ranks), &ranks).unwrap();
+        let scope = Scope::new([1; 32], fingerprint(&ranks), &ranks).unwrap();
         let layout = Layout::new(&ranks).unwrap();
         assert_eq!(scope.geometry.page_record_bytes, layout.page_record_bytes);
         assert_eq!(scope.geometry.row_record_bytes, layout.row_record_bytes);

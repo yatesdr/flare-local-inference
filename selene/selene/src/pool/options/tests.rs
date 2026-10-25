@@ -20,14 +20,13 @@ fn pool_addresses_select_the_explicit_transport() {
 }
 
 #[test]
-fn the_pool_scope_follows_the_record_layout_and_names_the_tenant() {
+fn the_pool_scope_follows_the_record_layout_and_matches_the_model() {
     let geometry = vec![
         crate::testing::geometry(64, &[("k", 4096), ("v", 5000)], 4096),
         crate::testing::geometry(64, &[("k", 4096), ("v", 5000)], 4096),
     ];
     let layout = Layout::new(&geometry).unwrap();
-    let scope = pool_scope("acme", [9; 32], &geometry).unwrap();
-    assert_eq!(scope.tenant, "acme");
+    let scope = pool_scope([9; 32], &geometry).unwrap();
     assert_eq!(scope.model_identity, [9; 32]);
     assert_eq!(scope.layout_fingerprint, geometry::fingerprint(&geometry));
     assert_eq!(scope.geometry.page_record_bytes, layout.page_record_bytes);

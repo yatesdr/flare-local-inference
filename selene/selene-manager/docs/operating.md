@@ -16,8 +16,8 @@ upgrades for `selene`. The wire contract is [PROTOCOL.md](../PROTOCOL.md) and
 - **Instances configure only their private tiers plus the pool address.** Each Flare instance
   keeps its own DRAM and NVMe settings for its private tiers and adds
   `--prefix-cache-pool <address>` (`unix:/path` for a manager on the same host, `host:port` for
-  a remote one) and `--prefix-cache-pool-tenant`. Everything shared, the index, holds, windows,
-  the manager's own store and the network, lives in the manager.
+  a remote one). The manager's `--name` supplies the identity salt. Everything shared,
+  the index, holds, windows, the manager's own store and the network, lives in the manager.
 - **Never put the manager behind a load balancer.** A session is stateful: the index entries an
   instance announced, the claims in flight and the windows granted to it all live in the one
   manager process it is connected to. A balancer that spreads instances over several managers
@@ -75,10 +75,9 @@ a crash the manager keeps the regions out of service until each process that had
 reconnected or exited (PROTOCOL.md 8.6). The files outlive a stopped manager and keep their
 memory: remove `/dev/shm/selene/<name>` to give it back.
 
-Tenancy separates keys, not memory: every instance with shared memory maps the same arena and
-staging files, so any of them can read another tenant's mapped bytes. Tenants are not a security
-boundary on one host. When tenants must not see each other's data, give each trust boundary its
-own uid (with distinct manager names) or its own host.
+Pool names isolate key namespaces. Instances of one pool map its shared arena and
+staging files. Processes running under the same uid can read other pools' files.
+Give each trust boundary its own uid (with distinct manager names) or its own host.
 
 ### The manager's network card is the pool's aggregate bandwidth
 
@@ -253,7 +252,7 @@ until restarted. `--name`, `--socket`, `--listen`, `--listen-data` and the TLS f
 
 The root holds one opaque 64-hex directory per scope plus `.lock` and `instances`. Remove a scope
 directory to drop that model's durable records, or all of them to clear the pool, only while the
-manager is stopped. A changed model identity, layout fingerprint or tenant is a different scope, so
+manager is stopped. A changed model identity, layout fingerprint or pool name is a different scope, so
 the old directory is safe to delete and cannot be reused by accident.
 
 ## Troubleshooting

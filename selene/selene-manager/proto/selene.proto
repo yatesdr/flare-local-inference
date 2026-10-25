@@ -29,7 +29,7 @@
 //   instance_id          16 bytes, STABLE across restarts. Derived by
 //                        `selene::pool::instance_id` (crate `flare-selene`,
 //                        src/pool/identity.rs), which documents the byte layout:
-//                        BLAKE2b-128 over "selene-instance-v2", then the tenant,
+//                        BLAKE2b-128 over "selene-instance-v2", then the pool name,
 //                        the model identity, the layout fingerprint and the GPU
 //                        UUIDs in ascending byte order, each preceded by its
 //                        length as a little-endian u32. Instances on one host use
@@ -100,8 +100,7 @@ message Geometry {
 // What a session may share. Records are only ever shared between sessions with
 // byte-identical scopes. A manager keeps one index per scope_id.
 message Scope {
-  // The organisation or deployment partition. Non-empty. Nothing crosses tenants.
-  string tenant = 1;
+  reserved 1;
   // 32-byte model package identity (weights, recipe and tokenizer).
   bytes model_identity = 2;
   // 16-byte fingerprint of the cache layout (page size, plane order, dtype).
@@ -113,7 +112,7 @@ message Scope {
 }
 // scope_id is derived by `selene::pool::scope_id` (crate `flare-selene`,
 // src/pool/identity.rs), which documents the byte layout: BLAKE2b-256 over
-// "selene-scope-v2", the model identity, the layout fingerprint, the tenant as one
+// "selene-scope-v2", the model identity, the layout fingerprint, the pool name as one
 // length byte then its bytes, and the canonical bytes of `geometry` (all integers
 // little-endian). The manager calls that function from the same crate and
 // SessionOpened echoes its value; the client must compare it with its own.
@@ -211,6 +210,7 @@ message HelloReply {
   // 16 bytes identifying the manager's host. An instance-sourced candidate is
   // offered to a requester only if both sessions have `shared_memory`.
   bytes host_id = 9;
+  string pool_name = 10;
 }
 
 // Every limit is enforced by the manager. A request beyond a limit is refused
@@ -405,7 +405,7 @@ enum OpenStatus {
   OPEN_STATUS_UNSPECIFIED = 0;
   OPEN_OK = 1;
   STALE_MANAGER = 2;     // manager_incarnation does not match.
-  INVALID_SCOPE = 3;     // malformed scope or geometry (sizes not multiples of 4096, empty tenant).
+  INVALID_SCOPE = 3;     // malformed scope or geometry (sizes not multiples of 4096).
   SHUTTING_DOWN = 4;
 }
 
@@ -1073,8 +1073,8 @@ message PutFilled {
 // the rest is the padded checksum segment (the persisted checksums later served
 // to requesters). Sent once, after every window is filled; after it the put runs
 // to Stored or PutRefused. Before indexing, the manager MUST validate the
-// metadata against the accepted geometry, the scope identity (model, layout
-// fingerprint, tenant), the accepted parent and first page, the byte length, and
+// metadata against the accepted geometry, model identity and layout fingerprint,
+// the accepted parent and first page, the byte length, and
 // the checksums it verified over the received payload; any mismatch is
 // PutRefused{INVALID}.
 message PutCommit {
