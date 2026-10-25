@@ -820,10 +820,10 @@ length, the frames are unchanged, and the channel is the stream carrier (an RDMA
 scatters through bounded packed staging, 13.5).
 
 **13.1 Attachment.** `RankAttach{manager_incarnation, instance_id, rank0_nonce, rank,
-agent_nonce, rank_secret, drain_only}`. The manager checks the incarnation (`RANK_STALE_MANAGER`),
+agent_nonce, rank_secret}`. The manager checks the incarnation (`RANK_STALE_MANAGER`),
 a live session of that instance run by that process (`RANK_NO_SESSION`: retry), the secret in
 constant time (`RANK_BAD_SECRET`), the rank (`RANK_BAD_RANK`), and that a channel-mode agent has a
-data listener to reach (`RANK_MIXED_MODE`). It assigns a generation from the session counter.
+data listener to reach (`RANK_NO_DATA_LISTENER`). It assigns a generation from the session counter.
 Claims, exports and puts of the instance, and claims naming it as a source, are refused
 `RANKS_DETACHED` (put `PUT_NOT_READY`) unless every rank 1..W-1 is attached and not drain-only. A
 new attachment of a rank supersedes the live one, which stays a drain-only party; the same
@@ -840,9 +840,9 @@ is the rank's own `Done` to rank 0, and rank 0 releases nothing and reports noth
 rank's.
 
 **13.3 Drain-only attachments.** When rank 0's session ends its agents are not closed: they can
-be granted nothing, and an agent whose stream broke may attach again with `drain_only` and the
-old secret, against retained obligations only, to attest and say goodbye. After a manager
-restart all obligations are gone with the old regions.
+be granted nothing, but their existing streams can attest and say goodbye. A new attachment
+requires a live rank-0 session. Stream loss retains shared-window obligations until the
+process exits. After a manager restart all obligations are gone with the old regions.
 
 **13.4 Windows and checksums.** A multi-process source states, per rank, slice transfer
 checksums (`RankSums`): rank 0's `WindowFilled.rank_sums`/`PutFilled.rank_sums` for itself and

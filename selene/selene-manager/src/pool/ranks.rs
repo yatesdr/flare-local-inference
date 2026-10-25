@@ -49,12 +49,6 @@ impl Agent {
     }
 }
 
-/// What is remembered of a rank-0 session after it ended, to let its agents drain.
-pub(super) struct Retained {
-    pub secret: [u8; 32],
-    pub since: Instant,
-}
-
 /// Constant-time equality of two secrets.
 fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
@@ -104,37 +98,26 @@ impl Core {
         ) else {
             return self.rank_refuse(&tx, S::RankBadRank);
         };
-        // The secret is checked against the live session's, or, to drain, against what was
-        // kept of an ended one.
-        let live = self.rank0_session(instance, rank0);
-        let (secret, world) = match live {
-            Some(sid) => {
-                let ranks = self.sessions[&sid].ranks.clone().expect("checked");
-                (ranks.secret, ranks.world)
-            }
-            None if attach.drain_only => match self.retained.get(&(instance, rank0)) {
-                Some(retained) => (retained.secret, u32::MAX),
-                None => return self.rank_refuse(&tx, S::RankDrainOnlyRefused),
-            },
-            None => return self.rank_refuse(&tx, S::RankNoSession),
+        let Some(sid) = self.rank0_session(instance, rank0) else {
+            return self.rank_refuse(&tx, S::RankNoSession);
         };
+        let ranks = self.sessions[&sid].ranks.as_ref().expect("checked");
+        let (secret, world) = (ranks.secret, ranks.world);
         if !same(&secret, &attach.rank_secret) {
             return self.rank_refuse(&tx, S::RankBadSecret);
         }
         if attach.rank == 0 || attach.rank >= world {
             return self.rank_refuse(&tx, S::RankBadRank);
         }
-        let drain_only = live.is_none();
         let shm_capable = peer.unix && peer.uid == self.euid && peer.gid == self.egid;
-        let rank0_shm = live.is_some_and(|sid| self.sessions[&sid].shm);
-        let mode = if shm_capable && (rank0_shm || drain_only) {
-            // A drain-only agent is granted nothing; the mode only says what it may still hold.
+        let rank0_shm = self.sessions[&sid].shm;
+        let mode = if shm_capable && rank0_shm {
             v2::RankMode::RankShared
         } else {
             v2::RankMode::RankChannel
         };
-        if mode == v2::RankMode::RankChannel && self.cfg.channel.is_none() && !drain_only {
-            return self.rank_refuse(&tx, S::RankMixedMode);
+        if mode == v2::RankMode::RankChannel && self.cfg.channel.is_none() {
+            return self.rank_refuse(&tx, S::RankNoDataListener);
         }
 
         // A new attachment of this rank supersedes the live one: that one stays here as a
@@ -188,7 +171,7 @@ impl Core {
                 rank: attach.rank,
                 nonce,
                 mode,
-                drain_only,
+                drain_only: false,
                 tx: tx.clone(),
                 goodbye: None,
                 overflowed: false,
@@ -282,7 +265,7 @@ impl Core {
     }
 
     /// Rank 0's session ended: its agents drain and nothing new is granted to them.
-    pub(super) fn rank0_lost(&mut self, instance: InstanceId, rank0: Nonce, secret: [u8; 32]) {
+    pub(super) fn rank0_lost(&mut self, instance: InstanceId, rank0: Nonce) {
         let live: Vec<u64> = self
             .agents
             .values()
@@ -296,13 +279,6 @@ impl Core {
                 "rank 0 is gone",
             );
         }
-        self.retained.insert(
-            (instance, rank0),
-            Retained {
-                secret,
-                since: Instant::now(),
-            },
-        );
     }
 
     /// Whether every peer rank of the multi-process session `sid` is attached and live.
@@ -321,18 +297,6 @@ impl Core {
                     && !a.drain_only
             })
         })
-    }
-
-    /// Forgets what was kept of ended rank-0 sessions once no agent can still drain.
-    pub(super) fn prune_retained(&mut self) {
-        let now = Instant::now();
-        let agents = &self.agents;
-        self.retained.retain(|(instance, rank0), kept| {
-            now.duration_since(kept.since) < std::time::Duration::from_secs(600)
-                || agents
-                    .values()
-                    .any(|a| a.instance == *instance && a.rank0 == *rank0)
-        });
     }
 
     /// Agents that stopped being able to write to their outbound queue are closed.
@@ -449,7 +413,6 @@ mod tests {
             rank,
             agent_nonce: vec![nonce; 16],
             rank_secret: SECRET.to_vec(),
-            drain_only: false,
             name: "agent".into(),
         }
     }
@@ -596,7 +559,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn when_rank_zero_ends_its_agents_only_drain_and_may_reattach_to_do_so() {
+    async fn when_rank_zero_ends_existing_agents_only_drain_and_new_attachments_are_refused() {
         let mut core = core();
         let me = unix(&core);
         let sid = open_rank0(&mut core, 2, RANK0, me);
@@ -604,28 +567,10 @@ mod tests {
         let aid = aid.unwrap();
         core.session_lost(sid);
         assert!(core.agents[&aid].drain_only);
-        assert!(core.retained.contains_key(&(INSTANCE, RANK0)));
-        // A new attach without the drain-only flag has no session to join.
+        // The existing stream may drain, but a new attachment needs a live session.
         assert_eq!(
             status(&join(&mut core, attach(1, 4), me).1),
             S::RankNoSession
-        );
-        // A drain-only one is accepted, with the old secret, and is granted nothing.
-        let mut drain = attach(1, 1);
-        drain.drain_only = true;
-        let (again, got) = join(&mut core, drain, me);
-        assert_eq!(status(&got), S::RankOk);
-        assert!(core.agents[&again.unwrap()].drain_only);
-        let mut wrong = attach(1, 1);
-        wrong.drain_only = true;
-        wrong.rank_secret = vec![0; 32];
-        assert_eq!(status(&join(&mut core, wrong, me).1), S::RankBadSecret);
-        let mut unknown = attach(1, 1);
-        unknown.drain_only = true;
-        unknown.rank0_nonce = vec![6; 16];
-        assert_eq!(
-            status(&join(&mut core, unknown, me).1),
-            S::RankDrainOnlyRefused
         );
     }
 
@@ -659,7 +604,7 @@ mod tests {
         // No data listener: a network agent cannot be served.
         assert_eq!(
             status(&join(&mut core, attach(1, 1), tcp()).1),
-            S::RankMixedMode
+            S::RankNoDataListener
         );
         // A short secret, or one rank only, is an invalid scope.
         let (tx, mut rx) = mpsc::channel(4);

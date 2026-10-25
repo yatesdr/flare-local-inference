@@ -5,7 +5,7 @@ use super::{
     claims::{Claim, ClaimKey},
     index::{InstanceId, ScopeIndex, SourceId},
     limits::Limits,
-    ranks::{Agent, Ranks, Retained},
+    ranks::{Agent, Ranks},
     store_bridge::{CatalogFeed, Link, PutKey, PutRec, StoreHandle},
     validate_scope,
 };
@@ -240,8 +240,6 @@ pub struct Core {
     pub(super) procs: HashMap<ProcKey, Proc>,
     /// Attached peer ranks of multi-process instances, by attachment id.
     pub(super) agents: HashMap<u64, Agent>,
-    /// What ended rank-0 sessions leave so their agents can still drain.
-    pub(super) retained: HashMap<ProcKey, Retained>,
     /// A session of this process is being replaced by another of the same process.
     pub(super) reconnecting: Option<ProcKey>,
     pub(super) scopes: HashMap<ScopeId, ScopeState>,
@@ -328,7 +326,6 @@ impl Core {
             instances: HashMap::new(),
             procs: HashMap::new(),
             agents: HashMap::new(),
-            retained: HashMap::new(),
             reconnecting: None,
             scopes: HashMap::new(),
             claims: HashMap::new(),
@@ -683,11 +680,8 @@ impl Core {
         }
         self.session_claims_lost(sid, &session);
         self.puts_lost(&session);
-        if let Some(ranks) = &session.ranks
-            && is_current
-            && self.reconnecting != Some(proc_key)
-        {
-            self.rank0_lost(session.instance, session.nonce, ranks.secret);
+        if session.ranks.is_some() && is_current && self.reconnecting != Some(proc_key) {
+            self.rank0_lost(session.instance, session.nonce);
         }
         self.update_readiness();
     }
@@ -826,7 +820,6 @@ impl Core {
         self.poll_exits();
         self.lookup_pass();
         self.claim_timers(now);
-        self.prune_retained();
         self.prune_procs();
         self.update_readiness();
         self.refresh_metrics();
