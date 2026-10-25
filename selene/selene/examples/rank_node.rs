@@ -6,15 +6,14 @@
 //! ```text
 //! rank_node source --socket PATH --world W
 //! rank_node rank0  --socket PATH --world W
-//! rank_node agent  --socket PATH --world W --rank R --link HOST:PORT [--stall-ms N]
+//! rank_node agent  --socket PATH --world W --rank R --link HOST:PORT [--hold-copy true]
 //! ```
 //!
 //! Rank 0 listens for its agents' links on a loopback port and prints `link-port N`. Each node
 //! prints `ready` once it can serve and then answers its commands, one per line: `restore`
 //! (rank 0: restore the source's record), `verify` (check this rank's slice of what was
-//! restored), `poll` (rank 0: say whether the pool still accounts for its transfers) and
-//! `quit`. Results come back as `fetched ok N`, `fetched err WHY`, `verify ok`, `poll ok` and
-//! `poll err`.
+//! restored), `poll` (rank 0: report transfer health), `release` (agent: release held copies),
+//! and `quit`. Results are `fetched ok N`, `fetched err WHY`, `verify ok`, `poll ok`, and `poll err`.
 
 use std::{
     io::{BufRead, Read, Write},
@@ -58,35 +57,27 @@ impl HostRegistrar for NoRegistration {
     }
 }
 
-/// A copier whose replies wait `stall` after the job was submitted.
-struct Stalled {
+/// Hold copy completions until the harness releases them.
+struct Held {
     inner: SimulatedGpu,
-    stall: Duration,
-    held: Vec<(Instant, Reply)>,
+    release: Arc<std::sync::atomic::AtomicBool>,
+    held: Vec<Reply>,
 }
 
-impl PageCopier for Stalled {
+impl PageCopier for Held {
     fn layout(&self) -> &Layout {
         self.inner.layout()
     }
     fn submit(&mut self, job: Job) -> Result<()> {
-        self.inner.submit(job)
+        self.inner.submit(job)?;
+        say("copy pending");
+        Ok(())
     }
     fn poll(&mut self, replies: &mut Vec<Reply>) {
-        let mut fresh = Vec::new();
-        self.inner.poll(&mut fresh);
-        let now = Instant::now();
-        self.held
-            .extend(fresh.into_iter().map(|r| (now + self.stall, r)));
-        let mut kept = Vec::new();
-        for (due, reply) in self.held.drain(..) {
-            if now >= due {
-                replies.push(reply);
-            } else {
-                kept.push((due, reply));
-            }
+        self.inner.poll(&mut self.held);
+        if self.release.load(std::sync::atomic::Ordering::Acquire) {
+            replies.append(&mut self.held);
         }
-        self.held = kept;
     }
     fn in_flight(&self) -> usize {
         self.inner.in_flight() + self.held.len()
@@ -237,7 +228,7 @@ struct Args {
     world: usize,
     rank: usize,
     link: String,
-    stall: Duration,
+    hold: bool,
 }
 
 fn args() -> Args {
@@ -249,7 +240,7 @@ fn args() -> Args {
         world: 2,
         rank: 1,
         link: String::new(),
-        stall: Duration::ZERO,
+        hold: false,
     };
     while let Some(flag) = it.next() {
         let value = it.next().expect("a value");
@@ -258,7 +249,7 @@ fn args() -> Args {
             "--world" => a.world = value.parse().unwrap(),
             "--rank" => a.rank = value.parse().unwrap(),
             "--link" => a.link = value,
-            "--stall-ms" => a.stall = Duration::from_millis(value.parse().unwrap()),
+            "--hold-copy" => a.hold = value.parse().unwrap(),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -466,7 +457,7 @@ fn restore(client: &mut PoolClient, world: usize, history: &TestHistory) {
     let candidate = answer
         .candidates
         .iter()
-        .find(|c| c.plan.source == part.source && c.plan.generation == part.generation)
+        .find(|c| c.plan.source == part.source && c.plan.key == part.end)
         .unwrap()
         .clone();
     let fetch = PoolFetch {
@@ -505,12 +496,13 @@ fn agent(args: &Args) {
     let mut stream = TcpStream::connect(&args.link).unwrap();
     stream.write_all(&(args.rank as u32).to_le_bytes()).unwrap();
     let (inner, gpu) = SimulatedGpu::new(&[local()]).unwrap();
-    let copier: flare_selene::SharedCopier = if args.stall.is_zero() {
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let copier: flare_selene::SharedCopier = if !args.hold {
         Arc::new(Mutex::new(inner))
     } else {
-        Arc::new(Mutex::new(Stalled {
+        Arc::new(Mutex::new(Held {
             inner,
-            stall: args.stall,
+            release: release.clone(),
             held: Vec::new(),
         }))
     };
@@ -539,6 +531,9 @@ fn agent(args: &Args) {
             } else {
                 "verify bad"
             }),
+            Ok(line) if line == "release" => {
+                release.store(true, std::sync::atomic::Ordering::Release);
+            }
             Ok(line) if line == "quit" => break,
             Ok(_) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
