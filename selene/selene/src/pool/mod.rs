@@ -36,8 +36,6 @@ pub mod rdma;
 mod shared;
 mod shm;
 pub mod slice;
-#[cfg(test)]
-mod smoke_tests;
 mod startup;
 mod store;
 pub(crate) mod tiers;

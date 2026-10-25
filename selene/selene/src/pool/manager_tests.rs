@@ -1928,3 +1928,6 @@ impl TestPinParts {
         })
     }
 }
+
+#[path = "tls_tests.rs"]
+mod tls_tests;
