@@ -8,6 +8,7 @@ mod agent;
 mod announce;
 mod cascade;
 mod budget;
+mod builder;
 mod client;
 mod codec;
 mod conn;
@@ -46,6 +47,7 @@ pub(crate) mod wire {
 mod types;
 
 pub use budget::Budget;
+pub use builder::{PoolBuilder, PreparedPool};
 pub use options::{PoolOptions, DEFAULT_POOL_TENANT, parse_pool_address, parse_pool_tenant, pool_address, pool_scope};
 pub use records::DeferredRecords;
 pub use agent::{AgentConfig, RankAgent, RankRecords};
@@ -53,7 +55,6 @@ pub use announce::{Announcer, IndexEntry, Notice, Snapshot};
 pub use client::{PoolAddress, PoolClient, PoolConfig, STARTUP_WAIT};
 pub use exporter::{Checksums, HostChain, HostPin, HostRecord, HostWindow, PutBytes};
 pub use identity::{Geometry, RankPlanes, Scope, instance_id, process_nonce, scope_id};
-pub use local::Tiers;
 pub use lookup::{Answer, LookupState, LookupTicket};
 pub use peers::{PoolOffer, PoolPeers, pool_rank_zero, pool_peer};
 pub use pins::{FilePin, MemoryPin};
