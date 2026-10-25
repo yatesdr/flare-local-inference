@@ -1,7 +1,6 @@
 #![allow(dead_code, unused_imports)]
 use selene_manager::{
     Key,
-    codec::Encoder,
     control,
     record::{self, Descriptor, Header, RankSizes},
     store::Config,
@@ -393,26 +392,7 @@ impl Drop for Host {
 }
 
 pub fn encode_header(header: &Header) -> [u8; 4096] {
-    let mut encoder = Encoder::default();
-    encoder.bytes(b"FLARECKP");
-    encoder.u32(1);
-    encoder.u32(header.flags);
-    encoder.bytes(&header.identity);
-    encoder.bytes(&header.fingerprint);
-    encoder.key(header.key);
-    encoder.u8(header.parent.is_some() as u8);
-    encoder.key(header.parent.unwrap_or_default());
-    encoder.bytes(&header.bucket);
-    encoder.u64(header.page_tokens);
-    encoder.u32(header.tail_pages);
-    encoder.u64(header.page_segment);
-    encoder.u64(header.row_segment);
-    encoder.u64(header.row_checksum);
-    encoder.u64(header.created);
-    record::encode_ranks(&mut encoder, &header.ranks);
-    let mut bytes = [0; 4096];
-    bytes[..encoder.0.len()].copy_from_slice(&encoder.0);
-    bytes
+    header.encode().unwrap()
 }
 
 pub fn content_for(
@@ -422,7 +402,7 @@ pub fn content_for(
     first: u32,
 ) -> (Header, Vec<u8>, Vec<u64>) {
     let pages = key.consumed_tokens / descriptor.page_tokens - u64::from(first);
-    let mut header = Header::new(descriptor, key, parent, [4; 16], pages as u32).unwrap();
+    let mut header = selene_manager::record::new_header(descriptor, key, parent, [4; 16], pages as u32).unwrap();
     let mut bytes = vec![0; header.length_with_row() as usize];
     let page_bytes = header.page_record_bytes() as usize;
     let mut hashes = Vec::new();

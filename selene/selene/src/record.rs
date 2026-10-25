@@ -72,8 +72,6 @@ const SUFFIX: &str = ".ckpt";
 
 /// Bytes of the fixed header fields that precede the rank entries.
 const FIXED_FIELD_BYTES: usize = 177;
-/// Length of a record file name: 16 hexadecimal digits, a hyphen, 32 digits, and `.ckpt`.
-const FILE_NAME_LENGTH: usize = 16 + 1 + 32 + SUFFIX.len();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RankSizes {
@@ -82,11 +80,11 @@ pub struct RankSizes {
 }
 
 impl RankSizes {
-    fn page_record_bytes(&self) -> u64 {
+    pub fn page_record_bytes(&self) -> u64 {
         self.planes.iter().map(|size| padded(*size)).sum()
     }
 
-    fn row_record_bytes(&self) -> u64 {
+    pub fn row_record_bytes(&self) -> u64 {
         padded(self.row_bytes)
     }
 
@@ -128,13 +126,40 @@ impl Header {
         created: SystemTime,
     ) -> Result<Self> {
         let layout = Layout::new(geometry)?;
-        let ranks = geometry
+        let ranks: Vec<RankSizes> = geometry
             .iter()
             .map(|rank| RankSizes {
                 planes: rank.planes.iter().map(|plane| plane.unit_bytes).collect(),
                 row_bytes: rank.row.unit_bytes,
             })
             .collect();
+        Self::from_sizes(
+            layout.page_tokens,
+            ranks,
+            identity,
+            fingerprint,
+            key,
+            parent,
+            bucket,
+            tail_pages,
+            created
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_sizes(
+        page_tokens: u64,
+        ranks: Vec<RankSizes>,
+        identity: [u8; 32],
+        fingerprint: [u8; 16],
+        key: PrefixKey,
+        parent: Option<PrefixKey>,
+        bucket: [u8; 16],
+        tail_pages: u32,
+        created: u64,
+    ) -> Result<Self> {
         let mut header = Self {
             identity,
             fingerprint,
@@ -142,15 +167,13 @@ impl Header {
             key,
             parent,
             bucket,
-            page_tokens: layout.page_tokens,
+            page_tokens,
             tail_pages,
             ranks,
             page_segment: 0,
             row_segment: 0,
             row_checksum: 0,
-            created: created
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_secs()),
+            created,
         };
         let derived = header.derive()?;
         header.page_segment = derived.page_segment;
@@ -425,7 +448,11 @@ impl Header {
         self.ranks.iter().map(RankSizes::row_record_bytes).sum()
     }
 
-    /// File length when the row segment is present.
+    /// File length with or without the state row.
+    pub fn length(&self, row: bool) -> u64 {
+        self.row_segment + if row { self.row_record_bytes() } else { 0 }
+    }
+
     pub fn length_with_row(&self) -> u64 {
         self.row_segment + self.row_record_bytes()
     }
@@ -587,13 +614,17 @@ pub fn temporary_name(key: &PrefixKey) -> String {
 }
 
 pub fn parse_file_name(name: &str) -> Option<PrefixKey> {
-    if name.len() != FILE_NAME_LENGTH || !name.is_ascii() {
+    parse_file_name_with_suffix(name, SUFFIX)
+}
+
+pub fn parse_file_name_with_suffix(name: &str, expected_suffix: &str) -> Option<PrefixKey> {
+    if name.len() != 49 + expected_suffix.len() || !name.is_ascii() {
         return None;
     }
     let (consumed, rest) = name.split_at(16);
     let rest = rest.strip_prefix('-')?;
     let (digest, suffix) = rest.split_at(32);
-    if suffix != SUFFIX {
+    if suffix != expected_suffix {
         return None;
     }
     let consumed = u64::from_be_bytes(hex_digits(consumed)?.try_into().ok()?);

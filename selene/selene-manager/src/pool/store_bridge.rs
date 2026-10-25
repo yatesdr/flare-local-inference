@@ -1166,7 +1166,7 @@ impl Core {
                 let (parent, first_page) = rec.accepted.unwrap_or((None, 0));
                 header.identity == descriptor.identity
                     && header.fingerprint == descriptor.fingerprint
-                    && header.matches(descriptor)
+                    && descriptor.matches(&header)
                     && header.key == rec.key
                     && header.parent == parent
                     && u64::from(header.tail_pages) + u64::from(first_page) == rec.chain_pages

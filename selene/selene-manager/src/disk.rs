@@ -772,11 +772,11 @@ fn inspect(path: &Path, name: &str, descriptor: &Descriptor) -> Result<(Header, 
     let length = u64::from_le_bytes(prefix[16..24].try_into().unwrap());
     let mut block = [0; 4096];
     file.read_exact(&mut block)?;
-    let header = Header::decode(&block)?;
+    let header = Header::decode(&block).map_err(|e| invalid(e.to_string()))?;
     if record::parse_file_name(name) != Some(header.key)
         || header.identity != descriptor.identity
         || header.fingerprint != descriptor.fingerprint
-        || !header.matches(descriptor)
+        || !descriptor.matches(&header)
         || length != header.length(row)
         || file.metadata()?.len() != ENVELOPE_BYTES + length
     {

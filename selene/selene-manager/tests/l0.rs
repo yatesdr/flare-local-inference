@@ -103,7 +103,7 @@ fn l0_01_tree_insert_chain_remove_parity() {
     }
     let fixture = include_bytes!("fixtures/flare-header-v1.bin");
     let decoded = Header::decode(fixture).unwrap();
-    let mut planned = Header::new(&descriptor(), key(130), Some(key(65)), [4; 16], 1).unwrap();
+    let mut planned = selene_manager::record::new_header(&descriptor(), key(130), Some(key(65)), [4; 16], 1).unwrap();
     planned.created = 1_700_000_000;
     planned.row_checksum = 0x0123456789abcdef;
     assert_eq!(decoded, planned);
@@ -1789,7 +1789,7 @@ async fn l0_56_dram_only_arena_boundary_ignores_the_envelope() {
     }];
     let mut client = host.client_with(value.clone()).await.unwrap();
     let fits = key(140 * 64 + 3);
-    let header = Header::new(&value, fits, None, [4; 16], 140).unwrap();
+    let header = selene_manager::record::new_header(&value, fits, None, [4; 16], 140).unwrap();
     assert_eq!(header.length_with_row(), 11_907_072);
     assert_eq!(
         header.length_with_row().max(4096).next_power_of_two(),
@@ -1803,7 +1803,7 @@ async fn l0_56_dram_only_arena_boundary_ignores_the_envelope() {
         "a 16 MiB extent must fit a 16 MiB DRAM-only arena"
     );
     let larger = key(220 * 64 + 3);
-    let header = Header::new(&value, larger, None, [4; 16], 220).unwrap();
+    let header = selene_manager::record::new_header(&value, larger, None, [4; 16], 220).unwrap();
     assert!(header.length_with_row() > 16 * 1024 * 1024);
     assert_eq!(
         client.put(larger, None, PutOptions::default()).await,
@@ -1891,7 +1891,7 @@ async fn l0_58_dram_only_refuses_a_record_whose_rounded_extent_cannot_fit() {
     host.start();
     let mut client = host.client().await;
     let large = key(2048 * 64);
-    let header = Header::new(&value, large, None, [4; 16], 2048).unwrap();
+    let header = selene_manager::record::new_header(&value, large, None, [4; 16], 2048).unwrap();
     assert!(header.length_with_row() <= 12 * 1024 * 1024);
     assert!(header.length_with_row().max(4096).next_power_of_two() > 12 * 1024 * 1024);
     assert_eq!(

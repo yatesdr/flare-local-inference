@@ -1,5 +1,4 @@
 pub mod arena;
-pub mod codec;
 pub mod config;
 pub mod control;
 pub mod data;
