@@ -17,15 +17,6 @@ pub enum Tier {
     Disk,
 }
 
-/// How record files move between disk and the GPU.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Transport {
-    /// Through a registered staging pool and batched stream copies.
-    Staged,
-    /// Through GPUDirect Storage, with no host payload staging.
-    Direct,
-}
-
 /// A GPU checkpoint the scheduler published, as the worker reports it to the store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublishedCheckpoint {
@@ -321,7 +312,6 @@ pub trait HostStore {
 /// Bytes per second assumed for a tier before its first transfers are measured.
 pub const INITIAL_MEMORY_RATE: f64 = 20e9;
 pub const INITIAL_STAGED_DISK_RATE: f64 = 3e9;
-pub const INITIAL_DIRECT_DISK_RATE: f64 = 10e9;
 /// Prefill tokens per second assumed before the worker supplies a measurement.
 pub const INITIAL_PREFILL_RATE: f64 = 8000.0;
 

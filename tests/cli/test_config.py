@@ -61,13 +61,14 @@ speculative_token_capacity = 8
 
 
 def test_prefix_cache_settings_validate(tmp_path):
-    configuration = load(tmp_path, "[prefix_cache]\nmemory = \"4G\"\ndisk_transport = \"direct\"\n")
+    configuration = load(tmp_path, "[prefix_cache]\nmemory = \"4G\"\n")
     assert configuration.get("prefix_cache.memory") == Setting("4G", "[prefix_cache]")
     assert configuration.directory("prefix_cache") is None
     with pytest.raises(UsageError, match="prefix_cache disk_limit"):
         load(tmp_path, "[prefix_cache]\ndisk_limit = \"lots\"\n")
-    with pytest.raises(UsageError, match="disk_transport"):
-        load(tmp_path, "[prefix_cache]\ndisk_transport = \"nvme\"\n")
+    for transport in ("nvme", "staged", "direct"):
+        with pytest.raises(UsageError, match="disk_transport"):
+            load(tmp_path, f'[prefix_cache]\ndisk_transport = "{transport}"\n')
 
 
 def test_recipe_supplies_concurrency_when_the_file_is_silent(tmp_path):

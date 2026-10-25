@@ -1,4 +1,4 @@
-//! Records retained as files, moved by a staged or direct transport.
+//! Records retained as files, moved through registered host staging.
 //!
 //! [`DiskStore`] indexes the record files under one directory, accounts their
 //! bytes against a limit, and evicts under the tree policy of the index: the
@@ -32,9 +32,9 @@ use crate::{
 };
 
 use super::{
-    CacheGeometry, HostHit, HostStore, INITIAL_DIRECT_DISK_RATE, INITIAL_STAGED_DISK_RATE,
+    CacheGeometry, HostHit, HostStore, INITIAL_STAGED_DISK_RATE,
     InboundTicket, JobId, Layout, PublishedCheckpoint, Retirement, Retiring, StoreEvent,
-    StoreOutcome, StoreReason, StoreStats, Tier, Transport,
+    StoreOutcome, StoreReason, StoreStats, Tier,
     copier::{self, Direction, PageCopier, SharedCopier},
     disk::{self, DiskThread, Operation},
     geometry::invalid,
@@ -85,7 +85,6 @@ pub enum TransportEvent {
 
 /// Moves whole records between GPU ids and record files.
 pub trait DiskTransport {
-    fn kind(&self) -> Transport;
     /// Stream a published GPU checkpoint into a new record file at `temporary`,
     /// renamed to `path` on completion. The record's pages are the last
     /// `header.tail_pages` entries of the checkpoint's chain.
@@ -1244,10 +1243,6 @@ impl Staged {
 }
 
 impl DiskTransport for Staged {
-    fn kind(&self) -> Transport {
-        Transport::Staged
-    }
-
     fn store(
         &mut self,
         id: super::JobId,
@@ -1496,10 +1491,6 @@ impl DiskStore {
         for record in by_age {
             index.touch(&record.header.key);
         }
-        let rate = match transport.kind() {
-            Transport::Staged => INITIAL_STAGED_DISK_RATE,
-            Transport::Direct => INITIAL_DIRECT_DISK_RATE,
-        };
         Ok(Self {
             index,
             identity,
@@ -1517,8 +1508,8 @@ impl DiskStore {
             maintenance: HashMap::new(),
             replacements: HashMap::new(),
             evicted: Vec::new(),
-            outbound_rate: Rate::new(rate),
-            inbound_rate: Rate::new(rate),
+            outbound_rate: Rate::new(INITIAL_STAGED_DISK_RATE),
+            inbound_rate: Rate::new(INITIAL_STAGED_DISK_RATE),
             announce: None,
             spill: false,
             retiring: Vec::new(),
@@ -1718,10 +1709,6 @@ impl DiskStore {
 
     pub fn layout(&self) -> &Layout {
         &self.layout
-    }
-
-    pub fn transport(&self) -> Transport {
-        self.transport.kind()
     }
 
     pub fn transport_mut(&mut self) -> &mut dyn DiskTransport {
@@ -2608,10 +2595,6 @@ mod tests {
     }
 
     impl DiskTransport for Recorder {
-        fn kind(&self) -> Transport {
-            Transport::Staged
-        }
-
         fn store(
             &mut self,
             id: JobId,
@@ -2950,7 +2933,6 @@ mod tests {
         assert_eq!((stats.disk_records, stats.disk_bytes), (4, total));
         assert_eq!(stats.inbound_rate, INITIAL_STAGED_DISK_RATE);
         assert_eq!(stats.outbound_rate, INITIAL_STAGED_DISK_RATE);
-        assert_eq!(store.transport(), Transport::Staged);
         assert_eq!(store.limit(), total);
 
         // After the oldest sibling leaves, the older child compacts before

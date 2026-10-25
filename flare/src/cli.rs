@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand, builder::PossibleValuesParser, builder::Typ
 use flare_helios::{
     engram::Storage,
     offload::{
-        PoolOptions, PrefixCacheOffload, Transport, DEFAULT_POOL_TENANT, parse_pool_address,
+        PoolOptions, PrefixCacheOffload, DEFAULT_POOL_TENANT, parse_pool_address,
         parse_pool_tenant, parse_size,
     },
     runtime_package::{KvCacheLimit, LoadOptions, MemoryLimit},
@@ -884,12 +884,6 @@ pub struct ServingOptions {
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
     pub prefix_cache_disk_limit: Option<u64>,
 
-    /// Transfer disk checkpoints through host staging or GPUDirect Storage [default: prefix_cache.disk_transport, else staged].
-    #[arg(long, value_name = "MODE", help_heading = "Prefix cache options",
-        value_parser = PossibleValuesParser::new(["staged", "direct"])
-            .map(|value| if value == "staged" { Transport::Staged } else { Transport::Direct }))]
-    pub prefix_cache_disk_transport: Option<Transport>,
-
     /// Share prefix checkpoints at `unix:PATH`, TLS `HOST:PORT`, or `plain:HOST:PORT` [default: not shared].
     #[arg(long, value_name = "ADDRESS", value_parser = parse_pool_address,
         help_heading = "Prefix cache options")]
@@ -1046,16 +1040,6 @@ impl ServingOptions {
         if let Some(bytes) = self.prefix_cache_disk_limit {
             options.extend(["--prefix-cache-disk-limit".into(), bytes.to_string()]);
         }
-        if let Some(transport) = self.prefix_cache_disk_transport {
-            options.extend([
-                "--prefix-cache-disk-transport".into(),
-                match transport {
-                    Transport::Staged => "staged",
-                    Transport::Direct => "direct",
-                }
-                .into(),
-            ]);
-        }
         if let Some(address) = &self.prefix_cache_pool {
             options.extend(["--prefix-cache-pool".into(), address.clone()]);
         }
@@ -1103,7 +1087,6 @@ impl ServingOptions {
                 memory_bytes: self.prefix_cache_memory,
                 disk: self.prefix_cache_disk.clone(),
                 disk_limit: self.prefix_cache_disk_limit,
-                transport: self.prefix_cache_disk_transport,
                 pool: self.prefix_cache_pool.clone().map(|address| PoolOptions {
                     address,
                     tenant: self.prefix_cache_pool_tenant
@@ -1465,8 +1448,6 @@ mod tests {
             "prefixes",
             "--prefix-cache-disk-limit",
             "0",
-            "--prefix-cache-disk-transport",
-            "direct",
         ]);
         assert_eq!(args.package, Some(PathBuf::from("model.safetensors")));
         assert_eq!(args.bind_address().to_string(), "[::1]:8001");
@@ -1482,7 +1463,6 @@ mod tests {
                 memory_bytes: Some(3 << 29),
                 disk: Some(PathBuf::from("prefixes")),
                 disk_limit: Some(0),
-                transport: Some(Transport::Direct),
                 pool: None,
             }
         );
@@ -1962,8 +1942,6 @@ mod tests {
             "/var/cache/flare",
             "--prefix-cache-disk-limit",
             "100G",
-            "--prefix-cache-disk-transport",
-            "staged",
         ]);
         let options = args.rank_options();
         assert_eq!(
@@ -1975,8 +1953,6 @@ mod tests {
                 "/var/cache/flare",
                 "--prefix-cache-disk-limit",
                 "107374182400",
-                "--prefix-cache-disk-transport",
-                "staged",
             ]
         );
         let mut forwarded = vec!["flare", "run", "model.safetensors"];

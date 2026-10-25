@@ -595,11 +595,7 @@ Offload limits interference through bounded work and explicit ownership:
   store and does not create its directory.
   Checkpoint and CPU input records share this limit and the model's locked
   record directory.
-- Disk transport: staged. `--prefix-cache-disk-transport` accepts `staged` and
-  `direct`; `direct` fails
-  startup until the direct transport exists, and afterwards when the cuFile
-  probe rejects the direct path. Once the probe exists, the default becomes
-  direct where the probe accepts it.
+- Disk records move through registered host staging and batched stream copies.
 - The staged transport's staging pool size is derived; it is not a setting.
 - A memory store retains at most as many records as it has row slabs, and
   rows take one quarter of the pool, so on Qwen, whose rows are 112 MiB, a
