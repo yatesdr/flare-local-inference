@@ -149,6 +149,7 @@ async fn serve(engine: &mut Engine, link: &Link) -> Result<()> {
                 eprintln!("warning: {reason}");
                 engine.shared.set_status(PoolStatus::Disabled(reason));
                 engine.shared.fail_lookups();
+                engine.close_ranks();
                 idle_until_stop(engine, link).await;
                 break;
             }

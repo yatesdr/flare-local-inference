@@ -35,6 +35,9 @@ pub(crate) enum RankEvent {
         result: std::result::Result<(), String>,
         quarantined: bool,
     },
+    /// The rank's agent will not use the pool (for instance its registration was not
+    /// approved).
+    Disabled { rank: usize, reason: String },
     /// The rank attached to the manager.
     Attached,
     /// The attachment of a rank changed or ended; its open transfers are cancelled by the
@@ -242,6 +245,13 @@ impl Ranks {
     }
 
     /// Every open transfer, on any rank.
+    /// Tell every agent the pool is off for this instance.
+    pub(crate) fn close_all(&self) {
+        for peer in &self.peers {
+            peer.end.send(Msg::Close(link::Close {}));
+        }
+    }
+
     pub(crate) fn idle(&self) -> bool {
         self.xfers.is_empty()
     }
@@ -318,6 +328,13 @@ impl Ranks {
                     mode,
                 };
                 events.push(RankEvent::Attached);
+            }
+            Msg::Disabled(off) => {
+                self.peers[index].state = State::Lost;
+                events.push(RankEvent::Disabled {
+                    rank,
+                    reason: off.reason,
+                });
             }
             Msg::Detached(_) => {
                 if !matches!(self.peers[index].state, State::Lost) {

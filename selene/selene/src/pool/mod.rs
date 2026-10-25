@@ -52,8 +52,8 @@ pub use shared::{
     ExportRequest, FetchFailure, FetchPart, PoolEvent, PoolFetch, PoolStatus, PutOutcome,
     PutRefusal, PutRequest, PutSource,
 };
-pub use startup::{Approve, PlannedRegion, RegisteredRegion};
 pub use slice::{RankSlice, SliceLayout, SliceSums};
+pub use startup::{Approve, PlannedRegion, RegisteredRegion};
 pub use store::{PoolPort, PooledStore};
 pub use tiers::{Releases, TierView};
 pub use types::{HeldRange, PoolCandidate, SourceRef, Tier};

@@ -534,6 +534,7 @@ fn agent(args: &Args) {
         registration_context: 0,
         gpu_uuid: gpus(args.world)[args.rank],
         records: None,
+        approve: None,
     })
     .unwrap();
     wait_until(|| agent.status() == PoolStatus::Ready);

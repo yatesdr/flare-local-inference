@@ -25,6 +25,7 @@ message LinkMessage {
     Detached detached = 12;
     WindowDone window_done = 13;
     Done done = 14;
+    Disabled disabled = 15;
   }
 }
 
@@ -58,6 +59,13 @@ message Attached {
   uint64 manager_incarnation = 1;
   uint64 generation = 2;
   selene.v2.RankMode mode = 3;
+}
+
+// The agent will not use the pool (its registration plan was not approved, or the manager's
+// regions changed, or it cannot attach). A multi-process instance uses the pool on all
+// ranks or none: rank 0 turns the pool off.
+message Disabled {
+  string reason = 1;
 }
 
 // The attachment ended. The agent has cancelled and is draining its transfers (their

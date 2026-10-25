@@ -194,6 +194,8 @@ struct Faults {
     host: Option<(usize, Option<usize>)>,
     /// What the peers' agents register through.
     registrar: Option<Arc<crate::pool::manager_tests::CountingRegistrar>>,
+    /// The peers' agents ask this before registering.
+    approve: Option<crate::pool::Approve>,
 }
 
 struct Gate {
@@ -338,6 +340,7 @@ fn instance_with(
                 },
                 registration_context: 0,
                 gpu_uuid: gpus[rank],
+                approve: faults.approve.clone(),
                 records: faults.host.map(|(pages, bad)| -> Box<dyn RankRecords> {
                     Box::new(RankFiles {
                         world,
@@ -1004,6 +1007,7 @@ fn a_restore_is_reported_only_after_every_rank_drained_and_no_rank_is_read_early
         cuts: Vec::new(),
         host: None,
         registrar: None,
+        approve: None,
     };
     let mut scenario = scenario(&manager, 2, &[Reach::Local, Reach::Local], &faults);
     scenario.serve(None);
@@ -1048,6 +1052,7 @@ fn a_rank_whose_copy_fails_fails_the_whole_restore_once_and_the_next_restore_wor
         cuts: Vec::new(),
         host: None,
         registrar: None,
+        approve: None,
     };
     let mut scenario = scenario(&manager, 2, &[Reach::Local, Reach::Local], &faults);
     scenario.serve(None);
@@ -1083,6 +1088,7 @@ fn a_cut_link_with_a_rank_still_copying_stops_the_pool_and_reports_nothing() {
         cuts: vec![(1, cut.clone())],
         host: None,
         registrar: None,
+        approve: None,
     };
     let mut scenario = scenario(&manager, 2, &[Reach::Local, Reach::Local], &faults);
     scenario.serve(None);
@@ -1568,4 +1574,92 @@ fn an_agent_registers_at_startup_and_never_again_across_a_manager_restart() {
         "nothing was registered after startup"
     );
     requester.close();
+}
+
+#[test]
+fn an_agent_is_asked_about_its_whole_plan_before_it_registers_anything() {
+    let manager = Manager::start();
+    let counting = Arc::new(crate::pool::manager_tests::CountingRegistrar::default());
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (seen, registered_when_asked) = (asked.clone(), counting.clone());
+    let faults = Faults {
+        registrar: Some(counting.clone()),
+        approve: Some(Arc::new(move |plan: &[crate::pool::PlannedRegion]| {
+            seen.lock().unwrap().push((
+                plan.iter().map(|r| r.name).collect::<Vec<_>>(),
+                registered_when_asked.calls.lock().unwrap().len(),
+            ));
+            Ok(())
+        })),
+        ..Default::default()
+    };
+    let requester = instance_with(&manager, 2, &[Reach::Local, Reach::Local], 2, &faults);
+    requester.ready();
+    assert_eq!(*asked.lock().unwrap(), vec![(vec!["arena", "staging"], 0)]);
+    assert_eq!(counting.calls.lock().unwrap().len(), 2);
+    requester.close();
+}
+
+#[test]
+fn an_agent_whose_plan_is_refused_registers_nothing_and_turns_the_pool_off_on_every_rank() {
+    let manager = Manager::start();
+    let counting = Arc::new(crate::pool::manager_tests::CountingRegistrar::default());
+    let faults = Faults {
+        registrar: Some(counting.clone()),
+        approve: Some(Arc::new(|_: &[crate::pool::PlannedRegion]| {
+            Err("over the memory budget".to_string())
+        })),
+        ..Default::default()
+    };
+    let requester = instance_with(&manager, 2, &[Reach::Local, Reach::Local], 2, &faults);
+    wait("the agent to be disabled", || {
+        matches!(requester.agents[0].status(), PoolStatus::Disabled(_))
+    });
+    assert!(counting.calls.lock().unwrap().is_empty());
+    assert!(requester.agents[0].registered_regions().is_empty());
+    wait("rank 0 to turn the pool off", || {
+        matches!(requester.rank0.status(), PoolStatus::Disabled(_))
+    });
+    requester.close();
+}
+
+#[test]
+fn when_rank_zero_turns_the_pool_off_its_agents_do_too() {
+    let manager = Manager::start();
+    let (copier, _gpu) = SimulatedGpu::shared(&[local()]).unwrap();
+    let (zero, peer) = memory_links();
+    let mut config = config(&manager, "requester", 2, vec![[2; 16], [3; 16]]);
+    config.approve = Some(Arc::new(|_: &[crate::pool::PlannedRegion]| {
+        Err("over the memory budget".to_string())
+    }));
+    let rank0 = PoolClient::start_ranked(
+        config,
+        RankSet { links: vec![zero] },
+        copier,
+        Arc::new(OkRegistrar),
+    )
+    .unwrap();
+    let (copier, _gpu1) = SimulatedGpu::shared(&[local()]).unwrap();
+    let agent = RankAgent::start(AgentConfig {
+        address: PoolAddress::Unix(manager.socket.clone()),
+        ca: None,
+        scope: scope(2),
+        rank: 1,
+        world: 2,
+        instance_name: "agent-1".into(),
+        link: peer,
+        copier,
+        registrar: Arc::new(OkRegistrar),
+        registration_context: 0,
+        gpu_uuid: [3; 16],
+        records: None,
+        approve: None,
+    })
+    .unwrap();
+    wait("rank 0 to be disabled", || {
+        matches!(rank0.status(), PoolStatus::Disabled(_))
+    });
+    wait("the agent to follow", || {
+        matches!(agent.status(), PoolStatus::Disabled(_))
+    });
 }
