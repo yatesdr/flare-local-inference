@@ -44,6 +44,18 @@ pub(crate) enum RankEvent {
     Lost { rank: usize, reason: String },
 }
 
+/// A peer rank's part of a claim.
+pub(crate) struct PeerPart {
+    pub(crate) rank: usize,
+    pub(crate) xfer: u64,
+    pub(crate) shared: bool,
+    /// The agent's `Done`: the rank has drained and covered its slice (or failed).
+    pub(crate) done: Option<std::result::Result<(), String>>,
+    /// The agent could not prove it drained.
+    pub(crate) quarantined: bool,
+    pub(crate) cancelled: bool,
+}
+
 /// Who a transfer belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum XferOwner {
@@ -347,23 +359,123 @@ impl Ranks {
 }
 
 impl super::Engine {
-    pub(crate) fn on_peer_export_window(
+    /// Start every peer rank's part of an export about to be pinned. The pages are the
+    /// chain's, in the order the records are covered.
+    pub(super) fn open_export_peers(
         &mut self,
-        _export: u64,
-        _rank: usize,
-        _index: u32,
-        _result: std::result::Result<(), String>,
-        _sums: Option<SliceSums>,
-    ) {
+        id: u64,
+        records: &[wire::Record],
+        chain: &crate::ExportChain,
+        rank_channels: &[wire::RankChannel],
+    ) -> std::result::Result<(), String> {
+        let Some(ranks) = self.ranks.as_mut() else {
+            return Ok(());
+        };
+        let mut pages = Vec::new();
+        for (index, node) in chain.nodes.iter().enumerate() {
+            let first = if index == 0 { chain.skip_pages } else { 0 } as usize;
+            let count = records.get(index).map_or(0, |record| record.pages as usize);
+            let Some(slice) = node.pages.get(first..first + count) else {
+                return Err("a chain node has fewer pages than its record".into());
+            };
+            pages.extend(slice.iter().map(|page| page.0));
+        }
+        let (page_bytes, row_bytes) = (self.st.page_record_bytes(), self.st.row_record_bytes());
+        let mut opened: Vec<PeerPart> = Vec::new();
+        for rank in 1..ranks.world() {
+            let channel = rank_channels
+                .iter()
+                .find(|c| c.rank as usize == rank)
+                .and_then(|c| c.channel.clone());
+            let shared = channel.is_none();
+            let expected = if shared {
+                wire::RankMode::RankShared
+            } else {
+                wire::RankMode::RankChannel
+            };
+            if ranks.mode(rank) != Some(expected) {
+                return Err(format!("rank {rank}'s attachment does not match its mode"));
+            }
+            let open = link::Open {
+                dir: link::Dir::Out as i32,
+                kind: wire::rank_fence::Kind::Export as i32,
+                fence_id: id,
+                records: records.to_vec(),
+                pages: pages.clone(),
+                has_slot: chain.row.is_some(),
+                slot: chain.row.map_or(0, |slot| slot.0),
+                channel,
+                page_bytes,
+                row_bytes,
+                ..Default::default()
+            };
+            let Some(xfer) = ranks.open(rank, XferOwner::Export(id), open) else {
+                // Cancel the ones already started.
+                for peer in &opened {
+                    ranks.cancel(peer.xfer);
+                }
+                return Err(format!("rank {rank} is not attached"));
+            };
+            opened.push(PeerPart {
+                rank,
+                xfer,
+                shared,
+                done: None,
+                quarantined: false,
+                cancelled: false,
+            });
+        }
+        self.source.set_peers(id, opened);
+        Ok(())
     }
 
+    /// Stop the peers of an export that is over or never started.
+    pub(super) fn cancel_export_peers(&mut self, id: u64) {
+        let cancels = self.source.take_uncancelled(id);
+        if let Some(ranks) = &self.ranks {
+            for xfer in cancels {
+                ranks.cancel(xfer);
+            }
+        }
+    }
+
+    /// A shared-memory peer drained its slice of one window of an export.
+    pub(crate) fn on_peer_export_window(
+        &mut self,
+        export: u64,
+        rank: usize,
+        index: u32,
+        result: std::result::Result<(), String>,
+        sums: Option<SliceSums>,
+    ) {
+        if !self
+            .source
+            .peer_window_done(export, rank, index, result, sums)
+        {
+            return;
+        }
+        let (spec, failed) = self.source.window_after_peers(export, index);
+        if failed {
+            self.fail_export_window(export, index);
+        } else if let Some(spec) = spec {
+            self.fill_done_if_idle(export, index, spec);
+        }
+        self.drive_export_now(export);
+    }
+
+    /// A peer rank ended its part of an export.
     pub(crate) fn on_peer_export_done(
         &mut self,
-        _export: u64,
-        _rank: usize,
-        _result: std::result::Result<(), String>,
-        _quarantined: bool,
+        export: u64,
+        rank: usize,
+        result: std::result::Result<(), String>,
+        quarantined: bool,
     ) {
+        self.source.peer_done(export, rank, result, quarantined);
+        if quarantined {
+            return self.quarantine();
+        }
+        self.drive_export_now(export);
     }
 
     pub(crate) fn on_peer_put_window(

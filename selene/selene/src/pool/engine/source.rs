@@ -8,7 +8,7 @@
 //! has drained, and the export ends with exactly one `ExportEnd`.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -29,6 +29,7 @@ use super::{
     Engine, Owner,
     coverage::Coverage,
     hostfill::{FillDone, FillJob, FillOwner},
+    ranks::{PeerPart, XferOwner},
     requester::ExpectedRecord,
 };
 
@@ -68,6 +69,18 @@ struct Export {
     slots: HashMap<u32, u32>,
     /// Filled windows the channel has not yet written out.
     sends_outstanding: u32,
+    /// The channels the request named for the peer ranks of a multi-process instance.
+    rank_channels: Vec<wire::RankChannel>,
+    /// The peer ranks' parts of this export.
+    peers: Vec<PeerPart>,
+    /// Shared-memory peers that have not yet drained their slice of a window, and the
+    /// slice checksums those that have reported.
+    peer_windows: HashMap<u32, PeerWindow>,
+}
+
+struct PeerWindow {
+    left: BTreeSet<usize>,
+    sums: Vec<(usize, crate::pool::SliceSums)>,
 }
 
 #[derive(Default)]
@@ -75,7 +88,110 @@ pub(crate) struct State {
     exports: HashMap<u64, Export>,
 }
 
+impl Export {
+    pub(super) fn set_peers(&mut self, peers: Vec<PeerPart>) {
+        self.peers = peers;
+    }
+
+    /// The transfers of the peers not yet cancelled or done, marked cancelled.
+    pub(super) fn take_uncancelled_peers(&mut self) -> Vec<u64> {
+        self.peers
+            .iter_mut()
+            .filter(|p| p.done.is_none() && !p.cancelled)
+            .map(|p| {
+                p.cancelled = true;
+                p.xfer
+            })
+            .collect()
+    }
+}
+
 impl State {
+    pub(super) fn set_peers(&mut self, export: u64, peers: Vec<PeerPart>) {
+        if let Some(run) = self.exports.get_mut(&export) {
+            run.set_peers(peers);
+        }
+    }
+
+    pub(super) fn take_uncancelled(&mut self, export: u64) -> Vec<u64> {
+        self.exports
+            .get_mut(&export)
+            .map(Export::take_uncancelled_peers)
+            .unwrap_or_default()
+    }
+
+    /// A shared peer reported one window. `false` when it was not expected.
+    pub(super) fn peer_window_done(
+        &mut self,
+        export: u64,
+        rank: usize,
+        index: u32,
+        result: std::result::Result<(), String>,
+        sums: Option<crate::pool::SliceSums>,
+    ) -> bool {
+        let Some(run) = self.exports.get_mut(&export) else {
+            return false;
+        };
+        let Some(window) = run.peer_windows.get_mut(&index) else {
+            return false;
+        };
+        if !window.left.remove(&rank) {
+            return false;
+        }
+        match (result, sums) {
+            (Ok(()), Some(sums)) => window.sums.push((rank, sums)),
+            (Err(why), _) => {
+                eprintln!("warning: export {export}: rank {rank}: {why}");
+                run.failed = true;
+            }
+            (Ok(()), None) => run.failed = true,
+        }
+        true
+    }
+
+    /// The window's spec once every peer has reported it, and whether the export failed.
+    pub(super) fn window_after_peers(
+        &self,
+        export: u64,
+        index: u32,
+    ) -> (Option<wire::WindowSpec>, bool) {
+        let Some(run) = self.exports.get(&export) else {
+            return (None, false);
+        };
+        let complete = run
+            .peer_windows
+            .get(&index)
+            .is_some_and(|w| w.left.is_empty());
+        (
+            complete.then(|| run.windows.get(&index).cloned()).flatten(),
+            run.failed,
+        )
+    }
+
+    pub(super) fn peer_done(
+        &mut self,
+        export: u64,
+        rank: usize,
+        result: std::result::Result<(), String>,
+        quarantined: bool,
+    ) {
+        let Some(run) = self.exports.get_mut(&export) else {
+            return;
+        };
+        if let Some(peer) = run
+            .peers
+            .iter_mut()
+            .find(|p| p.rank == rank && p.done.is_none())
+        {
+            peer.done = Some(result.clone());
+            peer.quarantined = quarantined;
+        }
+        if let Err(why) = result {
+            eprintln!("warning: export {export}: rank {rank}: {why}");
+            run.failed = true;
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.exports.is_empty()
     }
@@ -156,6 +272,9 @@ impl Engine {
             channel_open: false,
             slots: HashMap::new(),
             sends_outstanding: 0,
+            rank_channels: request.rank_channels.clone(),
+            peers: Vec::new(),
+            peer_windows: HashMap::new(),
         };
         self.source.exports.insert(id, export);
         self.event(PoolEvent::Export(ExportRequest {
@@ -265,7 +384,7 @@ impl Engine {
             }
             return release(self, pin);
         }
-        let records = expected
+        let records: Vec<wire::Record> = expected
             .iter()
             .zip(generations)
             .map(|(r, generation)| wire::Record {
@@ -276,6 +395,24 @@ impl Engine {
                 row: r.row,
             })
             .collect();
+        let rank_channels = run.rank_channels.clone();
+        // A multi-process instance's peers start before the manager can send a window.
+        if self.ranks.is_some() {
+            let opened = match &pin {
+                Pin::Gpu(chain) => self.open_export_peers(id, &records, chain, &rank_channels),
+                Pin::Host(_) => Err("a multi-process instance serves GPU exports only".into()),
+            };
+            if let Err(why) = opened {
+                eprintln!("warning: export {id} refused: {why}");
+                self.cancel_export_peers(id);
+                self.source.exports.remove(&id);
+                self.pin_refused(id, wire::ClaimReason::SourceBusy);
+                return release(self, pin);
+            }
+        }
+        let Some(run) = self.source.exports.get_mut(&id) else {
+            return release(self, pin);
+        };
         run.phase = Phase::Pinned;
         run.coverage = Some(Coverage::new(expected));
         run.pin = Some(pin);
@@ -405,7 +542,12 @@ impl Engine {
     /// the window is wrong and the export failed. A slot, if any, then is still the
     /// caller's.
     fn export_window(&mut self, id: u64, spec: wire::WindowSpec, slot: Option<u32>) -> bool {
-        let (page_bytes, row_bytes) = (self.st.page_record_bytes(), self.st.row_record_bytes());
+        let (whole_page, whole_row) = (self.st.page_record_bytes(), self.st.row_record_bytes());
+        // A window of this rank's own leg holds only its slices.
+        let (page_bytes, row_bytes) = match (&self.ranks, slot) {
+            (Some(ranks), Some(_)) => (ranks.layout.rank(0).page_len, ranks.layout.rank(0).row_len),
+            _ => (whole_page, whole_row),
+        };
         let memory = self.memory();
         let Some(run) = self.source.exports.get_mut(&id) else {
             return false;
@@ -460,6 +602,22 @@ impl Engine {
                 }
                 run.jobs_outstanding += jobs.len() as u32;
                 run.windows.insert(spec.index, spec);
+                // The shared-memory peers write their own slices of this window in step.
+                let shared: Vec<(usize, u64)> = run
+                    .peers
+                    .iter()
+                    .filter(|p| p.shared && p.done.is_none())
+                    .map(|p| (p.rank, p.xfer))
+                    .collect();
+                if slot.is_none() && !shared.is_empty() {
+                    run.peer_windows.insert(
+                        spec.index,
+                        PeerWindow {
+                            left: shared.iter().map(|(rank, _)| *rank).collect(),
+                            sums: Vec::new(),
+                        },
+                    );
+                }
                 for job in jobs {
                     self.queue_job(
                         job,
@@ -468,6 +626,24 @@ impl Engine {
                             window: spec.index,
                         },
                     );
+                }
+                for (rank, xfer) in shared {
+                    let sent = self.ranks.as_ref().is_some_and(|ranks| {
+                        ranks.send_window(
+                            rank,
+                            super::super::rank::link::Window {
+                                xfer,
+                                spec: Some(spec.clone()),
+                                sums: None,
+                            },
+                        )
+                    });
+                    if !sent {
+                        if let Some(run) = self.source.exports.get_mut(&id) {
+                            run.failed = true;
+                        }
+                        break;
+                    }
                 }
             }
             Pin::Host(pin) => {
@@ -549,16 +725,59 @@ impl Engine {
         self.drive_export(export);
     }
 
+    pub(super) fn fail_export_window(&mut self, export: u64, window: u32) {
+        self.fill_failed(export, window);
+    }
+
+    pub(super) fn fill_done_if_idle(&mut self, export: u64, index: u32, spec: wire::WindowSpec) {
+        if !self.window_still_running(export, index) {
+            self.fill_done(export, spec, None);
+        }
+    }
+
+    pub(super) fn drive_export_now(&mut self, export: u64) {
+        self.drive_export(export);
+    }
+
     /// Whether another job of the same window is still queued or running.
     fn window_still_running(&self, export: u64, window: u32) -> bool {
         let owner_is = |o: &Owner| matches!(o, Owner::Export { export: e, window: w } if *e == export && *w == window);
-        self.jobs.values().any(owner_is) || self.pending.iter().any(|(_, o)| owner_is(o))
+        self.jobs.values().any(owner_is)
+            || self.pending.iter().any(|(_, o)| owner_is(o))
+            || self
+                .source
+                .exports
+                .get(&export)
+                .and_then(|run| run.peer_windows.get(&window))
+                .is_some_and(|peers| !peers.left.is_empty())
     }
 
     /// The window's bytes are in place: tell the manager, with the persisted
     /// checksums for a host source and fresh ones for a GPU source.
     fn fill_done(&mut self, export: u64, spec: wire::WindowSpec, persisted: Option<Checksums>) {
         let page_bytes = self.st.page_record_bytes() as usize;
+        let on_channel = self
+            .source
+            .exports
+            .get(&export)
+            .is_some_and(|run| run.reference.is_some());
+        // What this rank hashes: a multi-process instance's rank states checksums of its own
+        // slices, which start each record of a shared window and fill a channel's slot.
+        let (stride, hash_len, row_len) = match &self.ranks {
+            Some(ranks) => {
+                let mine = ranks.layout.rank(0);
+                (
+                    if on_channel {
+                        mine.page_len as usize
+                    } else {
+                        page_bytes
+                    },
+                    mine.page_len as usize,
+                    mine.row_len as usize,
+                )
+            }
+            None => (page_bytes, page_bytes, self.st.row_record_bytes() as usize),
+        };
         let memory = self.memory();
         let sums = match persisted {
             Some(sums) => Some(sums),
@@ -570,9 +789,11 @@ impl Engine {
                     let count = spec.page_count as usize;
                     Checksums {
                         pages: (0..count)
-                            .map(|i| checksum(&bytes[i * page_bytes..(i + 1) * page_bytes]))
+                            .map(|i| checksum(&bytes[i * stride..i * stride + hash_len]))
                             .collect(),
-                        row: spec.row.then(|| checksum(&bytes[count * page_bytes..])),
+                        row: spec
+                            .row
+                            .then(|| checksum(&bytes[count * stride..count * stride + row_len])),
                     }
                 }),
         };
@@ -606,6 +827,32 @@ impl Engine {
                 run.failed = true;
             }
             return;
+        }
+        if self.ranks.is_some() {
+            // Rank 0 attests its own slice and those of the shared peers.
+            let run = self.source.exports.get_mut(&export).expect("present");
+            let peers = run.peer_windows.remove(&spec.index);
+            let mut rank_sums = vec![wire::RankSums {
+                rank: 0,
+                page_xxh3: sums.pages,
+                row_xxh3: sums.row.unwrap_or(0),
+                has_row: sums.row.is_some(),
+            }];
+            for (rank, peer) in peers.map(|p| p.sums).unwrap_or_default() {
+                rank_sums.push(wire::RankSums {
+                    rank: rank as u32,
+                    page_xxh3: peer.pages,
+                    row_xxh3: peer.row.unwrap_or(0),
+                    has_row: peer.row.is_some(),
+                });
+            }
+            return self.emit(Out::WindowFilled(wire::WindowFilled {
+                export_id: export,
+                index: spec.index,
+                status: wire::FillStatus::FillOk as i32,
+                rank_sums,
+                ..Default::default()
+            }));
         }
         self.emit(Out::WindowFilled(wire::WindowFilled {
             export_id: export,
@@ -680,6 +927,14 @@ impl Engine {
             channel.stop();
         }
         if run.channel_open {
+            return;
+        }
+        // The peer ranks end their parts too: after their copies drained.
+        if abandoned {
+            self.cancel_export_peers(id);
+        }
+        let run = self.source.exports.get_mut(&id).expect("present");
+        if run.peers.iter().any(|peer| peer.done.is_none()) {
             return;
         }
         let status = if run.failed {

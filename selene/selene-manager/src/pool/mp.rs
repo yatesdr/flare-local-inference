@@ -175,6 +175,11 @@ impl Core {
 
     /// The channels the requester's peers in channel mode dial, for `ClaimGranted`.
     pub(super) fn rank_channels(&self, key: ClaimKey) -> Vec<v2::RankChannel> {
+        self.rank_channels_of(key, false)
+    }
+
+    /// The channels the peers of the requester (`source` false) or of the source (true) dial.
+    pub(super) fn rank_channels_of(&self, key: ClaimKey, source: bool) -> Vec<v2::RankChannel> {
         let (Some(claim), Some(hub)) = (self.claims.get(&key), self.cfg.channel.as_ref()) else {
             return Vec::new();
         };
@@ -182,7 +187,7 @@ impl Core {
             .mp
             .legs
             .iter()
-            .filter(|leg| !leg.source)
+            .filter(|leg| leg.source == source)
             .map(|leg| v2::RankChannel {
                 rank: leg.rank,
                 channel: Some(super::channel_ref(hub, &leg.ch.token)),
@@ -243,6 +248,50 @@ impl Core {
             let result = super::pass::run(job);
             let _ = events.blocking_send(Event::Pass { key, index, result });
         });
+    }
+
+    /// Some of a multi-process source's ranks stated their slice checksums for a window. Each
+    /// rank counts once; the window is whole when every accessor has written its part, and
+    /// then it goes to the assembly pass.
+    pub(super) fn stated_part(
+        &mut self,
+        key: ClaimKey,
+        index: u32,
+        parts: Vec<(usize, SliceSums)>,
+        slot: u32,
+    ) {
+        let Some(claim) = self.claims.get_mut(&key) else {
+            return;
+        };
+        if claim.is_terminal() {
+            return;
+        }
+        let Some(window) = claim.windows.get_mut(index as usize) else {
+            return;
+        };
+        if window.phase != Phase::SourceWrite || window.arrived || window.writers & (1 << slot) == 0
+        {
+            return;
+        }
+        for (rank, sums) in parts {
+            match window.stated.get_mut(rank) {
+                Some(entry @ None) => *entry = Some(sums),
+                // An unknown rank, or one that already stated: a repeat is no vote.
+                _ => {
+                    return self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
+                }
+            }
+        }
+        window.writers &= !(1 << slot);
+        if window.writers != 0 {
+            return;
+        }
+        let stated: Option<Vec<SliceSums>> = window.stated.drain(..).collect();
+        let Some(stated) = stated else {
+            return self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
+        };
+        window.arrived = true;
+        self.window_arrived(key, index as usize, Stated::Ranks(stated));
     }
 
     /// A pass finished.
