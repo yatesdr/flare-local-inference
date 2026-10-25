@@ -42,6 +42,7 @@ use super::{
     shared::PoolStatus,
     shm::Regions,
     slice::{SliceLayout, SliceSums},
+    startup::{RegisteredRegion, Startup},
     wire::{self, rank_client_message as rc, rank_server_message as rs},
 };
 
@@ -215,6 +216,7 @@ pub struct RankAgent {
     wake: Arc<Notify>,
     status: Arc<Mutex<PoolStatus>>,
     thread: Option<JoinHandle<Result<()>>>,
+    registered: Vec<RegisteredRegion>,
 }
 
 impl RankAgent {
@@ -241,6 +243,7 @@ impl RankAgent {
         }
         let wake = Arc::new(Notify::new());
         let stop = Arc::new(AtomicBool::new(false));
+        let startup = Arc::new(Startup::new());
         let status = Arc::new(Mutex::new(PoolStatus::Connecting));
         let end = LinkEnd::start(config.link, wake.clone())
             .map_err(|e| Error::caused_by("cannot start the rank link", e))?;
@@ -257,6 +260,8 @@ impl RankAgent {
             context: config.registration_context,
             copier: config.copier,
             registrar: config.registrar,
+            startup: startup.clone(),
+            shared: None,
             wake: wake.clone(),
             stop: stop.clone(),
             status: status.clone(),
@@ -283,16 +288,37 @@ impl RankAgent {
             .name("selene-rank-agent".into())
             .spawn(move || run(agent))
             .map_err(|e| Error::caused_by("cannot start the rank agent thread", e))?;
+        let registered = match startup.wait(super::client::STARTUP_WAIT) {
+            Ok(registered) => registered,
+            Err(timed_out) => {
+                if timed_out {
+                    let reason = format!(
+                        "the pool manager did not answer within {:?} of startup; this rank \
+                         will not attach to the pool later (start the manager before the instance)",
+                        super::client::STARTUP_WAIT
+                    );
+                    eprintln!("warning: rank {}: {reason}", config.rank);
+                    *status.lock().unwrap() = PoolStatus::Disabled(reason);
+                }
+                Vec::new()
+            }
+        };
         Ok(RankAgent {
             stop,
             wake,
             status,
             thread: Some(thread),
+            registered,
         })
     }
 
     pub fn status(&self) -> PoolStatus {
         self.status.lock().unwrap().clone()
+    }
+
+    /// The ranges registered at startup. Empty when the agent did not attach.
+    pub fn registered_regions(&self) -> &[RegisteredRegion] {
+        &self.registered
     }
 
     /// Stop, drain every transfer, attest it to the manager and end. `Err` means copies
@@ -382,6 +408,9 @@ struct Agent {
     context: usize,
     copier: SharedCopier,
     registrar: Arc<dyn HostRegistrar + Send + Sync>,
+    startup: Arc<Startup>,
+    /// The manager's shared files as they were when mapped and registered at startup.
+    shared: Option<(wire::SharedMemory, Arc<Regions>)>,
     wake: Arc<Notify>,
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<PoolStatus>>,
@@ -435,6 +464,9 @@ impl Agent {
     }
 
     async fn serve(&mut self) -> Result<()> {
+        if !self.prepare().await {
+            return Ok(());
+        }
         if !self.greet().await {
             return Ok(());
         }
@@ -568,24 +600,36 @@ impl Agent {
         false
     }
 
-    /// Reach the manager, attach, and serve until the attachment ends.
-    async fn attempt(&mut self) -> Attempt {
-        let link = conn::Link {
+    fn link(&self) -> conn::Link {
+        conn::Link {
             address: self.address.clone(),
             ca: self.ca.clone(),
             roots: self.roots.clone(),
             wake: self.wake.clone(),
             stop: self.stop.clone(),
-            startup: Arc::new(super::startup::Startup::new()),
+            startup: self.startup.clone(),
             approve: None,
-        };
-        let (channel, connected_with) = match conn::connect(&link).await {
+        }
+    }
+
+    /// Connect and exchange Hellos.
+    async fn reach(
+        &self,
+        link: &conn::Link,
+    ) -> std::result::Result<
+        (
+            wire::pool_client::PoolClient<tonic::transport::Channel>,
+            wire::HelloReply,
+        ),
+        Attempt,
+    > {
+        let (channel, connected_with) = match conn::connect(link).await {
             Ok(connected) => connected,
-            Err(conn::Unreachable::Retry(why)) => return Attempt::Retry(why),
+            Err(conn::Unreachable::Retry(why)) => return Err(Attempt::Retry(why)),
             Err(conn::Unreachable::Untrusted(why)) => {
-                return Attempt::Disabled(format!(
+                return Err(Attempt::Disabled(format!(
                     "cannot verify the pool manager over TLS ({why})"
-                ));
+                )));
             }
         };
         let mut client = wire::pool_client::PoolClient::new(channel);
@@ -600,11 +644,103 @@ impl Agent {
         .await;
         let hello = match hello {
             Ok(Ok(reply)) => reply.into_inner(),
-            Ok(Err(status)) => return Attempt::Retry(format!("Hello failed: {status}")),
-            Err(_) => return Attempt::Retry("Hello timed out".into()),
+            Ok(Err(status)) => return Err(Attempt::Retry(format!("Hello failed: {status}"))),
+            Err(_) => return Err(Attempt::Retry("Hello timed out".into())),
         };
         if let Err(why) = conn::check_hello(&hello, connected_with) {
-            return Attempt::Disabled(why);
+            return Err(Attempt::Disabled(why));
+        }
+        Ok((client, hello))
+    }
+
+    /// Startup: the one time this agent registers memory. On the first Hello it maps and
+    /// registers the manager's shared files, when it offers them, and its own data-channel
+    /// staging, when the manager has a data listener; which of the two a rank then uses is
+    /// the manager's decision at attach. The registration window closes behind it. `false`
+    /// when the agent is not going to attach at all.
+    async fn prepare(&mut self) -> bool {
+        let link = self.link();
+        let mut backoff = FIRST_BACKOFF;
+        loop {
+            if self.stopping() || self.end.failed() {
+                return false;
+            }
+            if self.startup.is_closed() {
+                self.set_status(PoolStatus::Disabled(
+                    "the pool manager did not answer at startup".into(),
+                ));
+                return false;
+            }
+            match self.reach(&link).await {
+                Ok((_client, hello)) => {
+                    if !self.startup.begin() {
+                        return false;
+                    }
+                    let mut registered = Vec::new();
+                    if let Some(shared) = hello.shared_memory.as_ref() {
+                        match self.map_regions(shared) {
+                            Ok(regions) => {
+                                registered.push(conn::registered_region("arena", &regions.arena));
+                                registered
+                                    .push(conn::registered_region("staging", &regions.staging));
+                                self.shared = Some((shared.clone(), Arc::new(regions)));
+                            }
+                            Err(error) => eprintln!(
+                                "warning: rank {}: cannot use the pool's shared memory ({error})",
+                                self.rank
+                            ),
+                        }
+                    }
+                    if !hello.data_transports.is_empty() {
+                        match self.make_staging(&hello) {
+                            Ok(staging) => {
+                                registered.push(conn::registered_region(
+                                    "data-staging",
+                                    staging.region(),
+                                ));
+                                self.staging = Some(staging);
+                            }
+                            Err(error) => eprintln!(
+                                "warning: rank {}: cannot use the pool's data channel ({error})",
+                                self.rank
+                            ),
+                        }
+                    }
+                    self.registrar = Arc::new(super::startup::ClosedRegistrar);
+                    self.startup.done(registered);
+                    return true;
+                }
+                Err(Attempt::Disabled(why)) => {
+                    self.startup.close();
+                    eprintln!("warning: rank {}: {why}", self.rank);
+                    self.set_status(PoolStatus::Disabled(why));
+                    return false;
+                }
+                Err(_) => {
+                    let until = Instant::now() + backoff;
+                    while Instant::now() < until && !self.stopping() {
+                        let _ = tokio::time::timeout(IDLE_TICK, self.wake.notified()).await;
+                    }
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+            }
+        }
+    }
+
+    /// Reach the manager, attach, and serve until the attachment ends.
+    async fn attempt(&mut self) -> Attempt {
+        let link = self.link();
+        let (mut client, hello) = match self.reach(&link).await {
+            Ok(reached) => reached,
+            Err(attempt) => return attempt,
+        };
+        if let Some((registered, _)) = &self.shared
+            && hello.shared_memory.as_ref() != Some(registered)
+        {
+            return Attempt::Disabled(conn::regions_changed(
+                registered,
+                hello.shared_memory.as_ref(),
+            ));
         }
         let Some(bound) = self.bound.as_ref() else {
             return Attempt::Disabled("not bound to rank 0".into());
@@ -656,18 +792,12 @@ impl Agent {
             }
         }
         let mode = wire::RankMode::try_from(attached.mode).unwrap_or(wire::RankMode::Unspecified);
-        let regions = match (mode, hello.shared_memory.as_ref()) {
-            (wire::RankMode::RankShared, Some(shared)) => match self.map_regions(shared) {
-                Ok(regions) => Some(Arc::new(regions)),
-                Err(error) => {
-                    return Attempt::Disabled(format!(
-                        "cannot use the pool's shared memory: {error}"
-                    ));
-                }
-            },
+        let regions = match (mode, &self.shared) {
+            (wire::RankMode::RankShared, Some((_, regions))) => Some(regions.clone()),
             (wire::RankMode::RankShared, None) => {
                 return Attempt::Disabled(
-                    "the manager gave shared mode but no shared memory".into(),
+                    "the manager gave shared mode but no shared memory was registered at startup"
+                        .into(),
                 );
             }
             _ => None,
@@ -702,6 +832,19 @@ impl Agent {
         Ok(regions)
     }
 
+    /// The staging a channel leg copies through, registered at startup.
+    fn make_staging(&self, hello: &wire::HelloReply) -> Result<Arc<Staging>> {
+        let limits = conn::limits_or_default(hello.limits);
+        let mine = self.layout.rank(self.rank);
+        let slot_bytes = limits.max_window_bytes.max(mine.page_len).max(mine.row_len);
+        Ok(Arc::new(Staging::new(
+            &*self.registrar,
+            self.context,
+            STAGING_SLOTS,
+            slot_bytes,
+        )?))
+    }
+
     fn make_dial(&mut self, link: &conn::Link, hello: &wire::HelloReply) -> Result<()> {
         let limits = conn::limits_or_default(hello.limits);
         let (host, tls) = match &self.address {
@@ -722,15 +865,15 @@ impl Agent {
             }
             PoolAddress::Unix(_) => ("127.0.0.1".to_string(), None),
         };
-        if self.staging.is_none() {
-            let mine = self.layout.rank(self.rank);
-            let slot_bytes = limits.max_window_bytes.max(mine.page_len).max(mine.row_len);
-            self.staging = Some(Arc::new(Staging::new(
-                &*self.registrar,
-                self.context,
-                STAGING_SLOTS,
-                slot_bytes,
-            )?));
+        let Some(staging) = self.staging.as_ref() else {
+            return Err(Error::new(
+                "no data-channel staging was registered at startup",
+            ));
+        };
+        if staging.slot_bytes() < limits.max_window_bytes {
+            return Err(Error::new(
+                "the manager now allows larger windows than the staging registered at startup",
+            ));
         }
         self.dial = Some(Arc::new(Tcp {
             host,

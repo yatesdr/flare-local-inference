@@ -718,7 +718,10 @@ fn attach(
     }
 }
 
-fn registered_region(name: &'static str, region: &super::shm::Region) -> RegisteredRegion {
+pub(crate) fn registered_region(
+    name: &'static str,
+    region: &super::shm::Region,
+) -> RegisteredRegion {
     RegisteredRegion {
         name,
         address: region.base(),
@@ -727,7 +730,10 @@ fn registered_region(name: &'static str, region: &super::shm::Region) -> Registe
 }
 
 /// Why the manager's shared files no longer are the ones this process registered.
-fn regions_changed(registered: &wire::SharedMemory, now: Option<&wire::SharedMemory>) -> String {
+pub(crate) fn regions_changed(
+    registered: &wire::SharedMemory,
+    now: Option<&wire::SharedMemory>,
+) -> String {
     let what = match now {
         None => "no longer offers shared memory".to_string(),
         Some(now) if now.regions_generation != registered.regions_generation => format!(
