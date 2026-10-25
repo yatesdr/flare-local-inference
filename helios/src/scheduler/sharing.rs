@@ -2,7 +2,7 @@
 //! chain of a GPU checkpoint, and the read-only headroom check for pinning it.
 
 use super::*;
-use crate::offload::{ExportChain, ExportNode, ExportRefusal};
+use flare_selene::{ExportChain, ExportNode, ExportRefusal};
 
 /// A checkpoint that left the GPU cache, reported at logical removal.
 #[derive(Clone, Debug, PartialEq, Eq)]

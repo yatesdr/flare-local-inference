@@ -28,7 +28,7 @@ use crate::cache::{
     Reclaimable, SnapshotId, StateSnapshot,
 };
 use crate::execution::{CompletionRecord, GraphKind, REQUEST_LANES};
-use crate::offload::{InboundTicket, PublishedCheckpoint};
+use flare_selene::{InboundTicket, PublishedCheckpoint};
 use crate::{Result, Shutdown};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

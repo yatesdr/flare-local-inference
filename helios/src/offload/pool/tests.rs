@@ -1,5 +1,6 @@
 use super::*;
-use crate::offload::{CacheGeometry, PoolOptions};
+use flare_selene::CacheGeometry;
+use crate::offload::PoolOptions;
 use flare_selene::{pool::PoolStatus, testing::TrackingRegistrar as Registrar};
 use selene_manager::testing::{Manager, wait};
 use std::{sync::Arc, thread};
@@ -93,7 +94,7 @@ fn peer_registration_budget_disables_the_whole_ranked_instance() {
             wait("startup", || peer.agent.as_ref().unwrap().status() == PoolStatus::Ready);
             assert_eq!(
                 zero.identity.layout,
-                super::super::geometry::fingerprint(&vec![
+                flare_selene::geometry::fingerprint(&vec![
                     flare_selene::testing::geometry(
                         64,
                         &[("kv", 4096)],

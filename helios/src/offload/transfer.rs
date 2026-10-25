@@ -1443,7 +1443,7 @@ mod tests {
     #[test]
     #[ignore = "requires two CUDA devices"]
     fn split_pools_cost_each_device_its_part_and_round_trip_units() {
-        use super::super::{Plane, slab::SlabPool};
+        use flare_selene::{Plane, slab::SlabPool};
         use crate::runtime_package::driver::Driver as Loader;
         const PAGES: u64 = 80;
         const ROWS: u64 = 4;

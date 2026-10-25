@@ -157,7 +157,7 @@ struct Incoming {
     /// Pool lookup started when the request reached the worker. The worker clears
     /// it when the request is admitted, which withdraws a lookup still on the
     /// wire; a cancelled or failed request drops it with the `Incoming`.
-    pool_lookup: Option<crate::offload::LookupTicket>,
+    pool_lookup: Option<flare_selene::pool::LookupTicket>,
 }
 impl Incoming {
     fn prompt_score_range(&self, start: usize, tokens: usize) -> std::ops::Range<usize> {
@@ -321,7 +321,7 @@ pub struct ModelRuntime {
     shutdown: Mutex<Option<Shutdown>>,
     finished: Arc<(Mutex<bool>, Condvar)>,
     metrics: Arc<super::metrics::Metrics>,
-    input_store: Option<crate::offload::input::InputStore>,
+    input_store: Option<flare_selene::input::InputStore>,
 }
 
 impl ModelRuntime {
@@ -587,7 +587,7 @@ impl ModelRuntime {
         }
     }
 
-    pub(super) fn input_store(&self) -> Option<&crate::offload::input::InputStore> {
+    pub(super) fn input_store(&self) -> Option<&flare_selene::input::InputStore> {
         self.input_store.as_ref()
     }
 
@@ -787,7 +787,7 @@ struct ImagePreparation {
 }
 
 impl ImagePreparation {
-    fn new(store: Option<crate::offload::input::InputStore>) -> Self {
+    fn new(store: Option<flare_selene::input::InputStore>) -> Self {
         let (sender, jobs) = mpsc::sync_channel::<ImagePreparationJob>(1);
         let (results, receiver) = mpsc::sync_channel(1);
         let stop = Arc::new(AtomicBool::new(false));
@@ -841,10 +841,10 @@ struct Worker<'a> {
     admissions: Vec<Option<crate::model::Admission>>,
     inputs: Option<crate::model::Inputs>,
     queue_capacity: usize,
-    store: Option<Box<dyn crate::offload::PrefixStore>>,
+    store: Option<Box<dyn flare_selene::HostStore>>,
     /// The checkpoint each served export pins, until its `ExportEnded`: the only
     /// place an export's pin is released.
-    exports: HashMap<crate::offload::ExportId, crate::cache::CheckpointId>,
+    exports: HashMap<flare_selene::ExportId, crate::cache::CheckpointId>,
     /// Prefill tokens per second measured from completed prefill frames, which
     /// the host-store fetch policy compares with transfer time.
     prefill_rate: f64,
@@ -879,7 +879,7 @@ impl<'a> Worker<'a> {
             active: (0..config.limits.max_active).map(|_| None).collect(),
             admissions: (0..config.limits.max_active).map(|_| None).collect(),
             inputs: None,
-            prefill_rate: crate::offload::INITIAL_PREFILL_RATE,
+            prefill_rate: flare_selene::INITIAL_PREFILL_RATE,
             prefill_started: VecDeque::new(),
             image_preparation: None,
             preparing_image: None,
@@ -952,7 +952,7 @@ impl<'a> Worker<'a> {
         Ok(())
     }
 
-    fn attach_store(&mut self, store: Option<Box<dyn crate::offload::PrefixStore>>) {
+    fn attach_store(&mut self, store: Option<Box<dyn flare_selene::HostStore>>) {
         if store.is_some() {
             self.scheduler.enable_publications();
             self.scheduler.enable_evictions();
@@ -1961,7 +1961,7 @@ impl<'a> Worker<'a> {
         let Some(store) = self.store.as_mut() else {
             return Ok(false);
         };
-        use crate::offload::StoreEvent;
+        use flare_selene::StoreEvent;
         let mut events = Vec::new();
         store.poll(&mut events)?;
         let mut progress = !events.is_empty();
@@ -2127,14 +2127,14 @@ fn next_admission(
 /// a refusal, and the pin is recorded before the store hears of the export.
 fn serve_export(
     scheduler: &mut RequestScheduler,
-    store: &mut dyn crate::offload::PrefixStore,
-    exports: &mut HashMap<crate::offload::ExportId, crate::cache::CheckpointId>,
+    store: &mut dyn flare_selene::HostStore,
+    exports: &mut HashMap<flare_selene::ExportId, crate::cache::CheckpointId>,
     next: Option<crate::scheduler::NextAdmission>,
-    export: crate::offload::ExportId,
+    export: flare_selene::ExportId,
     (key, begin_tokens, want_row): (crate::cache::PrefixKey, u64, bool),
 ) -> Result<()> {
-    use crate::offload::ExportRefusal;
-    let refuse = |store: &mut dyn crate::offload::PrefixStore, reason| {
+    use flare_selene::ExportRefusal;
+    let refuse = |store: &mut dyn flare_selene::HostStore, reason| {
         store.export_refused(export, reason);
         Ok(())
     };
@@ -2165,8 +2165,8 @@ fn serve_export(
 /// checkpoint, and start a restore when the transfer beats recomputation.
 fn admit_with_host_store(
     scheduler: &mut RequestScheduler,
-    store: &mut dyn crate::offload::PrefixStore,
-    pool_lookup: Option<&crate::offload::LookupTicket>,
+    store: &mut dyn flare_selene::HostStore,
+    pool_lookup: Option<&flare_selene::pool::LookupTicket>,
     spec: RequestSpec,
     prefill_rate: f64,
     metrics: &super::metrics::Metrics,
@@ -2188,7 +2188,7 @@ fn admit_with_host_store(
                 break None;
             };
             metrics.host_lookup_cost(&hit, prefill_rate);
-            if crate::offload::worth_fetching(&hit, prefill_rate) {
+            if flare_selene::worth_fetching(&hit, prefill_rate) {
                 break Some(hit);
             }
             metrics.host_lookup_outcome(LookupOutcome::CostRejected);

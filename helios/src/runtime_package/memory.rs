@@ -1,12 +1,12 @@
 //! Choose physical cache capacities within reserved virtual address ranges.
 
+use flare_selene::{CacheGeometry, Plane};
 use super::{
     KvCacheLimit, LoadOptions, MemoryLimit, NativeModel, NativeResources,
     format::{Memory, Package, invalid},
 };
 use crate::{
     Result,
-    offload::{CacheGeometry, Plane},
     startup::StartupProgress,
 };
 
@@ -527,13 +527,13 @@ impl NativeModel {
             let staging = input_window;
             let (device, host) = options.prefix_cache.headroom_with_inputs(
                 self.ranks.len(),
-                &crate::offload::Layout::new(&geometry)?,
+                &flare_selene::Layout::new(&geometry)?,
                 staging != 0,
             )?;
             let index = if staging == 0 {
                 0
             } else {
-                crate::offload::input::INDEX_HEADROOM_BYTES
+                flare_selene::input::INDEX_HEADROOM_BYTES
             };
             let host = host
                 .checked_add(staging)
@@ -634,7 +634,7 @@ impl NativeModel {
                 layout: if geometry.is_empty() {
                     [0; 16]
                 } else {
-                    crate::offload::geometry::fingerprint(&geometry)
+                    flare_selene::geometry::fingerprint(&geometry)
                 },
                 rank: cluster.rank,
                 world: cluster.world,
@@ -1279,13 +1279,13 @@ mod tests {
         let mut reordered_ranks = original_ranks.clone();
         reordered_ranks[3] = reordered;
         assert_eq!(
-            crate::offload::geometry::fingerprint(&original_ranks),
-            crate::offload::geometry::fingerprint(&reordered_ranks),
+            flare_selene::geometry::fingerprint(&original_ranks),
+            flare_selene::geometry::fingerprint(&reordered_ranks),
         );
         let mut options = package(4096, 4096, 16);
         assert_eq!(
-            crate::offload::geometry::fingerprint(&[cache_geometry(&options, 64, 8, 16).unwrap()]),
-            crate::offload::geometry::fingerprint(
+            flare_selene::geometry::fingerprint(&[cache_geometry(&options, 64, 8, 16).unwrap()]),
+            flare_selene::geometry::fingerprint(
                 &[cache_geometry(&options, 64, 80, 160).unwrap()]
             )
         );

@@ -783,7 +783,7 @@ fn disabled_host_store_preserves_decode_prefix_reuse_and_cancellation() {
     assert!(!worker.service_store().unwrap());
     assert_eq!(fixture.metrics.cancelled.load(Ordering::Relaxed), 1);
     assert_eq!(worker.prefill_started.capacity(), 0);
-    assert_eq!(worker.prefill_rate, crate::offload::INITIAL_PREFILL_RATE);
+    assert_eq!(worker.prefill_rate, flare_selene::INITIAL_PREFILL_RATE);
     let stats = worker.scheduler.stats();
     assert_eq!((stats.cache_hits, stats.reused_tokens), (1, 13));
     assert_eq!(
@@ -1224,14 +1224,14 @@ fn fatal_broadcast_preserves_first_failure_and_reaches_pending_and_ingress() {
 /// A host store that answers lookups from a script and reports completions on demand.
 struct FakeStore {
     copies: std::collections::HashSet<crate::cache::PrefixKey>,
-    hit: Option<crate::offload::HostHit>,
+    hit: Option<flare_selene::HostHit>,
     reject_fetch: bool,
-    write_back_outcomes: VecDeque<crate::offload::StoreOutcome>,
-    write_backs: Vec<crate::offload::PublishedCheckpoint>,
+    write_back_outcomes: VecDeque<flare_selene::StoreOutcome>,
+    write_backs: Vec<flare_selene::PublishedCheckpoint>,
     progress: u64,
-    stored: Vec<crate::offload::PublishedCheckpoint>,
-    fetched: Vec<(crate::offload::HostHit, crate::offload::InboundTicket)>,
-    events: VecDeque<crate::offload::StoreEvent>,
+    stored: Vec<flare_selene::PublishedCheckpoint>,
+    fetched: Vec<(flare_selene::HostHit, flare_selene::InboundTicket)>,
+    events: VecDeque<flare_selene::StoreEvent>,
     close_error: Option<Error>,
     poll_error: Option<Error>,
     close_panics: bool,
@@ -1246,8 +1246,8 @@ struct FakeStore {
     tickets_seen: Vec<bool>,
     /// Tickets dropped without an answer.
     withdrawn: Arc<AtomicUsize>,
-    exports: Vec<(crate::offload::ExportId, crate::offload::ExportChain)>,
-    refused: Vec<(crate::offload::ExportId, crate::offload::ExportRefusal)>,
+    exports: Vec<(flare_selene::ExportId, flare_selene::ExportChain)>,
+    refused: Vec<(flare_selene::ExportId, flare_selene::ExportRefusal)>,
     reject_export: bool,
     evictions_lost: usize,
     /// Tickets stay unanswered instead of answering with nothing.
@@ -1255,13 +1255,13 @@ struct FakeStore {
     /// Each eviction notice with the number of `store` calls made before it.
     evicted: Vec<(
         crate::cache::PrefixKey,
-        Option<crate::offload::PublishedCheckpoint>,
+        Option<flare_selene::PublishedCheckpoint>,
         usize,
     )>,
 }
 
 impl FakeStore {
-    fn new(hit: Option<crate::offload::HostHit>) -> Self {
+    fn new(hit: Option<flare_selene::HostHit>) -> Self {
         Self {
             hit,
             copies: Default::default(),
@@ -1292,7 +1292,7 @@ impl FakeStore {
     }
 }
 
-impl crate::offload::PrefixStore for FakeStore {
+impl flare_selene::HostStore for FakeStore {
     fn has_copy(&self, key: crate::cache::PrefixKey) -> bool {
         self.copies.contains(&key)
     }
@@ -1311,10 +1311,10 @@ impl crate::offload::PrefixStore for FakeStore {
     fn begin_lookup(
         &mut self,
         history: &dyn flare_selene::History,
-    ) -> Option<crate::offload::LookupTicket> {
+    ) -> Option<flare_selene::pool::LookupTicket> {
         self.begun.push(history.token_count());
         let withdrawn = self.withdrawn.clone();
-        Some(crate::offload::LookupTicket::watched(
+        Some(flare_selene::pool::LookupTicket::watched(
             if self.pending_tickets {
                 flare_selene::pool::LookupState::Pending
             } else {
@@ -1327,18 +1327,18 @@ impl crate::offload::PrefixStore for FakeStore {
     }
     fn lookup_for(
         &mut self,
-        ticket: Option<&crate::offload::LookupTicket>,
+        ticket: Option<&flare_selene::pool::LookupTicket>,
         history: &dyn flare_selene::History,
         resident: u64,
         before: u64,
-    ) -> Option<crate::offload::HostHit> {
+    ) -> Option<flare_selene::HostHit> {
         self.tickets_seen.push(ticket.is_some());
         self.lookup(history, resident, before)
     }
     fn export_pinned(
         &mut self,
-        export: crate::offload::ExportId,
-        chain: crate::offload::ExportChain,
+        export: flare_selene::ExportId,
+        chain: flare_selene::ExportChain,
     ) -> flare_selene::Result<()> {
         if self.reject_export {
             return Err("export rejected".into());
@@ -1348,15 +1348,15 @@ impl crate::offload::PrefixStore for FakeStore {
     }
     fn export_refused(
         &mut self,
-        export: crate::offload::ExportId,
-        reason: crate::offload::ExportRefusal,
+        export: flare_selene::ExportId,
+        reason: flare_selene::ExportRefusal,
     ) {
         self.refused.push((export, reason));
     }
     fn evicted(
         &mut self,
         key: crate::cache::PrefixKey,
-        heir: Option<&crate::offload::PublishedCheckpoint>,
+        heir: Option<&flare_selene::PublishedCheckpoint>,
     ) {
         self.evicted
             .push((key, heir.cloned(), self.stored.len()));
@@ -1369,7 +1369,7 @@ impl crate::offload::PrefixStore for FakeStore {
         history: &dyn flare_selene::History,
         resident: u64,
         before: u64,
-    ) -> Option<crate::offload::HostHit> {
+    ) -> Option<flare_selene::HostHit> {
         self.hit.clone().filter(|hit| {
             history.key_at(hit.consumed_tokens) == Some(hit.key)
                 && hit.consumed_tokens > resident
@@ -1379,31 +1379,31 @@ impl crate::offload::PrefixStore for FakeStore {
     }
     fn published(
         &mut self,
-        checkpoint: &crate::offload::PublishedCheckpoint,
+        checkpoint: &flare_selene::PublishedCheckpoint,
     ) -> flare_selene::Result<()> {
         self.stored.push(checkpoint.clone());
         Ok(())
     }
     fn write_back(
         &mut self,
-        checkpoint: &crate::offload::PublishedCheckpoint,
-    ) -> flare_selene::Result<crate::offload::StoreOutcome> {
+        checkpoint: &flare_selene::PublishedCheckpoint,
+    ) -> flare_selene::Result<flare_selene::StoreOutcome> {
         self.write_backs.push(checkpoint.clone());
         let outcome = self
             .write_back_outcomes
             .pop_front()
-            .unwrap_or(crate::offload::StoreOutcome::Retry(
-                crate::offload::StoreReason::Queue,
+            .unwrap_or(flare_selene::StoreOutcome::Retry(
+                flare_selene::StoreReason::Queue,
             ));
-        if outcome == crate::offload::StoreOutcome::Present {
+        if outcome == flare_selene::StoreOutcome::Present {
             self.copies.insert(checkpoint.key);
         }
         Ok(outcome)
     }
     fn fetch(
         &mut self,
-        hit: crate::offload::HostHit,
-        ticket: crate::offload::InboundTicket,
+        hit: flare_selene::HostHit,
+        ticket: flare_selene::InboundTicket,
     ) -> flare_selene::Result<()> {
         if self.reject_fetch {
             return Err("fetch rejected".into());
@@ -1411,20 +1411,20 @@ impl crate::offload::PrefixStore for FakeStore {
         self.fetched.push((hit, ticket));
         Ok(())
     }
-    fn poll(&mut self, events: &mut Vec<crate::offload::StoreEvent>) -> flare_selene::Result<()> {
+    fn poll(&mut self, events: &mut Vec<flare_selene::StoreEvent>) -> flare_selene::Result<()> {
         if let Some(error) = &self.poll_error {
             return Err(error.clone().into());
         }
         for event in self.events.drain(..) {
-            if let crate::offload::StoreEvent::Stored { key, result: Ok(_), .. } = &event {
+            if let flare_selene::StoreEvent::Stored { key, result: Ok(_), .. } = &event {
                 self.copies.insert(*key);
             }
             events.push(event);
         }
         Ok(())
     }
-    fn stats(&self) -> crate::offload::StoreStats {
-        crate::offload::StoreStats {
+    fn stats(&self) -> flare_selene::StoreStats {
+        flare_selene::StoreStats {
             progress: self.progress,
             ..Default::default()
         }
@@ -1566,17 +1566,17 @@ fn a_store_that_cannot_report_completions_stops_the_worker() {
     );
 }
 
-fn host_hit(history: &crate::cache::PrefixHistory, consumed: u64) -> crate::offload::HostHit {
+fn host_hit(history: &crate::cache::PrefixHistory, consumed: u64) -> flare_selene::HostHit {
     let key = history.key_at(consumed).unwrap();
-    crate::offload::HostHit {
+    flare_selene::HostHit {
         key,
         consumed_tokens: consumed,
         resident_tokens: 0,
         pages: (consumed / 64) as usize,
         bytes: 1 << 20,
-        tier: crate::offload::Tier::Memory,
+        tier: flare_selene::Tier::Memory,
         estimated_seconds: 0.0,
-        chain: crate::offload::index::Match {
+        chain: flare_selene::index::Match {
             key,
             consumed_tokens: consumed,
             resident_tokens: 0,
@@ -1588,7 +1588,7 @@ fn host_hit(history: &crate::cache::PrefixHistory, consumed: u64) -> crate::offl
 }
 
 fn fake_store<'w>(worker: &'w mut Worker<'_>) -> &'w mut FakeStore {
-    let store = worker.store.as_mut().unwrap().as_mut() as *mut dyn crate::offload::PrefixStore;
+    let store = worker.store.as_mut().unwrap().as_mut() as *mut dyn flare_selene::HostStore;
     // SAFETY: The worker holds the only store and it was constructed as a FakeStore.
     unsafe { &mut *(store as *mut FakeStore) }
 }
@@ -1642,7 +1642,7 @@ fn host_hit_holds_the_request_inbound_until_the_restore_completes() {
     assert_eq!((ticket.key, ticket.pages.len()), (hit.key, 1));
     fake_store(&mut worker)
         .events
-        .push_back(crate::offload::StoreEvent::Fetched {
+        .push_back(flare_selene::StoreEvent::Fetched {
             key: ticket.key,
             result: Ok(1 << 20),
         });
@@ -1726,7 +1726,7 @@ fn failed_restores_readmit_the_request_without_the_host_store() {
             let (_, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
             fake_store(&mut worker)
                 .events
-                .push_back(crate::offload::StoreEvent::Fetched {
+                .push_back(flare_selene::StoreEvent::Fetched {
                     key: ticket.key,
                     result: Err("transfer failed".into()),
                 });
@@ -1796,7 +1796,7 @@ fn worker_with_checkpoint(
     let (_, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
     fake_store(&mut worker)
         .events
-        .push_back(crate::offload::StoreEvent::Fetched {
+        .push_back(flare_selene::StoreEvent::Fetched {
             key: ticket.key,
             result: Ok(1 << 20),
         });
@@ -1814,9 +1814,9 @@ fn export_request(
     key: crate::cache::PrefixKey,
     generation: u64,
     begin_tokens: u64,
-) -> crate::offload::StoreEvent {
-    crate::offload::StoreEvent::ExportRequested {
-        export: crate::offload::ExportId(export),
+) -> flare_selene::StoreEvent {
+    flare_selene::StoreEvent::ExportRequested {
+        export: flare_selene::ExportId(export),
         key,
         begin_tokens,
         want_row: true,
@@ -1824,9 +1824,9 @@ fn export_request(
     }
 }
 
-fn export_ended(export: u64) -> crate::offload::StoreEvent {
-    crate::offload::StoreEvent::ExportEnded {
-        export: crate::offload::ExportId(export),
+fn export_ended(export: u64) -> flare_selene::StoreEvent {
+    flare_selene::StoreEvent::ExportEnded {
+        export: flare_selene::ExportId(export),
     }
 }
 
@@ -1844,7 +1844,7 @@ fn an_export_pins_its_checkpoint_until_it_ends_and_releases_once() {
     let store = fake_store(&mut worker);
     assert!(store.refused.is_empty());
     let (export, chain) = store.exports.pop().unwrap();
-    assert_eq!(export, crate::offload::ExportId(7));
+    assert_eq!(export, flare_selene::ExportId(7));
     assert_eq!(chain.nodes.len(), 1);
     assert_eq!(chain.nodes[0].key, key);
     assert!(chain.row.is_some());
@@ -1878,7 +1878,7 @@ fn an_export_without_an_end_keeps_its_pin() {
 
 #[test]
 fn exports_that_cannot_be_served_are_refused_without_a_pin() {
-    use crate::offload::ExportRefusal::*;
+    use flare_selene::ExportRefusal::*;
     let fixture = Fixture::new();
     let (mut worker, _sender, _handle, id, key) = worker_with_checkpoint(&fixture, true);
     let base = pins(&worker, id);
@@ -1955,7 +1955,7 @@ fn an_export_is_refused_when_the_next_admission_would_no_longer_fit() {
             .refused
             .last()
             .map(|(e, r)| (e.0, *r)),
-        Some((2, crate::offload::ExportRefusal::NoHeadroom))
+        Some((2, flare_selene::ExportRefusal::NoHeadroom))
     );
     assert_eq!(pins(&worker, id), base);
 }
@@ -2043,7 +2043,7 @@ fn a_local_store_builds_no_lookup_and_a_failed_restore_starts_none() {
     let (_, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
     fake_store(&mut worker)
         .events
-        .push_back(crate::offload::StoreEvent::Fetched {
+        .push_back(flare_selene::StoreEvent::Fetched {
             key: ticket.key,
             result: Err("transfer failed".into()),
         });
@@ -3066,7 +3066,7 @@ fn failed_host_restore_replans_all_images_from_the_shallower_prefix() {
     let (_, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
     fake_store(&mut worker)
         .events
-        .push_back(crate::offload::StoreEvent::Fetched {
+        .push_back(flare_selene::StoreEvent::Fetched {
             key: ticket.key,
             result: Err("restore transfer failed".into()),
         });
@@ -3463,7 +3463,7 @@ fn completed_copyout_retries_capacity_waiters_without_a_new_model_fence() {
     let handle = worker.active[0].as_ref().unwrap().request;
     fake_store(&mut worker)
         .events
-        .push_back(crate::offload::StoreEvent::Fetched {
+        .push_back(flare_selene::StoreEvent::Fetched {
             key: history.key_at(64).unwrap(),
             result: Ok(4096),
         });
@@ -3471,7 +3471,7 @@ fn completed_copyout_retries_capacity_waiters_without_a_new_model_fence() {
     let publication = fake_store(&mut worker).stored[0].clone();
     worker.scheduler.cancel(handle).unwrap();
     worker.active[0] = None;
-    fake_store(&mut worker).write_back_outcomes.push_back(crate::offload::StoreOutcome::Queued);
+    fake_store(&mut worker).write_back_outcomes.push_back(flare_selene::StoreOutcome::Queued);
     worker.service_store().unwrap();
     assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
     let (incoming, _other_generation) = fixture.incoming(vec![1; 64], 1);
@@ -3482,7 +3482,7 @@ fn completed_copyout_retries_capacity_waiters_without_a_new_model_fence() {
     let fence = worker.scheduler.completed();
     fake_store(&mut worker)
         .events
-        .push_back(crate::offload::StoreEvent::Stored {
+        .push_back(flare_selene::StoreEvent::Stored {
             checkpoint: publication.id,
             key: publication.key,
             result: Ok(4096),
@@ -3572,7 +3572,7 @@ fn complete_store(worker: &mut Worker<'_>, id: crate::cache::CheckpointId, succe
     let key = worker.scheduler.cache().checkpoint(id).unwrap().prefix();
     fake_store(worker)
         .events
-        .push_back(crate::offload::StoreEvent::Stored {
+        .push_back(flare_selene::StoreEvent::Stored {
             checkpoint: id,
             key,
             result: if success {
@@ -3611,7 +3611,7 @@ fn queued_write_backs_release_one_pin_and_only_success_marks_them_clean() {
         let (_sender, receiver) = mpsc::channel();
         let mut worker = fixture.worker(receiver);
         let mut store = FakeStore::new(None);
-        store.write_back_outcomes.push_back(crate::offload::StoreOutcome::Queued);
+        store.write_back_outcomes.push_back(flare_selene::StoreOutcome::Queued);
         worker.attach_store(Some(Box::new(store)));
         let id = unpinned_checkpoint(&mut worker, 0, 64);
         worker.service_store().unwrap();
@@ -3631,7 +3631,7 @@ fn queued_write_backs_release_one_pin_and_only_success_marks_them_clean() {
 
 #[test]
 fn pressure_writes_cold_dirty_checkpoints_and_retry_stops_each_round() {
-    use crate::offload::{StoreOutcome::*, StoreReason};
+    use flare_selene::{StoreOutcome::*, StoreReason};
     for pooled in [false, true] {
         let fixture = Fixture::new();
         let (_sender, receiver) = mpsc::channel();
@@ -3686,7 +3686,7 @@ fn pressure_writes_cold_dirty_checkpoints_and_retry_stops_each_round() {
 
 #[test]
 fn write_back_does_not_take_capacity_from_the_next_admission() {
-    use crate::offload::StoreOutcome::*;
+    use flare_selene::StoreOutcome::*;
     let mut fixture = Fixture::new();
     fixture.config.limits.pages = 3;
     fixture.config.limits.max_sequence_tokens = 192;
@@ -3712,7 +3712,7 @@ fn write_back_does_not_take_capacity_from_the_next_admission() {
 
 #[test]
 fn admission_proceeds_while_a_write_back_copy_is_in_flight() {
-    use crate::offload::StoreOutcome::*;
+    use flare_selene::StoreOutcome::*;
     let fixture = Fixture::new();
     let (_sender, receiver) = mpsc::channel();
     let mut worker = fixture.worker(receiver);
@@ -3735,7 +3735,7 @@ fn admission_proceeds_while_a_write_back_copy_is_in_flight() {
 
 #[test]
 fn write_back_and_export_release_their_own_pins_in_either_completion_order() {
-    use crate::offload::StoreOutcome::*;
+    use flare_selene::StoreOutcome::*;
     for export_first in [false, true] {
         let fixture = Fixture::new();
         let (_sender, receiver) = mpsc::channel();
@@ -3774,7 +3774,7 @@ fn write_back_and_export_release_their_own_pins_in_either_completion_order() {
 
 #[test]
 fn write_back_pins_survive_ancestor_compaction() {
-    use crate::offload::StoreOutcome::*;
+    use flare_selene::StoreOutcome::*;
     let mut fixture = Fixture::new();
     fixture.config.limits.max_sequence_tokens = 256;
     fixture.config.limits.snapshots = 2;
@@ -3835,7 +3835,7 @@ fn write_back_pins_survive_ancestor_compaction() {
 
 #[test]
 fn present_stops_write_back_when_clean_reclamation_covers_the_watermark() {
-    use crate::offload::StoreOutcome::*;
+    use flare_selene::StoreOutcome::*;
     let mut fixture = Fixture::new();
     fixture.config.limits.pages = 130;
     let (_sender, receiver) = mpsc::channel();
@@ -3864,7 +3864,7 @@ fn a_present_write_back_marks_clean_without_a_pin() {
     let mut store = FakeStore::new(None);
     store
         .write_back_outcomes
-        .push_back(crate::offload::StoreOutcome::Present);
+        .push_back(flare_selene::StoreOutcome::Present);
     worker.attach_store(Some(Box::new(store)));
     let id = unpinned_checkpoint(&mut worker, 0, 64);
     worker.service_store().unwrap();
@@ -3880,7 +3880,7 @@ fn has_copy(worker: &mut Worker<'_>, id: crate::cache::CheckpointId) -> bool {
 
 #[test]
 fn losing_a_host_copy_makes_the_gpu_checkpoint_a_write_back_candidate_again() {
-    use crate::offload::StoreOutcome;
+    use flare_selene::StoreOutcome;
     let fixture = Fixture::new();
     let (_sender, receiver) = mpsc::channel();
     let mut worker = fixture.worker(receiver);
