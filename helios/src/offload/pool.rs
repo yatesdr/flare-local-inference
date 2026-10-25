@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use flare_selene::{
-    HostStore, Layout, PageCopier, SharedCopier,
+    HostStore, Layout, PageCopier,
     copier::{Job, Reply},
     pool::{
         AgentConfig, PlannedRegion, PoolClient, PoolConfig, PooledStore, RankAgent, RankSet,
@@ -12,7 +12,7 @@ use flare_selene::{
 };
 
 use super::{
-    CacheGeometry, PoolOptions, PrefixStore, adapter, pool_address, pool_scope, registrar, transfer,
+    CacheGeometry, PoolOptions, PrefixStore, pool_address, pool_scope, registrar, transfer,
 };
 use crate::{Result, startup::StartupProgress};
 
@@ -317,17 +317,14 @@ impl PreparedPool {
 
     pub(super) fn attach(self, local: Option<Box<dyn HostStore>>) -> Result<Box<dyn PrefixStore>> {
         let layout = self.copier.lock().unwrap().layout.clone();
-        let copier: SharedCopier = self.copier;
         let store = PooledStore::new(
-            adapter::Tiers::new(local),
+            flare_selene::pool::Tiers::new(local),
             self.client
                 .ok_or("a pool rank agent cannot serve rank zero's store")?,
             self.identity,
             &layout,
         );
-        Ok(Box::new(
-            adapter::Host::new(Box::new(store), true).with_pool_copier(copier),
-        ))
+        Ok(Box::new(store))
     }
 }
 

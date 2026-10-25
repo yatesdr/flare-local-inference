@@ -1306,7 +1306,7 @@ impl crate::offload::PrefixStore for FakeStore {
     }
     fn begin_lookup(
         &mut self,
-        history: &crate::cache::PrefixHistory,
+        history: &dyn flare_selene::History,
     ) -> Option<crate::offload::LookupTicket> {
         self.begun.push(history.token_count());
         let withdrawn = self.withdrawn.clone();
@@ -1324,7 +1324,7 @@ impl crate::offload::PrefixStore for FakeStore {
     fn lookup_for(
         &mut self,
         ticket: Option<&crate::offload::LookupTicket>,
-        history: &crate::cache::PrefixHistory,
+        history: &dyn flare_selene::History,
         resident: u64,
         before: u64,
     ) -> Option<crate::offload::HostHit> {
@@ -1335,7 +1335,7 @@ impl crate::offload::PrefixStore for FakeStore {
         &mut self,
         export: crate::offload::ExportId,
         chain: crate::offload::ExportChain,
-    ) -> Result<()> {
+    ) -> flare_selene::Result<()> {
         if self.reject_export {
             return Err("export rejected".into());
         }
@@ -1367,7 +1367,7 @@ impl crate::offload::PrefixStore for FakeStore {
     fn copies_drained(&self) -> bool {
         !self.undrained
     }
-    fn characterize(&mut self, scratch: &crate::offload::Scratch) -> Result<Option<String>> {
+    fn characterize(&mut self, scratch: &crate::offload::Scratch) -> flare_selene::Result<Option<String>> {
         self.characterized.push(scratch.clone());
         if self.characterize_fails {
             return Err("probe failed".into());
@@ -1377,7 +1377,7 @@ impl crate::offload::PrefixStore for FakeStore {
     }
     fn lookup(
         &mut self,
-        history: &crate::cache::PrefixHistory,
+        history: &dyn flare_selene::History,
         resident: u64,
         before: u64,
     ) -> Option<crate::offload::HostHit> {
@@ -1391,7 +1391,7 @@ impl crate::offload::PrefixStore for FakeStore {
     fn store(
         &mut self,
         checkpoint: &crate::offload::PublishedCheckpoint,
-    ) -> Result<crate::offload::StoreOutcome> {
+    ) -> flare_selene::Result<crate::offload::StoreOutcome> {
         self.stored.push(checkpoint.clone());
         Ok(self
             .store_outcomes
@@ -1401,7 +1401,7 @@ impl crate::offload::PrefixStore for FakeStore {
     fn write_back(
         &mut self,
         checkpoint: &crate::offload::PublishedCheckpoint,
-    ) -> Result<crate::offload::StoreOutcome> {
+    ) -> flare_selene::Result<crate::offload::StoreOutcome> {
         self.write_backs.push(checkpoint.clone());
         Ok(self
             .write_back_outcomes
@@ -1414,16 +1414,16 @@ impl crate::offload::PrefixStore for FakeStore {
         &mut self,
         hit: crate::offload::HostHit,
         ticket: crate::offload::InboundTicket,
-    ) -> Result<()> {
+    ) -> flare_selene::Result<()> {
         if self.reject_fetch {
             return Err("fetch rejected".into());
         }
         self.fetched.push((hit, ticket));
         Ok(())
     }
-    fn poll(&mut self, events: &mut Vec<crate::offload::StoreEvent>) -> Result<()> {
+    fn poll(&mut self, events: &mut Vec<crate::offload::StoreEvent>) -> flare_selene::Result<()> {
         if let Some(error) = &self.poll_error {
-            return Err(error.clone());
+            return Err(error.clone().into());
         }
         events.extend(self.events.drain(..));
         Ok(())
@@ -1434,10 +1434,10 @@ impl crate::offload::PrefixStore for FakeStore {
             ..Default::default()
         }
     }
-    fn close(&mut self) -> Result<()> {
+    fn close(&mut self) -> flare_selene::Result<()> {
         self.close_calls.fetch_add(1, Ordering::Relaxed);
         assert!(!self.close_panics, "transfer drain panicked");
-        self.close_error.clone().map_or(Ok(()), Err)
+        self.close_error.clone().map_or(Ok(()), |error| Err(error.into()))
     }
 }
 

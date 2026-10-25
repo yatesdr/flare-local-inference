@@ -15,7 +15,6 @@
 //! blocks it: `store` notes publications, `write_back` and `fetch` enqueue work,
 //! and `poll` drains completions.
 
-mod adapter;
 #[cfg(all(test, feature = "runtime-package"))]
 mod gpu_tests;
 pub(crate) mod pool;
@@ -30,14 +29,12 @@ pub use flare_selene::{
     StoreStats, Tier, Transport, disk, disk_store, geometry, index, input, pool::LookupTicket,
     record, slab, worth_fetching,
 };
+pub use flare_selene::{HostStore as PrefixStore, StoreEvent};
 use flare_selene::{HostStore, composite, memory};
 
 use std::path::PathBuf;
 
-use crate::{
-    Result,
-    cache::{CheckpointId, PrefixHistory, PrefixKey},
-};
+use crate::Result;
 
 /// Offload settings as the command line and configuration file supply them.
 /// `None` selects the default: no memory store and no disk store until the
@@ -720,7 +717,7 @@ pub fn open(prepared: Prepared) -> Result<Box<dyn PrefixStore>> {
         Some(pool) => pool.attach(local),
         None => {
             let store = local.ok_or("no prefix store tier is configured")?;
-            Ok(Box::new(adapter::Host::new(store, false)))
+            Ok(store)
         }
     }
 }
@@ -755,35 +752,6 @@ fn pool_scope(
     })
 }
 
-/// Completion of work a store accepted earlier.
-#[derive(Debug)]
-pub enum StoreEvent {
-    /// The copy-out of a published checkpoint finished; the worker may unpin it.
-    Stored {
-        checkpoint: CheckpointId,
-        key: PrefixKey,
-        result: Result<u64>,
-    },
-    /// The copy-in for an inbound ticket finished; the worker reports it to the scheduler.
-    Fetched { key: PrefixKey, result: Result<u64> },
-    /// No copy still reads the GPU checkpoint; retry its publication after progress.
-    Deferred { checkpoint: CheckpointId },
-    /// A pool manager asked this instance to export a GPU checkpoint. The worker
-    /// answers with `export_pinned` or `export_refused` in the same iteration.
-    ExportRequested {
-        export: ExportId,
-        key: PrefixKey,
-        generation: u64,
-        begin_tokens: u64,
-        want_row: bool,
-        /// Bytes of staging the manager reserved for the whole export.
-        reserved_bytes: u64,
-    },
-    /// The export finished or was cancelled and no copy still reads its pages;
-    /// the worker releases its pin, once.
-    ExportEnded { export: ExportId },
-}
-
 #[derive(Clone, Copy)]
 pub enum LookupOutcome {
     NoMatch,
@@ -791,86 +759,6 @@ pub enum LookupOutcome {
     CapacityRejected,
     EnqueueRejected,
     Admitted,
-}
-
-/// A host tier the model worker drives without waiting on it.
-///
-/// `store` and `fetch` enqueue work and return. `poll` reports completions.
-/// The worker pins queued copy-outs until Stored or Deferred, retaining only
-/// checkpoint IDs for retries. Ticket IDs belong to the scheduler until Fetched.
-///
-/// A store whose transfers can no longer be trusted reports the failure from
-/// `poll` and stops producing events. The worker then stops, so ids and pins
-/// held by transfers it cannot account for are never reused or released.
-pub trait PrefixStore {
-    /// Deepest record chain extending `resident` and strictly below `before`.
-    fn lookup(&mut self, history: &PrefixHistory, resident: u64, before: u64) -> Option<HostHit>;
-    /// Only Queued promises an event and retains a GPU copy-out pin.
-    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
-    /// Copy a checkpoint `store` answered Noted for, ahead of its eviction;
-    /// see `flare_selene::HostStore::write_back`.
-    fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
-        self.store(checkpoint)
-    }
-    /// Copy a looked-up chain into the ticket's ids. An error means no event follows.
-    fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()>;
-    /// Report completed work. `Err` means the store can no longer report
-    /// completions: transfers may still be running, and the worker must stop
-    /// rather than free the ids and pins they hold.
-    fn poll(&mut self, events: &mut Vec<StoreEvent>) -> Result<()>;
-    fn stats(&self) -> StoreStats;
-    /// Drain transfers, join threads, and finish pending disk writes.
-    /// On failure the caller must retain the store: transfer jobs may still
-    /// reference its registered host buffers and GPU destinations.
-    fn close(&mut self) -> Result<()>;
-
-    /// Whether this store shares prefixes through a pool. When it does not, the
-    /// worker builds no pool lookup history and sees no exports.
-    fn pooled(&self) -> bool {
-        false
-    }
-    /// Start looking for pool candidates for a request that just queued.
-    /// `None` when no lookup is possible.
-    fn begin_lookup(&mut self, _history: &PrefixHistory) -> Option<LookupTicket> {
-        None
-    }
-    /// `lookup` for a request that holds `ticket`. Without a ticket, or while
-    /// its lookup has no answer, this is the local lookup.
-    fn lookup_for(
-        &mut self,
-        _ticket: Option<&LookupTicket>,
-        history: &PrefixHistory,
-        resident: u64,
-        before: u64,
-    ) -> Option<HostHit> {
-        self.lookup(history, resident, before)
-    }
-    /// The worker pinned the checkpoint for `export` and describes its chain.
-    /// An error means the store will not serve the export; the worker unpins.
-    fn export_pinned(&mut self, _export: ExportId, _chain: ExportChain) -> Result<()> {
-        Ok(())
-    }
-    /// The worker did not pin a checkpoint for `export`.
-    fn export_refused(&mut self, _export: ExportId, _reason: ExportRefusal) {}
-    /// A published GPU checkpoint left the cache; `heir` is the child that took
-    /// over its pages when compaction removed it.
-    fn evicted(&mut self, _key: PrefixKey, _generation: u64, _heir: Option<&PublishedCheckpoint>) {}
-    /// Eviction notices were dropped before delivery; announce holdings again.
-    fn evictions_lost(&mut self) {}
-    /// Whether every copy the pool's own copier accepted has stopped. A store
-    /// with no such copier has none to wait for.
-    fn copies_drained(&self) -> bool {
-        true
-    }
-    /// Whether the pool's startup copy-level probe has not run.
-    fn needs_characterization(&self) -> bool {
-        false
-    }
-    /// Measure the pool's copy levels with `scratch`, GPU ids idle for the whole
-    /// call with no transfer in flight. Returns the line to log when it measured.
-    fn characterize(&mut self, _scratch: &Scratch) -> Result<Option<String>> {
-        Ok(None)
-    }
 }
 
 #[cfg(test)]

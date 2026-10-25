@@ -16,6 +16,7 @@ pub mod frame;
 #[cfg(test)]
 mod host_tests;
 mod identity;
+mod local;
 mod lookup;
 #[cfg(test)]
 mod manager_tests;
@@ -45,6 +46,7 @@ pub use announce::{Announcer, IndexEntry, Notice, Snapshot};
 pub use client::{PoolAddress, PoolClient, PoolConfig, STARTUP_WAIT};
 pub use exporter::{Checksums, HostChain, HostPin, HostRecord, HostWindow, PutBytes};
 pub use identity::{Geometry, RankPlanes, Scope, instance_id, process_nonce, scope_id};
+pub use local::Tiers;
 pub use lookup::{Answer, LookupState, LookupTicket};
 pub use pins::{FilePin, MemoryPin};
 pub use rank::{FrameReceiver, FrameSender, RankLink, RankSet};
