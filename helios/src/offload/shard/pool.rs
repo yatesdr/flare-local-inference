@@ -1,4 +1,5 @@
-use super::*;
+use crate::execution::RankStream;
+use flare_selene::{Result, record};
 pub use flare_selene::pool::{PoolOffer, PoolPeers};
 
 pub fn pool_rank_zero(offer: PoolOffer, peers: &mut [RankStream]) -> Result<Option<PoolPeers>> {
