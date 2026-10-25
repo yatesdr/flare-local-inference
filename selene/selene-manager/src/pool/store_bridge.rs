@@ -508,7 +508,7 @@ impl Core {
                 phase: PutPhase::Open,
                 link,
                 unfilled: 0,
-                fence: Party::Idle,
+                fence: Party::Drained,
                 refused: false,
                 key: record_key,
                 chain_pages: m.chain_pages,
@@ -628,7 +628,7 @@ impl Core {
                         },
                     );
                     for peer in &mut mp.peers {
-                        if peer.shared && peer.fence == Party::Idle {
+                        if peer.shared && peer.fence == Party::Drained {
                             peer.fence = Party::Pending;
                         }
                     }
@@ -983,7 +983,7 @@ impl Core {
             && mp.legs.iter().all(|leg| leg.ch.exited)
             && mp.peers.iter().all(|peer| {
                 !peer.shared
-                    || matches!(peer.fence, Party::Drained | Party::Idle)
+                    || matches!(peer.fence, Party::Drained)
                     || self.procs.get(&peer.proc).is_none_or(|p| p.exited)
             })
     }
@@ -1122,7 +1122,7 @@ impl Core {
                 if let Some(rec) = self.puts.get_mut(&key) {
                     rec.unfilled = rec.unfilled.saturating_sub(1);
                     if rec.unfilled == 0 && rec.fence == Party::Pending {
-                        rec.fence = Party::Idle;
+                        rec.fence = Party::Drained;
                     }
                     if rec.unfilled == 0 {
                         deferred = rec.deferred_commit.take();

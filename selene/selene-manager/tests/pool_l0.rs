@@ -15,7 +15,6 @@ fn host() -> Host {
     // Tight timers keep the timeout cases quick.
     host.config.pool.limits.pin_deadline_ms = 300;
     host.config.pool.limits.progress_timeout_ms = 600;
-    host.config.pool.reply_retention = Duration::from_millis(1500);
     host
 }
 

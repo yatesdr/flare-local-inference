@@ -30,8 +30,6 @@ pub type ClaimKey = (InstanceId, Nonce, u64);
 /// One party's drain obligation for a claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Party {
-    /// The party never touched the claim's memory.
-    Idle,
     /// It may still be accessing memory and has not said otherwise.
     Pending,
     Drained,
@@ -103,7 +101,6 @@ pub struct Claim {
     pub windows: Vec<Win>,
     pub requester_fence: Party,
     pub source_fence: Party,
-    pub terminal_at: Option<Instant>,
     pub granted_at: Option<Instant>,
     pub page_bytes: u64,
     pub row_bytes: u64,
@@ -162,10 +159,7 @@ pub struct ManagerGet {
 
 impl Claim {
     pub fn is_terminal(&self) -> bool {
-        matches!(
-            self.state,
-            v2::ClaimState::Copied | v2::ClaimState::Failed | v2::ClaimState::Expired
-        )
+        matches!(self.state, v2::ClaimState::Copied | v2::ClaimState::Failed)
     }
 
     fn holds_export_slot(&self, source_exited: bool) -> bool {
@@ -351,27 +345,6 @@ impl Core {
         let (instance, nonce) = (session.instance, session.nonce);
         let (scope_id, shm, claim_slots) = (session.scope, session.shm, session.claim_slots);
         let key: ClaimKey = (instance, nonce, m.claim_id);
-        if let Some(existing) = self.claims.get(&key) {
-            let replied = existing
-                .terminal_at
-                .is_some_and(|at| at.elapsed() < self.cfg.reply_retention);
-            if existing.is_terminal() && replied {
-                let message = self.terminal_message(existing);
-                self.send(sid, M::ClaimTerminal(message));
-            } else if existing.is_terminal() {
-                // The reply is gone; the record stays for its fences. A repeat is a replay.
-                self.send(
-                    sid,
-                    M::ClaimTerminal(v2::ClaimTerminal {
-                        claim_id: m.claim_id,
-                        state: v2::ClaimState::Failed as i32,
-                        reason: v2::ClaimReason::InvalidClaim as i32,
-                        fence_required: false,
-                    }),
-                );
-            }
-            return Ok(());
-        }
         let proc = self
             .procs
             .get_mut(&(instance, nonce))
@@ -629,9 +602,8 @@ impl Core {
             reserved_bytes: if retained { total } else { 0 },
             block,
             windows: Vec::new(),
-            requester_fence: Party::Idle,
+            requester_fence: Party::Drained,
             source_fence: Party::Pending,
-            terminal_at: None,
             granted_at: None,
             page_bytes: geometry.page_bytes,
             row_bytes: geometry.row_bytes,
@@ -816,9 +788,8 @@ impl Core {
             reserved_bytes: 0,
             block: None,
             windows: Vec::new(),
-            requester_fence: Party::Idle,
-            source_fence: Party::Idle,
-            terminal_at: None,
+            requester_fence: Party::Drained,
+            source_fence: Party::Drained,
             granted_at: None,
             page_bytes: geometry.page_bytes,
             row_bytes: geometry.row_bytes,
@@ -1007,7 +978,7 @@ impl Core {
                     );
                     return;
                 }
-                claim.state = v2::ClaimState::Copying;
+                claim.state = v2::ClaimState::Granted;
                 claim.last_progress = Instant::now();
                 let spec = claim.spec(index);
                 let sid = claim.requester_sid;
@@ -1119,9 +1090,8 @@ impl Core {
             reserved_bytes: 0,
             block: None,
             windows: Vec::new(),
-            requester_fence: Party::Idle,
-            source_fence: Party::Idle,
-            terminal_at: Some(now),
+            requester_fence: Party::Drained,
+            source_fence: Party::Drained,
             granted_at: None,
             page_bytes: 0,
             row_bytes: 0,
@@ -1156,7 +1126,7 @@ impl Core {
         match result {
             v2::PinResult::Refused => {
                 claim.export = ExportState::None;
-                claim.source_fence = Party::Idle;
+                claim.source_fence = Party::Drained;
                 let reason = refusal_reason(ack.refusal);
                 self.finish(key, v2::ClaimState::Failed, reason);
             }
@@ -1583,7 +1553,7 @@ impl Core {
         window.page_xxh3 = page_xxh3.clone();
         window.row_xxh3 = row_xxh3;
         let has_row = window.plan.row;
-        claim.state = v2::ClaimState::Copying;
+        claim.state = v2::ClaimState::Granted;
         claim.last_progress = Instant::now();
         let spec = claim.spec(index);
         let requester_sid = claim.requester_sid;
@@ -1668,8 +1638,7 @@ impl Core {
         match outcome {
             v2::CopyOutcome::CopyOk => {
                 // Exact coverage: every window issued, filled and released.
-                let covered = claim.state == v2::ClaimState::Copying
-                    || claim.state == v2::ClaimState::Granted;
+                let covered = claim.state == v2::ClaimState::Granted;
                 let pages: u64 = claim
                     .windows
                     .iter()
@@ -1746,16 +1715,7 @@ impl Core {
                     }),
                 );
             }
-            Some(claim) if claim.is_terminal() => {
-                // Answered again while the reply is kept; a no-op afterwards.
-                if claim
-                    .terminal_at
-                    .is_some_and(|at| at.elapsed() < self.cfg.reply_retention)
-                {
-                    let message = self.terminal_message(claim);
-                    self.send(sid, M::ClaimTerminal(message));
-                }
-            }
+            Some(claim) if claim.is_terminal() => {}
             Some(_) => {
                 self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::Cancelled);
             }
@@ -1864,7 +1824,6 @@ impl Core {
         let now = Instant::now();
         claim.state = state;
         claim.reason = reason;
-        claim.terminal_at = Some(now);
         self.count(
             "claims_total",
             format!("state=\"{state:?}\",reason=\"{reason:?}\""),
@@ -1877,7 +1836,7 @@ impl Core {
             .is_some_and(|proc| self.proc_exited_flag(&proc));
         let claim = self.claims.get_mut(&key).expect("claim exists");
         if claim.granted_at.is_none() {
-            claim.requester_fence = Party::Idle;
+            claim.requester_fence = Party::Drained;
         } else if requester_gone {
             claim.requester_fence = Party::Drained;
         }
@@ -2235,20 +2194,20 @@ impl Core {
         // manager's handler, so that handler's exit is its fence.
         let source_ok = match &claim.source_channel {
             Some(leg) => leg.exited,
-            None => matches!(claim.source_fence, Party::Drained | Party::Idle) || source_gone,
+            None => matches!(claim.source_fence, Party::Drained) || source_gone,
         };
         // On the data channel the requester never touches the claim's windows: the
         // manager's handler does, and its exit is the fence.
         let requester_ok = match &claim.channel {
             Some(open) => open.exited,
-            None => matches!(claim.requester_fence, Party::Drained | Party::Idle) || requester_gone,
+            None => matches!(claim.requester_fence, Party::Drained) || requester_gone,
         };
         // A multi-process requester's peers: a shared-memory one answers for itself (its own
         // attestation, or its process's exit); one on a leg is fenced by the handler's exit.
         let peers_ok = claim.mp.req.as_ref().is_none_or(|side| {
             side.peers.iter().all(|peer| {
                 !peer.shared
-                    || matches!(peer.fence, Party::Drained | Party::Idle)
+                    || matches!(peer.fence, Party::Drained)
                     || self.proc_exited_flag(&peer.proc)
             })
         }) && claim
@@ -2261,7 +2220,7 @@ impl Core {
         let source_peers_ok = claim.mp.src.as_ref().is_none_or(|side| {
             side.peers.iter().all(|peer| {
                 !peer.shared
-                    || matches!(peer.fence, Party::Drained | Party::Idle)
+                    || matches!(peer.fence, Party::Drained)
                     || self.proc_exited_flag(&peer.proc)
             })
         }) && claim
@@ -2313,7 +2272,6 @@ impl Core {
 
     pub(super) fn claim_timers(&mut self, now: Instant) {
         let progress = self.cfg.limits.progress_timeout();
-        let retention = self.cfg.reply_retention;
         let mut expire = Vec::new();
         let mut forget = Vec::new();
         let mut quarantine: Vec<(ClaimKey, Which)> = Vec::new();
@@ -2352,12 +2310,17 @@ impl Core {
                             !matches!(peer.fence, Party::Pending | Party::Quarantined)
                                 || self.proc_exited_flag(&peer.proc)
                         });
-                let settled = claim.block.is_none()
-                    && peers_settled
+                let drained = peers_settled
+                    && [&claim.channel, &claim.source_channel]
+                        .into_iter()
+                        .flatten()
+                        .all(|leg| leg.exited)
                     && claim
                         .windows
                         .iter()
-                        .all(|window| window.phase == Phase::Free)
+                        .all(|window| window.phase == Phase::Free);
+                let settled = claim.block.is_none()
+                    && drained
                     && !matches!(claim.export, ExportState::Requested | ExportState::Pinned)
                     && !matches!(claim.export, ExportState::Ended(Party::Quarantined))
                     && (claim.channel.is_some()
@@ -2368,12 +2331,9 @@ impl Core {
                     .as_ref()
                     .is_none_or(|proc| self.proc_exited_flag(proc));
                 let requester_gone = self.proc_exited_flag(&(key.0, key.1));
-                let fenced_by_exit = source_gone && requester_gone && claim.block.is_none();
-                if claim
-                    .terminal_at
-                    .is_some_and(|at| now.duration_since(at) >= retention)
-                    && (settled || fenced_by_exit)
-                {
+                let fenced_by_exit =
+                    source_gone && requester_gone && claim.block.is_none() && drained;
+                if settled || fenced_by_exit {
                     forget.push(*key);
                 }
                 continue;
@@ -2382,10 +2342,8 @@ impl Core {
                 expire.push((*key, v2::ClaimReason::Deadline));
             } else if claim.state == v2::ClaimState::Requested && now >= claim.pin_deadline {
                 expire.push((*key, v2::ClaimReason::SourceTimeout));
-            } else if matches!(
-                claim.state,
-                v2::ClaimState::Granted | v2::ClaimState::Copying
-            ) && now.duration_since(claim.last_progress) >= progress
+            } else if matches!(claim.state, v2::ClaimState::Granted)
+                && now.duration_since(claim.last_progress) >= progress
             {
                 expire.push((*key, v2::ClaimReason::NoProgress));
             }
@@ -2407,12 +2365,7 @@ impl Core {
             self.count("quarantined_total", "kind=\"channel\"");
         }
         for (key, reason) in expire {
-            let state = if reason == v2::ClaimReason::SourceTimeout {
-                v2::ClaimState::Failed
-            } else {
-                v2::ClaimState::Expired
-            };
-            self.finish(key, state, reason);
+            self.finish(key, v2::ClaimState::Failed, reason);
         }
         for key in forget {
             if let Some(claim) = self.claims.remove(&key) {
@@ -2734,7 +2687,7 @@ mod tests {
                 source_sid: 0,
                 endpoint: Key::default(),
                 want_row: true,
-                state: v2::ClaimState::Copying,
+                state: v2::ClaimState::Granted,
                 reason: v2::ClaimReason::Unspecified,
                 deadline: now + Duration::from_secs(30),
                 last_progress: now,
@@ -2761,8 +2714,7 @@ mod tests {
                     arrived: false,
                 }],
                 requester_fence: Party::Pending,
-                source_fence: Party::Idle,
-                terminal_at: None,
+                source_fence: Party::Drained,
                 granted_at: Some(now),
                 page_bytes: 4096,
                 row_bytes: 4096,
@@ -3046,7 +2998,7 @@ mod tests {
                     rank: 2,
                     proc: AGENT_2,
                     shared: false,
-                    fence: Party::Idle,
+                    fence: Party::Drained,
                 },
             ],
         });

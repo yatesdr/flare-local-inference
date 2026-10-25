@@ -99,7 +99,6 @@ only in that the writer keeps its copy until `Stored`; there is no separate test
 **Flare hooks.** K1 to K8 Flare.
 
 **Added after review.** A1, A2 `a1_and_a2_goodbye_clears_only_the_senders_obligations`;
-A5 `a5_fence_records_outlive_the_reply_and_replays_stay_refused`;
 A6 `a6_a_premature_or_partial_copy_ok_is_refused`; A7 `c1_...` (exact coverage accepted);
 A8 `a8_damage_at_rest_never_reaches_a_restore` (a record read from NVMe into DRAM is verified by the store and
 the claim fails `COPY_ERROR`; a window streamed straight from NVMe would be served with the persisted checksums);

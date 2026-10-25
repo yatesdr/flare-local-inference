@@ -220,7 +220,7 @@ the total; a nonzero value that does not fall means an instance is hung, not a l
 | `selene_pool_state`, `selene_pool_ready` | 1 recovering, 3 ready, 4 draining; and 1 when ready. | Recovery that does not finish. |
 | `selene_pool_sessions` | Live instance sessions. | Dropping to zero while instances serve. |
 | `selene_pool_index_entries` | Entries announced to the index. | Unbounded growth. |
-| `selene_pool_claims_in_flight`, `selene_pool_claim_records`, `selene_pool_lookups_queued` | Work in flight and records kept for fences and replies. | Records that never fall. |
+| `selene_pool_claims_in_flight`, `selene_pool_claim_records`, `selene_pool_lookups_queued` | Work in flight and records kept for fences. | Records that never fall. |
 | `selene_pool_claims_total{state,reason}`, `selene_pool_claims_refused_total{reason}`, `selene_pool_lookups_total{status}` | Outcomes. | `COPY_ERROR`, `CHECKSUM`, `NO_WINDOWS` rising. |
 | `selene_pool_puts_open` | Puts in flight. | |
 | `selene_pool_quarantined_bytes` | Window bytes out of service. | Anything sustained. |

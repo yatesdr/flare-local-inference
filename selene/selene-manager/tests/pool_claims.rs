@@ -20,7 +20,6 @@ fn host() -> Host {
     let mut host = Host::dram_only(2 * 1024 * 1024);
     host.config.pool.limits.pin_deadline_ms = 300;
     host.config.pool.limits.progress_timeout_ms = 600;
-    host.config.pool.reply_retention = Duration::from_millis(1500);
     host
 }
 
@@ -559,11 +558,11 @@ async fn c14_to_c19_invalid_unknown_and_replayed_claims() {
         w.requester.claim_terminal(15).await.reason,
         v2::ClaimReason::UnknownSource as i32
     );
-    // A duplicate of a refused claim is answered again with the same verdict.
+    // A reused id cannot start another lifecycle, even after refusal.
     w.requester.claim(claim).await;
     assert_eq!(
         w.requester.claim_terminal(15).await.reason,
-        v2::ClaimReason::UnknownSource as i32
+        v2::ClaimReason::InvalidClaim as i32
     );
 }
 
@@ -656,10 +655,6 @@ async fn c13_duplicates_change_nothing() {
             )
             .await;
     }
-    // A release after COPIED is answered with the terminal state again and does nothing.
-    w.requester.send(pool_release(1)).await;
-    let again = w.requester.claim_terminal(1).await;
-    assert_eq!(again.state, v2::ClaimState::Copied as i32);
     assert_eq!(granted.records.len(), 1);
     w.staging_settles_at(0).await;
 }
@@ -693,7 +688,7 @@ async fn c16_deadline_and_no_progress_expire_a_claim() {
     w.pin(&request).await;
     w.requester.claim_granted(1).await;
     let terminal = w.requester.claim_terminal(1).await;
-    assert_eq!(terminal.state, v2::ClaimState::Expired as i32);
+    assert_eq!(terminal.state, v2::ClaimState::Failed as i32);
     assert_eq!(terminal.reason, v2::ClaimReason::NoProgress as i32);
     assert!(terminal.fence_required);
     let cancel = w.source.export_cancel().await;
@@ -705,7 +700,7 @@ async fn c16_deadline_and_no_progress_expire_a_claim() {
     w.requester.claim(claim).await;
     let _second = w.source.export_request().await;
     let terminal = w.requester.claim_terminal(2).await;
-    assert_eq!(terminal.state, v2::ClaimState::Expired as i32);
+    assert_eq!(terminal.state, v2::ClaimState::Failed as i32);
     assert_eq!(terminal.reason, v2::ClaimReason::Deadline as i32);
 }
 
@@ -981,47 +976,6 @@ async fn r11_a_source_blip_quarantines_until_the_export_end_arrives_on_a_new_ses
             v2::FenceOutcome::Drained,
         )
         .await;
-    w.requester.fence(1, v2::FenceOutcome::Drained).await;
-    w.staging_settles_at(0).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a5_fence_records_outlive_the_reply_and_replays_stay_refused() {
-    let mut w = world(v2::Tier::Gpu, &[1024]).await;
-    let req_ident = w.requester_ident.clone();
-    let partial = granted(&mut w, 1, 1024).await;
-    let bytes = w.content(&partial.records, &partial.windows[0]);
-    w.source
-        .filled(partial.request.export_id, &partial.windows[0], &bytes)
-        .await;
-    w.requester.window_ready(1).await;
-    w.source
-        .export_end(
-            partial.request.export_id,
-            v2::ExportEndStatus::ExportComplete,
-            v2::FenceOutcome::Drained,
-        )
-        .await;
-    let held = w.staging_now().await;
-    // The requester's stream drops with a window in its hands; the process lives on.
-    let old = std::mem::replace(&mut w.requester, w.pool.open(&req_ident).await);
-    drop(old);
-    // Longer than the reply retention (1.5 s in this rig).
-    tokio::time::sleep(Duration::from_millis(2200)).await;
-    assert_eq!(
-        w.staging_used(),
-        held,
-        "the fence record outlives the reply"
-    );
-    // A replayed claim with the old id is refused, no second lifecycle.
-    let candidate = w.candidate(30, 1024).await;
-    let claim = w.requester.claim_for(1, &candidate, 0, true);
-    w.requester.claim(claim).await;
-    assert_eq!(
-        w.requester.claim_terminal(1).await.reason,
-        v2::ClaimReason::InvalidClaim as i32
-    );
-    // The late fence acknowledgment still resolves.
     w.requester.fence(1, v2::FenceOutcome::Drained).await;
     w.staging_settles_at(0).await;
 }
@@ -1310,7 +1264,7 @@ async fn x5_a_deadline_is_clamped_to_the_managers_limit() {
     w.requester.claim(claim).await;
     w.source.export_request().await;
     let terminal = w.requester.claim_terminal(1).await;
-    assert_eq!(terminal.state, v2::ClaimState::Expired as i32);
+    assert_eq!(terminal.state, v2::ClaimState::Failed as i32);
     assert_eq!(terminal.reason, v2::ClaimReason::Deadline as i32);
     assert!(
         began.elapsed() < Duration::from_secs(5),

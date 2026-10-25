@@ -688,12 +688,12 @@ message Record {
 enum ClaimState {
   CLAIM_STATE_UNSPECIFIED = 0;
   REQUESTED = 1;       // accepted by the manager; ExportRequest sent (or internal pin started).
-  SOURCE_PINNED = 2;   // the source acknowledged the pin. The hold exists.
+  reserved 2;
   GRANTED = 3;         // grant sent to the requester. Equivalent to the hold being granted.
-  COPYING = 4;         // first window filled (or first data-channel transfer started).
+  reserved 4;
   COPIED = 5;          // terminal: the requester validated and drained its writes.
   FAILED = 6;          // terminal.
-  EXPIRED = 7;         // terminal: whole-claim deadline or no-progress timeout.
+  reserved 7;
 }
 
 enum ClaimReason {
@@ -721,8 +721,8 @@ enum ClaimReason {
   COPY_ERROR = 18;            // a read, write or transport error reported by either side.
   CHECKSUM = 19;              // the requester's end-to-end check failed.
   CLAIM_MANAGER_SHUTDOWN = 20;
-  DEADLINE = 21;              // with state EXPIRED.
-  NO_PROGRESS = 22;           // with state EXPIRED.
+  DEADLINE = 21;              // with state FAILED.
+  NO_PROGRESS = 22;           // with state FAILED.
   UNKNOWN_CLAIM = 23;         // the manager has no such claim (after a manager restart, or a late release).
   RANKS_DETACHED = 24;        // a peer rank of a multi-process instance is not attached (refused at once).
   RANK_LOST = 25;             // an attached peer rank's stream ended during the transfer.
@@ -845,14 +845,14 @@ message CopyResult {
 message ClaimRelease { uint64 claim_id = 1; }
 
 // The single authoritative transition. Sent to the requester exactly once per
-// claim (plus again in answer to a later ClaimRelease for the same id). Carries
+// claim. Carries
 // the end state; COPIED only follows the requester's own CopyResult{COPY_OK}.
 // `fence_required` is true when the requester may still have accesses in flight
 // that it must prove stopped with FenceAck before the manager reuses the
 // windows: every terminal state except a refusal before any grant.
 message ClaimTerminal {
   uint64 claim_id = 1;
-  ClaimState state = 2;     // COPIED, FAILED or EXPIRED.
+  ClaimState state = 2;     // COPIED or FAILED.
   ClaimReason reason = 3;
   bool fence_required = 4;
 }

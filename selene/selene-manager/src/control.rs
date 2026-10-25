@@ -233,7 +233,6 @@ pub fn serve(
     let (shm, staging_arena, recovered_records) = store.pool_view();
     let pool_config = crate::pool::PoolConfig {
         limits: pool_settings.limits.clone(),
-        reply_retention: pool_settings.reply_retention,
         encryption: if config.tls_cert.is_some() {
             crate::proto::v2::Encryption::Tls
         } else {
