@@ -47,6 +47,7 @@ pub struct Config {
     pub nvme: u64,
     pub staging: usize,
     pub metrics: Option<String>,
+    #[cfg(any(test, feature = "test-support"))]
     pub faults: disk::Faults,
     pub max_window_bytes: u64,
     pub pool: crate::pool::limits::PoolSettings,
@@ -62,6 +63,7 @@ impl Config {
             nvme,
             staging: EMBEDDED_STAGING,
             metrics: None,
+            #[cfg(any(test, feature = "test-support"))]
             faults: disk::Faults::default(),
             max_window_bytes: DEFAULT_MAX_WINDOW,
             pool: Default::default(),
@@ -77,6 +79,7 @@ impl Config {
             nvme: 0,
             staging: EMBEDDED_STAGING,
             metrics: None,
+            #[cfg(any(test, feature = "test-support"))]
             faults: disk::Faults::default(),
             max_window_bytes: DEFAULT_MAX_WINDOW,
             pool: Default::default(),
@@ -713,6 +716,7 @@ impl Store {
             .map(|root| root.join(descriptor.name()));
         let disk = match (&directory, &self.lock) {
             (Some(_), Some(lock)) => Some(disk::Worker::start(
+                #[cfg(any(test, feature = "test-support"))]
                 self.config.faults.clone(),
                 lock.clone(),
             )),
@@ -2662,6 +2666,7 @@ impl Store {
                             set_slot_job(put, index, job);
                         }
                     }
+                    #[cfg(any(test, feature = "test-support"))]
                     self.config.faults.checkpoint("data");
                 }
                 ChunkAction::Blocked(data) => {

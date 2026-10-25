@@ -107,6 +107,7 @@ impl Drop for DiskExtent {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Default)]
 pub struct Faults {
     pub pause_at: Option<String>,
@@ -118,6 +119,7 @@ pub struct Faults {
     /// without racing completion receivers.
     pub trace: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
 }
+#[cfg(any(test, feature = "test-support"))]
 impl Faults {
     pub(crate) fn checkpoint(&self, point: &str) {
         if self.pause_at.as_deref() == Some(point) {
@@ -243,7 +245,10 @@ pub struct Worker {
     thread: Option<thread::JoinHandle<()>>,
 }
 impl Worker {
-    pub fn start(faults: Faults, lock: Arc<RootLock>) -> Self {
+    pub fn start(
+        #[cfg(any(test, feature = "test-support"))] faults: Faults,
+        lock: Arc<RootLock>,
+    ) -> Self {
         let (sender, writes) = mpsc::sync_channel::<Task>(8);
         let (read_sender, reads) = mpsc::sync_channel::<ReadTask>(8);
         let (async_read_sender, async_reads) = mpsc::sync_channel::<Task>(8);
@@ -263,6 +268,7 @@ impl Worker {
                     if let Ok(mut task) = reads.try_recv() {
                         let result = read_into(&task.file, task.offset, &mut task.buffer);
                         read_streak += 1;
+                        #[cfg(any(test, feature = "test-support"))]
                         faults.trace(b'R');
                         let _ = task.ack.send((result, task.buffer));
                         acted = true;
@@ -284,6 +290,7 @@ impl Worker {
                                 elapsed: started.elapsed(),
                                 data: Some(buffer),
                             };
+                            #[cfg(any(test, feature = "test-support"))]
                             faults.trace(b'R');
                             send_completion(&done, completion, &thread_stop);
                             state_thread.unpark();
@@ -308,7 +315,14 @@ impl Worker {
                                 let result = read_into(&file, offset, &mut buffer);
                                 (result.map(|()| 0), Some(buffer))
                             }
-                            task => (execute(task, &faults), None),
+                            task => (
+                                execute(
+                                    task,
+                                    #[cfg(any(test, feature = "test-support"))]
+                                    &faults,
+                                ),
+                                None,
+                            ),
                         };
                         let bytes = result.as_ref().copied().unwrap_or(0);
                         let mut completion = Completion {
@@ -318,6 +332,7 @@ impl Worker {
                             elapsed: started.elapsed(),
                             data,
                         };
+                        #[cfg(any(test, feature = "test-support"))]
                         faults.trace(b'W');
                         loop {
                             match done.try_send(completion) {
@@ -355,6 +370,7 @@ impl Worker {
                                 elapsed: started.elapsed(),
                                 data: Some(buffer),
                             };
+                            #[cfg(any(test, feature = "test-support"))]
                             faults.trace(b'R');
                             send_completion(&done, completion, &thread_stop);
                             state_thread.unpark();
@@ -368,6 +384,7 @@ impl Worker {
                         // No pending write: keep reading rather than idle.
                         let result = read_into(&task.file, task.offset, &mut task.buffer);
                         read_streak += 1;
+                        #[cfg(any(test, feature = "test-support"))]
                         faults.trace(b'R');
                         let _ = task.ack.send((result, task.buffer));
                         acted = true;
@@ -441,7 +458,8 @@ fn write_at(file: &File, bytes: &[u8], offset: u64) -> Result<()> {
     file.write_all_at(bytes, offset)
 }
 
-fn execute(task: Task, faults: &Faults) -> Result<u64> {
+fn execute(task: Task, #[cfg(any(test, feature = "test-support"))] faults: &Faults) -> Result<u64> {
+    #[cfg(any(test, feature = "test-support"))]
     faults.before_io()?;
     match task {
         Task::Chunk {
@@ -465,6 +483,7 @@ fn execute(task: Task, faults: &Faults) -> Result<u64> {
             let file = open(&temporary.path, true)?;
             match &data {
                 RecordData::Memory(extent) => {
+                    #[cfg(any(test, feature = "test-support"))]
                     faults.checkpoint("parent_write");
                     write_at(&file, extent.bytes(), ENVELOPE_BYTES)?;
                 }
@@ -488,11 +507,13 @@ fn execute(task: Task, faults: &Faults) -> Result<u64> {
                 data.bytes(),
                 &header,
                 row,
+                #[cfg(any(test, feature = "test-support"))]
                 faults,
             )?;
             if matches!(data, RecordData::Metadata(_)) {
                 destination.retire();
             }
+            #[cfg(any(test, feature = "test-support"))]
             faults.checkpoint("after_rename");
             Ok(data.bytes().len() as u64 + ENVELOPE_BYTES)
         }
@@ -526,6 +547,7 @@ fn execute(task: Task, faults: &Faults) -> Result<u64> {
                 &metadata,
                 &header,
                 false,
+                #[cfg(any(test, feature = "test-support"))]
                 faults,
             )?;
             Ok(header.row_segment + ENVELOPE_BYTES)
@@ -541,7 +563,7 @@ fn finish(
     metadata: &[u8],
     header: &Header,
     row: bool,
-    faults: &Faults,
+    #[cfg(any(test, feature = "test-support"))] faults: &Faults,
 ) -> Result<()> {
     let length = header.length(row);
     let arena = Arena::new(4096)?;
@@ -558,6 +580,7 @@ fn finish(
     write_at(file, envelope.bytes(), 0)?;
     file.set_len(ENVELOPE_BYTES + length)?;
     file.sync_data()?;
+    #[cfg(any(test, feature = "test-support"))]
     faults.checkpoint("before_rename");
     fs::rename(temporary, final_path)?;
     File::open(final_path.parent().unwrap())?.sync_all()?;
