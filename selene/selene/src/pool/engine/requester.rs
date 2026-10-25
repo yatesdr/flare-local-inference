@@ -110,7 +110,6 @@ struct Window {
 }
 
 struct Claim {
-    started: Instant,
     restore: u64,
     part: usize,
     peers: Vec<PeerPart>,
@@ -164,9 +163,7 @@ impl Engine {
         }
     }
 
-    /// Whether a restore of `parts` parts fits in the claim slots the manager grants this
-    /// session. Every part of a restore keeps its slot until the restore ends. A restore
-    /// larger than all the slots runs alone.
+    /// Keep each restore within the session's granted claim slots.
     fn claim_room(&self, parts: usize) -> bool {
         let granted = self
             .sess
@@ -183,7 +180,7 @@ impl Engine {
             .values()
             .map(|r| r.parts.len())
             .sum();
-        used == 0 || used + parts <= slots
+        used + parts <= slots
     }
 
     /// Start the waiting restores that now fit, in order, and give up on those that waited
@@ -229,8 +226,8 @@ impl Engine {
                 "this session has neither shared memory nor a data channel to copy through",
             ));
         }
-        if fetch.parts.is_empty() || fetch.parts.len() > 2 {
-            return Err(Error::new("a pool restore has one or two parts"));
+        if fetch.parts.len() != 1 {
+            return Err(Error::new("a pool restore has exactly one source"));
         }
         let mut bytes = 0;
         let mut parts = Vec::new();
@@ -303,7 +300,6 @@ impl Engine {
         self.requester.claims.insert(
             id,
             Claim {
-                started: now,
                 restore,
                 part: index,
                 peers: Vec::new(),
@@ -1063,15 +1059,6 @@ impl Engine {
         if gone {
             // Slots of windows that never reached a release go back with the claim.
             if let Some(mut claim) = self.requester.claims.remove(&id) {
-                if claim.verdict_ok
-                    && let Some(run) = self.requester.restores.get(&restore)
-                    && run.parts[claim.part].copied
-                    && run.parts[claim.part].fetch.part.pages > 0
-                {
-                    let part = &run.parts[claim.part].fetch.part;
-                    self.shared
-                        .observe_restore(part.level, part.pages as u64 * self.st.page_record_bytes() + u64::from(part.row) * self.st.row_record_bytes(), claim.started.elapsed());
-                }
                 for window in claim.windows.values_mut() {
                     if let Some(slot) = window.slot.take() {
                         self.free_slot(slot);

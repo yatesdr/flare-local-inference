@@ -1,27 +1,9 @@
-//! The two-source restore plan.
-//!
-//! A restore reads the pages after the GPU-resident prefix from at most two
-//! sources. Part A is the longest prefix held at the closest level that has any
-//! of it. Part B is one source at a strictly farther level, starting exactly
-//! where A ends and reaching the endpoint, kept only if its pages are worth
-//! fetching against recomputing them. Part A is chosen longest first, with source identity
-//! breaking ties, so the least has to come from farther away. A part that
-//! would supply no pages and no row is left out. The parts are disjoint and contiguous from
-//! the resident prefix, and the endpoint's continuation row comes from whichever
-//! part ends last.
-//!
-//! Positions are exact token counts; pages follow the floor of the token count
-//! over the page size, as the index does, so a part may start in the middle of a
-//! record and B may have no pages and only the row.
-//!
-//! This is pure logic over the candidates a lookup returned. Holding the sources,
-//! copying and checksumming belong to the pool client, which rebuilds the plan
-//! with [`Plan::rebuild`] when a hold fails.
+//! One source per restore: longest match, then closest copy level.
 
 use std::cmp::Reverse;
 
-use crate::levels::{Level, Ranking};
-use crate::{Error, History, PrefixKey, Result, worth_transfer};
+use crate::levels::Level;
+use crate::{Error, History, PrefixKey, Result};
 
 /// Whose cache a prefix belongs to. It is checked by the sources; the plan carries
 /// it so every part is validated against the same identity.
@@ -64,14 +46,10 @@ pub struct Request<'a> {
     pub history: &'a dyn History,
     pub identity: &'a Identity,
     pub page_tokens: u64,
-    pub page_bytes: u64,
-    pub row_bytes: u64,
     /// Tokens already in GPU memory.
     pub resident: u64,
     /// The endpoint must be strictly below this.
     pub before: u64,
-    pub ranking: &'a Ranking,
-    pub prefill_tokens_per_second: f64,
 }
 
 /// One source's share of the restore.
@@ -95,185 +73,62 @@ pub struct Part {
     pub chain: Vec<PrefixKey>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Which {
-    A,
-    B,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub identity: Identity,
     pub resident: u64,
-    pub a: Part,
-    pub b: Option<Part>,
+    pub part: Part,
 }
-
 impl Plan {
     pub fn endpoint(&self) -> PrefixKey {
-        self.b.as_ref().unwrap_or(&self.a).end
+        self.part.end
     }
-
-    /// Pages written into the ticket, over both parts.
     pub fn pages(&self) -> usize {
-        self.a.pages + self.b.as_ref().map_or(0, |b| b.pages)
+        self.part.pages
     }
-
-    /// The plan again after a hold on one part failed: the same endpoint from the
-    /// remaining candidates without that part's source, or `None`, a miss. An
-    /// endpoint that would end earlier cannot reuse the ticket's pages.
-    pub fn rebuild(
-        &self,
-        request: &Request,
-        candidates: &[Candidate],
-        failed: Which,
-    ) -> Option<Plan> {
-        let part = match failed {
-            Which::A => &self.a,
-            Which::B => self.b.as_ref()?,
-        };
-        let remaining: Vec<&Candidate> = candidates
-            .iter()
-            .filter(|c| (c.source, c.generation) != (part.source, part.generation))
-            .collect();
-        search(request, &remaining, Some(self.endpoint()))
-    }
-
-    /// Check the plan's invariants against the history: contiguous from the
-    /// resident prefix, disjoint destinations, one row, and verified keys.
     pub fn validate(&self, history: &dyn History, page_tokens: u64) -> Result<()> {
-        let pages = |tokens: u64| (tokens / page_tokens) as usize;
-        let mut begin = self.resident;
-        let mut dest = 0;
-        let parts = std::iter::once(&self.a).chain(self.b.as_ref());
-        for (index, part) in parts.enumerate() {
-            let last = index == usize::from(self.b.is_some());
-            let end = part.end.consumed_tokens;
-            let expected = pages(end) - pages(begin);
-            let ok = part.begin_tokens == begin
-                && part.dest_page == dest
-                && part.pages == expected
-                && part.row == last
-                && end >= begin
-                && history.key_at(end) == Some(part.end)
-                && part.chain.last() == Some(&part.end)
-                && part
-                    .chain
-                    .iter()
-                    .all(|key| history.key_at(key.consumed_tokens) == Some(*key));
-            if !ok {
-                return Err(Error::new(format!("restore part {index} is inconsistent")));
-            }
-            begin = end;
-            dest += part.pages;
+        let part = &self.part;
+        let expected =
+            (part.end.consumed_tokens / page_tokens).checked_sub(self.resident / page_tokens);
+        if part.begin_tokens != self.resident
+            || part.dest_page != 0
+            || !part.row
+            || expected != Some(part.pages as u64)
+            || part.end.consumed_tokens <= self.resident
+            || history.key_at(part.end.consumed_tokens) != Some(part.end)
+            || part.chain.last() != Some(&part.end)
+            || part
+                .chain
+                .iter()
+                .any(|key| history.key_at(key.consumed_tokens) != Some(*key))
+        {
+            return Err(Error::new("restore source is inconsistent"));
         }
         Ok(())
     }
 }
 
-/// Build the plan for a request from the candidates a lookup returned, or `None`
-/// when no candidate continues the resident prefix without a hole.
 pub fn plan(request: &Request, candidates: &[Candidate]) -> Option<Plan> {
-    let all: Vec<&Candidate> = candidates.iter().collect();
-    search(request, &all, None)
-}
-
-/// With `endpoint` set, only plans ending exactly there qualify.
-fn search(
-    request: &Request,
-    candidates: &[&Candidate],
-    endpoint: Option<PrefixKey>,
-) -> Option<Plan> {
-    let usable: Vec<&Candidate> = candidates
+    let source = candidates
         .iter()
-        .copied()
-        .filter(|c| {
-            let end = c.key.consumed_tokens;
-            end > request.resident
-                && end < request.before
-                && endpoint.is_none_or(|e| end <= e.consumed_tokens)
-                && valid(request, c)
+        .filter(|candidate| {
+            candidate.begin_tokens <= request.resident
+                && candidate.key.consumed_tokens > request.resident
+                && candidate.key.consumed_tokens < request.before
+                && valid(request, candidate)
         })
-        .collect();
-    let mut firsts: Vec<&Candidate> = usable
-        .iter()
-        .copied()
-        .filter(|c| c.begin_tokens <= request.resident)
-        .collect();
-    firsts.sort_by_key(|c| {
-        (
-            request.ranking.rank(c.level),
-            Reverse(c.key.consumed_tokens),
-            c.source.0,
-        )
-    });
-    for first in firsts {
-        let mut a = part(request, first, request.resident, 0, true);
-        if endpoint == Some(first.key) {
-            return Some(request.plan(a, None));
-        }
-        a.row = false;
-        let a_end = first.key.consumed_tokens;
-        let a_rank = request.ranking.rank(first.level);
-        let mut seconds: Vec<&Candidate> = usable
-            .iter()
-            .copied()
-            .filter(|c| {
-                c.key.consumed_tokens > a_end
-                    && c.begin_tokens <= a_end
-                    && request.ranking.rank(c.level) > a_rank
-                    && endpoint.is_none_or(|e| c.key == e)
-            })
-            .collect();
-        seconds.sort_by_key(|c| preference(request, c));
-        for second in seconds {
-            let b = part(request, second, a_end, a.pages, true);
-            if worth(request, second, &b, a_end) {
-                if a.pages == 0 {
-                    // A supplies nothing: B reads from the resident page itself.
-                    let only = part(request, second, request.resident, 0, true);
-                    return Some(request.plan(only, None));
-                }
-                return Some(request.plan(a, Some(b)));
-            }
-        }
-        if endpoint.is_none() {
-            a.row = true;
-            return Some(request.plan(a, None));
-        }
-    }
-    None
-}
-
-impl Request<'_> {
-    fn plan(&self, a: Part, b: Option<Part>) -> Plan {
-        Plan {
-            identity: self.identity.clone(),
-            resident: self.resident,
-            a,
-            b,
-        }
-    }
-}
-
-fn preference(request: &Request, c: &Candidate) -> (usize, Reverse<u64>, u64) {
-    (
-        request.ranking.rank(c.level),
-        Reverse(c.key.consumed_tokens),
-        c.source.0,
-    )
-}
-
-/// Whether the transfer beats recomputing the tokens it replaces.
-fn worth(request: &Request, c: &Candidate, b: &Part, from: u64) -> bool {
-    worth_transfer(
-        c.key.consumed_tokens - from,
-        request.ranking.part_seconds(
-            c.level,
-            b.pages as u64 * request.page_bytes + u64::from(b.row) * request.row_bytes,
-        ),
-        request.prefill_tokens_per_second,
-    )
+        .min_by_key(|candidate| {
+            (
+                Reverse(candidate.key.consumed_tokens),
+                candidate.level as usize,
+                candidate.source.0,
+            )
+        })?;
+    Some(Plan {
+        identity: request.identity.clone(),
+        resident: request.resident,
+        part: part(request, source, request.resident, 0, true),
+    })
 }
 
 /// The page where each node's tail starts, if the chain is consistent.
@@ -344,22 +199,16 @@ fn part(request: &Request, c: &Candidate, begin: u64, dest_page: usize, row: boo
 mod tests {
     use super::*;
     use crate::testing::TestHistory;
-    use Level::*;
-
-    const PT: u64 = 16;
-    const PREFILL: f64 = 8000.0;
-
     struct Fixture {
         history: TestHistory,
         identity: Identity,
-        ranking: Ranking,
     }
-
     impl Fixture {
         fn new() -> Self {
             let mut history = TestHistory::new([7; 32]);
-            let tokens: Vec<u32> = (0..2000).collect();
-            history.append(&tokens, &[]).unwrap();
+            history
+                .append(&(0..2000).collect::<Vec<u32>>(), &[])
+                .unwrap();
             Self {
                 history,
                 identity: Identity {
@@ -367,402 +216,124 @@ mod tests {
                     model: [7; 32],
                     layout: [1; 16],
                 },
-                // Cheap enough that fetching 800 tokens beats recomputing them.
-                ranking: Ranking::for_test(
-                    Level::DEFAULT_ORDER,
-                    &[
-                        (NeighbourGpu, 10.0),
-                        (HostDram, 10.0),
-                        (HostNvme, 100.0),
-                        (RemoteNvme, 200.0),
-                    ],
-                ),
             }
         }
-
-        fn request(&self, resident: u64) -> Request<'_> {
-            Request {
-                history: &self.history,
-                identity: &self.identity,
-                page_tokens: PT,
-                page_bytes: 4096,
-                row_bytes: 4096,
-                resident,
-                before: u64::MAX,
-                ranking: &self.ranking,
-                prefill_tokens_per_second: PREFILL,
-            }
-        }
-
-        fn key(&self, tokens: u64) -> PrefixKey {
-            self.history.key_at(tokens).unwrap()
-        }
-
-        /// A candidate supplying `begin..` through records ending at `ends`, whose
-        /// first record starts at page `first_start`.
-        fn candidate(
-            &self,
-            level: Level,
-            source: u64,
-            begin: u64,
-            first_start: usize,
-            ends: &[u64],
-            _us: u32,
-        ) -> Candidate {
-            let mut previous = first_start;
-            let nodes: Vec<ChainNode> = ends
+        fn candidate(&self, level: Level, source: u64, ends: &[u64]) -> Candidate {
+            let mut previous = 0;
+            let nodes = ends
                 .iter()
                 .map(|end| {
-                    let page = (end / PT) as usize;
-                    let node = ChainNode {
-                        key: self.key(*end),
-                        tail_pages: page - previous,
-                    };
-                    previous = page;
-                    node
+                    let tail_pages = (*end / 16 - previous) as usize;
+                    previous = *end / 16;
+                    ChainNode {
+                        key: self.history.key_at(*end).unwrap(),
+                        tail_pages,
+                    }
                 })
                 .collect();
             Candidate {
                 level,
                 source: SourceId(source),
                 generation: 1,
-                key: self.key(*ends.last().unwrap()),
-                begin_tokens: begin,
-                skip_pages: (begin / PT) as usize - first_start,
+                key: self.history.key_at(*ends.last().unwrap()).unwrap(),
+                begin_tokens: 0,
+                skip_pages: 0,
                 nodes,
             }
         }
-
-        fn plan(&self, resident: u64, candidates: &[Candidate]) -> Option<Plan> {
-            let plan = plan(&self.request(resident), candidates)?;
-            plan.validate(&self.history, PT).unwrap();
-            Some(plan)
+        fn request(&self, resident: u64) -> Request<'_> {
+            Request {
+                history: &self.history,
+                identity: &self.identity,
+                page_tokens: 16,
+                resident,
+                before: 2001,
+            }
         }
     }
-
     #[test]
-    fn local_a_then_pool_b_is_contiguous_with_one_row() {
+    fn longest_match_wins_then_closest_level_and_stable_source() {
         let f = Fixture::new();
-        let dram = f.candidate(HostDram, 1, 0, 0, &[800], 0);
-        let remote = f.candidate(RemoteNvme, 2, 800, 50, &[1600], 0);
-        let plan = f.plan(0, &[remote, dram]).unwrap();
-        let b = plan.b.as_ref().unwrap();
-        assert_eq!((plan.a.source, plan.a.level), (SourceId(1), HostDram));
-        assert_eq!(
-            (plan.a.begin_tokens, plan.a.dest_page, plan.a.pages),
-            (0, 0, 50)
-        );
-        assert!(!plan.a.row);
-        assert_eq!(
-            (b.source, b.begin_tokens, b.dest_page, b.pages),
-            (SourceId(2), 800, 50, 50)
-        );
-        assert_eq!(b.first_page, 0);
-        assert!(b.row);
-        assert_eq!(plan.endpoint(), f.key(1600));
-        assert_eq!(plan.pages(), 100);
-        assert_eq!(plan.identity, f.identity);
-    }
-
-    #[test]
-    fn a_resident_prefix_is_skipped_from_the_first_record() {
-        let f = Fixture::new();
-        // The record starts at page 0 but the GPU already holds the first 10 pages.
-        let dram = f.candidate(HostDram, 1, 0, 0, &[800], 0);
-        let plan = f.plan(160, &[dram]).unwrap();
-        assert_eq!(
-            (plan.a.begin_tokens, plan.a.first_page, plan.a.pages),
-            (160, 10, 40)
-        );
-        assert!(plan.a.row && plan.b.is_none());
-    }
-
-    #[test]
-    fn b_starts_inside_a_record_when_boundaries_differ() {
-        let f = Fixture::new();
-        let dram = f.candidate(HostDram, 1, 0, 0, &[800], 0);
-        // The pool's chain was cut at 640 and 1600; A ends in the second record.
-        let remote = f.candidate(RemoteNvme, 2, 0, 0, &[640, 1600], 0);
-        let plan = f.plan(0, &[dram, remote]).unwrap();
-        let b = plan.b.as_ref().unwrap();
-        assert_eq!((b.first_page, b.pages, b.dest_page), (10, 50, 50));
-        assert_eq!(b.chain, vec![f.key(1600)]);
-        // And in the first record, with both records read.
-        let remote = f.candidate(RemoteNvme, 2, 0, 0, &[1000, 1600], 0);
-        let dram = f.candidate(HostDram, 1, 0, 0, &[800], 0);
-        let plan = f.plan(0, &[dram, remote]).unwrap();
-        let b = plan.b.as_ref().unwrap();
-        assert_eq!((b.first_page, b.pages), (50, 50));
-        assert_eq!(b.chain, vec![f.key(1000), f.key(1600)]);
-    }
-
-    #[test]
-    fn a_split_in_the_middle_of_a_page_floors_both_parts() {
-        let f = Fixture::new();
-        let dram = f.candidate(HostDram, 1, 0, 0, &[808], 0);
-        let remote = f.candidate(RemoteNvme, 2, 808, 50, &[1608], 0);
-        let plan = f.plan(0, &[dram, remote]).unwrap();
-        let b = plan.b.as_ref().unwrap();
-        assert_eq!(plan.a.pages, 50);
-        assert_eq!(
-            (b.begin_tokens, b.first_page, b.pages, b.dest_page),
-            (808, 0, 50, 50)
-        );
-    }
-
-    #[test]
-    fn a_row_only_tail_has_no_pages_and_the_row() {
-        let f = Fixture::new();
-        let dram = f.candidate(HostDram, 1, 0, 0, &[800], 0);
-        let remote = f.candidate(RemoteNvme, 2, 800, 50, &[810], 0);
-        let plan = f.plan(0, &[dram, remote]).unwrap();
-        let b = plan.b.as_ref().unwrap();
-        assert_eq!(
-            (b.pages, b.dest_page, b.first_page, b.row),
-            (0, 50, 0, true)
-        );
-        assert_eq!(plan.endpoint(), f.key(810));
-        assert!(!plan.a.row);
-    }
-
-    #[test]
-    fn a_candidate_starting_above_the_resident_prefix_is_a_hole() {
-        let f = Fixture::new();
-        let late = f.candidate(HostDram, 1, 800, 50, &[1600], 0);
-        assert!(f.plan(0, std::slice::from_ref(&late)).is_none());
-        // Nothing at all is a miss too.
-        assert!(f.plan(0, &[]).is_none());
-        // A hole after A leaves A alone, with its own row.
-        let dram = f.candidate(HostDram, 2, 0, 0, &[800], 0);
-        let gap = f.candidate(RemoteNvme, 3, 960, 60, &[1600], 0);
-        let plan = f.plan(0, &[dram, gap]).unwrap();
-        assert!(plan.b.is_none() && plan.a.row);
-        assert_eq!(plan.endpoint(), f.key(800));
-    }
-
-    #[test]
-    fn a_candidate_covering_less_than_a_is_not_used() {
-        let f = Fixture::new();
-        let dram = f.candidate(HostDram, 1, 0, 0, &[800], 0);
-        let short = f.candidate(RemoteNvme, 2, 0, 0, &[400], 0);
-        let same = f.candidate(RemoteNvme, 3, 0, 0, &[800], 0);
-        let plan = f.plan(0, &[short, same, dram]).unwrap();
-        assert!(plan.b.is_none());
-        assert_eq!(plan.a.source, SourceId(1));
-    }
-
-    #[test]
-    fn nothing_is_copied_from_a_farther_level_than_a_closer_one_holds() {
-        let f = Fixture::new();
-        // The neighbour GPU is closest even though it holds less than DRAM.
-        let near = f.candidate(NeighbourGpu, 1, 0, 0, &[400], 0);
-        let dram = f.candidate(HostDram, 2, 0, 0, &[800], 0);
-        let plan = f.plan(0, &[dram, near]).unwrap();
-        assert_eq!(plan.a.source, SourceId(1));
-        let b = plan.b.as_ref().unwrap();
-        assert_eq!(
-            (b.source, b.begin_tokens, b.first_page, b.pages),
-            (SourceId(2), 400, 25, 25)
-        );
-        // A source at A's own level is never B.
-        let same_level = f.candidate(NeighbourGpu, 3, 0, 0, &[800], 0);
-        let plan = f
-            .plan(
-                0,
-                &[f.candidate(NeighbourGpu, 1, 0, 0, &[400], 0), same_level],
-            )
-            .unwrap();
-        assert!(plan.b.is_none());
-    }
-
-    #[test]
-    fn same_level_sources_share_a_cost_and_ties_use_source_id() {
-        let f = Fixture::new();
-        let slow = f.candidate(HostDram, 1, 0, 0, &[800], 50);
-        let fast = f.candidate(HostDram, 2, 0, 0, &[400], 20);
-        let unknown = f.candidate(HostDram, 3, 0, 0, &[1200], 0);
-        let plan = f
-            .plan(0, &[slow.clone(), fast.clone(), unknown.clone()])
-            .unwrap();
-        assert_eq!(plan.a.source, SourceId(3));
-        // Equal length at one level uses stable source identity.
-        let twin = f.candidate(HostDram, 4, 0, 0, &[800], 20);
-        let plan = f
-            .plan(0, &[unknown.clone(), twin, slow.clone(), fast])
-            .unwrap();
-        assert_eq!(plan.a.source, SourceId(3));
-        let plan = f
-            .plan(
-                0,
-                &[slow.clone(), f.candidate(HostDram, 4, 0, 0, &[800], 20)],
-            )
-            .unwrap();
-        assert_eq!(plan.a.source, SourceId(1));
-        let plan = f
-            .plan(0, &[f.candidate(HostDram, 5, 0, 0, &[800], 0), slow])
-            .unwrap();
-        assert_eq!(plan.a.source, SourceId(1));
-        // B takes the longest match at its level.
-        let dram = f.candidate(HostDram, 1, 0, 0, &[400], 0);
-        let b_slow = f.candidate(RemoteNvme, 5, 400, 25, &[1600], 90);
-        let b_fast = f.candidate(RemoteNvme, 6, 400, 25, &[1200], 30);
-        let plan = f.plan(0, &[dram, b_slow, b_fast]).unwrap();
-        assert_eq!(plan.b.unwrap().source, SourceId(5));
-    }
-
-    #[test]
-    fn an_a_that_supplies_nothing_is_left_out() {
-        let f = Fixture::new();
-        // A ends inside the first page: no pages, no row for B to follow.
-        let dram = f.candidate(HostDram, 1, 0, 0, &[8], 0);
-        let remote = f.candidate(RemoteNvme, 2, 8, 0, &[800], 0);
-        let plan = f.plan(0, &[dram, remote]).unwrap();
-        assert!(plan.b.is_none());
-        assert_eq!(
-            (plan.a.source, plan.a.begin_tokens, plan.a.pages),
-            (SourceId(2), 0, 50)
-        );
-        assert!(plan.a.row);
-    }
-
-    #[test]
-    fn extension_cost_uses_the_level_bandwidth() {
-        let mut f = Fixture::new();
-        f.ranking = Ranking::for_test(Level::DEFAULT_ORDER, &[(RemoteNvme, 2000.0)]);
         let candidates = [
-            f.candidate(HostDram, 1, 0, 0, &[800], 0),
-            f.candidate(RemoteNvme, 2, 800, 50, &[1600], 0),
+            f.candidate(Level::HostDram, 1, &[800]),
+            f.candidate(Level::RemoteNvme, 2, &[1600]),
         ];
-        assert!(f.plan(0, &candidates).unwrap().b.is_none());
-        f.ranking = Ranking::default();
-        assert!(f.plan(0, &candidates).unwrap().b.is_some());
-    }
-
-    #[test]
-    fn the_endpoint_stays_below_the_bound() {
-        let f = Fixture::new();
-        let dram = f.candidate(HostDram, 1, 0, 0, &[800], 0);
-        let remote = f.candidate(RemoteNvme, 2, 800, 50, &[1600], 0);
-        let mut request = f.request(0);
-        request.before = 1600;
-        let plan = plan(&request, &[dram.clone(), remote]).unwrap();
-        assert_eq!(plan.endpoint(), f.key(800));
-        request.before = 800;
-        assert!(super::plan(&request, &[dram]).is_none());
-    }
-
-    #[test]
-    fn candidates_that_do_not_match_the_history_are_dropped() {
-        let f = Fixture::new();
-        let good = f.candidate(HostDram, 1, 0, 0, &[800], 0);
-        let mut wrong_key = f.candidate(NeighbourGpu, 2, 0, 0, &[400], 0);
-        wrong_key.nodes[0].key.digest[0] ^= 1;
-        wrong_key.key = wrong_key.nodes[0].key;
-        let mut wrong_endpoint = f.candidate(NeighbourGpu, 3, 0, 0, &[400], 0);
-        wrong_endpoint.key = f.key(416);
-        let mut broken_tails = f.candidate(NeighbourGpu, 4, 0, 0, &[200, 400], 0);
-        broken_tails.nodes[1].tail_pages += 1;
-        let mut wrong_skip = f.candidate(NeighbourGpu, 5, 160, 0, &[400], 0);
-        wrong_skip.skip_pages = 0;
-        let mut no_nodes = f.candidate(NeighbourGpu, 6, 0, 0, &[400], 0);
-        no_nodes.nodes.clear();
-        let gpu = f.candidate(ThisGpu, 7, 0, 0, &[400], 0);
-        let mut beyond = f.candidate(NeighbourGpu, 8, 0, 0, &[400], 0);
-        beyond.key.consumed_tokens = 3200;
-        beyond.nodes[0].key = beyond.key;
-        beyond.nodes[0].tail_pages = 200;
+        assert_eq!(
+            plan(&f.request(0), &candidates).unwrap().part.source,
+            SourceId(2)
+        );
         let candidates = [
-            wrong_key,
-            wrong_endpoint,
-            broken_tails,
-            wrong_skip,
-            no_nodes,
-            gpu,
-            beyond,
-            good,
+            f.candidate(Level::HostNvme, 3, &[1600]),
+            f.candidate(Level::HostDram, 2, &[1600]),
+            f.candidate(Level::HostDram, 1, &[1600]),
         ];
-        let plan = f.plan(0, &candidates).unwrap();
-        assert_eq!((plan.a.source, plan.endpoint()), (SourceId(1), f.key(800)));
-    }
-
-    #[test]
-    fn rebuild_after_a_failed_hold_keeps_the_endpoint() {
-        let f = Fixture::new();
-        let dram = f.candidate(HostDram, 1, 0, 0, &[800], 0);
-        let remote = f.candidate(RemoteNvme, 2, 800, 50, &[1600], 0);
-        let other_b = f.candidate(RemoteNvme, 3, 800, 50, &[1600], 0);
-        let full = f.candidate(RemoteNvme, 4, 0, 0, &[1600], 0);
-        let candidates = [dram, remote, other_b, full];
-        let request = f.request(0);
-        let first = plan(&request, &candidates).unwrap();
         assert_eq!(
-            (first.a.source, first.b.as_ref().unwrap().source),
-            (SourceId(1), SourceId(2))
+            plan(&f.request(0), &candidates).unwrap().part.source,
+            SourceId(1)
         );
-
-        // B fails: another source of the same endpoint for B, A unchanged.
-        let again = first.rebuild(&request, &candidates, Which::B).unwrap();
+    }
+    #[test]
+    fn a_resident_prefix_can_start_inside_a_record() {
+        let f = Fixture::new();
+        let c = f.candidate(Level::HostDram, 1, &[640, 1600]);
+        let p = plan(&f.request(800), &[c]).unwrap();
+        p.validate(&f.history, 16).unwrap();
         assert_eq!(
-            (again.a.source, again.b.as_ref().unwrap().source),
-            (SourceId(1), SourceId(3))
+            (p.part.first_page, p.pages(), p.part.dest_page),
+            (10, 50, 0)
         );
-        again.validate(&f.history, PT).unwrap();
-
-        // A fails: a single part from the best remaining source of the endpoint.
-        let again = first.rebuild(&request, &candidates, Which::A).unwrap();
-        assert!(again.b.is_none() && again.a.row);
-        assert_eq!((again.a.source, again.a.pages), (SourceId(4), 100));
-        again.validate(&f.history, PT).unwrap();
+        assert_eq!(p.part.chain, [f.history.key_at(1600).unwrap()]);
+        assert!(p.part.row);
     }
-
     #[test]
-    fn rebuild_without_a_source_of_the_endpoint_is_a_miss() {
+    fn row_only_restore_keeps_the_endpoint_and_no_pages() {
         let f = Fixture::new();
-        let dram = f.candidate(HostDram, 1, 0, 0, &[800], 0);
-        let remote = f.candidate(RemoteNvme, 2, 800, 50, &[1600], 0);
-        let candidates = [dram, remote];
-        let request = f.request(0);
-        let first = plan(&request, &candidates).unwrap();
-        // B has no replacement, and a plan ending at 800 cannot reuse the ticket.
-        assert!(first.rebuild(&request, &candidates, Which::B).is_none());
-        assert!(first.rebuild(&request, &candidates, Which::A).is_none());
-        // A single-part plan has no B to fail.
-        let single = plan(&request, &candidates[..1]).unwrap();
-        assert!(single.rebuild(&request, &candidates, Which::B).is_none());
+        let c = f.candidate(Level::HostDram, 1, &[808, 815]);
+        let p = plan(&f.request(808), &[c]).unwrap();
+        p.validate(&f.history, 16).unwrap();
+        assert_eq!(p.pages(), 0);
+        assert!(p.part.row);
     }
-
     #[test]
-    fn a_failed_generation_is_excluded_but_a_newer_one_is_not() {
+    fn holes_foreign_keys_and_inconsistent_tails_are_misses() {
         let f = Fixture::new();
-        let old = f.candidate(HostDram, 1, 0, 0, &[800], 0);
-        let mut newer = old.clone();
-        newer.generation = 2;
-        let request = f.request(0);
-        let first = plan(&request, std::slice::from_ref(&old)).unwrap();
-        let again = first.rebuild(&request, &[old, newer], Which::A).unwrap();
-        assert_eq!(again.a.generation, 2);
-    }
-
-    #[test]
-    fn validate_rejects_inconsistent_plans() {
-        let f = Fixture::new();
-        let dram = f.candidate(HostDram, 1, 0, 0, &[800], 0);
-        let remote = f.candidate(RemoteNvme, 2, 800, 50, &[1600], 0);
-        let good = f.plan(0, &[dram, remote]).unwrap();
-        let mut gap = good.clone();
-        gap.b.as_mut().unwrap().begin_tokens += 16;
-        let mut overlap = good.clone();
-        overlap.b.as_mut().unwrap().dest_page = 49;
-        let mut two_rows = good.clone();
-        two_rows.a.row = true;
-        let mut no_row = good.clone();
-        no_row.b.as_mut().unwrap().row = false;
+        let good = f.candidate(Level::HostDram, 1, &[800]);
+        let mut hole = good.clone();
+        hole.begin_tokens = 16;
+        hole.skip_pages = 1;
         let mut foreign = good.clone();
-        foreign.b.as_mut().unwrap().chain[0].digest[0] ^= 1;
-        let mut miscounted = good.clone();
-        miscounted.a.pages += 1;
-        for bad in [gap, overlap, two_rows, no_row, foreign, miscounted] {
-            assert!(bad.validate(&f.history, PT).is_err());
+        foreign.key.digest[0] ^= 1;
+        let mut gap = f.candidate(Level::HostDram, 2, &[400, 800]);
+        gap.nodes[1].tail_pages += 1;
+        let mut no_nodes = good.clone();
+        no_nodes.nodes.clear();
+        for bad in [hole, foreign, gap, no_nodes] {
+            assert!(plan(&f.request(0), &[bad]).is_none());
         }
+        assert!(plan(&f.request(0), &[]).is_none());
+    }
+    #[test]
+    fn endpoints_stay_below_the_bound_and_above_the_resident_prefix() {
+        let f = Fixture::new();
+        let c = f.candidate(Level::HostDram, 1, &[800]);
+        let mut request = f.request(0);
+        request.before = 800;
+        assert!(plan(&request, std::slice::from_ref(&c)).is_none());
+        assert!(plan(&f.request(800), &[c]).is_none());
+    }
+    #[test]
+    fn validate_rejects_bad_destination_row_and_page_count() {
+        let f = Fixture::new();
+        let c = f.candidate(Level::HostDram, 1, &[800]);
+        let p = plan(&f.request(0), &[c]).unwrap();
+        let mut bad = p.clone();
+        bad.part.dest_page = 1;
+        assert!(bad.validate(&f.history, 16).is_err());
+        let mut bad = p.clone();
+        bad.part.row = false;
+        assert!(bad.validate(&f.history, 16).is_err());
+        let mut bad = p;
+        bad.part.pages += 1;
+        assert!(bad.validate(&f.history, 16).is_err());
     }
 }

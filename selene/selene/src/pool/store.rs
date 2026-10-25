@@ -6,11 +6,8 @@
 //! restore may take its pages from the pool, and exports reach the model
 //! worker through `poll`.
 //!
-//! A restore has at most two sources. Its closest part may be local (this
-//! instance's DRAM or NVMe) or pool; the second part is always a pool source.
-//! A local first part is copied first and the pool part follows, so the
-//! endpoint's row, which the pool part carries, is written last. All parts
-//! succeed or the restore fails as one: pages are never published partially.
+//! A restore uses one source. A failed pool copy may use this host's own copy
+//! of the same endpoint, after the pool's writes have drained.
 
 use std::{
     collections::HashMap,
@@ -22,9 +19,8 @@ use crate::{
     PrefixKey, PublishedCheckpoint, Result, StoreEvent, StoreOutcome, StoreReason, StoreStats,
     Tier as Local,
     index::Match,
-    levels::Level,
-    plan::{self, Identity, Plan, Request, SourceId, Which},
-    store::INITIAL_PREFILL_RATE,
+    levels::{Level, Ranking},
+    plan::{self, Identity, Plan, Request, SourceId},
 };
 
 use super::{
@@ -43,8 +39,6 @@ pub trait PoolPort {
     fn begin_lookup(&self, history: &dyn History, held: Vec<HeldRange>) -> LookupTicket;
     fn fetch(&mut self, fetch: PoolFetch) -> Result<u64>;
     fn poll(&mut self, events: &mut Vec<PoolEvent>) -> Result<()>;
-    fn ranking(&self) -> crate::levels::Ranking;
-    fn observe_restore(&self, level: Level, bytes: u64, elapsed: Duration);
     fn saved(&self, entry: IndexEntry);
     fn evicted(&self, key: PrefixKey, tier: Tier, generation: u64, heir: Option<IndexEntry>);
     fn evictions_lost(&self);
@@ -68,12 +62,6 @@ impl PoolPort for PoolClient {
     }
     fn poll(&mut self, events: &mut Vec<PoolEvent>) -> Result<()> {
         PoolClient::poll(self, events)
-    }
-    fn ranking(&self) -> crate::levels::Ranking {
-        PoolClient::ranking(self)
-    }
-    fn observe_restore(&self, level: Level, bytes: u64, elapsed: Duration) {
-        PoolClient::observe_restore(self, level, bytes, elapsed)
     }
     fn saved(&self, entry: IndexEntry) {
         PoolClient::saved(self, entry)
@@ -116,53 +104,20 @@ const LOCAL: SourceId = SourceId(0);
 const SKIP: Duration = Duration::from_secs(1);
 /// Plans remembered between a lookup and its fetch.
 const PLANS: usize = 256;
-/// Times a failed pool restore is replanned from other sources.
-const RETRIES: u32 = 2;
 /// Copies out of the GPU in flight beyond which a publication is declined.
 const COPY_QUEUE: usize = 16;
-/// The keys a history has at the positions a plan mentions, kept so that a
-/// plan can be rebuilt after the request's history is gone.
-struct KeptHistory {
-    tokens: u64,
-    keys: HashMap<u64, PrefixKey>,
-}
-
-impl History for KeptHistory {
-    fn token_count(&self) -> u64 {
-        self.tokens
-    }
-    fn key_at(&self, consumed_tokens: u64) -> Option<PrefixKey> {
-        self.keys.get(&consumed_tokens).copied()
-    }
-    fn aligned_boundaries(&self) -> &[PrefixKey] {
-        &[]
-    }
-}
-
 struct Planned {
     plan: Plan,
     local: Option<HostHit>,
-    pool: Vec<PoolCandidate>,
-    history: KeptHistory,
-    resident: u64,
-    before: u64,
+    candidate: PoolCandidate,
 }
-
-enum Stage {
-    /// The local first part is copying; the pool part follows.
-    Local { local_key: PrefixKey },
-    /// A pool restore is running under this id.
-    Pool { id: u64 },
-    /// The pool could not restore it and this host's own copy of the same endpoint is
-    /// copying into the same pages.
-    Fallback { local_key: PrefixKey },
-}
-
 struct Restore {
-    planned: Planned,
     ticket: InboundTicket,
-    stage: Stage,
-    retries: u32,
+    local: Option<HostHit>,
+    id: Option<u64>,
+    level: Level,
+    bytes: u64,
+    started: Instant,
 }
 
 pub struct PooledStore<S: HostStore, P: PoolPort = PoolClient> {
@@ -172,10 +127,9 @@ pub struct PooledStore<S: HostStore, P: PoolPort = PoolClient> {
     page_tokens: u64,
     page_record_bytes: u64,
     row_record_bytes: u64,
-    prefill_rate: f64,
     plans: HashMap<(PrefixKey, u64), Planned>,
     restores: HashMap<PrefixKey, Restore>,
-    local_timings: HashMap<PrefixKey, (Level, usize, Instant)>,
+    rates: Ranking,
     skip: HashMap<(SourceRef, Tier), Instant>,
     inner_events: Vec<StoreEvent>,
     pool_events: Vec<PoolEvent>,
@@ -251,10 +205,9 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             page_tokens: layout.page_tokens,
             page_record_bytes: layout.page_record_bytes,
             row_record_bytes: layout.row_record_bytes,
-            prefill_rate: INITIAL_PREFILL_RATE,
             plans: HashMap::new(),
             restores: HashMap::new(),
-            local_timings: HashMap::new(),
+            rates: Ranking::default(),
             skip: HashMap::new(),
             inner_events: Vec::new(),
             pool_events: Vec::new(),
@@ -273,11 +226,6 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
 
     pub fn pool(&self) -> &P {
         &self.pool
-    }
-
-    /// The measured prefill rate the planner weighs transfers against.
-    pub fn set_prefill_rate(&mut self, tokens_per_second: f64) {
-        self.prefill_rate = tokens_per_second;
     }
 
     // ---- publication -----------------------------------------------------------
@@ -330,128 +278,10 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             .is_none_or(|until| now >= *until)
     }
 
-    fn request<'a>(
-        &'a self,
-        history: &'a dyn History,
-        ranking: &'a crate::levels::Ranking,
-        resident: u64,
-        before: u64,
-    ) -> Request<'a> {
-        Request {
-            history,
-            identity: &self.identity,
-            page_tokens: self.page_tokens,
-            page_bytes: self.page_record_bytes,
-            row_bytes: self.row_record_bytes,
-            resident,
-            before,
-            ranking,
-            prefill_tokens_per_second: self.prefill_rate,
-        }
-    }
-
-    fn hit_for(
-        &self,
-        plan: &Plan,
-        local: Option<&HostHit>,
-        resident: u64,
-        ranking: &crate::levels::Ranking,
-    ) -> HostHit {
-        let endpoint = plan.endpoint();
-        let pages = plan.pages();
-        let mut seconds = 0.0;
-        let mut nodes = Vec::new();
-        for part in std::iter::once(&plan.a).chain(plan.b.as_ref()) {
-            nodes.extend(part.chain.iter().copied());
-            seconds += if part.source == LOCAL {
-                local.map_or(0.0, |hit| hit.estimated_seconds)
-            } else {
-                ranking.part_seconds(
-                    part.level,
-                    part.pages as u64 * self.page_record_bytes
-                        + u64::from(part.row) * self.row_record_bytes,
-                )
-            };
-        }
-        HostHit {
-            key: endpoint,
-            consumed_tokens: endpoint.consumed_tokens,
-            resident_tokens: resident,
-            pages,
-            bytes: pages as u64 * self.page_record_bytes + self.row_record_bytes,
-            tier: if plan.a.source == LOCAL {
-                local.map_or(Local::Memory, |hit| hit.tier)
-            } else {
-                Local::Memory
-            },
-            estimated_seconds: seconds,
-            chain: Match {
-                key: endpoint,
-                consumed_tokens: endpoint.consumed_tokens,
-                resident_tokens: resident,
-                nodes,
-                skip_pages: plan.a.first_page,
-                pages,
-            },
-        }
-    }
-
     // ---- restores ---------------------------------------------------------------
 
-    fn pool_part(
-        &self,
-        planned: &Planned,
-        part: &plan::Part,
-        ticket: &InboundTicket,
-    ) -> Option<FetchPart> {
-        let candidate = planned.pool.iter().find(|c| {
-            c.plan.source == part.source
-                && c.plan.generation == part.generation
-                && c.plan.key == part.end
-        })?;
-        Some(FetchPart {
-            candidate: candidate.clone(),
-            part: part.clone(),
-            pages: ticket.pages[part.dest_page..part.dest_page + part.pages].to_vec(),
-            slot: part.row.then_some(ticket.slot),
-        })
-    }
-
     fn fetch_local(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()> {
-        let key = hit.key;
-        let level = match hit.tier {
-            Local::Memory => Level::HostDram,
-            Local::Disk => Level::HostNvme,
-        };
-        let timing = (level, ticket.pages.len(), Instant::now());
-        self.inner.fetch(hit, ticket)?;
-        self.local_timings.insert(key, timing);
-        Ok(())
-    }
-
-    /// Start the pool parts of a plan; the ids it returns name the restore.
-    fn start_pool(&mut self, endpoint: PrefixKey) -> Result<()> {
-        let restore = self.restores.get(&endpoint).expect("registered");
-        let parts: Vec<_> = std::iter::once(&restore.planned.plan.a)
-            .chain(restore.planned.plan.b.as_ref())
-            .filter(|p| p.source != LOCAL)
-            .cloned()
-            .collect();
-        let fetch_parts = parts
-            .iter()
-            .map(|part| self.pool_part(&restore.planned, part, &restore.ticket))
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| Error::new("a planned pool source is no longer known"))?;
-        let id = PoolPort::fetch(
-            &mut self.pool,
-            PoolFetch {
-                id: 0,
-                page_tokens: self.page_tokens,
-                parts: fetch_parts,
-            },
-        )?;
-        self.restores.get_mut(&endpoint).expect("registered").stage = Stage::Pool { id };
-        Ok(())
+        self.inner.fetch(hit, ticket)
     }
 
     fn fail(&mut self, key: PrefixKey, error: Error, events: &mut Vec<StoreEvent>) {
@@ -460,9 +290,9 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             result: Err(error),
         });
     }
+}
 
-    /// A pool restore finished. A failure may be replanned from other sources
-    /// when the restore is all pool; otherwise it fails as one.
+impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
     fn pool_finished(
         &mut self,
         id: u64,
@@ -472,87 +302,42 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
         let Some(key) = self
             .restores
             .iter()
-            .find(|(_, r)| matches!(r.stage, Stage::Pool { id: running } if running == id))
+            .find(|(_, r)| r.id == Some(id))
             .map(|(key, _)| *key)
         else {
             return;
         };
-        let failure = match result {
+        let mut restore = self.restores.remove(&key).expect("found");
+        match result {
             Ok(bytes) => {
-                if let Some(restore) = self.restores.remove(&key) {
-                    // A restore that began in a local tier was counted by it.
-                    self.pool_fetched += u64::from(restore.planned.plan.a.source != LOCAL);
+                if !restore.ticket.pages.is_empty() {
+                    self.rates
+                        .observe(restore.level, restore.bytes, restore.started.elapsed());
                 }
+                self.pool_fetched += 1;
                 self.pool_bytes_in += bytes;
                 events.push(StoreEvent::Fetched {
                     key,
                     result: Ok(bytes),
                 });
-                return;
             }
-            Err(failure) => failure,
-        };
-        if failure.no_headroom
-            && let Some(source) = failure.source.clone()
-        {
-            self.skip.insert(source, Instant::now() + SKIP);
-        }
-        let (all_pool, retries) = {
-            let restore = self.restores.get(&key).expect("found");
-            (restore.planned.plan.a.source != LOCAL, restore.retries)
-        };
-        if all_pool
-            && retries < RETRIES
-            && let Some(part) = failure.part
-        {
-            let which = if part == 0 { Which::A } else { Which::B };
-            let now = Instant::now();
-            let replanned = {
-                let planned = &self.restores[&key].planned;
-                let usable: Vec<plan::Candidate> = planned
-                    .pool
-                    .iter()
-                    .filter(|c| self.usable(now, c))
-                    .map(|c| c.plan.clone())
-                    .collect();
-                let ranking = PoolPort::ranking(&self.pool);
-                let request =
-                    self.request(&planned.history, &ranking, planned.resident, planned.before);
-                planned.plan.rebuild(&request, &usable, which)
-            };
-            if let Some(replanned) = replanned
-                && replanned.a.source != LOCAL
-            {
-                let restore = self.restores.get_mut(&key).expect("found");
-                restore.retries += 1;
-                restore.planned.plan = replanned;
-                if self.start_pool(key).is_ok() {
+            Err(failure) => {
+                self.pool_fetch_failed += 1;
+                if failure.no_headroom
+                    && let Some(source) = failure.source
+                {
+                    self.skip.insert(source, Instant::now() + SKIP);
+                }
+                if let Some(hit) = restore.local.take().filter(|hit| hit.key == key)
+                    && self.fetch_local(hit, restore.ticket.clone()).is_ok()
+                {
+                    restore.id = None;
+                    self.restores.insert(key, restore);
                     return;
                 }
+                self.fail(key, failure.error, events);
             }
         }
-        // The pool has no source left: this host's own copy of the same endpoint restores
-        // into the same pages, and only a restore with no source left is a recompute.
-        let own = self.restores.get(&key).and_then(|restore| {
-            let pool_only = restore.planned.plan.a.source != LOCAL;
-            restore
-                .planned
-                .local
-                .clone()
-                .filter(|hit| pool_only && hit.key == key)
-        });
-        if let Some(hit) = own {
-            let ticket = self.restores[&key].ticket.clone();
-            if self.inner.fetch(hit, ticket).is_ok() {
-                self.restores.get_mut(&key).expect("found").stage =
-                    Stage::Fallback { local_key: key };
-                self.pool_fetch_failed += 1;
-                return;
-            }
-        }
-        self.restores.remove(&key);
-        self.pool_fetch_failed += 1;
-        self.fail(key, failure.error, events);
     }
 }
 
@@ -576,46 +361,49 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
             return local;
         };
         let now = Instant::now();
-        let pool: Vec<PoolCandidate> = answer
+        let pool: Vec<_> = answer
             .candidates
             .iter()
             .filter(|c| self.usable(now, c))
             .cloned()
             .collect();
-        let mut candidates: Vec<plan::Candidate> = pool.iter().map(|c| c.plan.clone()).collect();
+        let mut candidates: Vec<_> = pool.iter().map(|c| c.plan.clone()).collect();
         candidates.extend(local.as_ref().and_then(|hit| self.local_candidate(hit)));
-        let ranking = PoolPort::ranking(&self.pool);
-        let request = self.request(history, &ranking, resident, before);
-        let mut plan = plan::plan(&request, &candidates)?;
-        // A pool part followed by a part of this host's own tiers cannot be run: the store
-        // fetches its own part first and the pool serves the rest. Plan again from the pool's
-        // candidates alone, and fall back to the local hit when they cannot cover the restore.
-        if plan.b.as_ref().is_some_and(|b| b.source == LOCAL) {
-            let pool_only: Vec<plan::Candidate> = candidates
-                .iter()
-                .filter(|c| c.source != LOCAL)
-                .cloned()
-                .collect();
-            match plan::plan(&request, &pool_only) {
-                Some(replanned) => plan = replanned,
-                None => return local,
-            }
-        }
-        if plan.a.source == LOCAL && plan.b.is_none() {
+        let plan = plan::plan(
+            &Request {
+                history,
+                identity: &self.identity,
+                page_tokens: self.page_tokens,
+                resident,
+                before,
+            },
+            &candidates,
+        )?;
+        if plan.part.source == LOCAL {
             return local;
         }
-        if plan.validate(history, self.page_tokens).is_err() {
-            return local;
-        }
-        let mut keys = HashMap::new();
-        for candidate in &candidates {
-            for key in candidate.nodes.iter().map(|n| n.key).chain([candidate.key]) {
-                if let Some(real) = history.key_at(key.consumed_tokens) {
-                    keys.insert(key.consumed_tokens, real);
-                }
-            }
-        }
-        let hit = self.hit_for(&plan, local.as_ref(), resident, &ranking);
+        plan.validate(history, self.page_tokens).ok()?;
+        let candidate = pool
+            .into_iter()
+            .find(|c| c.plan.source == plan.part.source && c.plan.key == plan.endpoint())?;
+        let bytes = plan.pages() as u64 * self.page_record_bytes + self.row_record_bytes;
+        let hit = HostHit {
+            key: plan.endpoint(),
+            consumed_tokens: plan.endpoint().consumed_tokens,
+            resident_tokens: resident,
+            pages: plan.pages(),
+            bytes,
+            tier: Local::Memory,
+            estimated_seconds: self.rates.part_seconds(plan.part.level, bytes),
+            chain: Match {
+                key: plan.endpoint(),
+                consumed_tokens: plan.endpoint().consumed_tokens,
+                resident_tokens: resident,
+                nodes: plan.part.chain.clone(),
+                skip_pages: plan.part.first_page,
+                pages: plan.pages(),
+            },
+        };
         if self.plans.len() >= PLANS {
             self.plans.clear();
         }
@@ -624,30 +412,102 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
             Planned {
                 plan,
                 local,
-                pool,
-                history: KeptHistory {
-                    tokens: history.token_count(),
-                    keys,
-                },
-                resident,
-                before,
+                candidate,
             },
         );
         Some(hit)
     }
 
     fn begin_lookup(&mut self, history: &dyn History) -> Option<LookupTicket> {
-        let mut held = Vec::new();
-        if let Some(hit) = self.inner.lookup(history, 0, history.token_count()) {
-            held.push(HeldRange {
-                level: match hit.tier {
-                    Local::Memory => Level::HostDram,
-                    Local::Disk => Level::HostNvme,
-                },
-                end: hit.key,
-            });
+        Some(self.pool.begin_lookup(history, Vec::new()))
+    }
+
+    fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()> {
+        let Some(planned) = self.plans.remove(&(hit.key, hit.resident_tokens)) else {
+            return self.fetch_local(hit, ticket);
+        };
+        self.plans.retain(|(key, _), _| *key != hit.key);
+        if ticket.key != hit.key || ticket.pages.len() != planned.plan.pages() {
+            return Err(Error::new("the ticket does not match the planned restore"));
         }
-        Some(PoolPort::begin_lookup(&self.pool, history, held))
+        let level = planned.plan.part.level;
+        let bytes = hit.bytes;
+        let started = Instant::now();
+        let id = self.pool.fetch(PoolFetch {
+            id: 0,
+            page_tokens: self.page_tokens,
+            parts: vec![FetchPart {
+                candidate: planned.candidate,
+                part: planned.plan.part,
+                pages: ticket.pages.clone(),
+                slot: Some(ticket.slot),
+            }],
+        })?;
+        self.restores.insert(
+            hit.key,
+            Restore {
+                ticket,
+                local: planned.local,
+                id: Some(id),
+                level,
+                bytes,
+                started,
+            },
+        );
+        Ok(())
+    }
+
+    fn poll(&mut self, events: &mut Vec<StoreEvent>) -> Result<()> {
+        let mut inner_events = std::mem::take(&mut self.inner_events);
+        let inner = self.inner.poll(&mut inner_events);
+        for event in inner_events.drain(..) {
+            if let StoreEvent::Fetched { key, .. } = &event {
+                if self.restores.get(key).is_some_and(|r| r.id.is_none()) {
+                    self.restores.remove(key);
+                }
+            }
+            events.push(event);
+        }
+        self.inner_events = inner_events;
+        let mut pool_events = std::mem::take(&mut self.pool_events);
+        let pool = self.pool.poll(&mut pool_events);
+        for event in pool_events.drain(..) {
+            match event {
+                PoolEvent::Export(request) if request.tier == Tier::Gpu => {
+                    events.push(StoreEvent::ExportRequested {
+                        export: request.export,
+                        key: request.key,
+                        generation: request.generation,
+                        begin_tokens: request.begin_tokens,
+                        want_row: request.want_row,
+                        reserved_bytes: request.reserved_bytes,
+                    })
+                }
+                PoolEvent::Export(request) => match self.inner.pin_export(
+                    request.tier,
+                    request.key,
+                    request.generation,
+                    request.begin_tokens,
+                    request.want_row,
+                ) {
+                    Ok(pin) => self.pool.host_pinned(request.export, pin),
+                    Err(reason) => self.pool.export_refused(request.export, reason),
+                },
+                PoolEvent::ExportEnded { export } => {
+                    events.push(StoreEvent::ExportEnded { export })
+                }
+                PoolEvent::Fetched { id, result } => self.pool_finished(id, result, events),
+                PoolEvent::Put { id, outcome } => {
+                    if !self.cascade.ended(&mut self.inner, id, &outcome) {
+                        self.puts.push((id, outcome));
+                    }
+                }
+                PoolEvent::Status(_) => {}
+            }
+        }
+        self.pool_events = pool_events;
+        self.cascade.pump(&mut self.inner, &mut self.pool);
+        inner.and(pool)
     }
 
     fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
@@ -672,147 +532,6 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
 
     fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
         self.copy_out(checkpoint)
-    }
-
-    fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()> {
-        let Some(planned) = self.plans.remove(&(hit.key, hit.resident_tokens)) else {
-            return self.fetch_local(hit, ticket);
-        };
-        self.plans.retain(|(key, _), _| *key != hit.key);
-        if ticket.key != hit.key || ticket.pages.len() != planned.plan.pages() {
-            return Err(Error::new("the ticket does not match the planned restore"));
-        }
-        let endpoint = hit.key;
-        let local_first = planned.plan.a.source == LOCAL;
-        let stage = Stage::Pool { id: 0 };
-        let local_hit = planned.local.clone();
-        let a_pages = planned.plan.a.pages;
-        self.restores.insert(
-            endpoint,
-            Restore {
-                planned,
-                ticket: ticket.clone(),
-                stage,
-                retries: 0,
-            },
-        );
-        let started = if local_first {
-            let local_hit = local_hit.ok_or_else(|| Error::new("the local part has no hit"));
-            local_hit.and_then(|local_hit| {
-                let local_key = local_hit.key;
-                let part_ticket = InboundTicket {
-                    key: local_key,
-                    pages: ticket.pages[..a_pages].to_vec(),
-                    slot: ticket.slot,
-                };
-                self.fetch_local(local_hit, part_ticket)?;
-                self.restores.get_mut(&endpoint).expect("inserted").stage =
-                    Stage::Local { local_key };
-                Ok(())
-            })
-        } else {
-            self.start_pool(endpoint)
-        };
-        if started.is_err() {
-            self.restores.remove(&endpoint);
-        }
-        started
-    }
-
-    fn poll(&mut self, events: &mut Vec<StoreEvent>) -> Result<()> {
-        let mut inner_events = std::mem::take(&mut self.inner_events);
-        let inner = self.inner.poll(&mut inner_events);
-        for event in inner_events.drain(..) {
-            if let StoreEvent::Fetched { key, result } = &event
-                && let Some((level, pages, started)) = self.local_timings.remove(key)
-                && result.is_ok()
-                && pages > 0
-            {
-                PoolPort::observe_restore(
-                    &self.pool,
-                    level,
-                    pages as u64 * self.page_record_bytes + self.row_record_bytes,
-                    started.elapsed(),
-                );
-            }
-            match event {
-                StoreEvent::Fetched { key, result }
-                    if self.restores.values().any(
-                        |r| matches!(r.stage, Stage::Local { local_key } if local_key == key),
-                    ) =>
-                {
-                    let endpoint = self
-                        .restores
-                        .iter()
-                        .find(|(_, r)| matches!(r.stage, Stage::Local { local_key } if local_key == key))
-                        .map(|(endpoint, _)| *endpoint)
-                        .expect("matched above");
-                    match result {
-                        Err(error) => {
-                            self.restores.remove(&endpoint);
-                            self.fail(endpoint, error, events);
-                        }
-                        Ok(_) => {
-                            if let Err(error) = self.start_pool(endpoint) {
-                                self.restores.remove(&endpoint);
-                                self.fail(endpoint, error, events);
-                            }
-                        }
-                    }
-                }
-                StoreEvent::Fetched { key, result }
-                    if self.restores.get(&key).is_some_and(
-                        |r| matches!(r.stage, Stage::Fallback { local_key } if local_key == key),
-                    ) =>
-                {
-                    self.restores.remove(&key);
-                    events.push(StoreEvent::Fetched { key, result });
-                }
-                other => events.push(other),
-            }
-        }
-        self.inner_events = inner_events;
-        let mut pool_events = std::mem::take(&mut self.pool_events);
-        let pool = PoolPort::poll(&mut self.pool, &mut pool_events);
-        for event in pool_events.drain(..) {
-            match event {
-                PoolEvent::Export(request) if request.tier == Tier::Gpu => {
-                    events.push(StoreEvent::ExportRequested {
-                        export: request.export,
-                        key: request.key,
-                        generation: request.generation,
-                        begin_tokens: request.begin_tokens,
-                        want_row: request.want_row,
-                        reserved_bytes: request.reserved_bytes,
-                    })
-                }
-                // A host tier is this store's to pin; the model worker is not involved.
-                PoolEvent::Export(request) => match self.inner.pin_export(
-                    request.tier,
-                    request.key,
-                    request.generation,
-                    request.begin_tokens,
-                    request.want_row,
-                ) {
-                    Ok(pin) => PoolPort::host_pinned(&mut self.pool, request.export, pin),
-                    Err(reason) => PoolPort::export_refused(&mut self.pool, request.export, reason),
-                },
-                PoolEvent::ExportEnded { export } => {
-                    events.push(StoreEvent::ExportEnded { export })
-                }
-                PoolEvent::Fetched { id, result } => self.pool_finished(id, result, events),
-                PoolEvent::Put { id, outcome } => {
-                    if !self.cascade.ended(&mut self.inner, id, &outcome) {
-                        self.puts.push((id, outcome));
-                    }
-                }
-                PoolEvent::Status(_) => {}
-            }
-        }
-        self.pool_events = pool_events;
-        self.cascade.pump(&mut self.inner, &mut self.pool);
-        inner?;
-        pool
     }
 
     fn stats(&self) -> StoreStats {

@@ -899,12 +899,11 @@ same completion events the store produces.
   host tier. `Present` requires a committed local copy; a lookup hint is not
   sufficient. `Oversize` means the record exceeds the tier, and `Retry` means
   that capacity or queue room is temporarily unavailable.
-- **Two sources.** A restore reads at most two parts: the longest prefix held
-  at the closest level, then one farther source from exactly where that part
-  ends, with the endpoint's row from whichever ends last. The parts are planned
-  by the store, which holds the first locally before planning the second; to the
-  worker the restore is one inbound ticket and one `Fetched` event, after both
-  parts' writes drain, and a failure of either discards the destination pages.
+- **One source.** The store chooses the longest matching prefix, then the
+  closest level. It restores the whole suffix after the GPU-resident prefix,
+  including the endpoint row, from that source. A failed pool restore may use
+  a local copy of the same endpoint after the pool's writes drain; otherwise
+  the destination is discarded and the request recomputes.
 
 Loading attaches the pool to the local tiers, if any, as a `PooledStore`; with
 no memory or disk tier every restore comes from the pool. The pool has its own

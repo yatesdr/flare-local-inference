@@ -14,7 +14,6 @@ use tokio::sync::Notify;
 
 use crate::{
     Error, ExportChain, ExportId, ExportRefusal, PageId, PrefixKey, Result, StateSlotId,
-    levels::{Level, Ranking},
 };
 
 use super::{
@@ -233,7 +232,6 @@ pub(crate) struct Shared {
     events: Mutex<VecDeque<PoolEvent>>,
     commands: Mutex<VecDeque<Command>>,
     registry: Mutex<Registry>,
-    ranking: Mutex<Ranking>,
     topology: std::sync::atomic::AtomicU64,
     /// Lookups the manager accepts at once; 0 until the manager states it.
     max_lookups: AtomicU32,
@@ -250,7 +248,6 @@ impl Shared {
             events: Mutex::new(VecDeque::new()),
             commands: Mutex::new(VecDeque::new()),
             registry: Mutex::new(Registry::default()),
-            ranking: Mutex::new(Ranking::default()),
             topology: std::sync::atomic::AtomicU64::new(0),
             max_lookups: AtomicU32::new(0),
             paused_until: Mutex::new(None),
@@ -304,14 +301,6 @@ impl Shared {
 
     pub(crate) fn take_commands(&self) -> Vec<Command> {
         self.commands.lock().unwrap().drain(..).collect()
-    }
-
-    pub(crate) fn ranking(&self) -> Ranking {
-        self.ranking.lock().unwrap().clone()
-    }
-
-    pub(crate) fn observe_restore(&self, level: Level, bytes: u64, elapsed: std::time::Duration) {
-        self.ranking.lock().unwrap().observe(level, bytes, elapsed);
     }
 
     /// Identifies the manager and link the session runs over; 0 while no session

@@ -13,7 +13,6 @@ use std::{
 
 use crate::{
     CacheGeometry, History, PageId, PrefixKey, Result, StateSlotId,
-    levels::Ranking,
     geometry::fingerprint,
     plan::{self, Identity, Request},
     pool::{
@@ -421,21 +420,16 @@ fn fetch_for(
         !answer.candidates.is_empty(),
         "the manager offered a candidate"
     );
-    let ranking = Ranking::default();
     let request = Request {
         history,
         identity: &identity(world),
         page_tokens: PT,
-        page_bytes: whole(world).0 as u64,
-        row_bytes: whole(world).1 as u64,
         resident: 0,
         before: u64::MAX,
-        ranking: &ranking,
-        prefill_tokens_per_second: 8000.0,
     };
     let plan = plan::plan(&request, &answer.plan_candidates()).expect("a plan");
     assert_eq!(plan.pages(), pages);
-    let part = plan.a.clone();
+    let part = plan.part.clone();
     let candidate = answer
         .candidates
         .iter()

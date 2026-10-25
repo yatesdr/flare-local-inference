@@ -77,8 +77,7 @@ the instance side (`flare-selene`, `selene::pool`) implements the other.
 11. **Transfer cost** uses the requester's rolling bandwidth for each copy level,
     seeded until a restore completes. The manager does not report per-source estimates.
 12. **Logical split versus physical page offset.** `Claim.begin_tokens`
-    is the exact logical split (the resident prefix end, or for part B exactly
-    A's endpoint `consumed_tokens`) and need not be page-aligned. The source
+    is the resident prefix end and need not be page-aligned. The source
     supplies pages from `floor(begin_tokens / page_tokens)` to
     `floor(key.consumed_tokens / page_tokens)` plus the row, the same flooring
     Flare's `Match` uses. Zero pages with the row is a legal row-only tail. A
@@ -86,9 +85,8 @@ the instance side (`flare-selene`, `selene::pool`) implements the other.
     offset into the first record.
 13. **Claims run after admission, inside `fetch`** (see "Claims run after admission" in the client's state machine). Lookup is asynchronous
     while a request queues; claims start when the scheduler has reserved the
-    ticket. Part B stays provisional until part A is held. A failed claim is
-    retried only against other candidates for the same endpoint key; otherwise the
-    restore fails and the request recomputes.
+    ticket. A failed claim drains before reporting failure; the request
+    recomputes, or uses a local copy of the same endpoint when available.
 14. **GPU exports need retained staging first.** A
     GPU-tier export is accepted only after staging for the whole export is
     reserved: the manager reserves it from the index's size before sending the
@@ -770,67 +768,22 @@ window of the old epoch, so it needs no wait. Recreated files need no hold: they
 are different files that no old mapping can reach. When the hold ends the
 allocators are fresh, so every window of the old epoch is free by construction.
 
-## 9. The two-source restore plan
+## 9. Single-source restores
 
-A plan has one or two parts. All of this is the selene client's logic; the
-manager sees independent claims (tagged `plan_id`, `part`).
+The client chooses the longest matching prefix, then the closest copy level,
+then a stable source identifier. One source supplies every missing page and the
+endpoint row. Its chain must cover the resident prefix through the endpoint;
+local and pool prefixes are never stitched together.
 
-```
-resident (GPU)           A.end                       endpoint E
-   |-------- part A -------|---------- part B ----------|
-   dest pages [0, a)        dest pages [a, a+b)           row from B (or from A if B absent)
-```
+The page count is `floor(endpoint/page_tokens) - floor(resident/page_tokens)`.
+A zero-page tail with a row is legal. Destination pages start at zero. Every key
+in the chain must match the request history and scope.
 
-Properties, enforced by the client before it submits anything:
-
-- A covers `[resident, A.end)`; B covers `[A.end, E)`, so the parts are disjoint
-  and contiguous from the resident checkpoint to the endpoint. A.end is the exact
-  logical split (`consumed_tokens`, decision 12); the physical pages follow Flare's
-  flooring: A has `floor(A.end/pt) - floor(resident/pt)` pages, B has
-  `floor(E/pt) - floor(A.end/pt)` (possibly 0, with the row only). Coverage is
-  validated on both the logical split and the physical page offset.
-- Destination page offsets: A starts at 0, B at A's page count; their page
-  counts sum to the ticket's page count.
-- A is requested with `want_row = false`; B (or A, if alone) with `want_row =
-  true`. Exactly one row, from whichever part ends last.
-- Each part names its source, the source's generation, the record-relative first
-  page (`Record.first_page`, i.e. `Match.skip_pages`), and its validated key
-  chain (tenant, model, layout fingerprint via the scope, keys via
-  `history.key_at`).
-
-Sequence:
-
-1. **Plan:** from local candidates and the lookup result, A = the longest prefix
-   at the closest level that has any of it; B = one farther source for the rest
-   (rule 2), kept only if `worth_fetching` holds for B's pages (rule 4). Rule 1
-   (never copy what a closer level holds) is enforced by `held` in the lookup
-   and by the trim in the plan.
-2. **Hold A** (before B's start is fixed): a local record gets a local pin
-   immediately; a pool part is a `Claim` that must reach `GRANTED`. If the hold
-   fails (`NOT_FOUND`, `GENERATION_CHANGED`, `NO_HEADROOM`, timeout, source
-   limit), the plan is rebuilt: another source of A's endpoint, or a single
-   part from the best remaining source of the full endpoint, or a miss.
-3. **Hold B** (provisional until A is held): a `Claim` with
-   `begin_tokens = A.end` (exact). Failure: another source of
-   the same endpoint for B; else all-or-nothing (step 6).
-4. **Copy:** A and B copy concurrently into disjoint destination ranges
-   (selene submits two inbound jobs to `PageCopier`).
-5. **Validate:** every page and row checksum, and the prefix identity, before the
-   job is considered complete.
-6. **All or nothing:** if either part fails at any point, the client cancels the
-   other (`ClaimRelease` or a local unpin), waits for all submitted copies to
-   drain, releases the holds, and reports one failed `Fetched`. The request
-   recomputes. Nothing partial is published.
-
-Edge cases the tests cover: record boundaries differ between sources (B starts
-mid-record: `skip_pages > 0`), a row-only tail (B has `pages = 0, row = true`,
-endpoint in the same page as A's end), a hole (B's source lacks the pages right
-after A's end: `CHAIN_GAP`, no plan), eviction of A's source while planning (hold
-fails, rebuild), and loss of B's source mid-copy (all or nothing).
-
-Consequence of the per-requester claim limit (default 2): a plan with two pool
-parts uses every claim slot of the instance, so a second concurrent pool restore
-is refused `CLAIM_LIMIT` and recomputes.
+After admission, the client obtains one claim and validates page and row checksums
+before completing the restore. A failure drains all submitted copies and reports
+one failed `Fetched`. A local copy of the same endpoint can be tried after the
+pool copy drains; other pool sources are not replanned. Nothing partial is
+published. Waiting restores use the bounded claim-slot queue.
 
 ## 10. Limits
 
