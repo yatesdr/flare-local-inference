@@ -11,7 +11,7 @@ mod utility;
 pub(crate) use cost::observed_duration_ns;
 pub use policy::{PolicyConfig, RequestAccounting};
 use refresh::PlanOrigin;
-pub use sharing::{EvictedCheckpoint, ExportLookup, NextAdmission};
+pub use sharing::{EvictedCheckpoint, NextAdmission};
 pub mod speculation;
 pub(crate) mod decoded_history;
 mod rounds;

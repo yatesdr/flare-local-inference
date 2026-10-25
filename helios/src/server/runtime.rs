@@ -2300,7 +2300,6 @@ fn serve_export(
     (key, generation, begin_tokens, want_row): (crate::cache::PrefixKey, u64, u64, bool),
 ) -> Result<()> {
     use crate::offload::ExportRefusal;
-    use crate::scheduler::ExportLookup;
     let refuse = |store: &mut dyn crate::offload::PrefixStore, reason| {
         store.export_refused(export, reason);
         Ok(())
@@ -2309,9 +2308,8 @@ fn serve_export(
         return refuse(store, ExportRefusal::Busy);
     }
     let id = match scheduler.checkpoint_by_generation(&key, generation) {
-        ExportLookup::Found(id) => id,
-        ExportLookup::Missing => return refuse(store, ExportRefusal::NotFound),
-        ExportLookup::Changed => return refuse(store, ExportRefusal::GenerationChanged),
+        Ok(id) => id,
+        Err(reason) => return refuse(store, reason),
     };
     let Some(chain) = scheduler.export_chain(id, begin_tokens, want_row) else {
         return refuse(store, ExportRefusal::ChainGap);

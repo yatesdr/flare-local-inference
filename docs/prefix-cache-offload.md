@@ -122,11 +122,12 @@ one package.
 
 ### 2.2 Store interface
 
-The worker depends on one trait:
+The worker uses Selene's `HostStore`, re-exported by Helios as `PrefixStore`.
+Its core operations are:
 
 ```rust
-pub trait PrefixStore {
-    fn lookup(&mut self, history: &PrefixHistory, resident: u64, before: u64) -> Option<HostHit>;
+pub trait HostStore {
+    fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit>;
     fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
     fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()>;
@@ -826,8 +827,15 @@ registrations survive reconnects to the same regions and remain alive through
 copy drain at close. A changed generation disables sharing with one warning;
 the instance continues locally and needs a restart to register the new regions.
 
+Selene's `PoolBuilder` owns pool settings, scope and instance identity, attachment,
+and registration-plan accounting. The native loader supplies GPU identities,
+cache geometry, remaining budget figures, a copier and a registrar. Selene also
+owns rank framing, pool handshakes and record relay work; native joins bind those
+resources to prepared CUDA storage and retain them through shutdown.
+
 The worker's part is a set of defaulted `PrefixStore` hooks, all run on the
-model worker thread and none waiting on the network.
+model worker thread and none waiting on the network. The worker consumes the
+same completion events the store produces.
 
 - **Exports.** The store reports an `ExportRequested` event through `poll`.
   `service_store` answers it in the same iteration: it finds the checkpoint by
@@ -1038,7 +1046,7 @@ on the file format fixed in step 5.
 8. **Memory store and disk store.** `selene/selene/src/memory.rs` and
    `selene/selene/src/disk_store.rs`, each implementing `HostStore` from
    `selene/selene/src/store.rs` over the components above, which the
-   adapter in `helios/src/offload/adapter.rs` exposes as `PrefixStore`; the disk store
+   runtime re-exports directly as `PrefixStore`; the disk store
    behind the `DiskTransport` trait with the `Staged` implementation, its
    staging pool, `write_from`, and `read_into`. Acceptance: the step 7 GPU
    test repeated through each store's `store` and `fetch`, and CPU tests of

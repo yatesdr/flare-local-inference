@@ -98,20 +98,7 @@ impl PreparedPool {
             disk,
         }
         .start(copier.clone(), registrar)?;
-        let plan: Vec<_> = pool
-            .registered_regions()
-            .iter()
-            .map(|region| flare_selene::pool::PlannedRegion {
-                name: region.name,
-                bytes: region.bytes as u64,
-            })
-            .collect();
-        let (host, device) = Budget::costs(&plan)?;
-        phase.finish(if plan.is_empty() {
-            "local tiers only".into()
-        } else {
-            format!("{host} host bytes · {device} device bytes per GPU")
-        });
+        phase.finish(pool.summary()?);
         Ok((Self { pool, copier }, charges))
     }
     pub(crate) fn take_listener(&mut self) -> Option<(std::net::TcpListener, [u8; 16])> {

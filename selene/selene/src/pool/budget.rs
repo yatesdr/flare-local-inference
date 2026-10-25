@@ -7,17 +7,17 @@ pub struct Budget {
 }
 
 impl Budget {
-    pub fn costs(plan: &[PlannedRegion]) -> std::result::Result<(u64, u64), String> {
-        plan.iter()
-            .try_fold((0u64, 0u64), |(host, device), region| {
-                Ok((
-                    host.checked_add(region.bytes)
-                        .ok_or("pool host bytes overflow")?,
-                    device
-                        .checked_add(region.bytes.div_ceil(512))
-                        .ok_or("pool device bytes overflow")?,
-                ))
-            })
+    pub(super) fn costs(
+        mut bytes: impl Iterator<Item = u64>,
+    ) -> std::result::Result<(u64, u64), String> {
+        bytes.try_fold((0u64, 0u64), |(host, device), bytes| {
+            Ok((
+                host.checked_add(bytes).ok_or("pool host bytes overflow")?,
+                device
+                    .checked_add(bytes.div_ceil(512))
+                    .ok_or("pool device bytes overflow")?,
+            ))
+        })
     }
 
     pub fn charges(&self, host: u64, device: u64) -> Vec<u64> {
@@ -34,8 +34,8 @@ impl Budget {
             .collect()
     }
 
-    pub fn approve(&self, plan: &[PlannedRegion]) -> std::result::Result<(), String> {
-        let (host, device) = Self::costs(plan)?;
+    pub(super) fn approve(&self, plan: &[PlannedRegion]) -> std::result::Result<(), String> {
+        let (host, device) = Self::costs(plan.iter().map(|region| region.bytes))?;
         let available_host = self
             .host
             .as_ref()
@@ -81,7 +81,7 @@ mod tests {
     #[test]
     fn approval_charges_whole_regions_and_each_gpu_before_registration() {
         let plan = plan(1 << 30, 1 << 29);
-        let (host, device) = Budget::costs(&plan).unwrap();
+        let (host, device) = Budget::costs(plan.iter().map(|region| region.bytes)).unwrap();
         assert_eq!((host, device), (3 << 29, 3 << 20));
         let budget = Budget {
             host: Ok(host),
@@ -103,7 +103,7 @@ mod tests {
             devices: vec![(device, false), (device - 1, false)],
         };
         assert!(budget.approve(&plan).unwrap_err().contains("GPU 1"));
-        assert!(Budget::costs(&self::plan(u64::MAX, 1)).is_err());
+        assert!(Budget::costs(self::plan(u64::MAX, 1).iter().map(|region| region.bytes)).is_err());
     }
 
     #[test]
@@ -112,7 +112,10 @@ mod tests {
             name: "data-staging",
             bytes: 4097,
         }];
-        assert_eq!(Budget::costs(&plan).unwrap(), (4097, 9));
+        assert_eq!(
+            Budget::costs(plan.iter().map(|region| region.bytes)).unwrap(),
+            (4097, 9)
+        );
         let budget = Budget {
             host: Ok(4097),
             devices: vec![(2058, true), (2058, true), (9, false)],
