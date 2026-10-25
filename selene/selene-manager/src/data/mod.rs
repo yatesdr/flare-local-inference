@@ -94,31 +94,11 @@ pub trait DataChannel: Send {
         remote_offset: u64,
     ) -> io::Result<()>;
 
-    /// Ask the peer to copy `len` bytes from its (`remote_region`, `remote_offset`) into local
-    /// (`region`, `offset`). Completion arrives through `poll`.
-    #[allow(clippy::too_many_arguments)]
-    fn read(
-        &mut self,
-        transfer: u64,
-        index: u32,
-        region: Region,
-        offset: u64,
-        len: u64,
-        remote_region: Region,
-        remote_offset: u64,
-    ) -> io::Result<()>;
-
     /// Completed or failed `(transfer, index)` windows since the last call.
     fn poll(&mut self, done: &mut Vec<(u64, u32, io::Result<()>)>) -> io::Result<()>;
 
     /// Stop the channel and complete every outstanding window with an error.
     fn close(&mut self) -> io::Result<()>;
-
-    /// Whether this channel moves bytes over RDMA. A data-path failure on such a channel makes
-    /// the peer stream-only until the manager restarts.
-    fn is_rdma(&self) -> bool {
-        false
-    }
 }
 
 /// Pieces needed for `len` bytes: `ceil(len / 1 MiB)`.

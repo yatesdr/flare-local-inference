@@ -549,7 +549,7 @@ async fn d9_the_data_channel_needs_a_listener() {
 #[cfg(feature = "rdma")]
 mod over_rdma {
     use super::*;
-    use support::rdma::{self as r, Instance};
+    use support::rdma::Instance;
 
     fn rdma_net() -> Net {
         Net::start_with(
@@ -573,9 +573,9 @@ mod over_rdma {
         let mut parent: Option<Key> = None;
         for (index, token) in tokens.iter().enumerate() {
             let record = key(*token);
-            match r::put_record(
-                &instance,
+            match channel::put_record(
                 &mut writer,
+                &Security::Plain,
                 1 + index as u64,
                 record,
                 parent,
@@ -624,9 +624,9 @@ mod over_rdma {
         let mut tcp = net.tcp().await;
         let instance = Instance::new();
         let mut writer = open(&mut tcp, "writer").await;
-        match r::put_record(
-            &instance,
+        match channel::put_record(
             &mut writer,
+            &Security::Plain,
             1,
             key(2048),
             None,

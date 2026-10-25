@@ -561,7 +561,7 @@ struct Link {
     pair: Option<rdma::Pair>,
 }
 
-async fn connect(target: &Target) -> io::Result<Link> {
+async fn connect(target: &Target, claim: bool) -> io::Result<Link> {
     let (host, port) = target
         .address
         .rsplit_once(':')
@@ -590,7 +590,7 @@ async fn connect(target: &Target) -> io::Result<Link> {
     conn.write_all(&target.token).await?;
     // The payload goes by RDMA when the manager offered it and a pair can be made here;
     // otherwise on this connection. Say which, once.
-    let pair = if target.rdma && target.tls.is_none() {
+    let pair = if claim && target.rdma && target.tls.is_none() {
         target
             .staging
             .rdma()
@@ -648,7 +648,7 @@ async fn receive(target: &Target, id: Id) -> io::Result<()> {
     let Id::Claim(claim) = id else {
         unreachable!("receive serves claims");
     };
-    let link = connect(target).await?;
+    let link = connect(target, true).await?;
     let rdma = link.pair.is_some();
     let result = match link.pair {
         Some(pair) => receive_rdma(target, claim, link.conn, pair).await,
@@ -808,11 +808,8 @@ async fn fill(target: &Target, id: Id, filled: mpsc::UnboundedReceiver<Filled>) 
         matches!(id, Id::Put(_) | Id::Export(_)),
         "fill serves puts and exports"
     );
-    let link = connect(target).await?;
-    let rdma = link.pair.is_some();
-    // The pair, if any, outlives the reading and writing: it is the fence.
+    let link = connect(target, false).await?;
     let (mut reader, mut writer) = tokio::io::split(link.conn);
-    let in_flight: Arc<Mutex<HashMap<u32, u32>>> = Arc::default();
     let reading = async {
         loop {
             // Grants come as the manager's store makes them: no deadline. A manager
@@ -837,15 +834,6 @@ async fn fill(target: &Target, id: Id, filled: mpsc::UnboundedReceiver<Filled>) 
                         slot: held.give(),
                     });
                 }
-                // The manager has read the window out of its slot over RDMA.
-                ToInstance::Taken(index) if rdma => {
-                    let slot = in_flight
-                        .lock()
-                        .unwrap()
-                        .remove(&index)
-                        .ok_or_else(|| invalid("a window was taken that was not offered"))?;
-                    target.events.push(Event::Sent { id, index, slot });
-                }
                 ToInstance::Abort(text) => {
                     return Err(io::Error::other(format!(
                         "the manager ended the transfer: {text}"
@@ -864,23 +852,8 @@ async fn fill(target: &Target, id: Id, filled: mpsc::UnboundedReceiver<Filled>) 
                 index: window.index,
                 row_xxh3: window.row_xxh3,
                 page_xxh3: window.page_xxh3,
-                slot: if rdma {
-                    target.staging.offset(window.slot)
-                } else {
-                    NO_SLOT
-                },
+                slot: NO_SLOT,
             };
-            if rdma {
-                // The manager reads the slot over RDMA: say which, and wait for TAKEN.
-                in_flight.lock().unwrap().insert(window.index, window.slot);
-                timeout(IDLE_TIMEOUT, async {
-                    frame.write(&mut writer).await?;
-                    writer.flush().await
-                })
-                .await
-                .map_err(|_| timed_out("the manager stopped reading a window"))??;
-                continue;
-            }
             // SAFETY: the engine handed the slot over with the window and does not touch
             // it until `Sent`.
             let bytes = unsafe { target.staging.bytes(window.slot, window.length)? };
@@ -904,9 +877,6 @@ async fn fill(target: &Target, id: Id, filled: mpsc::UnboundedReceiver<Filled>) 
         result = reading => result,
         result = writing => result,
     };
-    note_failure(target, rdma, &result);
-    // Dropped after both halves: the pair's destruction stops any read of a slot.
-    drop(link.pair);
     result
 }
 

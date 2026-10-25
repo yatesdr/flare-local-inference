@@ -1,7 +1,7 @@
 //! The instance's end of an RDMA data channel (experimental).
 //!
 //! The manager does every transfer: it writes a claim's windows into slots of this
-//! process's staging and reads a put's windows out of them, with one-sided RDMA on
+//! process's private staging, with one-sided RDMA on
 //! a reliable-connected queue pair made for the transfer. This side only registers
 //! its staging once, makes a queue pair per transfer, brings it up against the
 //! manager's description and tears it down; it posts no work. Tearing it down is
@@ -225,8 +225,7 @@ mod verbs {
                 return Err(fail(io::Error::last_os_error(), ptr::null_mut()));
             }
             let access = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
-                | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
-                | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0;
+                | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0;
             // SAFETY: the caller guarantees the range stays mapped.
             let mr = unsafe { ffi::ibv_reg_mr(pd, base.cast(), len, access as i32) };
             if mr.is_null() {
@@ -319,8 +318,7 @@ mod verbs {
                 device: device.clone(),
             };
             let access = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
-                | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
-                | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0;
+                | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0;
             let mut attr = ffi::ibv_qp_attr {
                 qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
                 pkey_index: 0,

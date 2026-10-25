@@ -65,3 +65,16 @@ jobs:
         with:
           name: flare-windows-native
           path: flare/target/release/flare.exe
+
+  rdma:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install RDMA build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build clang libclang-dev pkg-config protobuf-compiler libnl-3-dev libnl-route-3-dev libibverbs-dev librdmacm-dev liburing-dev
+      - name: Compile experimental RDMA
+        run: |
+          cargo check --locked --manifest-path selene/selene/Cargo.toml --tests --features rdma
+          cargo check --locked --manifest-path selene/selene-manager/Cargo.toml --tests --features rdma

@@ -485,8 +485,8 @@ first page, page count, row flag, length, row checksum, slot, one checksum per p
 stream carrier by `length` payload bytes, then `END`; for a put `GRANT` from the manager and
 `FILLED` (with the instance's checksums) from the instance, payload following on the stream
 carrier. On the RDMA carrier the payload never travels on the connection: the manager writes a
-claim's window into a slot the instance lent (`CREDIT`) and then names the slot in `WINDOW`; it reads a
-put's slot out of the instance's staging and releases it with `TAKEN`. Windows arrive in index
+claim's window into a private slot the instance lent (`CREDIT`) and then names it in `WINDOW`.
+Puts and rank legs use the stream carrier. Windows arrive in index
 order and are checked by the receiver's coverage exactly as shared windows are, so a transfer that
 ends short or over is a `COPY_ERROR`; `COPY_OK` waits for `END`.
 
@@ -816,8 +816,7 @@ is on the manager's host and rank 0 is in shared memory too, because window coor
 an agent only through rank 0) or `RANK_CHANNEL` (it has its own data channel per transfer, named
 in a `rank_channels` entry of `ClaimGranted`, `ExportRequest` or `PutAccept`; rank 0's own is the
 message's `channel`). A channel carries only that rank's slice: `Shape.length` is the slice's
-length, the frames are unchanged, and the channel is the stream carrier (an RDMA leg gathers and
-scatters through bounded packed staging, 13.5).
+length, the frames are unchanged, and the channel is the stream carrier.
 
 **13.1 Attachment.** `RankAttach{manager_incarnation, instance_id, rank0_nonce, rank,
 agent_nonce, rank_secret}`. The manager checks the incarnation (`RANK_STALE_MANAGER`),
@@ -858,11 +857,7 @@ for rank 0 and its shared peers, one leg per channel rank), an exact `CopyResult
 arrives before a leg has finished reading is latched, and a put's `PutCommit` carries the
 record the manager rewrites with the checksums it computed.
 
-**13.5 RDMA.** A rank's leg may use the contiguous RDMA carrier: the manager gathers a window's
-slice into a packed buffer from a bounded registered pool, writes it into the rank's lent slot,
-and for a put reads the packed bytes and scatters them. A buffer returns to the pool only after
-the work request completed and the queue pair was quiesced or flushed, else it is quarantined
-with the leg.
-
-The queue-pair path is exercised in tests only with a stand-in device; it has not been run on
-real RDMA hardware.
+**13.5 RDMA.** Experimental RDMA carries only unsliced claim windows as signalled WRITEs.
+Rank legs and puts use TCP. Each transfer owns its queue pair, whose destruction fences all
+outstanding work before its handler reports `Closed`. The manager never advertises its region
+keys or addresses; only the instance's private transfer staging is remotely writable.
