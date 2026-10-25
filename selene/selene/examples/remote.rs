@@ -23,7 +23,7 @@ use std::{
 use flare_selene::{
     CacheGeometry, History, HostRegistrar, Job, Layout, PageCopier, PageId, Registration, Reply,
     Result, SplitMapping, StateSlotId,
-    characterize::Ranking,
+    levels::Ranking,
     geometry::fingerprint,
     plan::{self, Identity, Request},
     pool::{
@@ -365,7 +365,7 @@ fn main() {
             gpu_uuids: vec![[o.gpu; 16]],
             export_slots: 2,
             claim_slots: 2,
-            level_order: None,
+
             registration_context: 0,
             approve: None,
         },

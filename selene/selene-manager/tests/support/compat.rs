@@ -284,7 +284,7 @@ impl Client {
                 }],
                 before_tokens,
                 held: vec![],
-                level_order: pool::default_order(),
+
                 max_candidates: 0,
             })
             .await;

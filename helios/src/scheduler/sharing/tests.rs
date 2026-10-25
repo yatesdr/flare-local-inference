@@ -331,29 +331,6 @@ fn headroom_honours_snapshot_aliases_and_agrees_with_admission() {
 }
 
 #[test]
-fn scratch_is_lent_and_returned_or_quarantined_when_a_drain_is_not_shown() {
-    let mut s = scheduler(2, 16, 4);
-    let (lent, withheld) = s
-        .with_startup_scratch(8, |pages, slot| {
-            assert_eq!(pages.len(), 8);
-            assert!(pages.windows(2).all(|pair| pair[0] < pair[1]));
-            assert!(slot.0 > 0);
-            (pages.len(), true)
-        })
-        .unwrap();
-    assert_eq!((lent, withheld), (8, 0));
-    assert_eq!((s.free_page_count(), s.free_snapshot_count()), (16, 4));
-    // More ids than exist: nothing is taken.
-    assert!(s.with_startup_scratch(17, |_, _| ((), true)).is_none());
-    assert_eq!((s.free_page_count(), s.free_snapshot_count()), (16, 4));
-    // Copies that may still run keep their ids out for good, and it is counted.
-    let ((), withheld) = s.with_startup_scratch(8, |_, _| ((), false)).unwrap();
-    assert_eq!(withheld, 8);
-    assert_eq!((s.free_page_count(), s.free_snapshot_count()), (8, 3));
-    assert_eq!(s.stats().quarantined_pages, 8);
-}
-
-#[test]
 fn headroom_reserves_the_next_decode_step_of_running_requests() {
     let build = |free: usize| {
         let mut s = scheduler(2, 8, 4);

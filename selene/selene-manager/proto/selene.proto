@@ -140,7 +140,7 @@ enum Tier {
 
 // The copy-priority level of a candidate from the requester's perspective
 // (design table "Tier priority for copies"). The numbering is the default
-// order; the order in use is carried by LookupRequest.level_order.
+// order.
 enum Level {
   LEVEL_UNSPECIFIED = 0;
   THIS_GPU = 1;        // never offered as a candidate; appears only in HeldRange.
@@ -652,10 +652,7 @@ message LookupRequest {
   // `before` in Flare's lookup, capped at the history length).
   uint64 before_tokens = 3;
   repeated HeldRange held = 4;
-  // The order in use for this requester, closest first, containing each of
-  // NEIGHBOUR_GPU, HOST_DRAM, HOST_NVME, REMOTE_NVME exactly once (THIS_GPU
-  // may appear and is ignored). Reply ordering and rule 5 use it.
-  repeated Level level_order = 5;
+  reserved 5;
   // At most Limits.max_candidates; 0 means the limit.
   uint32 max_candidates = 6;
 }
@@ -667,7 +664,7 @@ enum LookupStatus {
   LOOKUP_OK = 1;          // possibly with no candidates.
   LOOKUP_NOT_READY = 2;   // readiness is not READY; retry_after_ms hints when.
   LOOKUP_OVERLOADED = 3;  // max_concurrent_lookups or the manager's lookup work bound hit.
-  LOOKUP_INVALID = 4;     // limits exceeded, boundaries not ascending, bad level_order.
+  LOOKUP_INVALID = 4;     // limits exceeded, boundaries not ascending, invalid boundaries.
 }
 
 message ChainNode {
@@ -681,9 +678,9 @@ message ChainNode {
 // (design "Rules" 1, 3 and 5):
 //  * the requester's own instance is never a source;
 //  * a candidate at level L is trimmed to begin at the largest end among `held`
-//    ranges at levels closer than L (in level_order), rounded down to a page
+//    ranges at levels closer than L (in the fixed copy order), rounded down to a page
 //    boundary, and dropped if it then supplies no page and no row beyond that;
-//  * replies are ordered by level (level_order), then lower est_us_per_page,
+//  * replies are ordered by level, then lower est_us_per_page,
 //    then longer match (larger key.consumed_tokens).
 // Everything here is a hint. The client re-checks every node against its own
 // history (`key == history.key_at(key.consumed_tokens)`) and drops a candidate

@@ -1,5 +1,5 @@
 use crate::{
-    ExportRefusal, HostHit, HostStore, InboundTicket, PrefixKey, PublishedCheckpoint, Scratch,
+    ExportRefusal, HostHit, HostStore, InboundTicket, PrefixKey, PublishedCheckpoint,
     StoreOutcome, StoreStats, Tier,
 };
 
@@ -89,19 +89,6 @@ impl HostStore for Tiers {
         match &mut self.0 {
             Some(tiers) => tiers.pin_export(tier, key, generation, begin_tokens, want_row),
             None => Err(ExportRefusal::NotFound),
-        }
-    }
-
-    fn probe(
-        &mut self,
-        tier: Tier,
-        scratch: &Scratch,
-        pages: usize,
-        cold: bool,
-    ) -> crate::Result<Option<std::time::Duration>> {
-        match &mut self.0 {
-            Some(tiers) => tiers.probe(tier, scratch, pages, cold),
-            None => Ok(None),
         }
     }
 

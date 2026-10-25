@@ -19,9 +19,9 @@ use std::{
 
 use crate::{
     Error, ExportChain, ExportId, ExportRefusal, History, HostHit, HostStore, InboundTicket,
-    PrefixKey, PublishedCheckpoint, Result, Scratch, StoreEvent, StoreOutcome, StoreReason,
+    PrefixKey, PublishedCheckpoint, Result, StoreEvent, StoreOutcome, StoreReason,
     StoreStats, Tier as Local,
-    characterize::{Characterizer, Level, Pages},
+    levels::Level,
     index::Match,
     plan::{self, Identity, Plan, Request, SourceId, Which},
     store::INITIAL_PREFILL_RATE,
@@ -33,7 +33,6 @@ use super::{
     client::PoolClient,
     exporter::HostPin,
     lookup::{LookupState, LookupTicket},
-    probe::StoreProbe,
     shared::{FetchPart, PoolEvent, PoolFetch, PutOutcome, PutRequest},
     types::{HeldRange, PoolCandidate, SourceRef, Tier},
 };
@@ -41,18 +40,10 @@ use super::{
 /// What the store uses of the pool client. [`PoolClient`] is the implementation;
 /// tests of the store's planning and sequencing substitute a recording one.
 pub trait PoolPort {
-    fn copies_drained(&self) -> bool {
-        true
-    }
-    /// An instance-scoped probe namespace, when the port has a process identity.
-    fn probe_model(&self) -> Option<[u8; 32]> {
-        None
-    }
     fn begin_lookup(&self, history: &dyn History, held: Vec<HeldRange>) -> LookupTicket;
     fn fetch(&mut self, fetch: PoolFetch) -> Result<u64>;
     fn poll(&mut self, events: &mut Vec<PoolEvent>) -> Result<()>;
-    fn ranking(&self) -> crate::characterize::Ranking;
-    fn set_ranking(&self, ranking: crate::characterize::Ranking);
+    fn ranking(&self) -> crate::levels::Ranking;
     fn observe_restore(&self, level: Level, pages: usize, elapsed: Duration);
     fn saved(&self, entry: IndexEntry);
     fn evicted(&self, key: PrefixKey, tier: Tier, generation: u64, heir: Option<IndexEntry>);
@@ -69,12 +60,6 @@ pub trait PoolPort {
 }
 
 impl PoolPort for PoolClient {
-    fn copies_drained(&self) -> bool {
-        PoolClient::copies_drained(self)
-    }
-    fn probe_model(&self) -> Option<[u8; 32]> {
-        Some(PoolClient::probe_model(self))
-    }
     fn begin_lookup(&self, history: &dyn History, held: Vec<HeldRange>) -> LookupTicket {
         PoolClient::begin_lookup(self, history, held)
     }
@@ -84,11 +69,8 @@ impl PoolPort for PoolClient {
     fn poll(&mut self, events: &mut Vec<PoolEvent>) -> Result<()> {
         PoolClient::poll(self, events)
     }
-    fn ranking(&self) -> crate::characterize::Ranking {
+    fn ranking(&self) -> crate::levels::Ranking {
         PoolClient::ranking(self)
-    }
-    fn set_ranking(&self, ranking: crate::characterize::Ranking) {
-        PoolClient::set_ranking(self, ranking)
     }
     fn observe_restore(&self, level: Level, pages: usize, elapsed: Duration) {
         PoolClient::observe_restore(self, level, pages, elapsed)
@@ -127,14 +109,6 @@ impl PoolPort for PoolClient {
         PoolClient::close(self)
     }
 }
-
-/// Pages of the three sizes the characterizer times: a small, a typical and a
-/// long prefix. The scratch ids must cover the long one.
-pub const PROBE_PAGES: Pages = Pages {
-    small: 2,
-    typical: 16,
-    long: 64,
-};
 
 /// The planner's name for this instance's own tiers.
 const LOCAL: SourceId = SourceId(0);
@@ -209,10 +183,6 @@ pub struct PooledStore<S: HostStore, P: PoolPort = PoolClient> {
     puts: Vec<(u64, PutOutcome)>,
     /// Moves of the last local tier's records to the manager.
     cascade: Cascade,
-    characterizer: Option<Characterizer>,
-    characterized: bool,
-    /// What the synthetic probe records are keyed by: the model and, once connected, this instance.
-    probe_model: [u8; 32],
     /// Restores that were wholly from the pool, which the local tiers did not count.
     pool_fetched: u64,
     /// Restores that failed in the pool part.
@@ -261,19 +231,17 @@ impl<S: HostStore> PooledStore<S, PoolClient> {
             model: config.scope.model_identity,
             layout: config.scope.layout_fingerprint,
         };
-        let order = config.level_order;
         let pool = match ranks {
             Some(ranks) => PoolClient::start_ranked(config, ranks, copier, registrar)?,
             None => PoolClient::start(config, copier, registrar)?,
         };
         let store = Self::new(inner, pool, identity, &layout);
-        store.with_pinned_order(order)
+        Ok(store)
     }
 }
 
 impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
     pub fn new(mut inner: S, pool: P, identity: Identity, layout: &crate::Layout) -> Self {
-        let probe_model = pool.probe_model().unwrap_or(identity.model);
         inner.announce_to(pool.announcer());
         inner.cascade();
         Self {
@@ -292,64 +260,10 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             pool_events: Vec::new(),
             puts: Vec::new(),
             cascade: Cascade::new(layout),
-            characterizer: Characterizer::new(PROBE_PAGES, None).ok(),
-            characterized: false,
-            probe_model,
             pool_fetched: 0,
             pool_fetch_failed: 0,
             pool_bytes_in: 0,
         }
-    }
-
-    /// Pin the order of the copy levels instead of measuring it. `order` names
-    /// the four levels closest first.
-    pub fn with_pinned_order(mut self, order: Option<[Level; 4]>) -> Result<Self> {
-        let pinned = order.map(|order| {
-            let mut levels = vec![Level::ThisGpu];
-            levels.extend(order);
-            levels
-        });
-        self.characterizer = Some(Characterizer::new(PROBE_PAGES, pinned)?);
-        Ok(self)
-    }
-
-    /// Whether the startup probe has not yet run.
-    pub fn needs_characterization(&self) -> bool {
-        !self.characterized
-    }
-
-    /// Measure the cost of each copy level end to end and rank them, if the
-    /// startup probe has not run. Blocks for the time the transfers take,
-    /// bounded: three repetitions at each of [`PROBE_PAGES`] for each level
-    /// this instance can time. The `scratch` ids must be idle for the whole call
-    /// and no transfer may be in flight;
-    /// call it before the scheduler admits requests. Returns the one log line
-    /// naming the order in use, when it measured.
-    pub fn characterize(&mut self, scratch: &Scratch) -> Result<Option<String>> {
-        let mut characterizer = self
-            .characterizer
-            .take()
-            .ok_or_else(|| Error::new("the characterizer could not be built"))?;
-        let measured = {
-            let mut probe = StoreProbe {
-                inner: &mut self.inner,
-                pool: &mut self.pool,
-                scratch,
-                model: self.probe_model,
-                page_tokens: self.page_tokens,
-                page_bytes: self.page_record_bytes as usize,
-                row_bytes: self.row_record_bytes as usize,
-                stash: &mut self.pool_events,
-            };
-            characterizer.update(&mut probe)
-        };
-        let line = measured.then(|| {
-            PoolPort::set_ranking(&self.pool, characterizer.ranking().clone());
-            characterizer.ranking().log_line()
-        });
-        self.characterizer = Some(characterizer);
-        self.characterized = true;
-        Ok(line)
     }
 
     /// The puts that ended since the last call.
@@ -424,7 +338,7 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
     fn request<'a>(
         &'a self,
         history: &'a dyn History,
-        ranking: &'a crate::characterize::Ranking,
+        ranking: &'a crate::levels::Ranking,
         resident: u64,
         before: u64,
     ) -> Request<'a> {
@@ -445,7 +359,7 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
         local: Option<&HostHit>,
         pool: &[PoolCandidate],
         resident: u64,
-        ranking: &crate::characterize::Ranking,
+        ranking: &crate::levels::Ranking,
     ) -> HostHit {
         let endpoint = plan.endpoint();
         let pages = plan.pages();
@@ -652,9 +566,6 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
 impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
     fn pooled(&self) -> bool {
         true
-    }
-    fn copies_drained(&self) -> bool {
-        self.pool.copies_drained()
     }
     fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit> {
         self.inner.lookup(history, resident, before)
@@ -930,14 +841,6 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
 
     fn evictions_lost(&mut self) {
         PoolPort::evictions_lost(&self.pool);
-    }
-
-    fn needs_characterization(&self) -> bool {
-        PooledStore::needs_characterization(self)
-    }
-
-    fn characterize(&mut self, scratch: &Scratch) -> Result<Option<String>> {
-        PooledStore::characterize(self, scratch)
     }
 
     fn evicted(&mut self, key: PrefixKey, generation: u64, heir: Option<&PublishedCheckpoint>) {

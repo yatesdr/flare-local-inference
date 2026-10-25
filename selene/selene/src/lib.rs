@@ -11,7 +11,7 @@
 //! read-through. Every store is driven from the model worker thread and never
 //! blocks it: `store` and `fetch` enqueue work, `poll` drains completions.
 
-pub mod characterize;
+pub mod levels;
 pub mod composite;
 pub mod copier;
 pub mod disk;
@@ -40,7 +40,7 @@ pub use registrar::{HostRegistrar, Registration, SplitMapping};
 pub use store::{
     ExportChain, ExportId, ExportNode, ExportRefusal, HostHit, HostStore, INITIAL_DIRECT_DISK_RATE,
     INITIAL_MEMORY_RATE, INITIAL_PREFILL_RATE, INITIAL_STAGED_DISK_RATE, InboundTicket, JobId,
-    PublishedCheckpoint, Retirement, Retiring, Scratch, StoreEvent, StoreOutcome, StoreReason,
+    PublishedCheckpoint, Retirement, Retiring, StoreEvent, StoreOutcome, StoreReason,
     StoreStats, Tier, Transport, worth_fetching, worth_transfer,
 };
 pub use vocab::{CheckpointId, HASH_BLOCK_TOKENS, History, PageId, PrefixKey, StateSlotId};

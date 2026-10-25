@@ -70,7 +70,7 @@ impl PoolBuilder<'_> {
                 .map_or(gpu_uuids, |peers| peers.gpu_uuids.clone()),
             export_slots: 2,
             claim_slots: 2,
-            level_order: None,
+
             registration_context,
             approve: Some(Arc::new(move |plan| budget.approve(plan))),
         };

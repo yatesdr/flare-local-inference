@@ -13,7 +13,7 @@ use std::{
 
 use crate::{
     CacheGeometry, History, PageId, PrefixKey, Result, StateSlotId,
-    characterize::Ranking,
+    levels::Ranking,
     geometry::fingerprint,
     plan::{self, Identity, Request},
     pool::{
@@ -61,7 +61,7 @@ fn config_at(address: PoolAddress, name: &str, world: usize, gpus: Vec<[u8; 16]>
         gpu_uuids: gpus,
         export_slots: 2,
         claim_slots: 2,
-        level_order: None,
+
         registration_context: 0,
         approve: None,
     }

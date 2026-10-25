@@ -499,11 +499,6 @@ impl Engine {
                     end: Some(codec::key_to(range.end)),
                 })
                 .collect(),
-            level_order: lookup
-                .level_order
-                .iter()
-                .map(|level| codec::level_to(*level) as i32)
-                .collect(),
             max_candidates: 0,
         };
         self.lookups.insert(lookup.id, now + LOOKUP_TIMEOUT);

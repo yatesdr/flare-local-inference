@@ -40,7 +40,7 @@ use std::{
 };
 
 use crate::{
-    CheckpointId, Error, ExportRefusal, History, PrefixKey, Result, Scratch,
+    CheckpointId, Error, ExportRefusal, History, PrefixKey, Result,
     pool::{Announcer, HostPin, Tier as PoolTier},
 };
 
@@ -1256,19 +1256,6 @@ impl HostStore for CompositeStore {
             &|key| disk.announced_entry(key),
         );
         polled
-    }
-
-    fn probe(
-        &mut self,
-        tier: Tier,
-        scratch: &Scratch,
-        pages: usize,
-        cold: bool,
-    ) -> Result<Option<Duration>> {
-        match tier {
-            Tier::Memory => self.memory.probe(tier, scratch, pages, cold),
-            Tier::Disk => self.disk.probe(tier, scratch, pages, cold),
-        }
     }
 
     fn cascade(&mut self) {

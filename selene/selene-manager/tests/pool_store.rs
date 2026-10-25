@@ -164,7 +164,7 @@ async fn u2_u8_and_a9_present_queue_and_invalid_metadata() {
             }],
             before_tokens: 5000,
             held: vec![],
-            level_order: pool::default_order(),
+
             max_candidates: 0,
         })
         .await;

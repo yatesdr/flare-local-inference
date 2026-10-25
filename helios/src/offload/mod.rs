@@ -25,7 +25,7 @@ pub mod transfer;
 pub use flare_selene::{
     CacheGeometry, ExportChain, ExportId, ExportNode, ExportRefusal, HostHit,
     INITIAL_DIRECT_DISK_RATE, INITIAL_MEMORY_RATE, INITIAL_PREFILL_RATE, INITIAL_STAGED_DISK_RATE,
-    InboundTicket, JobId, Layout, Plane, PublishedCheckpoint, Scratch, StoreOutcome, StoreReason,
+    InboundTicket, JobId, Layout, Plane, PublishedCheckpoint, StoreOutcome, StoreReason,
     StoreStats, Tier, Transport, disk, disk_store, geometry, index, input, pool::LookupTicket,
     record, slab, worth_fetching,
 };

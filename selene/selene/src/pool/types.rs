@@ -1,7 +1,7 @@
 //! The pool's vocabulary in selene's own types. The wire messages stay inside
 //! the codec; nothing here depends on them.
 
-use crate::{PrefixKey, characterize::Level, plan};
+use crate::{PrefixKey, levels::Level, plan};
 
 /// Where a copy of a record lives, from the source's point of view. Distinct
 /// from [`crate::Tier`], which names the local store a hit is read from.

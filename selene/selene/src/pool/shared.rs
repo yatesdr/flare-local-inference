@@ -14,7 +14,7 @@ use tokio::sync::Notify;
 
 use crate::{
     Error, ExportChain, ExportId, ExportRefusal, PageId, PrefixKey, Result, StateSlotId,
-    characterize::{Level, Ranking},
+    levels::{Level, Ranking},
 };
 
 use super::{
@@ -181,7 +181,6 @@ pub(crate) struct LookupSend {
     pub boundaries: Vec<PrefixKey>,
     pub before: u64,
     pub held: Vec<HeldRange>,
-    pub level_order: Vec<Level>,
 }
 
 pub(crate) enum Command {
@@ -311,10 +310,6 @@ impl Shared {
         self.ranking.lock().unwrap().clone()
     }
 
-    pub(crate) fn set_ranking(&self, ranking: Ranking) {
-        *self.ranking.lock().unwrap() = ranking;
-    }
-
     pub(crate) fn observe_restore(&self, level: Level, pages: usize, elapsed: std::time::Duration) {
         self.ranking.lock().unwrap().observe(level, pages, elapsed);
     }
@@ -401,14 +396,12 @@ impl Shared {
                 }
                 registry.next_wire += 1;
                 let wire = registry.next_wire;
-                let level_order = self.ranking().order().to_vec();
                 let sent = self.push_command(
                     Command::Lookup(LookupSend {
                         id: wire,
                         boundaries,
                         before,
                         held: held.clone(),
-                        level_order,
                     }),
                     false,
                 );

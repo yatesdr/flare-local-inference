@@ -145,14 +145,6 @@ pub enum StoreEvent {
     ExportEnded { export: ExportId },
 }
 
-/// GPU ids that are idle for as long as a measurement runs, for the
-/// characterization probes to copy into: `pages` pages and one state slot.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Scratch {
-    pub pages: Vec<PageId>,
-    pub slot: StateSlotId,
-}
-
 /// Counters every store maintains; rates are bytes per second of completed transfers.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StoreStats {
@@ -266,11 +258,6 @@ pub trait HostStore {
     fn pooled(&self) -> bool {
         false
     }
-    /// Whether every copy accepted by the store's dedicated copier has stopped.
-    fn copies_drained(&self) -> bool {
-        true
-    }
-
     /// The worker pinned the checkpoint for `export` and describes its chain.
     /// An error means the store cannot serve the export; the worker unpins.
     fn export_pinned(&mut self, _export: ExportId, _chain: ExportChain) -> Result<()> {
@@ -286,16 +273,6 @@ pub trait HostStore {
     /// worker delivered them, so the announced holdings may be stale and must be
     /// announced again in full.
     fn evictions_lost(&mut self) {}
-    /// Whether the copy levels should be measured again. Only a pooled store
-    /// ever says yes.
-    fn needs_characterization(&self) -> bool {
-        false
-    }
-    /// Measure the copy levels with idle `scratch` ids; see the pooled store.
-    /// Returns the log line when it measured.
-    fn characterize(&mut self, _scratch: &Scratch) -> Result<Option<String>> {
-        Ok(None)
-    }
     /// Announce what this store's tiers hold, now and as they change, through
     /// `announcer`, and serve them as exports. Nothing is recorded before this.
     fn announce_to(&mut self, _announcer: Announcer) {}
@@ -311,21 +288,6 @@ pub trait HostStore {
         _want_row: bool,
     ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
         Err(ExportRefusal::NotFound)
-    }
-    /// Time one restore of `pages` synthetic pages of this instance's own `tier`
-    /// into `scratch`, end to end (lookup, read, checksum, upload), reading
-    /// `cold` from the device where that applies, and leave the store as it was.
-    /// `Ok(None)` when this store has no such tier. Runs to completion before
-    /// returning and must be called only while no transfer is in flight and
-    /// the scratch ids are idle.
-    fn probe(
-        &mut self,
-        _tier: Tier,
-        _scratch: &Scratch,
-        _pages: usize,
-        _cold: bool,
-    ) -> Result<Option<std::time::Duration>> {
-        Ok(None)
     }
     /// The host tier a publication is copied into first: memory when there is
     /// a memory tier, otherwise disk.

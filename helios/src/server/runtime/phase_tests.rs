@@ -1250,12 +1250,8 @@ struct FakeStore {
     refused: Vec<(crate::offload::ExportId, crate::offload::ExportRefusal)>,
     reject_export: bool,
     evictions_lost: usize,
-    needs_characterization: bool,
-    characterize_fails: bool,
-    undrained: bool,
     /// Tickets stay unanswered instead of answering with nothing.
     pending_tickets: bool,
-    characterized: Vec<crate::offload::Scratch>,
     /// Each eviction notice with the number of `store` calls made before it.
     evicted: Vec<(
         crate::cache::PrefixKey,
@@ -1290,11 +1286,7 @@ impl FakeStore {
             refused: Vec::new(),
             reject_export: false,
             evictions_lost: 0,
-            needs_characterization: false,
-            characterize_fails: false,
-            undrained: false,
             pending_tickets: false,
-            characterized: Vec::new(),
             evicted: Vec::new(),
         }
     }
@@ -1360,20 +1352,6 @@ impl crate::offload::PrefixStore for FakeStore {
     }
     fn evictions_lost(&mut self) {
         self.evictions_lost += 1;
-    }
-    fn needs_characterization(&self) -> bool {
-        self.needs_characterization
-    }
-    fn copies_drained(&self) -> bool {
-        !self.undrained
-    }
-    fn characterize(&mut self, scratch: &crate::offload::Scratch) -> flare_selene::Result<Option<String>> {
-        self.characterized.push(scratch.clone());
-        if self.characterize_fails {
-            return Err("probe failed".into());
-        }
-        self.needs_characterization = false;
-        Ok(Some("copy order: gpu, dram".into()))
     }
     fn lookup(
         &mut self,
@@ -2085,126 +2063,6 @@ fn a_local_store_builds_no_lookup_and_a_failed_restore_starts_none() {
     assert_eq!(worker.parked.len(), 1);
     assert!(worker.parked[0].0.pool_lookup.is_none());
     assert_eq!(fake_store(&mut worker).begun, [70]);
-}
-
-#[test]
-fn the_pool_is_characterized_before_admission_and_never_again() {
-    let mut fixture = Fixture::new();
-    fixture.config.limits.pages = 96;
-    let (sender, receiver) = mpsc::channel();
-    let mut worker = fixture.worker(receiver);
-    let mut store = FakeStore::new(None);
-    store.pooled = true;
-    store.needs_characterization = true;
-    let free = (
-        worker.scheduler.free_page_count(),
-        worker.scheduler.free_snapshot_count(),
-    );
-    worker.attach_store(Some(Box::new(store)));
-    let seen = &fake_store(&mut worker).characterized;
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].pages.len(), CHARACTERIZATION_PAGES);
-    assert_eq!(
-        (
-            worker.scheduler.free_page_count(),
-            worker.scheduler.free_snapshot_count()
-        ),
-        free
-    );
-    // A topology change during serving never lends scratch or probes again.
-    fake_store(&mut worker).needs_characterization = true;
-    worker.service_store().unwrap();
-    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
-    sender.send(vec![incoming]).unwrap();
-    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
-    assert!(worker.active[0].is_some());
-    worker.characterize_pool();
-    assert_eq!(fake_store(&mut worker).characterized.len(), 1);
-}
-
-#[test]
-fn a_local_store_is_not_characterized() {
-    let fixture = Fixture::new();
-    let (_sender, receiver) = mpsc::channel();
-    let mut worker = fixture.worker(receiver);
-    let mut store = FakeStore::new(None);
-    store.needs_characterization = true;
-    worker.attach_store(Some(Box::new(store)));
-    assert!(fake_store(&mut worker).characterized.is_empty());
-}
-
-#[test]
-fn too_few_idle_ids_skip_characterization_without_retrying() {
-    let fixture = Fixture::new();
-    let (_sender, receiver) = mpsc::channel();
-    let mut worker = fixture.worker(receiver);
-    let mut store = FakeStore::new(None);
-    store.pooled = true;
-    store.needs_characterization = true;
-    worker.attach_store(Some(Box::new(store)));
-    worker.characterize_pool();
-    assert!(fake_store(&mut worker).characterized.is_empty());
-    assert!(worker.pool_characterized);
-}
-
-#[test]
-fn a_failed_probe_that_drained_returns_its_ids_keeps_serving_and_is_not_retried() {
-    let mut fixture = Fixture::new();
-    fixture.config.limits.pages = 96;
-    let (_sender, receiver) = mpsc::channel();
-    let mut worker = fixture.worker(receiver);
-    let mut store = FakeStore::new(None);
-    store.pooled = true;
-    store.needs_characterization = true;
-    store.characterize_fails = true;
-    worker.attach_store(Some(Box::new(store)));
-    worker.characterize_pool();
-    assert_eq!(fake_store(&mut worker).characterized.len(), 1);
-    assert_eq!(worker.scheduler.free_page_count(), 96);
-    assert_eq!(worker.scheduler.stats().quarantined_pages, 0);
-    worker.characterize_pool();
-    assert_eq!(fake_store(&mut worker).characterized.len(), 1);
-    // The worker still admits requests.
-    let (sender, receiver) = mpsc::channel();
-    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
-    sender.send(vec![incoming]).unwrap();
-    let mut worker = fixture.worker(receiver);
-    worker.attach_store(Some(Box::new(FakeStore::new(None))));
-    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
-}
-
-#[test]
-fn a_probe_whose_copies_cannot_be_shown_to_have_stopped_quarantines_its_ids() {
-    for fails in [true, false] {
-        let mut fixture = Fixture::new();
-        fixture.config.limits.pages = 96;
-        let (sender, receiver) = mpsc::channel();
-        let mut worker = fixture.worker(receiver);
-        let mut store = FakeStore::new(None);
-        store.pooled = true;
-        store.needs_characterization = true;
-        store.characterize_fails = fails;
-        store.undrained = true;
-        worker.attach_store(Some(Box::new(store)));
-        worker.characterize_pool();
-        assert_eq!(
-            worker.scheduler.free_page_count(),
-            96 - CHARACTERIZATION_PAGES
-        );
-        assert_eq!(
-            worker.scheduler.stats().quarantined_pages,
-            CHARACTERIZATION_PAGES
-        );
-        assert_eq!(worker.scheduler.free_snapshot_count(), 15);
-        // Serving continues on what is left, and the probe is not run again.
-        fake_store(&mut worker).needs_characterization = true;
-        worker.characterize_pool();
-        assert_eq!(fake_store(&mut worker).characterized.len(), 1);
-        let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
-        sender.send(vec![incoming]).unwrap();
-        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
-        assert!(worker.active[0].is_some());
-    }
 }
 
 #[test]

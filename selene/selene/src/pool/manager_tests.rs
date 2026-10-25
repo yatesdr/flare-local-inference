@@ -13,9 +13,9 @@ use std::{
 };
 
 use crate::{
-    History, HostRegistrar, InboundTicket, PageId, PrefixKey, Registration, Result, Scratch,
+    History, HostRegistrar, InboundTicket, PageId, PrefixKey, Registration, Result,
     SplitMapping, StateSlotId, StoreEvent, StoreOutcome, StoreStats,
-    characterize::Ranking,
+    levels::Ranking,
     geometry::fingerprint,
     plan::{self, Identity, Request},
     pool::{
@@ -288,7 +288,7 @@ fn config_on(manager: &Manager, name: &str, gpu: u8, local: bool) -> PoolConfig 
         gpu_uuids: vec![[gpu; 16]],
         export_slots: 2,
         claim_slots: 2,
-        level_order: None,
+
         registration_context: 0,
         approve: None,
     }
@@ -684,7 +684,7 @@ fn a_gpu_checkpoint_is_exported_by_device_copies_and_its_pin_released() {
     let fetch = fetch_for(&mut requester, &history, pages, &[300, 301, 302]);
     assert_eq!(
         fetch.parts[0].candidate.plan.level,
-        crate::characterize::Level::NeighbourGpu
+        crate::levels::Level::NeighbourGpu
     );
     requester.client.fetch(fetch).unwrap();
     // The worker's side: pin the chain and answer, then release at the end.
@@ -986,72 +986,6 @@ fn a_manager_that_is_not_there_at_startup_is_never_attached_to_later() {
     assert!(matches!(client.status(), PoolStatus::Disabled(_)));
     assert!(registrar.calls.lock().unwrap().is_empty());
     client.close().unwrap();
-}
-
-struct NoStore;
-
-impl crate::HostStore for NoStore {
-    fn lookup(&mut self, _: &dyn History, _: u64, _: u64) -> Option<crate::HostHit> {
-        None
-    }
-    fn store(&mut self, _: &crate::PublishedCheckpoint) -> Result<StoreOutcome> {
-        Ok(StoreOutcome::Oversize)
-    }
-    fn fetch(&mut self, _: crate::HostHit, _: InboundTicket) -> Result<()> {
-        Err("no tiers".into())
-    }
-    fn poll(&mut self, _: &mut Vec<StoreEvent>) -> Result<()> {
-        Ok(())
-    }
-    fn stats(&self) -> StoreStats {
-        StoreStats::default()
-    }
-    fn close(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
-#[test]
-fn a_store_with_no_tiers_of_its_own_times_the_manager_level_through_a_real_claim() {
-    // The probe gives up on a step that takes more than a few seconds and the level is then
-    // left unmeasured, which is right for a production host and not a failure of the product.
-    // On a machine saturated by other work a probe can be that slow, so a fresh store gets
-    // a few tries; what is asserted is that the level is measured when the probe completes.
-    let manager = Manager::start();
-    let mut last = String::new();
-    for _ in 0..4 {
-        let (copier, _gpu) = SimulatedGpu::shared(&geo()).unwrap();
-        let mut store = PooledStore::connect(
-            NoStore,
-            config(&manager, "probe", 1),
-            copier,
-            Arc::new(OkRegistrar),
-        )
-        .unwrap();
-        wait("Ready", || store.pool().status() == PoolStatus::Ready);
-        let scratch = Scratch {
-            pages: (0..64).map(PageId).collect(),
-            slot: StateSlotId(0),
-        };
-        assert!(store.needs_characterization());
-        let line = store.characterize(&scratch).unwrap().expect("measured");
-        assert!(line.contains("restore source order"), "{line}");
-        let ranking = store.pool().ranking();
-        let measured = ranking
-            .us_per_page(crate::characterize::Level::HostDram)
-            .is_some();
-        let neighbour = ranking
-            .us_per_page(crate::characterize::Level::NeighbourGpu)
-            .is_some();
-        assert!(!store.needs_characterization());
-        crate::HostStore::close(&mut store).unwrap();
-        if measured {
-            assert!(!neighbour);
-            return;
-        }
-        last = line;
-    }
-    panic!("the manager serves its DRAM here, but no probe measured it: {last}");
 }
 
 // ---- the eviction cascade against the real manager ----
@@ -1482,7 +1416,7 @@ fn put_then_restore(manager: &Manager, carrier: &str) {
     let fetch = fetch_for(&mut requester, &history, 5, &scratch);
     assert_eq!(
         fetch.parts[0].candidate.plan.level,
-        crate::characterize::Level::RemoteNvme,
+        crate::levels::Level::RemoteNvme,
         "a manager on another host is the remote level"
     );
     requester.client.fetch(fetch).unwrap();
@@ -1547,41 +1481,6 @@ fn a_record_put_into_a_manager_on_another_host_is_restored_over_tls() {
 fn a_record_put_into_a_manager_on_another_host_is_restored_over_rdma() {
     let manager = Manager::start_network_with(false, true);
     put_then_restore(&manager, "rdma");
-}
-
-#[test]
-fn the_remote_level_is_timed_by_the_probe_through_a_real_claim() {
-    let manager = Manager::start_network(false);
-    let (copier, _gpu) = SimulatedGpu::shared(&geo()).unwrap();
-    let mut store = PooledStore::connect(
-        NoStore,
-        config(&manager, "probe", 1),
-        copier,
-        Arc::new(OkRegistrar),
-    )
-    .unwrap();
-    wait("Ready", || store.pool().status() == PoolStatus::Ready);
-    let scratch = Scratch {
-        pages: (0..64).map(PageId).collect(),
-        slot: StateSlotId(0),
-    };
-    assert!(store.needs_characterization());
-    let line = store.characterize(&scratch).unwrap().expect("measured");
-    let ranking = store.pool().ranking();
-    assert!(
-        ranking
-            .us_per_page(crate::characterize::Level::RemoteNvme)
-            .is_some(),
-        "the manager's records are the remote level: {line}"
-    );
-    assert!(
-        ranking
-            .us_per_page(crate::characterize::Level::HostDram)
-            .is_none(),
-        "a manager on another host serves no same-host level: {line}"
-    );
-    assert!(!store.needs_characterization());
-    crate::HostStore::close(&mut store).unwrap();
 }
 
 #[test]

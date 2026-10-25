@@ -890,13 +890,10 @@ same completion events the store produces.
   the first host tier, using the same policy in local and pool modes. A dirty
   GPU eviction drops the checkpoint and sends the existing eviction notice;
   it never waits for a host copy.
-- **What write-back copies.** A store answers `write_back` with a copy into
-  the first host tier only when restoring the checkpoint would beat
-  recomputing it (the `worth_transfer` arithmetic at that tier's measured
-  rate, or its first estimate), no recent lookup showed a host tier of the pool
-  already holding it, and the tier's copy queue has room. It answers `Present`
-  when the pool already holds it, `Oversize` when it is not worth keeping, and
-  `Retry` when the queue or slabs are short.
+- **What write-back copies.** A selected checkpoint is copied into the first
+  host tier. `Present` requires a committed local copy; a lookup hint is not
+  sufficient. `Oversize` means the record exceeds the tier, and `Retry` means
+  that capacity or queue room is temporarily unavailable.
 - **Two sources.** A restore reads at most two parts: the longest prefix held
   at the closest level, then one farther source from exactly where that part
   ends, with the endpoint's row from whichever ends last. The parts are planned
@@ -941,25 +938,12 @@ Unix sockets. A manager that declares the other encryption setting disables
 the pool for the process. With the
 `rdma` cargo feature, a manager started with `--rdma` is reached by RDMA instead: the
 manager writes into slots the instance lends and reads the slots a put fills; an instance
-without a device, or after one failed RDMA transfer, uses the stream. The remote level is
-timed by the same probe as the others, through a real put and claim on the manager, and
-ranks by that measurement.
+without a device, or after one failed RDMA transfer, uses the stream.
 
-The store probes each copy level once, after opening and before admission opens.
-It borrows 64 free page ids and one state slot and returns them after the
-probe, allocating nothing on the GPU. Too few free ids skip measurement; a
-failed probe leaves the default order. Neither is retried. If copies have not
-drained a second after the probe, the ids and state slot remain quarantined
-and are counted in scheduler statistics. Startup logs the order and any failure
-or quarantined capacity.
-
-Serving never runs another probe, including after topology changes. Successful
-restores refine each level's order using the median of its last three durations
-per page. A difference within the larger measurement spread keeps the default
-order, and a pinned order always wins. Local parts are timed separately from
-pool claims; failed transfers and row-only restores do not update the ranking.
-The manager also refines source costs from completed claims, weighted by pages,
-and supplies those estimates to the restore planner.
+Copy priority is fixed: neighbour GPU, host DRAM, host NVMe, then remote NVMe.
+There are no synthetic startup transfers or borrowed GPU scratch ids.
+Successful restores refine transfer costs without changing that priority;
+failed transfers and row-only restores do not update the rates.
 
 A pooled instance can span hosts. Rank zero owns the pool session and decisions;
 each peer runs an agent that moves only its own rank's bytes. The pool identity
