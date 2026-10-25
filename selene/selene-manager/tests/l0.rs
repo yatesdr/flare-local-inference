@@ -1461,7 +1461,8 @@ async fn l0_54_get_sources_survive_eviction_pressure() {
         4 * 1024 * 1024,
     );
     config.name = instance_name("get-pressure");
-    config.faults.delay_ms = 150;
+    let (gate, entered, release) = selene_manager::disk::IoGate::new();
+    config.faults.read_gate = Some(gate.clone());
     let mut host = Host::open_config(config);
     host.start();
     let mut client = host.client().await;
@@ -1482,10 +1483,25 @@ async fn l0_54_get_sources_survive_eviction_pressure() {
     let streamed_key = [key(192)];
     let fetch = reader.fetch(&streamed_key, 0, 3);
     let put = async {
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        pressure.store(key(256), None).await
+        let entered = tokio::task::spawn_blocking(move || {
+            entered
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the restore never reached disk");
+            entered
+        })
+        .await
+        .unwrap();
+        let put = tokio::spawn(async move {
+            let bytes = pressure.store(key(256), None).await;
+            (pressure, bytes)
+        });
+        host.wait(|host| host.gauge("open_ops") >= 2);
+        release.send(()).unwrap();
+        let (pressure, bytes) = put.await.unwrap();
+        (pressure, bytes, entered)
     };
-    let (fetched, pressed) = tokio::join!(fetch, put);
+    let (fetched, (returned, pressed, entered)) = tokio::join!(fetch, put);
+    pressure = returned;
     assert_eq!(fetched[0], streamed);
     assert!(!pressed.is_empty());
     assert!(!first.is_empty() && !second.is_empty());
@@ -1493,13 +1509,27 @@ async fn l0_54_get_sources_survive_eviction_pressure() {
     // 128 pages do not fit the arena: the header is read once and each
     // payload window later, while another put adds eviction pressure.
     let large = client.store(key(128 * 64), None).await;
+    gate.arm();
     let large_key = [key(128 * 64)];
     let fetch = reader.fetch(&large_key, 0, 128);
     let put = async {
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        pressure.store(key(384), None).await
+        tokio::task::spawn_blocking(move || {
+            entered
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the restore never reached disk");
+        })
+        .await
+        .unwrap();
+        let put = tokio::spawn(async move {
+            let bytes = pressure.store(key(384), None).await;
+            (pressure, bytes)
+        });
+        host.wait(|host| host.gauge("open_ops") >= 2);
+        release.send(()).unwrap();
+        put.await.unwrap()
     };
-    let (fetched, pressed) = tokio::join!(fetch, put);
+    let (fetched, (returned, pressed)) = tokio::join!(fetch, put);
+    drop(returned);
     assert_eq!(fetched[0], large);
     assert!(!pressed.is_empty());
     host.wait(|host| host.gauge("open_ops") == 0);

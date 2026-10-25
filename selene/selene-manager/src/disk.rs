@@ -129,6 +129,12 @@ impl IoGate {
             release,
         )
     }
+    pub fn arm(&self) {
+        assert!(
+            !self.armed.swap(true, Ordering::AcqRel),
+            "disk gate is already armed"
+        );
+    }
     fn wait(&self) -> Result<()> {
         if self.armed.swap(false, Ordering::AcqRel) {
             self.entered
@@ -148,6 +154,7 @@ impl IoGate {
 #[derive(Clone, Debug, Default)]
 pub struct Faults {
     pub io_gate: Option<Arc<IoGate>>,
+    pub read_gate: Option<Arc<IoGate>>,
     pub pause_at: Option<String>,
     pub signal: Option<PathBuf>,
     pub disk_full: Option<PathBuf>,
@@ -307,7 +314,13 @@ impl Worker {
                 let mut acted = false;
                 if read_streak < 4 {
                     if let Ok(mut task) = reads.try_recv() {
-                        let result = read_into(&task.file, task.offset, &mut task.buffer);
+                        let result = read_into(
+                            &task.file,
+                            task.offset,
+                            &mut task.buffer,
+                            #[cfg(any(test, feature = "test-support"))]
+                            &faults,
+                        );
                         read_streak += 1;
                         #[cfg(any(test, feature = "test-support"))]
                         faults.trace(b'R');
@@ -323,7 +336,13 @@ impl Worker {
                         } = task
                         {
                             let started = Instant::now();
-                            let result = read_into(&file, offset, &mut buffer);
+                            let result = read_into(
+                                &file,
+                                offset,
+                                &mut buffer,
+                                #[cfg(any(test, feature = "test-support"))]
+                                &faults,
+                            );
                             let completion = Completion {
                                 id,
                                 result,
@@ -353,7 +372,13 @@ impl Worker {
                                 ..
                             } => {
                                 let mut buffer = buffer;
-                                let result = read_into(&file, offset, &mut buffer);
+                                let result = read_into(
+                                    &file,
+                                    offset,
+                                    &mut buffer,
+                                    #[cfg(any(test, feature = "test-support"))]
+                                    &faults,
+                                );
                                 (result.map(|()| 0), Some(buffer))
                             }
                             task => (
@@ -403,7 +428,13 @@ impl Worker {
                         } = task
                         {
                             let started = Instant::now();
-                            let result = read_into(&file, offset, &mut buffer);
+                            let result = read_into(
+                                &file,
+                                offset,
+                                &mut buffer,
+                                #[cfg(any(test, feature = "test-support"))]
+                                &faults,
+                            );
                             let completion = Completion {
                                 id,
                                 result,
@@ -423,7 +454,13 @@ impl Worker {
                 if !acted {
                     if let Ok(mut task) = reads.try_recv() {
                         // No pending write: keep reading rather than idle.
-                        let result = read_into(&task.file, task.offset, &mut task.buffer);
+                        let result = read_into(
+                            &task.file,
+                            task.offset,
+                            &mut task.buffer,
+                            #[cfg(any(test, feature = "test-support"))]
+                            &faults,
+                        );
                         read_streak += 1;
                         #[cfg(any(test, feature = "test-support"))]
                         faults.trace(b'R');
@@ -476,7 +513,16 @@ fn send_completion(done: &SyncSender<Completion>, mut completion: Completion, st
     }
 }
 
-fn read_into(file: &File, offset: u64, buffer: &mut Extent) -> Result<()> {
+fn read_into(
+    file: &File,
+    offset: u64,
+    buffer: &mut Extent,
+    #[cfg(any(test, feature = "test-support"))] faults: &Faults,
+) -> Result<()> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(gate) = &faults.read_gate {
+        gate.wait()?;
+    }
     read_at(file, buffer.bytes_mut(), offset)
 }
 
