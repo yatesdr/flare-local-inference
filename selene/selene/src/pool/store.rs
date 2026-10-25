@@ -631,7 +631,18 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
         candidates.extend(local.as_ref().and_then(|hit| self.local_candidate(hit)));
         let ranking = PoolPort::ranking(&self.pool);
         let request = self.request(history, &ranking, resident, before);
-        let plan = plan::plan(&request, &candidates)?;
+        let mut plan = plan::plan(&request, &candidates)?;
+        // A pool part followed by a part of this host's own tiers cannot be run: the store
+        // fetches its own part first and the pool serves the rest. Plan again from the pool's
+        // candidates alone, and fall back to the local hit when they cannot cover the restore.
+        if plan.b.as_ref().is_some_and(|b| b.source == LOCAL) {
+            let pool_only: Vec<plan::Candidate> =
+                candidates.iter().filter(|c| c.source != LOCAL).cloned().collect();
+            match plan::plan(&request, &pool_only) {
+                Some(replanned) => plan = replanned,
+                None => return local,
+            }
+        }
         if plan.a.source == LOCAL && plan.b.is_none() {
             return local;
         }
@@ -1487,6 +1498,24 @@ mod tests {
         let b = &fetch.parts[1];
         assert_eq!((b.part.pages, b.part.row, b.pages.len()), (0, true, 0));
         assert_eq!(b.slot, Some(StateSlotId(3)));
+    }
+
+    #[test]
+    fn a_pool_part_is_never_planned_ahead_of_a_part_of_the_local_tiers() {
+        // A neighbour's pages end at 808; this host's own disk ends at 815, in the same page.
+        // The plan would take the pages from the neighbour and the row from the disk, which
+        // the store cannot run in that order. It must restore from the pool alone.
+        let mut rig = rig();
+        rig.local_hit(815, Local::Disk);
+        rig.answer(vec![rig.candidate(Level::NeighbourGpu, 1, 0, 0, &[808], 0)]);
+        let hit = rig.lookup().unwrap();
+        assert_eq!(hit.key, rig.key(808));
+        let ticket = rig.ticket(&hit);
+        rig.store.fetch(hit, ticket).unwrap();
+        let fetch = rig.pool.lock().unwrap().fetches[0].clone();
+        assert_eq!(fetch.parts.len(), 1);
+        assert!(fetch.parts[0].part.row, "the pool part carries the row");
+        assert!(rig.local.0.lock().unwrap().fetches.is_empty(), "nothing is fetched locally");
     }
 
     #[test]
