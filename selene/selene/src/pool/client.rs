@@ -85,6 +85,7 @@ pub struct PoolClient {
     next_put: u64,
     registered: Vec<RegisteredRegion>,
     probe_model: [u8; 32],
+    copier: SharedCopier,
 }
 
 impl PoolClient {
@@ -251,7 +252,7 @@ impl PoolClient {
             settings.clone(),
             shared.clone(),
             announce.clone(),
-            copier,
+            copier.clone(),
             registrar,
         );
         if let (Some(set), Some(secret)) = (ranks, rank_secret) {
@@ -307,7 +308,15 @@ impl PoolClient {
             next_put: 0,
             registered,
             probe_model,
+            copier,
         })
+    }
+
+    pub fn copies_drained(&self) -> bool {
+        self.copier
+            .lock()
+            .map(|copier| copier.in_flight() == 0)
+            .unwrap_or(false)
     }
 
     pub fn status(&self) -> PoolStatus {

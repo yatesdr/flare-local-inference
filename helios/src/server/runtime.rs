@@ -1094,7 +1094,7 @@ impl<'a> Worker<'a> {
                 drop(std::mem::ManuallyDrop::into_inner(store));
             }
             Err(error) => {
-                shutdown.error.get_or_insert(error);
+                shutdown.error.get_or_insert(error.into());
             }
         }
     }

@@ -41,6 +41,9 @@ use super::{
 /// What the store uses of the pool client. [`PoolClient`] is the implementation;
 /// tests of the store's planning and sequencing substitute a recording one.
 pub trait PoolPort {
+    fn copies_drained(&self) -> bool {
+        true
+    }
     /// An instance-scoped probe namespace, when the port has a process identity.
     fn probe_model(&self) -> Option<[u8; 32]> {
         None
@@ -67,6 +70,9 @@ pub trait PoolPort {
 }
 
 impl PoolPort for PoolClient {
+    fn copies_drained(&self) -> bool {
+        PoolClient::copies_drained(self)
+    }
     fn probe_model(&self) -> Option<[u8; 32]> {
         Some(PoolClient::probe_model(self))
     }
@@ -730,6 +736,12 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
 }
 
 impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
+    fn pooled(&self) -> bool {
+        true
+    }
+    fn copies_drained(&self) -> bool {
+        self.pool.copies_drained()
+    }
     fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit> {
         self.inner.lookup(history, resident, before)
     }

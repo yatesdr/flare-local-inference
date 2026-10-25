@@ -265,6 +265,15 @@ pub trait HostStore {
     /// reference its registered host buffers and GPU destinations.
     fn close(&mut self) -> Result<()>;
 
+    /// Whether request lookups should start while queued for this shared store.
+    fn pooled(&self) -> bool {
+        false
+    }
+    /// Whether every copy accepted by the store's dedicated copier has stopped.
+    fn copies_drained(&self) -> bool {
+        true
+    }
+
     /// The worker pinned the checkpoint for `export` and describes its chain.
     /// An error means the store cannot serve the export; the worker unpins.
     fn export_pinned(&mut self, _export: ExportId, _chain: ExportChain) -> Result<()> {
