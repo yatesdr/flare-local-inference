@@ -51,8 +51,6 @@ const MAX_BACKOFF: Duration = Duration::from_secs(5);
 const BUSY_TICK: Duration = Duration::from_millis(1);
 const IDLE_TICK: Duration = Duration::from_millis(20);
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
-/// Finished transfers remembered, so a late command for one is recognised.
-const TOMBSTONES: usize = 1024;
 /// Slots of this agent's own staging when its slices travel on a channel.
 const STAGING_SLOTS: u32 = 16;
 
@@ -280,7 +278,6 @@ impl RankAgent {
             dial: None,
             xfers: HashMap::new(),
             high: 0,
-            tombstones: VecDeque::new(),
             jobs: HashMap::new(),
             pending: VecDeque::new(),
             next_job: 0,
@@ -431,7 +428,6 @@ struct Agent {
     xfers: HashMap<u64, Xfer>,
     /// Transfers at or below this have been opened; a lower id is a replay.
     high: u64,
-    tombstones: VecDeque<u64>,
     jobs: HashMap<JobId, (u64, u32)>,
     pending: VecDeque<(Job, (u64, u32))>,
     next_job: u64,
@@ -1778,10 +1774,6 @@ impl Agent {
             quarantined: false,
         }));
         self.attest(run.kind, run.fence_id, true);
-        self.tombstones.push_back(xfer);
-        while self.tombstones.len() > TOMBSTONES {
-            self.tombstones.pop_front();
-        }
     }
 
     /// Tell the manager this agent stopped touching a transfer's memory.

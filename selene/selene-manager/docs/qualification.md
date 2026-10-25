@@ -20,7 +20,6 @@ client (`tests/support/pool.rs`) and never model the manager's state machine.
 | `tests/pool_channel.rs` | Instances on other hosts: a chain put and restored over TCP and TLS byte for byte (mid-record starts, persisted checksums), an instance that never connects, dies mid-window or mid-fill, a released claim, a lost session, corrupt and cancelled puts, no listener; with the `rdma` feature the same over RDMA on a queue pair per transfer. |
 | `tests/pool_relay.rs` | Copies between instances that share no memory with the manager: a host record and a GPU checkpoint relayed from a remote source to a remote and to a local requester, a source or a requester that dies mid-relay, a stalled source leg, a source that never connects, a source whose session is lost; every case ends with nothing quarantined and the same record relayable again. |
 | `tests/l0.rs` | The store engine through the pool protocol: admission and refusal classification, eviction and compaction, chain durability, crash and recovery, streaming and oversize records, budget and cancel, directory modes, failed-start cleanup, signal handling, kill/restart, and a throughput smoke test. |
-| `tests/proto.rs` | The proto file is the one both ends were built from (digest). |
 
 ## Running
 
