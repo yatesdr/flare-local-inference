@@ -33,6 +33,7 @@ use super::{
     Engine, Owner,
     coverage::Coverage,
     hostfill::{FillJob, FillOwner},
+    ranks::{PeerPart, PeerWindow, XferOwner},
     requester::ExpectedRecord,
 };
 
@@ -87,6 +88,10 @@ struct Put {
     slots: HashMap<u32, u32>,
     /// Filled windows the channel has not yet written out.
     sends_outstanding: u32,
+    /// The peer ranks' parts of this put.
+    peers: Vec<PeerPart>,
+    /// Shared-memory peers that have not yet drained their slice of a window.
+    peer_windows: HashMap<u32, PeerWindow>,
 }
 
 #[derive(Default)]
@@ -94,7 +99,122 @@ pub(crate) struct State {
     puts: HashMap<u64, Put>,
 }
 
+/// What a put's peers are told to copy.
+pub(super) struct PeerSetup {
+    pub record: wire::Record,
+    pub pages: Vec<u32>,
+    pub row: bool,
+    pub slot: u32,
+}
+
 impl State {
+    /// The record and pages a put's peers are opened with, for a GPU put.
+    pub(super) fn peer_setup(&self, put: u64, pages: u32) -> Option<PeerSetup> {
+        let p = self.puts.get(&put)?;
+        let Source::Gpu { pages: chain, slot } = &p.source else {
+            return None;
+        };
+        let from = p.first_page as usize;
+        let mine = chain.get(from..from + pages as usize)?;
+        Some(PeerSetup {
+            record: wire::Record {
+                key: Some(codec::key_to(p.key)),
+                generation: 0,
+                first_page: 0,
+                pages,
+                row: p.row,
+            },
+            pages: mine.iter().map(|page| page.0).collect(),
+            row: p.row,
+            slot: slot.0,
+        })
+    }
+
+    pub(super) fn peers_left(&self, put: u64, window: u32) -> bool {
+        self.puts
+            .get(&put)
+            .and_then(|p| p.peer_windows.get(&window))
+            .is_some_and(|w| !w.left.is_empty())
+    }
+
+    /// A shared peer reported one window. `false` when it was not expected.
+    pub(super) fn peer_window_done(
+        &mut self,
+        put: u64,
+        rank: usize,
+        index: u32,
+        result: std::result::Result<(), String>,
+        sums: Option<crate::pool::SliceSums>,
+    ) -> bool {
+        let Some(p) = self.puts.get_mut(&put) else {
+            return false;
+        };
+        let Some(window) = p.peer_windows.get_mut(&index) else {
+            return false;
+        };
+        if !window.left.remove(&rank) {
+            return false;
+        }
+        match (result, sums) {
+            (Ok(()), Some(sums)) => window.sums.push((rank, sums)),
+            (Err(why), _) => {
+                p.failed
+                    .get_or_insert(Error::new(format!("rank {rank}: {why}")));
+            }
+            (Ok(()), None) => {
+                p.failed
+                    .get_or_insert(Error::new(format!("rank {rank} stated no checksums")));
+            }
+        }
+        true
+    }
+
+    pub(super) fn peer_done(
+        &mut self,
+        put: u64,
+        rank: usize,
+        result: std::result::Result<(), String>,
+        quarantined: bool,
+    ) {
+        let Some(p) = self.puts.get_mut(&put) else {
+            return;
+        };
+        if let Some(peer) = p
+            .peers
+            .iter_mut()
+            .find(|peer| peer.rank == rank && peer.done.is_none())
+        {
+            peer.done = Some(result.clone());
+            peer.quarantined = quarantined;
+        }
+        if let Err(why) = result {
+            p.failed
+                .get_or_insert(Error::new(format!("rank {rank}: {why}")));
+        }
+    }
+
+    pub(super) fn set_peers(&mut self, put: u64, peers: Vec<PeerPart>) {
+        if let Some(p) = self.puts.get_mut(&put) {
+            p.peers = peers;
+        }
+    }
+
+    pub(super) fn take_uncancelled(&mut self, put: u64) -> Vec<u64> {
+        self.puts
+            .get_mut(&put)
+            .map(|p| {
+                p.peers
+                    .iter_mut()
+                    .filter(|peer| peer.done.is_none() && !peer.cancelled)
+                    .map(|peer| {
+                        peer.cancelled = true;
+                        peer.xfer
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.puts.is_empty()
     }
@@ -191,6 +311,8 @@ impl Engine {
                 channel_open: false,
                 slots: HashMap::new(),
                 sends_outstanding: 0,
+                peers: Vec::new(),
+                peer_windows: HashMap::new(),
             },
         );
     }
@@ -298,6 +420,11 @@ impl Engine {
         }]));
         put.sums = vec![0; pages as usize];
         put.phase = Phase::Accepted;
+        if self.ranks.is_some()
+            && let Err(why) = self.open_put_peers(id, pages as u32, &accept.rank_channels)
+        {
+            return self.fail_put(id, Error::new(why));
+        }
         if let Some(reference) = &accept.channel {
             match self.open_channel(Id::Put(id), reference) {
                 Ok(channel) => {
@@ -340,7 +467,12 @@ impl Engine {
     /// A window of a put to fill. `false` when it was not taken up and its slot,
     /// if any, is still the caller's.
     fn put_window(&mut self, id: u64, spec: wire::WindowSpec, slot: Option<u32>) -> bool {
-        let (page_bytes, row_bytes) = (self.st.page_record_bytes(), self.st.row_record_bytes());
+        let (whole_page, whole_row) = (self.st.page_record_bytes(), self.st.row_record_bytes());
+        // A window of this rank's own leg holds only its slices.
+        let (page_bytes, row_bytes) = match (&self.ranks, slot) {
+            (Some(ranks), Some(_)) => (ranks.layout.rank(0).page_len, ranks.layout.rank(0).row_len),
+            _ => (whole_page, whole_row),
+        };
         let memory = self.memory();
         let Some(put) = self.writer.puts.get_mut(&id) else {
             return false;
@@ -375,6 +507,22 @@ impl Engine {
         let first = put.first_page + dest;
         let count = spec.page_count as usize;
         put.windows.insert(spec.index, (spec, dest));
+        // The shared-memory peers write their own slices of this window in step.
+        let shared: Vec<(usize, u64)> = put
+            .peers
+            .iter()
+            .filter(|p| p.shared && p.done.is_none())
+            .map(|p| (p.rank, p.xfer))
+            .collect();
+        if slot.is_none() && !shared.is_empty() {
+            put.peer_windows.insert(
+                spec.index,
+                PeerWindow {
+                    left: shared.iter().map(|(rank, _)| *rank).collect(),
+                    sums: Vec::new(),
+                },
+            );
+        }
         match &put.source {
             Source::Gpu { pages, slot } => {
                 let mut jobs = Vec::new();
@@ -408,6 +556,29 @@ impl Engine {
                         },
                     );
                 }
+                for (rank, xfer) in shared {
+                    let sent = self.ranks.as_ref().is_some_and(|ranks| {
+                        ranks.send_window(
+                            rank,
+                            super::super::rank::link::Window {
+                                xfer,
+                                spec: Some(spec.clone()),
+                                sums: None,
+                            },
+                        )
+                    });
+                    if !sent {
+                        self.fail_put(id, Error::new(format!("rank {rank}'s link is down")));
+                        break;
+                    }
+                }
+            }
+            Source::Host(_) if self.ranks.is_some() => {
+                self.fail_put(
+                    id,
+                    Error::new("a multi-process instance writes GPU pages only"),
+                );
+                return true;
             }
             Source::Host(bytes) => {
                 let bytes = bytes.clone();
@@ -430,6 +601,37 @@ impl Engine {
         true
     }
 
+    /// After a shared peer reported a window: finish the window if its other copies are in.
+    pub(super) fn put_after_peer_window(&mut self, id: u64, window: u32) {
+        let failed = self
+            .writer
+            .puts
+            .get(&id)
+            .is_some_and(|put| put.failed.is_some());
+        if failed {
+            self.send_cancel(id);
+        } else if !self.put_peers_left(id, window)
+            && self
+                .writer
+                .puts
+                .get(&id)
+                .is_some_and(|put| put.windows.contains_key(&window))
+        {
+            let running = {
+                let owner_is = |o: &Owner| matches!(o, Owner::Put { put: a, window: b } if *a == id && *b == window);
+                self.jobs.values().any(owner_is) || self.pending.iter().any(|(_, o)| owner_is(o))
+            };
+            if !running {
+                self.window_filled(id, window, None);
+            }
+        }
+        self.drive_put(id);
+    }
+
+    pub(super) fn put_drive_now(&mut self, id: u64) {
+        self.drive_put(id);
+    }
+
     /// A D2H job of a put drained.
     pub(crate) fn on_put_job(&mut self, id: u64, window: u32, result: crate::Result<()>) {
         let Some(put) = self.writer.puts.get_mut(&id) else {
@@ -444,7 +646,8 @@ impl Engine {
                     .jobs
                     .values()
                     .any(|o| matches!((o, owner), (Owner::Put { put: a, window: b }, Owner::Put { put: c, window: d }) if *a == c && *b == d))
-                    || self.pending.iter().any(|(_, o)| matches!(o, Owner::Put { put: a, window: b } if *a == id && *b == window));
+                    || self.pending.iter().any(|(_, o)| matches!(o, Owner::Put { put: a, window: b } if *a == id && *b == window))
+                    || self.put_peers_left(id, window);
                 if !running {
                     self.window_filled(id, window, None);
                 }
@@ -478,6 +681,24 @@ impl Engine {
     /// (the source's own when it persists them, otherwise of what was written).
     fn window_filled(&mut self, id: u64, window: u32, supplied: Option<Checksums>) {
         let page_bytes = self.st.page_record_bytes() as usize;
+        // What this rank hashes: a multi-process instance's rank states checksums of its own
+        // slices, which start each record of a shared window and fill a channel's slot.
+        let on_channel = self.dial.is_some();
+        let (stride, hash_len, row_len) = match &self.ranks {
+            Some(ranks) => {
+                let mine = ranks.layout.rank(0);
+                (
+                    if on_channel {
+                        mine.page_len as usize
+                    } else {
+                        page_bytes
+                    },
+                    mine.page_len as usize,
+                    mine.row_len as usize,
+                )
+            }
+            None => (page_bytes, page_bytes, self.st.row_record_bytes() as usize),
+        };
         let memory = self.memory();
         let Some(put) = self.writer.puts.get_mut(&id) else {
             return;
@@ -494,19 +715,25 @@ impl Engine {
             let count = spec.page_count as usize;
             Some(Checksums {
                 pages: (0..count)
-                    .map(|i| checksum(&bytes[i * page_bytes..(i + 1) * page_bytes]))
+                    .map(|i| checksum(&bytes[i * stride..i * stride + hash_len]))
                     .collect(),
-                row: spec.row.then(|| checksum(&bytes[count * page_bytes..])),
+                row: spec
+                    .row
+                    .then(|| checksum(&bytes[count * stride..count * stride + row_len])),
             })
         });
         let Some(sums) = sums.filter(|s| s.pages.len() == spec.page_count as usize) else {
             return self.fail_put(id, Error::new("a window's checksums are missing"));
         };
-        for (i, sum) in sums.pages.iter().enumerate() {
-            put.sums[dest as usize + i] = *sum;
-        }
-        if spec.row {
-            put.row_sum = sums.row;
+        // A multi-process writer cannot state whole-page checksums; the manager computes the
+        // ones the record keeps.
+        if self.ranks.is_none() {
+            for (i, sum) in sums.pages.iter().enumerate() {
+                put.sums[dest as usize + i] = *sum;
+            }
+            if spec.row {
+                put.row_sum = sums.row;
+            }
         }
         if put.via_channel {
             // The window is written to the manager on the channel, from its slot.
@@ -528,6 +755,34 @@ impl Engine {
                 self.fail_put(id, Error::new("the data channel is gone"));
             }
             return;
+        }
+        if self.ranks.is_some() {
+            // Rank 0 attests its own slice and those of the shared peers.
+            let peers = self
+                .writer
+                .puts
+                .get_mut(&id)
+                .and_then(|put| put.peer_windows.remove(&window));
+            let mut rank_sums = vec![wire::RankSums {
+                rank: 0,
+                page_xxh3: sums.pages,
+                row_xxh3: sums.row.unwrap_or(0),
+                has_row: sums.row.is_some(),
+            }];
+            for (rank, peer) in peers.map(|p| p.sums).unwrap_or_default() {
+                rank_sums.push(wire::RankSums {
+                    rank: rank as u32,
+                    page_xxh3: peer.pages,
+                    row_xxh3: peer.row.unwrap_or(0),
+                    has_row: peer.row.is_some(),
+                });
+            }
+            return self.emit(Out::PutFilled(wire::PutFilled {
+                put_id: id,
+                index: window,
+                rank_sums,
+                ..Default::default()
+            }));
         }
         self.emit(Out::PutFilled(wire::PutFilled {
             put_id: id,
@@ -610,6 +865,7 @@ impl Engine {
             let ready = put.phase == Phase::Accepted
                 && put.coverage.as_ref().is_some_and(|c| c.complete())
                 && put.windows.is_empty()
+                && put.peer_windows.is_empty()
                 && put.jobs_outstanding == 0
                 && put.sends_outstanding == 0;
             if ready {
@@ -623,6 +879,12 @@ impl Engine {
             channel.stop();
         }
         if put.jobs_outstanding > 0 || put.channel_open {
+            return;
+        }
+        // The peer ranks end their parts too: after their copies drained.
+        self.cancel_put_peers_if_over(id);
+        let put = self.writer.puts.get_mut(&id).expect("present");
+        if put.peers.iter().any(|peer| peer.done.is_none()) {
             return;
         }
         let fenced = put.stored.is_some() || put.phase == Phase::Begun || put.fence_sent;

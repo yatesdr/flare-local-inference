@@ -647,3 +647,142 @@ fn three_ranks_mixing_shared_memory_and_channels_export_to_a_multi_process_insta
     source.close();
     requester.close();
 }
+
+// ---- puts from a multi-process instance -------------------------------------------
+
+use crate::pool::{PutRequest, PutSource};
+
+/// Put the checkpoint `publish` placed on every rank of `writer` into the manager's store.
+fn put_from(writer: &mut Instance, history: &TestHistory, pages: usize) -> PrefixKey {
+    let key = history.key_at(pages as u64 * PT).unwrap();
+    writer
+        .rank0
+        .put(PutRequest {
+            key,
+            parent: None,
+            bucket: history.bucket_at(key.consumed_tokens).unwrap(),
+            chain_pages: pages as u64,
+            tail_pages: pages as u64,
+            row: true,
+            generation: 1,
+            source: PutSource::Gpu {
+                pages: (0..pages).map(|p| PageId(20 + p as u32)).collect(),
+                slot: StateSlotId(5),
+            },
+        })
+        .unwrap();
+    key
+}
+
+/// Fill every rank's GPU as `publish` does, without announcing.
+fn fill_gpus(writer: &Instance, world: usize, pages: usize) {
+    let data = bytes_of(world, pages);
+    let (page, _) = whole(world);
+    for (rank, memory) in writer.memory.iter().enumerate() {
+        for p in 0..pages {
+            let from = p * page + rank * 8192;
+            memory
+                .pages
+                .lock()
+                .unwrap()
+                .insert(20 + p as u32, data[from..from + 8192].to_vec());
+        }
+        let from = pages * page + rank * 4096;
+        memory
+            .rows
+            .lock()
+            .unwrap()
+            .insert(5, data[from..from + 4096].to_vec());
+    }
+}
+
+fn put_then_restore(
+    manager: &Manager,
+    world: usize,
+    writer_reach: &[Reach],
+    reader: Option<&[Reach]>,
+) {
+    let mut writer = instance_reaching(manager, world, writer_reach);
+    writer.ready();
+    let history = history_of(4000);
+    let pages = 4;
+    fill_gpus(&writer, world, pages);
+    put_from(&mut writer, &history, pages);
+    let outcome = writer.event("the put", |e| match e {
+        PoolEvent::Put { outcome, .. } => Some(format!("{outcome:?}")),
+        _ => None,
+    });
+    assert!(outcome.starts_with("Stored"), "{outcome}");
+    let (page, row) = whole(world);
+    let scratch = [300, 301, 302, 303];
+    match reader {
+        None => {
+            // A single-process instance of the same shape restores the whole record, which
+            // proves the checksums the record keeps are the whole-page ones.
+            let mut plain = plain(manager, world, Reach::Local);
+            wait("the reader", || plain.client.status() == PoolStatus::Ready);
+            wait_offered(&plain.client, &history);
+            let fetch = fetch_for(&plain.client, world, &history, pages, &scratch);
+            plain.client.fetch(fetch).unwrap();
+            expect_fetched(
+                &mut plain.client,
+                "the restore",
+                (pages * page + row) as u64,
+            );
+            let data = bytes_of(world, pages);
+            let landed = plain.memory.pages.lock().unwrap();
+            for (i, id) in scratch.iter().enumerate() {
+                assert_eq!(
+                    landed.get(id).map(Vec::as_slice),
+                    Some(&data[i * page..(i + 1) * page]),
+                    "page {i}"
+                );
+            }
+            assert_eq!(
+                plain.memory.rows.lock().unwrap().get(&9).map(Vec::as_slice),
+                Some(&data[pages * page..])
+            );
+            drop(landed);
+            let _ = plain.client.close();
+        }
+        Some(reach) => {
+            let mut other = instance_seeded(manager, world, reach, 60);
+            other.ready();
+            wait_offered(&other.rank0, &history);
+            let fetch = fetch_for(&other.rank0, world, &history, pages, &scratch);
+            other.rank0.fetch(fetch).unwrap();
+            let result = other.event("the restore", |e| match e {
+                PoolEvent::Fetched { result, .. } => {
+                    Some(result.as_ref().map(|b| *b).map_err(|f| f.error.to_string()))
+                }
+                _ => None,
+            });
+            assert_eq!(result, Ok((pages * page + row) as u64));
+            assert_slices(&other, world, pages, &scratch);
+            other.close();
+        }
+    }
+    writer.close();
+}
+
+#[test]
+fn a_two_rank_instance_puts_a_record_a_single_process_instance_restores() {
+    put_then_restore(&Manager::start(), 2, &[Reach::Local, Reach::Local], None);
+}
+
+#[test]
+fn a_peer_on_a_channel_writes_its_slice_of_a_put() {
+    let manager = Manager::start_network(false);
+    put_then_restore(&manager, 2, &[Reach::Local, Reach::Network], None);
+}
+
+#[test]
+fn three_ranks_on_channels_put_and_another_multi_process_instance_restores() {
+    let manager = Manager::start_network(false);
+    put_then_restore(
+        &manager,
+        3,
+        &[Reach::Network, Reach::Network, Reach::Network],
+        Some(&[Reach::Local, Reach::Network, Reach::Local]),
+    );
+}
