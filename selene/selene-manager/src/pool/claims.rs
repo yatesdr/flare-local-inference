@@ -10,7 +10,7 @@ use super::{
     core::{ChanOwner, Core, Nonce, ProcKey, Session},
     index::{InstanceId, SourceId, Tier, walk_chain},
     key_from, key_to,
-    mp::{MpState, Stated},
+    mp::{Leg, MpState, Stated, join_legs, root, stop_legs},
     store_bridge::persisted_checksums,
     tier_from, tier_to,
     windows::{self, PlannedWindow, RecordShape},
@@ -107,11 +107,8 @@ pub struct Claim {
     pub row_bytes: u64,
     /// Set when the manager's own store is the source.
     pub manager: Option<ManagerGet>,
-    /// Set when the bytes move to the requester on the data channel instead of shared windows.
-    pub channel: Option<Channel>,
-    /// Set when the source has no shared memory: it writes the windows to the manager on the
-    /// data channel and the manager relays them on.
-    pub source_channel: Option<Channel>,
+    /// Every requester/source channel, including rank zero and its peers.
+    pub legs: Vec<Leg>,
     /// What multi-process instances add: peer participants, their legs, the assembly pass.
     pub mp: MpState,
 }
@@ -140,6 +137,13 @@ pub struct ManagerGet {
 }
 
 impl Claim {
+    pub(super) fn channel(&self) -> Option<&Channel> {
+        root(&self.legs, false)
+    }
+    fn source_channel(&self) -> Option<&Channel> {
+        root(&self.legs, true)
+    }
+
     pub fn is_terminal(&self) -> bool {
         matches!(self.state, v2::ClaimState::Copied | v2::ClaimState::Failed)
     }
@@ -254,17 +258,8 @@ impl Core {
     pub(super) fn quarantined_bytes(&self) -> u64 {
         let mut total = 0;
         for claim in self.claims.values().filter(|claim| claim.is_terminal()) {
-            let stuck = claim.channel.as_ref().is_some_and(|open| !open.exited);
-            let stuck_source = claim
-                .source_channel
-                .as_ref()
-                .is_some_and(|open| !open.exited);
-            let stuck_rank = claim
-                .mp
-                .legs
-                .iter()
-                .any(|leg| !leg.source && !leg.ch.exited);
-            let stuck_source_rank = claim.mp.legs.iter().any(|leg| leg.source && !leg.ch.exited);
+            let stuck = claim.legs.iter().any(|leg| !leg.source && !leg.ch.exited);
+            let stuck_source = claim.legs.iter().any(|leg| leg.source && !leg.ch.exited);
             let stuck_source_peer = claim.mp.src.as_ref().is_some_and(|side| {
                 side.peers.iter().any(|peer| {
                     peer.shared
@@ -285,9 +280,8 @@ impl Core {
                 })
             });
             for window in &claim.windows {
-                if (stuck || stuck_rank || stuck_peer) && window.phase == Phase::RequesterRead
-                    || (stuck_source || stuck_source_rank || stuck_source_peer)
-                        && window.phase == Phase::SourceWrite
+                if (stuck || stuck_peer) && window.phase == Phase::RequesterRead
+                    || (stuck_source || stuck_source_peer) && window.phase == Phase::SourceWrite
                 {
                     total += window.plan.length;
                     continue;
@@ -594,15 +588,14 @@ impl Core {
             page_bytes: geometry.page_bytes,
             row_bytes: geometry.row_bytes,
             manager: None,
-            channel: requester_leg,
-            source_channel: source_leg,
+            legs: join_legs(requester_leg, source_leg, mp_legs),
             mp: MpState {
                 req: req_mp,
                 src: src_mp,
-                legs: mp_legs,
                 ..Default::default()
             },
         };
+        self.bind_claim_legs(&claim);
         let reserved = claim.reserved_bytes;
         self.claims.insert(key, claim);
         self.exports.insert(export_id, key);
@@ -791,21 +784,21 @@ impl Core {
                 done: false,
                 transfer_released: false,
             }),
-            channel: channel.map(|(transfer, token)| Channel {
-                transfer,
-                token,
-                exited: false,
-            }),
-            source_channel: None,
+            legs: join_legs(
+                channel.map(|(transfer, token)| Channel {
+                    transfer,
+                    token,
+                    exited: false,
+                }),
+                None,
+                mp_legs,
+            ),
             mp: MpState {
                 req: req_mp,
-                legs: mp_legs,
                 ..Default::default()
             },
         };
-        if let Some(open) = &claim.channel {
-            self.channels.insert(open.transfer, ChanOwner::Claim(key));
-        }
+        self.bind_claim_legs(&claim);
         self.claims.insert(key, claim);
         let chain: Vec<Key> = walk.nodes.iter().map(|node| node.key).collect();
         if let Err(reason) = self.manager_get(key, chain, walk.skip_pages, walk.pages, m.want_row) {
@@ -834,8 +827,7 @@ impl Core {
                 claim.last_progress = now;
                 claim.requester_fence = Party::Pending;
                 let channel = claim
-                    .channel
-                    .as_ref()
+                    .channel()
                     .zip(self.cfg.channel.as_ref())
                     .map(|(open, hub)| super::channel_ref(hub, &open.token));
                 if let Some(side) = claim.mp.req.as_mut() {
@@ -963,7 +955,7 @@ impl Core {
                 claim.last_progress = Instant::now();
                 let spec = claim.spec(index);
                 let sid = claim.requester_sid;
-                if let Some((open, hub)) = claim.channel.as_ref().zip(self.cfg.channel.as_ref()) {
+                if let Some((open, hub)) = claim.channel().zip(self.cfg.channel.as_ref()) {
                     // The window goes to the requester on the data channel; the claim
                     // learns it is free when the handler reports it sent.
                     let region = u8::try_from(grant.region)
@@ -1009,11 +1001,8 @@ impl Core {
                     manager.done = true;
                 }
                 // Every window is queued: the handler ends the transfer after them.
-                if let Some((open, hub)) = claim.channel.as_ref().zip(self.cfg.channel.as_ref()) {
-                    hub.finish(open.transfer);
-                }
                 if let Some(hub) = self.cfg.channel.as_ref() {
-                    for leg in claim.mp.legs.iter().filter(|leg| !leg.source) {
+                    for leg in claim.legs.iter().filter(|leg| !leg.source) {
                         hub.finish(leg.ch.transfer);
                     }
                 }
@@ -1069,8 +1058,7 @@ impl Core {
             page_bytes: 0,
             row_bytes: 0,
             manager: None,
-            channel: None,
-            source_channel: None,
+            legs: Vec::new(),
             mp: MpState::default(),
         };
         let message = self.terminal_message(&claim);
@@ -1207,8 +1195,7 @@ impl Core {
         claim.requester_fence = Party::Pending;
         let requester_sid = claim.requester_sid;
         let channel = claim
-            .channel
-            .as_ref()
+            .channel()
             .zip(self.cfg.channel.as_ref())
             .map(|(open, hub)| super::channel_ref(hub, &open.token));
         let mut granted = v2::ClaimGranted {
@@ -1272,9 +1259,9 @@ impl Core {
             let source_peers = claim.mp.src.is_some();
             let writers = if source_peers {
                 claim
-                    .mp
                     .legs
                     .iter()
+                    .filter(|leg| leg.rank != 0)
                     .filter(|leg| leg.source)
                     .fold(1u64, |mask, leg| mask | 1 << leg.rank)
             } else {
@@ -1287,13 +1274,13 @@ impl Core {
         }
         let outstanding = claim.unreleased();
         let (export_id, source_sid) = (claim.export_id, claim.source_sid);
-        let source_leg = claim.source_channel.as_ref().map(|leg| leg.transfer);
+        let source_leg = claim.source_channel().map(|leg| leg.transfer);
         // A multi-process source's peers in channel mode are granted each window on their own
         // leg, with their own slice's shape.
         let peer_grants: Vec<(u64, u32)> = claim
-            .mp
             .legs
             .iter()
+            .filter(|leg| leg.rank != 0)
             .filter(|leg| leg.source)
             .map(|leg| (leg.ch.transfer, leg.rank))
             .collect();
@@ -1362,7 +1349,7 @@ impl Core {
         let Some(claim) = self.claims.get_mut(&key) else {
             return Ok(());
         };
-        if claim.source_proc != Some(sender) || claim.source_channel.is_some() {
+        if claim.source_proc != Some(sender) || claim.source_channel().is_some() {
             // A relayed source states its windows' checksums on the data channel.
             return Ok(());
         }
@@ -1516,7 +1503,7 @@ impl Core {
         claim.last_progress = Instant::now();
         let spec = claim.spec(index);
         let requester_sid = claim.requester_sid;
-        if let Some((open, hub)) = claim.channel.as_ref().zip(self.cfg.channel.as_ref()) {
+        if let Some((open, hub)) = claim.channel().zip(self.cfg.channel.as_ref()) {
             let region = u8::try_from(spec.region)
                 .ok()
                 .and_then(crate::data::Region::from_u8);
@@ -1608,14 +1595,14 @@ impl Core {
                 // On the data channel the claim's windows are freed as the handler reports
                 // them sent, on another path than this message. The requester's verdict
                 // proves it read them all, so windows still marked sent-or-sending count.
-                let windows_done = if claim.channel.is_some() || !claim.mp.legs.is_empty() {
-                    claim
-                        .windows
-                        .iter()
-                        .all(|window| matches!(window.phase, Phase::RequesterRead | Phase::Free))
-                } else {
-                    claim.all_windows_done()
-                };
+                let windows_done =
+                    if claim.channel().is_some() || claim.legs.iter().any(|leg| leg.rank != 0) {
+                        claim.windows.iter().all(|window| {
+                            matches!(window.phase, Phase::RequesterRead | Phase::Free)
+                        })
+                    } else {
+                        claim.all_windows_done()
+                    };
                 let complete = covered && exact && windows_done && !claim.windows.is_empty();
                 if complete {
                     self.claims.get_mut(&key).unwrap().verdict_latched = true;
@@ -1734,8 +1721,12 @@ impl Core {
             // every rank has finished, and a leg's bytes can still be in the manager's
             // handler. The leg's close fails the claim if any window never arrived.
             let finished = status == v2::ExportEndStatus::ExportComplete
-                && (claim.source_channel.is_some()
-                    || claim.mp.legs.iter().any(|leg| leg.source && !leg.ch.exited)
+                && (claim.source_channel().is_some()
+                    || claim
+                        .legs
+                        .iter()
+                        .filter(|leg| leg.rank != 0)
+                        .any(|leg| leg.source && !leg.ch.exited)
                     || claim.windows.iter().all(|window| {
                         // A window in the assembly pass has been filled, too.
                         window.arrived || matches!(window.phase, Phase::RequesterRead | Phase::Free)
@@ -1796,38 +1787,22 @@ impl Core {
     /// The claim is over: end its data-channel transfers. The claim's windows go back
     /// only when the handlers have exited, which `reclaim` checks.
     fn stop_channel(&mut self, key: ClaimKey) {
-        let Some(hub) = self.cfg.channel.clone() else {
-            // Without a hub there never was a transfer.
-            if let Some(claim) = self.claims.get_mut(&key) {
-                for leg in [claim.channel.as_mut(), claim.source_channel.as_mut()]
-                    .into_iter()
-                    .flatten()
-                    .chain(claim.mp.legs.iter_mut().map(|leg| &mut leg.ch))
-                {
-                    leg.exited = true;
-                }
-            }
-            return;
-        };
-        let Some(claim) = self.claims.get_mut(&key) else {
-            return;
-        };
-        let mut quiet = Vec::new();
-        for leg in [claim.channel.as_mut(), claim.source_channel.as_mut()]
-            .into_iter()
-            .flatten()
-            .chain(claim.mp.legs.iter_mut().map(|leg| &mut leg.ch))
-        {
-            if leg.exited {
-                continue;
-            }
-            if hub.stop(leg.transfer) {
-                leg.exited = true;
-                quiet.push(leg.transfer);
-            }
+        if let Some(claim) = self.claims.get_mut(&key) {
+            stop_legs(
+                &mut claim.legs,
+                self.cfg.channel.as_ref(),
+                &mut self.channels,
+            );
         }
-        for transfer in quiet {
-            self.channels.remove(&transfer);
+    }
+    fn bind_claim_legs(&mut self, claim: &Claim) {
+        for (index, leg) in claim.legs.iter().enumerate() {
+            let owner = match (leg.rank, leg.source) {
+                (0, false) => ChanOwner::Claim(claim.key),
+                (0, true) => ChanOwner::Source(claim.key),
+                _ => ChanOwner::ClaimRank(claim.key, index),
+            };
+            self.channels.insert(leg.ch.transfer, owner);
         }
     }
 
@@ -1843,7 +1818,7 @@ impl Core {
                     let rank = self
                         .claims
                         .get(&key)
-                        .and_then(|claim| claim.mp.legs.get(leg))
+                        .and_then(|claim| claim.legs.get(leg))
                         .map(|leg| leg.rank);
                     if let Some(rank) = rank {
                         self.reader_done(key, index, rank);
@@ -1861,7 +1836,7 @@ impl Core {
                     let rank = self
                         .claims
                         .get(&key)
-                        .and_then(|claim| claim.mp.legs.get(leg))
+                        .and_then(|claim| claim.legs.get(leg))
                         .filter(|leg| leg.source)
                         .map(|leg| leg.rank);
                     if let Some(rank) = rank {
@@ -1894,8 +1869,7 @@ impl Core {
                     let rank = self
                         .puts
                         .get(&key)
-                        .and_then(|rec| rec.mp.as_ref())
-                        .and_then(|mp| mp.legs.get(leg))
+                        .and_then(|rec| rec.legs.get(leg))
                         .map(|leg| leg.rank);
                     if let Some(rank) = rank {
                         let parts = vec![(
@@ -1943,20 +1917,30 @@ impl Core {
                 if let Some(hub) = &self.cfg.channel {
                     hub.forget(transfer);
                 }
-                match self.channels.remove(&transfer) {
+                let owner = self.channels.remove(&transfer);
+                let legs = match owner {
+                    Some(
+                        ChanOwner::Claim(key)
+                        | ChanOwner::Source(key)
+                        | ChanOwner::ClaimRank(key, _),
+                    ) => self.claims.get_mut(&key).map(|claim| &mut claim.legs),
+                    Some(ChanOwner::Put(key) | ChanOwner::PutRank(key, _)) => {
+                        self.puts.get_mut(&key).map(|rec| &mut rec.legs)
+                    }
+                    None => None,
+                };
+                if let Some(leg) =
+                    legs.and_then(|legs| legs.iter_mut().find(|leg| leg.ch.transfer == transfer))
+                {
+                    leg.ch.exited = true;
+                }
+                match owner {
                     Some(ChanOwner::ClaimRank(key, leg)) => {
-                        if let Some(open) = self
-                            .claims
-                            .get_mut(&key)
-                            .and_then(|claim| claim.mp.legs.get_mut(leg))
-                        {
-                            open.ch.exited = true;
-                        }
                         // A leg that ends before the claim is over, with windows it never
                         // read or wrote, fails the claim; one that finished is simply done.
                         let owed = self.claims.get(&key).is_some_and(|claim| {
                             !claim.is_terminal()
-                                && claim.mp.legs.get(leg).is_some_and(|open| {
+                                && claim.legs.get(leg).is_some_and(|open| {
                                     if open.source {
                                         claim
                                             .windows
@@ -1976,23 +1960,9 @@ impl Core {
                         self.reclaim(key);
                     }
                     Some(ChanOwner::Claim(key)) => {
-                        if let Some(open) = self
-                            .claims
-                            .get_mut(&key)
-                            .and_then(|claim| claim.channel.as_mut())
-                        {
-                            open.exited = true;
-                        }
                         self.reclaim(key);
                     }
                     Some(ChanOwner::Source(key)) => {
-                        if let Some(open) = self
-                            .claims
-                            .get_mut(&key)
-                            .and_then(|claim| claim.source_channel.as_mut())
-                        {
-                            open.exited = true;
-                        }
                         // A source that closes its channel before the claim is over has
                         // given up the windows it owed.
                         let owed = self.claims.get(&key).is_some_and(|claim| {
@@ -2006,16 +1976,8 @@ impl Core {
                         }
                         self.reclaim(key);
                     }
-                    Some(ChanOwner::Put(key)) => self.put_channel_closed(key),
-                    Some(ChanOwner::PutRank(key, leg)) => {
-                        if let Some(open) = self
-                            .puts
-                            .get_mut(&key)
-                            .and_then(|rec| rec.mp.as_mut())
-                            .and_then(|mp| mp.legs.get_mut(leg))
-                        {
-                            open.ch.exited = true;
-                        }
+                    Some(ChanOwner::Put(key)) => self.puts_settle(key),
+                    Some(ChanOwner::PutRank(key, _)) => {
                         self.puts_resettle(key);
                     }
                     None => {}
@@ -2124,20 +2086,24 @@ impl Core {
             .is_none_or(|proc| self.proc_exited_flag(proc));
         // A source without shared memory touches the claim's windows only through the
         // manager's handler, so that handler's exit is its fence.
-        let source_ok = match &claim.source_channel {
+        let source_ok = match claim.source_channel() {
             Some(leg) => leg.exited,
             None => matches!(claim.source_fence(), Party::Drained) || source_gone,
         };
         // On the data channel the requester never touches the claim's windows: the
         // manager's handler does, and its exit is the fence.
-        let requester_ok = match &claim.channel {
+        let requester_ok = match claim.channel() {
             Some(open) => open.exited,
             None => matches!(claim.requester_fence, Party::Drained) || requester_gone,
         };
         // A multi-process requester's peers: a shared-memory one answers for itself (its own
         // attestation, or its process's exit); one on a leg is fenced by the handler's exit.
-        let peers_ok = claim.mp.quiet(false, |proc| self.proc_exited_flag(proc));
-        let source_peers_ok = claim.mp.quiet(true, |proc| self.proc_exited_flag(proc));
+        let peers_ok = claim
+            .mp
+            .quiet(&claim.legs, false, |proc| self.proc_exited_flag(proc));
+        let source_peers_ok = claim
+            .mp
+            .quiet(&claim.legs, true, |proc| self.proc_exited_flag(proc));
         // The assembly pass reads manager memory too.
         let quiet = claim.mp.passes == 0;
         let (source_ok, requester_ok) = (
@@ -2186,7 +2152,7 @@ impl Core {
         for (key, claim) in &self.claims {
             if claim.is_terminal() {
                 let peers_settled = claim.mp.passes == 0
-                    && claim.mp.legs.iter().all(|leg| leg.ch.exited)
+                    && claim.legs.iter().all(|leg| leg.ch.exited)
                     && [&claim.mp.req, &claim.mp.src]
                         .into_iter()
                         .flatten()
@@ -2196,10 +2162,6 @@ impl Core {
                                 || self.proc_exited_flag(&peer.proc)
                         });
                 let drained = peers_settled
-                    && [&claim.channel, &claim.source_channel]
-                        .into_iter()
-                        .flatten()
-                        .all(|leg| leg.exited)
                     && claim
                         .windows
                         .iter()
@@ -2208,7 +2170,7 @@ impl Core {
                     && drained
                     && !matches!(claim.export, ExportState::Requested | ExportState::Pinned)
                     && !matches!(claim.export, ExportState::Ended(Party::Quarantined))
-                    && (claim.channel.is_some()
+                    && (claim.channel().is_some()
                         || !matches!(claim.requester_fence, Party::Pending | Party::Quarantined))
                     && !matches!(claim.source_fence(), Party::Pending);
                 let source_gone = claim
@@ -2408,7 +2370,7 @@ impl Core {
                 // the manager's handler, whose exit is the fence. Its session ending
                 // clears what it owed for the export itself.
                 if let Some(claim) = self.claims.get_mut(&key) {
-                    if claim.source_channel.is_some() {
+                    if claim.source_channel().is_some() {
                         claim.export = ExportState::Ended(Party::Drained);
                     }
                 }
@@ -2584,8 +2546,7 @@ mod tests {
                     done: false,
                     transfer_released: false,
                 }),
-                channel: None,
-                source_channel: None,
+                legs: Vec::new(),
                 mp: MpState::default(),
             },
         );
@@ -2689,15 +2650,22 @@ mod tests {
         }
         let claim = core.claims.get_mut(&key).unwrap();
         claim.windows[0].phase = Phase::RequesterRead;
-        claim.channel = Some(Channel {
-            transfer,
-            token,
-            exited: false,
-        });
+        claim.legs.insert(
+            0,
+            Leg {
+                rank: 0,
+                source: false,
+                ch: Channel {
+                    transfer,
+                    token,
+                    exited: false,
+                },
+            },
+        );
         core.channels.insert(transfer, ChanOwner::Claim(key));
         core.finish(key, v2::ClaimState::Failed, v2::ClaimReason::Cancelled);
         let claim = &core.claims[&key];
-        assert!(!claim.channel.as_ref().unwrap().exited);
+        assert!(!claim.channel().unwrap().exited);
         assert_eq!(
             claim.windows[0].phase,
             Phase::RequesterRead,
@@ -2752,11 +2720,18 @@ mod tests {
         }
         let claim = core.claims.get_mut(&key).unwrap();
         claim.windows[0].phase = Phase::SourceWrite;
-        claim.source_channel = Some(Channel {
-            transfer,
-            token,
-            exited: false,
-        });
+        claim.legs.insert(
+            0,
+            Leg {
+                rank: 0,
+                source: true,
+                ch: Channel {
+                    transfer,
+                    token,
+                    exited: false,
+                },
+            },
+        );
         core.channels.insert(transfer, ChanOwner::Source(key));
         core.finish(key, v2::ClaimState::Failed, v2::ClaimReason::Cancelled);
         assert_eq!(
@@ -2775,7 +2750,7 @@ mod tests {
 
     // ---- multi-process requesters -------------------------------------------------
 
-    use super::super::mp::{MpPeer, MpSide, RankLeg};
+    use super::super::mp::{Leg, MpPeer, MpSide};
 
     fn three_ranks() -> std::sync::Arc<flare_selene::pool::SliceLayout> {
         use flare_selene::pool::{Geometry, RankPlanes};
@@ -2835,7 +2810,7 @@ mod tests {
                 },
             ],
         });
-        claim.mp.legs = vec![RankLeg {
+        claim.legs = vec![Leg {
             rank: 2,
             source: false,
             ch: Channel {
@@ -2888,7 +2863,7 @@ mod tests {
         core.finish(key, v2::ClaimState::Failed, v2::ClaimReason::Cancelled);
         // The requester's session fenced itself (the fixture's party is Pending).
         core.claims.get_mut(&key).unwrap().requester_fence = Party::Drained;
-        core.claims.get_mut(&key).unwrap().mp.legs[0].ch.exited = true;
+        core.claims.get_mut(&key).unwrap().legs[0].ch.exited = true;
         core.reclaim(key);
         assert_eq!(
             core.claims[&key].windows[0].phase,
@@ -2917,7 +2892,7 @@ mod tests {
         core.finish(key, v2::ClaimState::Failed, v2::ClaimReason::Cancelled);
         let claim = core.claims.get_mut(&key).unwrap();
         claim.requester_fence = Party::Drained;
-        claim.mp.legs[0].ch.exited = true;
+        claim.legs[0].ch.exited = true;
         claim.mp.req.as_mut().unwrap().peers[0].fence = Party::Quarantined;
         core.reclaim(key);
         assert_eq!(core.claims[&key].windows[0].phase, Phase::RequesterRead);
@@ -2957,8 +2932,8 @@ mod tests {
         claim.windows[0].readers = 0;
         // Rank 2's slices are still to come from its data channel.
         claim.windows[0].writers = 0b100;
-        claim.mp.legs[0].source = true;
-        claim.mp.legs[0].ch.exited = leg_exited;
+        claim.legs[0].source = true;
+        claim.legs[0].ch.exited = leg_exited;
         core.exports.insert(7, key);
         key
     }
