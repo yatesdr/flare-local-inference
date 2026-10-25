@@ -2688,9 +2688,8 @@ impl HostStore for DiskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{
-        Ids, StoppedCopier, TestHistory as PrefixHistory, checkpoint, pattern, test_directory,
-    };
+    use crate::testing::{Ids, checkpoint, pattern, test_directory};
+    use crate::testing::{StoppedCopier, TestHistory as PrefixHistory};
     use crate::{
         slab::{STAGING_PAGE_SLABS, STAGING_ROW_SLABS},
         testing::geometry as rank,

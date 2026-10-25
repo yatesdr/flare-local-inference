@@ -1400,9 +1400,8 @@ impl HostStore for CompositeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{
-        Ids, StoppedCopier, TestHistory as PrefixHistory, checkpoint, pattern, test_directory,
-    };
+    use crate::testing::{Ids, checkpoint, pattern, test_directory};
+    use crate::testing::{StoppedCopier, TestHistory as PrefixHistory};
     use crate::{
         CacheGeometry, INITIAL_MEMORY_RATE, Layout, PageId, StateSlotId,
         disk::DiskThread,

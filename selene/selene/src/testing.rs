@@ -167,78 +167,6 @@ impl PageCopier for StoppedCopier {
     }
 }
 
-#[derive(Default)]
-pub struct Ids {
-    count: u32,
-}
-impl Ids {
-    pub fn new() -> Self {
-        Self { count: 0 }
-    }
-    pub fn next(&mut self) -> CheckpointId {
-        self.count += 1;
-        CheckpointId::new(u64::from(self.count))
-    }
-}
-
-pub fn checkpoint(
-    ids: &mut Ids,
-    history: &dyn History,
-    consumed: u64,
-    parent: Option<u64>,
-    chain_pages: Vec<PageId>,
-    tail_pages: usize,
-    slot: StateSlotId,
-) -> PublishedCheckpoint {
-    PublishedCheckpoint {
-        id: ids.next(),
-        key: history.key_at(consumed).unwrap(),
-        parent: parent.map(|parent| history.key_at(parent).unwrap()),
-        bucket: history
-            .key_at(consumed - consumed % HASH_BLOCK_TOKENS as u64)
-            .unwrap()
-            .digest,
-        chain_pages,
-        tail_pages,
-        slot,
-    }
-}
-
-pub fn test_directory(tier: &str, test: &str) -> Option<PathBuf> {
-    let base = std::env::var_os("FLARE_OFFLOAD_TEST_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let directory = base.join(format!(
-        "flare-offload-{tier}-{test}-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&directory);
-    fs::create_dir_all(&directory).unwrap();
-    let probe = directory.join(".probe");
-    match flare_eos::direct_file(&probe, true) {
-        Ok(_) => {
-            fs::remove_file(&probe).unwrap();
-            Some(directory)
-        }
-        Err(error) if cfg!(unix) && error.raw_os_error() == Some(libc::EINVAL) => {
-            eprintln!(
-                "skipping {test}: {} refuses direct I/O",
-                directory.display()
-            );
-            fs::remove_dir_all(&directory).unwrap();
-            None
-        }
-        Err(error) => panic!("probe {}: {error}", probe.display()),
-    }
-}
-
-pub fn pattern(bytes: &mut [u8], seed: u64) {
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        let index = index as u64;
-        *byte = (index.wrapping_mul(31) ^ seed.wrapping_mul(7919) ^ (index >> 8)) as u8;
-    }
-}
-
 /// The device pages and state rows a [`SimulatedGpu`] copies to and from, by id.
 #[derive(Clone, Default)]
 pub struct GpuMemory {
@@ -331,5 +259,77 @@ impl PageCopier for SimulatedGpu {
 
     fn close(&mut self) -> Result<()> {
         Ok(())
+    }
+}
+
+#[derive(Default)]
+pub struct Ids {
+    count: u32,
+}
+impl Ids {
+    pub fn new() -> Self {
+        Self { count: 0 }
+    }
+    pub fn next(&mut self) -> CheckpointId {
+        self.count += 1;
+        CheckpointId::new(u64::from(self.count))
+    }
+}
+
+pub fn checkpoint(
+    ids: &mut Ids,
+    history: &dyn History,
+    consumed: u64,
+    parent: Option<u64>,
+    chain_pages: Vec<PageId>,
+    tail_pages: usize,
+    slot: StateSlotId,
+) -> PublishedCheckpoint {
+    PublishedCheckpoint {
+        id: ids.next(),
+        key: history.key_at(consumed).unwrap(),
+        parent: parent.map(|parent| history.key_at(parent).unwrap()),
+        bucket: history
+            .key_at(consumed - consumed % HASH_BLOCK_TOKENS as u64)
+            .unwrap()
+            .digest,
+        chain_pages,
+        tail_pages,
+        slot,
+    }
+}
+
+pub fn test_directory(tier: &str, test: &str) -> Option<PathBuf> {
+    let base = std::env::var_os("FLARE_OFFLOAD_TEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let directory = base.join(format!(
+        "flare-offload-{tier}-{test}-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&directory);
+    fs::create_dir_all(&directory).unwrap();
+    let probe = directory.join(".probe");
+    match flare_eos::direct_file(&probe, true) {
+        Ok(_) => {
+            fs::remove_file(&probe).unwrap();
+            Some(directory)
+        }
+        Err(error) if cfg!(unix) && error.raw_os_error() == Some(libc::EINVAL) => {
+            eprintln!(
+                "skipping {test}: {} refuses direct I/O",
+                directory.display()
+            );
+            fs::remove_dir_all(&directory).unwrap();
+            None
+        }
+        Err(error) => panic!("probe {}: {error}", probe.display()),
+    }
+}
+
+pub fn pattern(bytes: &mut [u8], seed: u64) {
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let index = index as u64;
+        *byte = (index.wrapping_mul(31) ^ seed.wrapping_mul(7919) ^ (index >> 8)) as u8;
     }
 }

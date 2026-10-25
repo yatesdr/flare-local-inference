@@ -1371,7 +1371,8 @@ mod disk_store {
     };
 
     use flare_selene::{
-        HostStore, InboundTicket, Layout, PageId, StateSlotId, StoreEvent, StoreOutcome, Tier,
+        HostStore, InboundTicket, Layout, PageId, PublishedCheckpoint, StateSlotId, StoreEvent,
+        StoreOutcome, Tier,
         disk::DiskThread,
         disk_store::{DiskStore, Staged},
         record::{self, Scanned},
