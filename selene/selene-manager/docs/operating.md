@@ -240,7 +240,7 @@ the total; a nonzero value that does not fall means an instance is hung, not a l
 | `selene_nvme_errors_total` | NVMe read and write failures. | Any increase. |
 | `selene_nvme_bytes_total`, `selene_nvme_seconds_total` | Durable bytes written and disk time. | Disk time growing faster than bytes. |
 | `selene_memory_allocated_bytes`, `selene_staging_allocated_bytes` | Arena and staging in use. | Near `--memory` / `--staging`. |
-| `selene_nvme_reserved_bytes` | Rounded reservations in force. | Near `--nvme`: DRAM eviction stops. |
+| `selene_nvme_reserved_bytes`, `selene_nvme_reserved_peak_bytes` | What `--nvme` bounds, now and its high-water mark since start: every record's envelope and file (or arena extent and envelope), what each unfinished put will leave on disk, and the staging hold of each unfinished streamed put. Never above `--nvme`. Windows leased for claims and exports are not in it; `selene_staging_allocated_bytes` shows them with the holds, and `--staging` bounds them. | Near `--nvme`: puts are refused `BUDGET` and DRAM eviction stops. |
 | `selene_evictions_total`, `selene_compactions_total` | DRAM evictions and row compactions. | Hot set not staying resident. |
 | `selene_hits_total{namespace,tier}`, `selene_records{namespace,tier}`, `selene_bytes{namespace,tier}` | Hits and inventory of the manager's own records. | Hit rate collapse. |
 
