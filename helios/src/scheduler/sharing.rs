@@ -2,7 +2,7 @@
 //! chain of a GPU checkpoint, and the read-only headroom check for pinning it.
 
 use super::*;
-use crate::offload::{ExportChain, ExportNode};
+use crate::offload::{ExportChain, ExportNode, ExportRefusal};
 
 /// A checkpoint that left the GPU cache, reported at logical removal.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,16 +20,6 @@ pub struct NextAdmission {
     pub prompt_tokens: usize,
     pub max_new_tokens: u32,
     pub growable: bool,
-}
-
-/// What a lookup by key and generation found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExportLookup {
-    Found(CheckpointId),
-    /// No GPU-ready checkpoint holds the key.
-    Missing,
-    /// The key is held by a different checkpoint than the requested generation.
-    Changed,
 }
 
 impl RequestScheduler {
@@ -108,11 +98,15 @@ impl RequestScheduler {
         std::mem::take(&mut self.evictions_lost)
     }
 
-    pub fn checkpoint_by_generation(&self, key: &PrefixKey, generation: u64) -> ExportLookup {
+    pub fn checkpoint_by_generation(
+        &self,
+        key: &PrefixKey,
+        generation: u64,
+    ) -> std::result::Result<CheckpointId, ExportRefusal> {
         match self.cache.ready_by_prefix(key) {
-            None => ExportLookup::Missing,
-            Some(id) if id.value() == generation => ExportLookup::Found(id),
-            Some(_) => ExportLookup::Changed,
+            None => Err(ExportRefusal::NotFound),
+            Some(id) if id.value() == generation => Ok(id),
+            Some(_) => Err(ExportRefusal::GenerationChanged),
         }
     }
 
@@ -410,17 +404,14 @@ mod tests {
         let pending = publish(&mut s, &h, Some(a), 128, &[1], 9);
         let key = s.cache.checkpoint(a).unwrap().prefix();
         let pending_key = s.cache.checkpoint(pending).unwrap().prefix();
-        assert_eq!(
-            s.checkpoint_by_generation(&key, a.value()),
-            ExportLookup::Found(a)
-        );
+        assert_eq!(s.checkpoint_by_generation(&key, a.value()), Ok(a));
         assert_eq!(
             s.checkpoint_by_generation(&key, a.value() + 1),
-            ExportLookup::Changed
+            Err(ExportRefusal::GenerationChanged)
         );
         assert_eq!(
             s.checkpoint_by_generation(&pending_key, pending.value()),
-            ExportLookup::Missing
+            Err(ExportRefusal::NotFound)
         );
     }
 

@@ -54,7 +54,6 @@ pub trait PoolPort {
     fn ranking(&self) -> crate::characterize::Ranking;
     fn set_ranking(&self, ranking: crate::characterize::Ranking);
     fn observe_restore(&self, level: Level, pages: usize, elapsed: Duration);
-    fn topology(&self) -> crate::characterize::Topology;
     fn saved(&self, entry: IndexEntry);
     fn evicted(&self, key: PrefixKey, tier: Tier, generation: u64, heir: Option<IndexEntry>);
     fn evictions_lost(&self);
@@ -93,9 +92,6 @@ impl PoolPort for PoolClient {
     }
     fn observe_restore(&self, level: Level, pages: usize, elapsed: Duration) {
         PoolClient::observe_restore(self, level, pages, elapsed)
-    }
-    fn topology(&self) -> crate::characterize::Topology {
-        PoolClient::topology(self)
     }
     fn saved(&self, entry: IndexEntry) {
         PoolClient::saved(self, entry)
@@ -221,7 +217,7 @@ pub struct PooledStore<S: HostStore, P: PoolPort = PoolClient> {
     /// Records lookup answers showed in a host tier of the pool, with when.
     held: HashMap<PrefixKey, (Level, Instant)>,
     characterizer: Option<Characterizer>,
-    characterized_for: Option<crate::characterize::Topology>,
+    characterized: bool,
     /// What the synthetic probe records are keyed by: the model and, once connected, this instance.
     probe_model: [u8; 32],
     /// Restores that were wholly from the pool, which the local tiers did not count.
@@ -307,7 +303,7 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             cascade: Cascade::new(layout),
             held: HashMap::new(),
             characterizer: Characterizer::new(PROBE_PAGES, None).ok(),
-            characterized_for: None,
+            characterized: false,
             probe_model,
             pool_fetched: 0,
             pool_fetch_failed: 0,
@@ -330,7 +326,7 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
 
     /// Whether the startup probe has not yet run.
     pub fn needs_characterization(&self) -> bool {
-        self.characterized_for.is_none()
+        !self.characterized
     }
 
     /// Measure the cost of each copy level end to end and rank them, if the
@@ -345,7 +341,6 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
             .characterizer
             .take()
             .ok_or_else(|| Error::new("the characterizer could not be built"))?;
-        let topology = PoolPort::topology(&self.pool);
         let measured = {
             let mut probe = StoreProbe {
                 inner: &mut self.inner,
@@ -357,14 +352,14 @@ impl<S: HostStore, P: PoolPort> PooledStore<S, P> {
                 row_bytes: self.row_record_bytes as usize,
                 stash: &mut self.pool_events,
             };
-            characterizer.update(topology, &mut probe)
+            characterizer.update(&mut probe)
         };
         let line = measured.then(|| {
             PoolPort::set_ranking(&self.pool, characterizer.ranking().clone());
             characterizer.ranking().log_line()
         });
         self.characterizer = Some(characterizer);
-        self.characterized_for = Some(topology);
+        self.characterized = true;
         Ok(line)
     }
 
@@ -1228,7 +1223,6 @@ mod tests {
     #[derive(Default)]
     struct PoolState {
         ranking: Option<Ranking>,
-        topology: u64,
         /// Serve the probe record at this level, as a manager would.
         manager_level: Option<Level>,
         host_pinned: Vec<ExportId>,
@@ -1332,9 +1326,6 @@ mod tests {
             let mut ranking = self.ranking();
             ranking.observe(level, pages, elapsed);
             self.set_ranking(ranking);
-        }
-        fn topology(&self) -> crate::characterize::Topology {
-            crate::characterize::Topology(self.0.lock().unwrap().topology)
         }
         fn evictions_lost(&self) {
             self.0.lock().unwrap().lost += 1;
@@ -2101,9 +2092,8 @@ mod tests {
     }
 
     #[test]
-    fn levels_are_probed_only_at_startup_even_when_the_topology_changes() {
+    fn levels_are_probed_only_at_startup() {
         let mut rig = rig();
-        rig.pool.lock().unwrap().topology = 5;
         // Own DRAM is slow here; the manager serves host NVMe quickly.
         rig.local.0.lock().unwrap().probe = Some((Local::Memory, 500));
         rig.pool.lock().unwrap().manager_level = Some(Level::HostNvme);
@@ -2126,8 +2116,7 @@ mod tests {
         // Nothing moved: nothing is measured again.
         assert!(!rig.store.needs_characterization());
         assert!(rig.store.characterize(&scratch()).unwrap().is_none());
-        // A different manager or link does not trigger another probe.
-        rig.pool.lock().unwrap().topology = 6;
+        // Another call after startup does not trigger another probe.
         assert!(!rig.store.needs_characterization());
         assert!(rig.store.characterize(&scratch()).unwrap().is_none());
         // The pool's events that were not the probe's are kept for the worker.
@@ -2139,7 +2128,6 @@ mod tests {
      {
         let local = FakeLocal::default();
         let pool = Arc::new(Mutex::new(PoolState::default()));
-        pool.lock().unwrap().topology = 1;
         let ranking = Ranking::default();
         let order = [
             Level::RemoteNvme,

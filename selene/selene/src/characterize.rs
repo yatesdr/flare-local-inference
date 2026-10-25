@@ -323,7 +323,7 @@ fn join(levels: &[Level]) -> String {
 pub struct Characterizer {
     pages: Pages,
     pinned: Option<[Level; 5]>,
-    topology: Option<Topology>,
+    measured: bool,
     ranking: Ranking,
 }
 
@@ -340,7 +340,7 @@ impl Characterizer {
         Ok(Self {
             pages,
             pinned,
-            topology: None,
+            measured: false,
             ranking,
         })
     }
@@ -351,8 +351,8 @@ impl Characterizer {
 
     /// Measure and rank on the first call only. Returns whether it measured; the caller logs
     /// [`Ranking::log_line`].
-    pub fn update(&mut self, topology: Topology, probe: &mut dyn Probe) -> bool {
-        if self.topology.is_some() {
+    pub fn update(&mut self, probe: &mut dyn Probe) -> bool {
+        if self.measured {
             return false;
         }
         let mut measured = [Measured::default(); 5];
@@ -366,7 +366,7 @@ impl Characterizer {
             pages: self.pages,
             observed: Default::default(),
         };
-        self.topology = Some(topology);
+        self.measured = true;
         true
     }
 }
@@ -503,7 +503,7 @@ mod tests {
 
     fn measured(script: &mut Script) -> Ranking {
         let mut characterizer = Characterizer::new(PAGES, None).unwrap();
-        assert!(characterizer.update(Topology(1), script));
+        assert!(characterizer.update(script));
         characterizer.ranking().clone()
     }
 
@@ -765,7 +765,7 @@ mod tests {
         }
         let mut characterizer = Characterizer::new(PAGES, None).unwrap();
         let mut probe = FailTypical(std::mem::take(&mut script));
-        characterizer.update(Topology(1), &mut probe);
+        characterizer.update(&mut probe);
         let ranking = characterizer.ranking();
         assert!(ranking.measured(NeighbourGpu).small.is_some());
         assert_eq!(ranking.us_per_page(NeighbourGpu), None);
@@ -783,7 +783,7 @@ mod tests {
             (RemoteNvme, 4.0),
         ]);
         let mut characterizer = Characterizer::new(PAGES, Some(pinned.clone())).unwrap();
-        characterizer.update(Topology(1), &mut script);
+        characterizer.update(&mut script);
         assert_eq!(characterizer.ranking().order().to_vec(), pinned);
         assert_eq!(characterizer.ranking().us_per_page(HostDram), Some(2.0));
         assert!(characterizer.ranking().log_line().contains("pinned"));
@@ -797,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn measures_once_even_when_the_topology_changes() {
+    fn measures_only_once() {
         let mut script = Script::fixed(&[
             (NeighbourGpu, 1.0),
             (HostDram, 1.0),
@@ -805,11 +805,11 @@ mod tests {
             (RemoteNvme, 1.0),
         ]);
         let mut characterizer = Characterizer::new(PAGES, None).unwrap();
-        assert!(characterizer.update(Topology(1), &mut script));
+        assert!(characterizer.update(&mut script));
         let calls = script.calls.len();
-        assert!(!characterizer.update(Topology(1), &mut script));
+        assert!(!characterizer.update(&mut script));
         assert_eq!(script.calls.len(), calls);
-        assert!(!characterizer.update(Topology(2), &mut script));
+        assert!(!characterizer.update(&mut script));
         assert_eq!(script.calls.len(), calls);
     }
 

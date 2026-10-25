@@ -1,4 +1,4 @@
-use crate::{CacheGeometry, Layout, geometry};
+use crate::{CacheGeometry, geometry};
 
 /// The manager an instance shares prefix checkpoints with, and the tenant that
 /// scopes what it may see.
@@ -20,7 +20,7 @@ pub fn parse_pool_address(text: &str) -> std::result::Result<String, String> {
     pool_address(text).map(|_| text.to_owned())
 }
 
-pub fn pool_address(text: &str) -> std::result::Result<crate::pool::PoolAddress, String> {
+pub(super) fn pool_address(text: &str) -> std::result::Result<crate::pool::PoolAddress, String> {
     use crate::pool::PoolAddress;
     let invalid =
         || format!("invalid pool address '{text}': use unix:PATH, HOST:PORT or plain:HOST:PORT");
@@ -76,38 +76,25 @@ pub fn parse_pool_tenant(text: &str) -> std::result::Result<String, String> {
 }
 
 /// What a pool shares: the tenant, the model and the record layout.
-pub fn pool_scope(
+pub(super) fn pool_scope(
     tenant: &str,
     identity: [u8; 32],
     geometry: &[CacheGeometry],
 ) -> crate::Result<crate::pool::Scope> {
-    let layout = Layout::new(geometry)?;
-    Ok(crate::pool::Scope {
-        tenant: tenant.to_owned(),
-        model_identity: identity,
-        layout_fingerprint: geometry::fingerprint(geometry),
-        geometry: crate::pool::Geometry {
-            page_tokens: layout.page_tokens,
-            ranks: geometry
-                .iter()
-                .map(|rank| crate::pool::RankPlanes {
-                    plane_bytes: rank
-                        .planes
-                        .iter()
-                        .map(|plane| plane.padded_bytes())
-                        .collect(),
-                    row_bytes: rank.row.padded_bytes(),
-                })
-                .collect(),
-            page_record_bytes: layout.page_record_bytes,
-            row_record_bytes: layout.row_record_bytes,
-        },
-    })
+    let mut scope =
+        crate::pool::Scope::new(tenant, identity, geometry::fingerprint(geometry), geometry)?;
+    for rank in &mut scope.geometry.ranks {
+        for bytes in rank.plane_bytes.iter_mut().chain([&mut rank.row_bytes]) {
+            *bytes = bytes.div_ceil(geometry::BLOCK_BYTES) * geometry::BLOCK_BYTES;
+        }
+    }
+    Ok(scope)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Layout;
     #[test]
     fn pool_addresses_select_the_explicit_transport() {
         use crate::pool::PoolAddress;

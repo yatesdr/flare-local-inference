@@ -1,7 +1,7 @@
 //! Attach a pool before the host allocates its final cache storage.
 use super::{
-    AgentConfig, Budget, DeferredRecords, PlannedRegion, PoolClient, PoolConfig, PoolOptions,
-    PoolPeers, PooledStore, RankAgent, RankSet, RegisteredRegion, pool_address, pool_scope,
+    AgentConfig, Budget, DeferredRecords, PoolClient, PoolConfig, PoolOptions, PoolPeers,
+    PooledStore, RankAgent, RankSet, RegisteredRegion, pool_address, pool_scope,
 };
 use crate::{
     CacheGeometry, HostRegistrar, HostStore, Layout, Registration, Result, SharedCopier,
@@ -127,15 +127,7 @@ impl PoolBuilder<'_> {
             // Finish attachment before caches consume its startup allowance.
             prepared.close()?;
         }
-        let plan: Vec<_> = prepared
-            .registered_regions()
-            .iter()
-            .map(|region| PlannedRegion {
-                name: region.name,
-                bytes: region.bytes as u64,
-            })
-            .collect();
-        let (host, device) = Budget::costs(&plan)?;
+        let (host, device) = prepared.registration_costs()?;
         let charges = Budget {
             host: Ok(0),
             devices,
@@ -146,7 +138,22 @@ impl PoolBuilder<'_> {
 }
 
 impl PreparedPool {
-    pub fn registered_regions(&self) -> &[RegisteredRegion] {
+    fn registration_costs(&self) -> Result<(u64, u64)> {
+        Ok(Budget::costs(
+            self.registered_regions()
+                .iter()
+                .map(|region| region.bytes as u64),
+        )?)
+    }
+    pub fn summary(&self) -> Result<String> {
+        let (host, device) = self.registration_costs()?;
+        Ok(if self.approved() {
+            format!("{host} host bytes · {device} device bytes per GPU")
+        } else {
+            "local tiers only".into()
+        })
+    }
+    fn registered_regions(&self) -> &[RegisteredRegion] {
         match (&self.client, &self.agent) {
             (Some(client), _) => client.registered_regions(),
             (_, Some(agent)) => agent.registered_regions(),
