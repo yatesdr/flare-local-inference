@@ -22,7 +22,8 @@ use super::{
     engine::{Ended, Engine, PROTOCOL},
     net::{self, Dial},
     shared::PoolStatus,
-    shm::Regions,
+    shm::{Attachment, Regions},
+    startup::{RegisteredRegion, Startup},
     wire::{self, client_message::M as Out, server_message::M as In},
 };
 
@@ -33,6 +34,8 @@ pub(crate) struct Link {
     pub roots: net::Roots,
     pub wake: Arc<Notify>,
     pub stop: Arc<AtomicBool>,
+    /// The registration window `PoolClient::start` waits on.
+    pub startup: Arc<Startup>,
 }
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(3);
@@ -118,7 +121,10 @@ pub(crate) fn run(mut engine: Engine, link: Link) -> Result<()> {
         .enable_all()
         .build()
         .map_err(|e| Error::caused_by("cannot start the pool runtime", e))?;
-    runtime.block_on(serve(&mut engine, &link))
+    let result = runtime.block_on(serve(&mut engine, &link));
+    // Whatever ended the thread, `start` must not keep waiting for it.
+    link.startup.close();
+    result
 }
 
 async fn serve(engine: &mut Engine, link: &Link) -> Result<()> {
@@ -128,9 +134,16 @@ async fn serve(engine: &mut Engine, link: &Link) -> Result<()> {
         if link.stop.load(Ordering::SeqCst) {
             break;
         }
+        if never_attaching(engine, link) {
+            // `PoolClient::start` gave up and said so: stay on the local tiers.
+            engine.shared.fail_lookups();
+            idle_until_stop(engine, link).await;
+            break;
+        }
         let started = Instant::now();
         match attempt(engine, link).await {
             Attempt::Disabled(reason) => {
+                link.startup.close();
                 eprintln!("warning: {reason}");
                 engine.shared.set_status(PoolStatus::Disabled(reason));
                 engine.shared.fail_lookups();
@@ -395,7 +408,15 @@ fn topology_of(hello: &wire::HelloReply, shared_memory: bool) -> u64 {
     hasher.finish() | 1
 }
 
+/// The startup window closed with the client unattached, so it never will be.
+fn never_attaching(engine: &Engine, link: &Link) -> bool {
+    engine.attachment.is_none() && link.startup.is_closed()
+}
+
 async fn attempt(engine: &mut Engine, link: &Link) -> Attempt {
+    if never_attaching(engine, link) {
+        return Attempt::Ended;
+    }
     engine.shared.set_status(PoolStatus::Connecting);
     // Stopping interrupts connecting; once a session is open the engine owns it.
     let established = tokio::select! {
@@ -457,43 +478,9 @@ async fn establish(engine: &mut Engine, link: &Link) -> std::result::Result<Esta
     if let Err(reason) = check_hello(&hello, connected_with) {
         return Err(Attempt::Disabled(reason));
     }
-    let regions = match hello.shared_memory.as_ref() {
-        Some(shared) => match map_regions(engine, shared) {
-            Ok(regions) => Some(Arc::new(regions)),
-            Err(error) => {
-                eprintln!(
-                    "warning: cannot use the pool's shared memory ({error}); restores and exports are off"
-                );
-                None
-            }
-        },
-        None => None,
-    };
-    // Without shared memory, windows pass through this process's own staging and the
-    // manager's data channel, if it offers one.
-    let dial = match (&regions, &link.address) {
-        (None, PoolAddress::Tcp(address) | PoolAddress::TcpPlaintext(address))
-            if !hello.data_transports.is_empty() =>
-        {
-            match net_dial(
-                engine,
-                link,
-                address,
-                limits_or_default(hello.limits),
-                hello
-                    .data_transports
-                    .contains(&(wire::DataTransport::Rdma as i32)),
-            ) {
-                Ok(dial) => Some(dial),
-                Err(error) => {
-                    eprintln!(
-                        "warning: cannot use the pool's data channel ({error}); restores and puts are off"
-                    );
-                    None
-                }
-            }
-        }
-        _ => None,
+    let (regions, dial) = match attach(engine, link, &hello) {
+        Ok(memory) => memory,
+        Err(attempt) => return Err(attempt),
     };
     let st = engine.st.clone();
     let (tx, rx) = mpsc::channel::<wire::ClientMessage>(OUTBOUND);
@@ -597,8 +584,128 @@ fn net_dial(
     }))
 }
 
-fn map_regions(engine: &Engine, shared: &wire::SharedMemory) -> Result<Regions> {
-    let mut regions = Regions::map(shared)?;
+/// What this connection copies through: the manager's shared regions, this process's own
+/// data-channel staging, or nothing.
+///
+/// The first connect decides, and registers what it needs while registration is open. Every
+/// later connect must find what the first attached to: the same shared files continue with the
+/// existing registrations; different ones turn the pool off, since they cannot be registered now.
+fn attach(
+    engine: &mut Engine,
+    link: &Link,
+    hello: &wire::HelloReply,
+) -> std::result::Result<(Option<Arc<Regions>>, Option<Arc<dyn Dial>>), Attempt> {
+    let limits = limits_or_default(hello.limits);
+    let rdma_offered = hello
+        .data_transports
+        .contains(&(wire::DataTransport::Rdma as i32));
+    let network = match &link.address {
+        PoolAddress::Tcp(address) | PoolAddress::TcpPlaintext(address)
+            if !hello.data_transports.is_empty() =>
+        {
+            Some(address)
+        }
+        _ => None,
+    };
+    let dial = |engine: &mut Engine, address: &String| match net_dial(
+        engine,
+        link,
+        address,
+        limits.clone(),
+        rdma_offered,
+    ) {
+        Ok(dial) => Some(dial),
+        Err(error) => {
+            eprintln!(
+                "warning: cannot use the pool's data channel ({error}); restores and puts are off"
+            );
+            None
+        }
+    };
+    match &engine.attachment {
+        Some(Attachment::Shm { shared, regions }) => {
+            let regions = regions.clone();
+            match hello.shared_memory.as_ref() {
+                Some(now) if now == shared => Ok((Some(regions), None)),
+                other => Err(Attempt::Disabled(regions_changed(shared, other))),
+            }
+        }
+        Some(Attachment::Net) => Ok((None, network.and_then(|address| dial(engine, address)))),
+        Some(Attachment::Nothing) => Ok((None, None)),
+        None => {
+            // The first connect: the only time anything is registered.
+            if !link.startup.begin() {
+                return Err(Attempt::Ended);
+            }
+            let mut registered = Vec::new();
+            let (attachment, regions, net) = match hello.shared_memory.as_ref() {
+                Some(shared) => match Regions::map(shared)
+                    .and_then(|regions| register_regions(engine, regions))
+                {
+                    Ok(regions) => {
+                        let regions = Arc::new(regions);
+                        registered.push(registered_region("arena", &regions.arena));
+                        registered.push(registered_region("staging", &regions.staging));
+                        (
+                            Attachment::Shm {
+                                shared: shared.clone(),
+                                regions: regions.clone(),
+                            },
+                            Some(regions),
+                            None,
+                        )
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "warning: cannot use the pool's shared memory ({error}); restores and exports are off"
+                        );
+                        (Attachment::Nothing, None, None)
+                    }
+                },
+                // Without shared memory, windows pass through this process's own staging and the
+                // manager's data channel, if it offers one.
+                None => match network.and_then(|address| dial(engine, address)) {
+                    Some(dial) => {
+                        if let Some(staging) = &engine.net {
+                            registered.push(registered_region("data-staging", staging.region()));
+                        }
+                        (Attachment::Net, None, Some(dial))
+                    }
+                    None => (Attachment::Nothing, None, None),
+                },
+            };
+            engine.attachment = Some(attachment);
+            engine.close_registration();
+            link.startup.done(registered);
+            Ok((regions, net))
+        }
+    }
+}
+
+fn registered_region(name: &'static str, region: &super::shm::Region) -> RegisteredRegion {
+    RegisteredRegion {
+        name,
+        address: region.base(),
+        bytes: region.len(),
+    }
+}
+
+/// Why the manager's shared files no longer are the ones this process registered.
+fn regions_changed(registered: &wire::SharedMemory, now: Option<&wire::SharedMemory>) -> String {
+    let what = match now {
+        None => "no longer offers shared memory".to_string(),
+        Some(now) if now.regions_generation != registered.regions_generation => format!(
+            "recreated its shared memory (generation {:016x}, was {:016x})",
+            now.regions_generation, registered.regions_generation
+        ),
+        Some(_) => "moved its shared memory".to_string(),
+    };
+    format!(
+        "the pool manager {what}; this instance registered the old regions at startup and cannot register others, so it uses its local tiers only until it is restarted"
+    )
+}
+
+fn register_regions(engine: &Engine, mut regions: Regions) -> Result<Regions> {
     let registrar = engine.registrar();
     regions.arena.register(registrar, engine.st.context)?;
     regions.staging.register(registrar, engine.st.context)?;

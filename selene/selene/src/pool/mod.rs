@@ -24,6 +24,7 @@ mod probe;
 pub mod rdma;
 mod shared;
 mod shm;
+mod startup;
 #[cfg(test)]
 mod smoke_tests;
 mod store;
@@ -35,7 +36,7 @@ pub(crate) mod wire {
 mod types;
 
 pub use announce::{Announcer, IndexEntry, Notice, Snapshot};
-pub use client::{PoolAddress, PoolClient, PoolConfig};
+pub use client::{PoolAddress, PoolClient, PoolConfig, STARTUP_WAIT};
 pub use exporter::{Checksums, HostChain, HostPin, HostRecord, HostWindow, PutBytes};
 pub use identity::{Geometry, RankPlanes, Scope, instance_id, process_nonce, scope_id};
 pub use lookup::{Answer, LookupState, LookupTicket};
@@ -44,6 +45,7 @@ pub use shared::{
     ExportRequest, FetchFailure, FetchPart, PoolEvent, PoolFetch, PoolStatus, PutOutcome,
     PutRefusal, PutRequest, PutSource,
 };
+pub use startup::RegisteredRegion;
 pub use store::{PoolPort, PooledStore};
 pub use tiers::{Releases, TierView};
 pub use types::{HeldRange, PoolCandidate, SourceRef, Tier};
