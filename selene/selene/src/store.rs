@@ -129,8 +129,6 @@ pub enum StoreEvent {
     },
     /// The copy-in for an inbound ticket finished; the worker reports it to the scheduler.
     Fetched { key: PrefixKey, result: Result<u64> },
-    /// No copy still reads the GPU checkpoint; retry its publication after progress.
-    Deferred { checkpoint: CheckpointId },
     /// A manager asked this instance to export a GPU checkpoint. The worker
     /// answers with `export_pinned` or `export_refused` in the same iteration.
     ExportRequested {
@@ -233,8 +231,7 @@ pub enum Retirement {
 /// A host tier the model worker drives without waiting on it.
 ///
 /// `store` and `fetch` enqueue work and return. `poll` reports completions.
-/// The worker pins queued copy-outs until Stored or Deferred, retaining only
-/// checkpoint IDs for retries. Ticket IDs belong to the scheduler until Fetched.
+/// The worker pins queued copy-outs until Stored. Ticket IDs belong to the scheduler until Fetched.
 ///
 /// A store whose transfers can no longer be trusted reports the failure from
 /// `poll` and stops producing events. The worker then stops, so ids and pins

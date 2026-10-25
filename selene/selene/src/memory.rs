@@ -782,8 +782,10 @@ impl Core {
                 let result = match self.start_record(&checkpoint, parent, tail, true) {
                     Ok(true) => continue,
                     Ok(false) => {
-                        events.push(StoreEvent::Deferred {
+                        events.push(StoreEvent::Stored {
                             checkpoint: checkpoint.id,
+                            key: checkpoint.key,
+                            result: Err(invalid("no room for the deferred record")),
                         });
                         finished.push(checkpoint.key);
                         continue;
@@ -2274,10 +2276,10 @@ mod tests {
             matches!(&events[0], StoreEvent::Stored { key, result: Ok(_), .. } if *key == root.key)
         );
         assert!(
-            matches!(&events[1], StoreEvent::Deferred { checkpoint } if *checkpoint == child.id)
+            matches!(&events[1], StoreEvent::Stored { checkpoint, result: Err(_), .. } if *checkpoint == child.id)
         );
         assert!(
-            matches!(&events[2], StoreEvent::Deferred { checkpoint } if *checkpoint == grandchild.id)
+            matches!(&events[2], StoreEvent::Stored { checkpoint, result: Err(_), .. } if *checkpoint == grandchild.id)
         );
         assert!(core.deferred.is_empty());
         assert!(core.outbound.is_empty());

@@ -466,7 +466,11 @@ impl CompositeStore {
             Ok(None) => {
                 self.remove_copy(key);
                 self.stats.store_skipped += 1;
-                events.push(StoreEvent::Deferred { checkpoint });
+                events.push(StoreEvent::Stored {
+                    checkpoint,
+                    key,
+                    result: Err(invalid("no room for the record on disk")),
+                });
                 return;
             }
             Err(error) => {
@@ -2022,7 +2026,7 @@ mod tests {
         let (_, big_bytes) = copy_landed(&mut small, &big, None, 2);
         small.memory_stored(big.id, big.key, Ok(big_bytes), &mut events);
         assert!(
-            matches!(&events[..], [StoreEvent::Deferred { checkpoint }] if *checkpoint == big.id)
+            matches!(&events[..], [StoreEvent::Stored { checkpoint, result: Err(_), .. }] if *checkpoint == big.id)
         );
         events.clear();
         assert!(!small.memory.index().contains(&big.key));
@@ -2846,7 +2850,7 @@ mod tests {
         store.memory_stored(wanted.id, wanted.key, Ok(bytes), &mut landed_events);
         assert!(matches!(
             landed_events.as_slice(),
-            [StoreEvent::Deferred { .. }]
+            [StoreEvent::Stored { result: Err(_), .. }]
         ));
         store.poll(&mut events).unwrap();
         let retiring = store.take_retiring();

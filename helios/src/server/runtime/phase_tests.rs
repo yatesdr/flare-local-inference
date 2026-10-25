@@ -3611,100 +3611,6 @@ fn zero_output_budget_requires_prompt_scoring_at_both_admission_checks() {
 }
 
 #[test]
-fn publication_retries_wait_for_progress_and_pin_only_admitted_copies() {
-    use crate::offload::{StoreOutcome, StoreReason};
-    let mut fixture = Fixture::new();
-    fixture.config.limits.snapshots = 1;
-    let (_sender, receiver) = mpsc::channel();
-    let mut worker = fixture.worker(receiver);
-    let mut store = FakeStore::new(None);
-    store
-        .store_outcomes
-        .push_back(StoreOutcome::Retry(StoreReason::Slabs));
-    worker.attach_store(Some(Box::new(store)));
-    let spec = RequestSpec {
-        prompt: vec![0; 70],
-        message_boundaries: vec![],
-        conditioning: vec![],
-        max_new_tokens: 1,
-        grammar_constrained: false,
-        host_stops: false,
-        prompt_logprobs: false,
-        growable_output: true,
-    };
-    let plan = worker.scheduler.plan_admission(&spec).unwrap();
-    let key = plan.history().key_at(64).unwrap();
-    let admitted = worker
-        .scheduler
-        .admit_planned(
-            spec.clone(),
-            plan,
-            Some(crate::scheduler::InboundRequest {
-                key,
-                consumed_tokens: 64,
-                pages: 1,
-            }),
-        )
-        .unwrap();
-    worker.scheduler.finish_inbound(key, true).unwrap();
-    let id = worker
-        .scheduler
-        .request(admitted.handle)
-        .unwrap()
-        .prefix()
-        .unwrap();
-    assert!(worker.service_store().unwrap());
-    assert_eq!(worker.deferred_stores, [id]);
-    assert_eq!(
-        worker.scheduler.cache().checkpoint(id).unwrap().pin_count(),
-        1
-    );
-    assert!(!worker.service_store().unwrap());
-    assert_eq!(fake_store(&mut worker).stored.len(), 1);
-    fake_store(&mut worker).progress += 1;
-    assert!(worker.service_store().unwrap());
-    assert!(worker.deferred_stores.is_empty());
-    assert_eq!(fake_store(&mut worker).stored.len(), 2);
-    assert_eq!(
-        worker.scheduler.cache().checkpoint(id).unwrap().pin_count(),
-        2
-    );
-    assert_eq!(
-        fixture.metrics.host_retry_success.load(Ordering::Relaxed),
-        1
-    );
-    fake_store(&mut worker)
-        .events
-        .push_back(crate::offload::StoreEvent::Deferred { checkpoint: id });
-    worker.service_store().unwrap();
-    assert_eq!(worker.deferred_stores, [id]);
-    worker.scheduler.cancel(admitted.handle).unwrap();
-    let mut other = spec;
-    other.prompt.fill(1);
-    let plan = worker.scheduler.plan_admission(&other).unwrap();
-    let key = plan.history().key_at(64).unwrap();
-    worker
-        .scheduler
-        .admit_planned(
-            other,
-            plan,
-            Some(crate::scheduler::InboundRequest {
-                key,
-                consumed_tokens: 64,
-                pages: 1,
-            }),
-        )
-        .unwrap();
-    assert!(worker.scheduler.cache().checkpoint(id).is_err());
-    worker.service_store().unwrap();
-    assert!(worker.deferred_stores.is_empty());
-    assert_eq!(
-        fixture.metrics.host_retry_abandoned.load(Ordering::Relaxed),
-        1
-    );
-}
-
-#[test]
 fn completed_copyout_retries_capacity_waiters_without_a_new_model_fence() {
     let mut fixture = Fixture::new();
     fixture.config.limits.pages = 2;
@@ -3860,7 +3766,6 @@ fn noted_publications_remain_dirty_without_pins_or_copies_when_there_is_room() {
                 .unwrap()
                 .host_clean()
         );
-        assert!(worker.deferred_stores.is_empty());
         assert_eq!(fake_store(&mut worker).stored.len(), 1);
         assert!(!worker.service_store().unwrap());
         assert!(fake_store(&mut worker).write_backs.is_empty());

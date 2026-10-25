@@ -870,11 +870,9 @@ struct Worker<'a> {
     inputs: Option<crate::model::Inputs>,
     queue_capacity: usize,
     store: Option<Box<dyn crate::offload::PrefixStore>>,
-    deferred_stores: Vec<crate::cache::CheckpointId>,
     /// The checkpoint each served export pins, until its `ExportEnded`: the only
     /// place an export's pin is released.
     exports: HashMap<crate::offload::ExportId, crate::cache::CheckpointId>,
-    store_progress: u64,
     pool_characterized: bool,
     /// Prefill tokens per second measured from completed prefill frames, which
     /// the host-store fetch policy compares with transfer time.
@@ -904,9 +902,7 @@ impl<'a> Worker<'a> {
             receiver,
             queue_capacity,
             store: None,
-            deferred_stores: Vec::new(),
             exports: HashMap::new(),
-            store_progress: 0,
             pool_characterized: false,
             pending: VecDeque::with_capacity(queue_capacity),
             parked: VecDeque::new(),
@@ -2072,13 +2068,6 @@ impl<'a> Worker<'a> {
                     self.scheduler.unpin_checkpoint(checkpoint)?;
                     released = true;
                 }
-                StoreEvent::Deferred { checkpoint } => {
-                    self.scheduler.unpin_checkpoint(checkpoint)?;
-                    released = true;
-                    if !self.deferred_stores.contains(&checkpoint) {
-                        self.deferred_stores.push(checkpoint);
-                    }
-                }
                 StoreEvent::Fetched { key, result } => {
                     requeued.extend(self.scheduler.finish_inbound(key, result.is_ok())?);
                 }
@@ -2126,56 +2115,17 @@ impl<'a> Worker<'a> {
                 incoming.blocked = None;
             }
         }
-        let current_progress = store.stats().progress;
-        let retry = current_progress != self.store_progress;
-        self.store_progress = current_progress;
-        let mut publications = self.scheduler.take_publications();
-        let retry_ids = self.deferred_stores.clone();
-        let mut waiting = Vec::new();
-        for id in self.deferred_stores.drain(..) {
-            if let Some(publication) = self.scheduler.publication(id) {
-                if retry {
-                    publications.push(publication);
-                } else {
-                    waiting.push(id);
-                }
-            } else {
-                self.metrics
-                    .host_retry_abandoned
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        for publication in publications {
+        for publication in self.scheduler.take_publications() {
             progress = true;
-            let outcome = store.store(&publication);
-            if let Ok(outcome) = outcome {
+            if let Ok(outcome) = store.store(&publication) {
                 self.metrics.host_store_outcome(outcome);
                 self.scheduler.store_outcome(publication.id, outcome)?;
-                if matches!(outcome, StoreOutcome::Retry(_)) {
-                    if !waiting.contains(&publication.id) {
-                        waiting.push(publication.id);
-                    }
-                    continue;
-                }
-                if retry_ids.contains(&publication.id) {
-                    let counter = if outcome == StoreOutcome::Oversize {
-                        &self.metrics.host_retry_abandoned
-                    } else {
-                        &self.metrics.host_retry_success
-                    };
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
-            } else if retry_ids.contains(&publication.id) {
-                self.metrics
-                    .host_retry_abandoned
-                    .fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.deferred_stores = waiting;
         let next = next_admission(&self.scheduler, &self.parked, &self.pending);
         for id in self.scheduler.write_back_candidates(next) {
             // Like exports, copy-outs must leave the next admission and decode room.
-            if !self.scheduler.export_fits(id, next) || self.deferred_stores.contains(&id) {
+            if !self.scheduler.export_fits(id, next) {
                 continue;
             }
             let Some(publication) = self.scheduler.publication(id) else {
