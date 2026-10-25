@@ -6,6 +6,7 @@ mod policy;
 mod refresh;
 mod service;
 mod sharing;
+pub(crate) use sharing::WriteBackCache;
 mod utility;
 #[cfg(feature = "server")]
 pub(crate) use cost::observed_duration_ns;

@@ -1278,6 +1278,8 @@ impl MemoryStore {
 }
 
 impl HostStore for MemoryStore {
+    fn has_copy(&self, key: PrefixKey) -> bool { self.core.index.complete(&key) }
+
     fn write_back_reserve(&self, largest_pages: usize, prefill_rate: f64) -> usize {
         crate::store::write_back_reserve(
             largest_pages,

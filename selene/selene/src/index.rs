@@ -384,7 +384,32 @@ impl<L> Index<L> {
     }
 
     pub fn complete(&self, key: &PrefixKey) -> bool {
-        self.chain(key, 0, &|node| node.ready).is_some()
+        self.complete_with(key, &|node| node.ready)
+    }
+
+    pub(crate) fn complete_with(
+        &self,
+        key: &PrefixKey,
+        usable: &impl Fn(&Node<L>) -> bool,
+    ) -> bool {
+        let Some(endpoint) = self.nodes.get(key).filter(|node| node.row) else {
+            return false;
+        };
+        let mut node = endpoint;
+        let mut pages = 0;
+        loop {
+            if !usable(node) {
+                return false;
+            }
+            pages += node.tail_pages;
+            match node.parent {
+                None => return pages as u64 == key.consumed_tokens / self.page_tokens,
+                Some(parent) => match self.nodes.get(&parent) {
+                    Some(parent) => node = parent,
+                    None => return false,
+                },
+            }
+        }
     }
 
     fn chain(
@@ -604,6 +629,26 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn a_retained_checkpoint_requires_its_row_and_every_ancestor() {
+        let mut index = Index::new(64);
+        let full = history(256);
+        let root = full.key_at(64).unwrap();
+        let leaf = full.key_at(192).unwrap();
+        insert(&mut index, &full, 64, None);
+        insert(&mut index, &full, 192, Some(64));
+        assert!(index.complete(&leaf));
+        index.set_ready(&root, false).unwrap();
+        assert!(!index.complete(&leaf));
+        assert!(index.complete_with(&leaf, &|_| true));
+        index.set_ready(&root, true).unwrap();
+        index.nodes.get_mut(&leaf).unwrap().row = false;
+        assert!(!index.complete(&leaf));
+        index.nodes.get_mut(&leaf).unwrap().row = true;
+        index.remove(&leaf).unwrap();
+        assert!(!index.complete(&leaf));
     }
 
     #[test]
