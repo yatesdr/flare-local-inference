@@ -1225,7 +1225,6 @@ fn fatal_broadcast_preserves_first_failure_and_reaches_pending_and_ingress() {
 struct FakeStore {
     hit: Option<crate::offload::HostHit>,
     reject_fetch: bool,
-    store_outcomes: VecDeque<crate::offload::StoreOutcome>,
     write_back_outcomes: VecDeque<crate::offload::StoreOutcome>,
     write_backs: Vec<crate::offload::PublishedCheckpoint>,
     progress: u64,
@@ -1265,7 +1264,6 @@ impl FakeStore {
         Self {
             hit,
             reject_fetch: false,
-            store_outcomes: VecDeque::new(),
             write_back_outcomes: VecDeque::new(),
             write_backs: Vec::new(),
             progress: 0,
@@ -1368,15 +1366,12 @@ impl crate::offload::PrefixStore for FakeStore {
                 && hit.consumed_tokens < before
         })
     }
-    fn store(
+    fn published(
         &mut self,
         checkpoint: &crate::offload::PublishedCheckpoint,
-    ) -> flare_selene::Result<crate::offload::StoreOutcome> {
+    ) -> flare_selene::Result<()> {
         self.stored.push(checkpoint.clone());
-        Ok(self
-            .store_outcomes
-            .pop_front()
-            .unwrap_or(crate::offload::StoreOutcome::Queued))
+        Ok(())
     }
     fn write_back(
         &mut self,
@@ -1638,7 +1633,7 @@ fn host_hit_holds_the_request_inbound_until_the_restore_completes() {
         (RequestPhase::Restore, 1)
     );
     let restored = live.prefix().unwrap();
-    // Polling the restore publishes it and admits its copy-out in the same pass.
+    // Polling the restore publishes it without an eager copy-out.
     assert_eq!(fake_store(&mut worker).stored.len(), 1);
     let publication = fake_store(&mut worker).stored[0].clone();
     assert_eq!(
@@ -1650,32 +1645,8 @@ fn host_hit_holds_the_request_inbound_until_the_restore_completes() {
         (restored, 1, 1)
     );
     assert_eq!(publication.key, history.key_at(70).unwrap());
-    assert_eq!(
-        worker
-            .scheduler
-            .cache()
-            .checkpoint(restored)
-            .unwrap()
-            .pin_count(),
-        2
-    );
-    fake_store(&mut worker)
-        .events
-        .push_back(crate::offload::StoreEvent::Stored {
-            checkpoint: restored,
-            key: publication.key,
-            result: Ok(1 << 20),
-        });
-    assert!(worker.service_store().unwrap());
-    assert_eq!(
-        worker
-            .scheduler
-            .cache()
-            .checkpoint(restored)
-            .unwrap()
-            .pin_count(),
-        1
-    );
+    assert_eq!(pins(&worker, restored), 1);
+    assert!(fake_store(&mut worker).write_backs.is_empty());
     advance(&mut worker, GraphKind::Restore, 1, None);
     advance(&mut worker, GraphKind::Resume, 2, Some(1));
     assert_eq!(
@@ -1875,17 +1846,12 @@ fn an_export_without_an_end_keeps_its_pin() {
     store
         .events
         .push_back(export_request(1, key, id.value(), 0));
-    store.events.push_back(crate::offload::StoreEvent::Stored {
-        checkpoint: id,
-        key,
-        result: Ok(1 << 20),
-    });
     worker.service_store().unwrap();
     worker.retire(&[handle]).unwrap();
     for _ in 0..3 {
         worker.service_store().unwrap();
     }
-    // The request's and the copy-out's pins are gone; the export's remains.
+    // The request's pin is gone; the export's remains.
     assert_eq!(pins(&worker, id), 1);
     assert_eq!(worker.exports.len(), 1);
 }
@@ -1980,18 +1946,9 @@ fn pooled_and_local_stores_hear_of_evictions() {
         let mut fixture = Fixture::new();
         fixture.config.limits.pages = 3;
         fixture.config.limits.max_sequence_tokens = 192;
-        let (mut worker, _sender, handle, id, key) = worker_with_checkpoint(&fixture, pooled);
-        // Release the request's and the copy-out's pins so the checkpoint can be evicted.
+        let (mut worker, _sender, handle, _id, key) = worker_with_checkpoint(&fixture, pooled);
         worker.retire(&[handle]).unwrap();
         let publication = fake_store(&mut worker).stored[0].clone();
-        fake_store(&mut worker)
-            .events
-            .push_back(crate::offload::StoreEvent::Stored {
-                checkpoint: id,
-                key,
-                result: Ok(1 << 20),
-            });
-        worker.service_store().unwrap();
         let (queued, generation) = fixture.incoming(vec![9; 150], 4);
         std::mem::forget(generation);
         worker.pending.push_back(queued);
@@ -3494,6 +3451,9 @@ fn completed_copyout_retries_capacity_waiters_without_a_new_model_fence() {
     let publication = fake_store(&mut worker).stored[0].clone();
     worker.scheduler.cancel(handle).unwrap();
     worker.active[0] = None;
+    fake_store(&mut worker).write_back_outcomes.push_back(crate::offload::StoreOutcome::Queued);
+    worker.service_store().unwrap();
+    assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
     let (incoming, _other_generation) = fixture.incoming(vec![1; 64], 1);
     sender.send(vec![incoming]).unwrap();
     assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
@@ -3604,7 +3564,7 @@ fn complete_store(worker: &mut Worker<'_>, id: crate::cache::CheckpointId, succe
 }
 
 #[test]
-fn noted_publications_remain_dirty_without_pins_or_copies_when_there_is_room() {
+fn publications_remain_dirty_without_pins_or_copies_when_there_is_room() {
     for pooled in [false, true] {
         let mut fixture = Fixture::new();
         fixture.config.limits.pages = 256;
@@ -3612,9 +3572,6 @@ fn noted_publications_remain_dirty_without_pins_or_copies_when_there_is_room() {
         let mut worker = fixture.worker(receiver);
         let mut store = FakeStore::new(None);
         store.pooled = pooled;
-        store
-            .store_outcomes
-            .push_back(crate::offload::StoreOutcome::Noted);
         worker.attach_store(Some(Box::new(store)));
         let id = unpinned_checkpoint(&mut worker, 0, 64);
         worker.service_store().unwrap();
@@ -3634,13 +3591,15 @@ fn noted_publications_remain_dirty_without_pins_or_copies_when_there_is_room() {
 }
 
 #[test]
-fn queued_publications_release_one_pin_and_only_success_marks_them_clean() {
+fn queued_write_backs_release_one_pin_and_only_success_marks_them_clean() {
     for success in [false, true] {
         let mut fixture = Fixture::new();
-        fixture.config.limits.pages = 256;
+        fixture.config.limits.pages = 128;
         let (_sender, receiver) = mpsc::channel();
         let mut worker = fixture.worker(receiver);
-        worker.attach_store(Some(Box::new(FakeStore::new(None))));
+        let mut store = FakeStore::new(None);
+        store.write_back_outcomes.push_back(crate::offload::StoreOutcome::Queued);
+        worker.attach_store(Some(Box::new(store)));
         let id = unpinned_checkpoint(&mut worker, 0, 64);
         worker.service_store().unwrap();
         assert_eq!(pins(&worker, id), 1);
@@ -3678,7 +3637,6 @@ fn pressure_writes_cold_dirty_checkpoints_and_retry_stops_each_round() {
         let mut worker = fixture.worker(receiver);
         let mut store = FakeStore::new(None);
         store.pooled = pooled;
-        store.store_outcomes.extend([Noted; 3]);
         store
             .write_back_outcomes
             .extend([Queued, Retry(StoreReason::Queue)]);
@@ -3734,7 +3692,6 @@ fn write_back_does_not_take_capacity_from_the_next_admission() {
     let (_sender, receiver) = mpsc::channel();
     let mut worker = fixture.worker(receiver);
     let mut store = FakeStore::new(None);
-    store.store_outcomes.push_back(Noted);
     store.write_back_outcomes.push_back(Queued);
     worker.attach_store(Some(Box::new(store)));
     let id = unpinned_checkpoint(&mut worker, 0, 64);
@@ -3759,7 +3716,6 @@ fn admission_proceeds_while_a_write_back_copy_is_in_flight() {
     let (_sender, receiver) = mpsc::channel();
     let mut worker = fixture.worker(receiver);
     let mut store = FakeStore::new(None);
-    store.store_outcomes.push_back(Noted);
     store.write_back_outcomes.push_back(Queued);
     worker.attach_store(Some(Box::new(store)));
     let id = unpinned_checkpoint(&mut worker, 0, 64);
@@ -3785,7 +3741,6 @@ fn write_back_and_export_release_their_own_pins_in_either_completion_order() {
         let mut worker = fixture.worker(receiver);
         let mut store = FakeStore::new(None);
         store.pooled = true;
-        store.store_outcomes.push_back(Noted);
         store.write_back_outcomes.push_back(Queued);
         worker.attach_store(Some(Box::new(store)));
         let id = unpinned_checkpoint(&mut worker, 0, 64);
@@ -3832,7 +3787,6 @@ fn write_back_pins_survive_ancestor_compaction() {
     let (_sender, receiver) = mpsc::channel();
     let mut worker = fixture.worker(receiver);
     let mut store = FakeStore::new(None);
-    store.store_outcomes.extend([Noted; 2]);
     worker.attach_store(Some(Box::new(store)));
     let a = unpinned_checkpoint(&mut worker, 0, 64);
     let b = unpinned_checkpoint(&mut worker, 0, 128);
@@ -3892,7 +3846,6 @@ fn present_stops_write_back_when_clean_reclamation_covers_the_watermark() {
     let (_sender, receiver) = mpsc::channel();
     let mut worker = fixture.worker(receiver);
     let mut store = FakeStore::new(None);
-    store.store_outcomes.extend([Noted; 3]);
     store.write_back_outcomes.push_back(Present);
     worker.attach_store(Some(Box::new(store)));
     let a = unpinned_checkpoint(&mut worker, 0, 64);
@@ -3909,13 +3862,13 @@ fn present_stops_write_back_when_clean_reclamation_covers_the_watermark() {
 }
 
 #[test]
-fn present_at_publication_marks_clean_without_a_pin_or_write_back() {
+fn a_present_write_back_marks_clean_without_a_pin() {
     let fixture = Fixture::new();
     let (_sender, receiver) = mpsc::channel();
     let mut worker = fixture.worker(receiver);
     let mut store = FakeStore::new(None);
     store
-        .store_outcomes
+        .write_back_outcomes
         .push_back(crate::offload::StoreOutcome::Present);
     worker.attach_store(Some(Box::new(store)));
     let id = unpinned_checkpoint(&mut worker, 0, 64);
@@ -3929,5 +3882,5 @@ fn present_at_publication_marks_clean_without_a_pin_or_write_back() {
             .unwrap()
             .host_clean()
     );
-    assert!(fake_store(&mut worker).write_backs.is_empty());
+    assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
 }

@@ -188,10 +188,7 @@ fn over_budget_startup_registers_nothing_and_serves_local_only() {
             tail_pages: 2,
             slot: flare_selene::StateSlotId(1),
         };
-        assert!(matches!(
-            store.store(&checkpoint).unwrap(),
-            super::super::StoreOutcome::Noted
-        ));
+        store.published(&checkpoint).unwrap();
         store.close().unwrap();
     }
 }

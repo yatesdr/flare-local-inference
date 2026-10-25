@@ -261,7 +261,7 @@ fn a_store_dropped_while_its_records_are_being_hashed_frees_no_slab_under_the_ha
 fn a_publication_is_noted_and_the_memory_copy_waits_for_write_back() {
     let mut rig = rig(8);
     let checkpoint = rig.publish(3, 100);
-    assert_eq!(rig.store.store(&checkpoint).unwrap(), StoreOutcome::Noted);
+    rig.store.published(&checkpoint).unwrap();
     assert!(rig.poll().is_empty());
     assert_eq!(rig.store.stats().outbound_in_flight, 0);
     assert!(rig.store.lookup(&rig.history, 0, u64::MAX).is_none());

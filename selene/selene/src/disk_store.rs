@@ -2319,12 +2319,6 @@ impl HostStore for DiskStore {
         Some(self.hit(chain))
     }
 
-    /// A publication is only noted: the worker asks for the copy with
-    /// `write_back` when it expects to evict the checkpoint.
-    fn store(&mut self, _checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
-        Ok(StoreOutcome::Noted)
-    }
-
     fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
         if let Some(outcome) = self.store_status(checkpoint)? {
             self.stats.store_skipped += 1;
@@ -5058,7 +5052,7 @@ mod tests {
         let full = history(1000);
         let mut ids = Ids::new();
         let publication = checkpoint(&mut ids, &full, 128, None, pages(0..2), 2, StateSlotId(1));
-        assert_eq!(store.store(&publication).unwrap(), StoreOutcome::Noted);
+        store.published(&publication).unwrap();
         assert!(log.borrow().calls.is_empty());
         assert!(store.index.is_empty());
         assert_eq!(

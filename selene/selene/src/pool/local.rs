@@ -29,10 +29,10 @@ impl HostStore for Tiers {
         self.0.as_mut()?.lookup(history, resident, before)
     }
 
-    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> crate::Result<StoreOutcome> {
+    fn published(&mut self, checkpoint: &PublishedCheckpoint) -> crate::Result<()> {
         match &mut self.0 {
-            Some(tiers) => tiers.store(checkpoint),
-            None => Ok(StoreOutcome::Present),
+            Some(tiers) => tiers.published(checkpoint),
+            None => Ok(()),
         }
     }
 

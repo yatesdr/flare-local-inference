@@ -68,7 +68,7 @@ impl HostStore for FakeLocal {
             .clone()
             .filter(|hit| hit.resident_tokens == resident && hit.consumed_tokens < before)
     }
-    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+    fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
         let mut state = self.0.lock().unwrap();
         state.stored.push(checkpoint.key);
         Ok(state.store_outcome.unwrap_or(StoreOutcome::Queued))
@@ -599,7 +599,7 @@ fn gpu_publications_are_announced_and_their_evictions_reported() {
         slot: StateSlotId(1),
     };
     // Publishing announces the GPU holding and copies nothing.
-    assert_eq!(rig.store.store(&checkpoint).unwrap(), StoreOutcome::Noted);
+    rig.store.published(&checkpoint).unwrap();
     assert!(rig.copies().is_empty());
     let saved = rig.pool.lock().unwrap().saved.clone();
     assert_eq!(saved.len(), 1);
@@ -1017,7 +1017,7 @@ impl Rig {
 fn a_publication_is_noted_and_announced_and_copies_nothing_until_written_back() {
     let mut rig = rig();
     let checkpoint = rig.publication(800);
-    assert_eq!(rig.store.store(&checkpoint).unwrap(), StoreOutcome::Noted);
+    rig.store.published(&checkpoint).unwrap();
     assert!(rig.copies().is_empty());
     assert_eq!(rig.announced_on_gpu(), 1);
     assert_eq!(

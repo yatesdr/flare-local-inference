@@ -511,7 +511,7 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
         inner.and(pool)
     }
 
-    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+    fn published(&mut self, checkpoint: &PublishedCheckpoint) -> Result<()> {
         // The publication is announced as a GPU holding, so neighbours can
         // claim it; copying it to a host tier waits for `write_back`.
         PoolPort::saved(
@@ -527,7 +527,7 @@ impl<S: HostStore, P: PoolPort> HostStore for PooledStore<S, P> {
                     + self.row_record_bytes,
             },
         );
-        Ok(StoreOutcome::Noted)
+        Ok(())
     }
 
     fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
