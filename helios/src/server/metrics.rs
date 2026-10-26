@@ -254,6 +254,8 @@ pub(super) struct Metrics {
     host_row_refills: AtomicU64,
     host_lookup_outcomes: [AtomicU64; 5],
     host_store_reasons: [AtomicU64; 6],
+    pub(super) host_retry_success: AtomicU64,
+    pub(super) host_retry_abandoned: AtomicU64,
     host_cost_sums: [AtomicU64; 3],
     host_missing_tokens: [AtomicU64; 8],
     host_transfer_ns: [AtomicU64; 8],
@@ -824,6 +826,16 @@ impl Metrics {
                 "host_cache_row_refills_total",
                 "Compacted endpoints restored by complete record replacement.",
                 &self.host_row_refills,
+            ),
+            (
+                "host_cache_retry_success_total",
+                "Deferred publications admitted or found present after resource progress.",
+                &self.host_retry_success,
+            ),
+            (
+                "host_cache_retry_abandoned_total",
+                "Deferred publications abandoned after eviction or permanent refusal.",
+                &self.host_retry_abandoned,
             ),
             (
                 "host_cache_stored_total",

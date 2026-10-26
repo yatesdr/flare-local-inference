@@ -137,11 +137,6 @@ impl RequestScheduler {
             .sum()
     }
 
-    pub(crate) fn largest_admission_pages(&self) -> usize {
-        self.admission_pages(self.limits.max_sequence_tokens - 1, 1, true, 0)
-            .min(self.limits.pages as usize)
-    }
-
     /// Whether pinning `id` for an export still leaves room for every running
     /// decode's next step and for `next`, the request admission would take:
     /// the supply is free storage, storage awaiting retirement fences, and
@@ -164,53 +159,3 @@ impl RequestScheduler {
 
 #[cfg(test)]
 mod tests;
-
-/// The scheduler supplies geometry and pins; Selene decides which records to retain.
-pub(crate) struct WriteBackCache<'a> {
-    pub scheduler: &'a mut RequestScheduler,
-    pub next: Option<NextAdmission>,
-}
-impl flare_selene::writeback::Cache for WriteBackCache<'_> {
-    fn supply(&self) -> flare_selene::writeback::Supply {
-        let scheduler = &self.scheduler;
-        flare_selene::writeback::Supply {
-            free: scheduler.free_pages.len(),
-            demand: scheduler.decode_growth_pages()
-                + self.next.map_or(0, |next| {
-                    scheduler.admission_pages(
-                        next.prompt_tokens,
-                        next.max_new_tokens,
-                        next.growable,
-                        0,
-                    )
-                }),
-            largest_admission: scheduler.largest_admission_pages(),
-        }
-    }
-    fn projected(&self, retained: &dyn Fn(PrefixKey) -> bool) -> usize {
-        let (backing, _) = self.scheduler.pending_backing(
-            &self
-                .scheduler
-                .cache
-                .reclaimable_where(&|key| retained(*key)),
-        );
-        backing.into_iter().filter(|free| *free).count()
-    }
-    fn candidates(&self) -> Vec<CheckpointId> {
-        self.scheduler.cache.coldest_unpinned()
-    }
-    fn publication(&self, id: CheckpointId) -> Option<PublishedCheckpoint> {
-        self.scheduler.publication(id)
-    }
-    fn resident(&self, id: CheckpointId) -> bool {
-        self.scheduler.cache.checkpoint(id).is_ok()
-    }
-    fn can_pin(&self, id: CheckpointId) -> bool {
-        self.scheduler.export_fits(id, self.next)
-    }
-    fn pin(&mut self, id: CheckpointId) -> flare_selene::Result<()> {
-        self.scheduler
-            .pin_checkpoint(id)
-            .map_err(|error| flare_selene::Error::new(error.to_string()))
-    }
-}

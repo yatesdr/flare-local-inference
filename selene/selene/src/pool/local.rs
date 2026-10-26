@@ -15,14 +15,6 @@ impl Tiers {
 }
 
 impl HostStore for Tiers {
-    fn has_copy(&self, key: PrefixKey) -> bool { self.0.as_ref().is_none_or(|tiers| tiers.has_copy(key)) }
-
-    fn write_back_reserve(&self, largest_pages: usize, prefill_rate: f64) -> usize {
-        self.0.as_ref().map_or(largest_pages, |tiers| {
-            tiers.write_back_reserve(largest_pages, prefill_rate)
-        })
-    }
-
     fn reused(&mut self, key: PrefixKey) {
         if let Some(tiers) = &mut self.0 {
             tiers.reused(key);
@@ -38,16 +30,9 @@ impl HostStore for Tiers {
         self.0.as_mut()?.lookup(history, resident, before)
     }
 
-    fn published(&mut self, checkpoint: &PublishedCheckpoint) -> crate::Result<()> {
+    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> crate::Result<StoreOutcome> {
         match &mut self.0 {
-            Some(tiers) => tiers.published(checkpoint),
-            None => Ok(()),
-        }
-    }
-
-    fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> crate::Result<StoreOutcome> {
-        match &mut self.0 {
-            Some(tiers) => tiers.write_back(checkpoint),
+            Some(tiers) => tiers.store(checkpoint),
             None => Ok(StoreOutcome::Present),
         }
     }

@@ -131,7 +131,7 @@ mod memory {
             slot: StateSlotId(source_slot),
         };
 
-        assert_eq!(store.write_back(&checkpoint).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
         match super::wait_event(&mut store, 60) {
             StoreEvent::Stored { result, .. } => {
                 assert_eq!(
@@ -285,7 +285,7 @@ mod memory {
             slot: StateSlotId(source_slot),
         };
 
-        assert_eq!(store.write_back(&checkpoint).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().outbound_in_flight, 1);
         match super::wait_event(&mut store, 60) {
             StoreEvent::Stored {
@@ -409,7 +409,7 @@ mod memory {
         );
 
         // The same key is already resident: no second copy-out.
-        assert_ne!(store.write_back(&checkpoint).unwrap(), StoreOutcome::Queued);
+        assert_ne!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().store_skipped, 1);
         store.close().unwrap();
         assert_eq!(store.stats().memory_records, 1);
@@ -428,7 +428,7 @@ mod memory {
             Transfers::start(&[(context, device)], geometry.clone(), &small).unwrap(),
         ));
         let mut store = MemoryStore::new(IDENTITY, small, transfers).unwrap();
-        assert_eq!(store.write_back(&checkpoint).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
         assert!(matches!(
             super::wait_event(&mut store, 60),
             StoreEvent::Stored { result: Ok(_), .. }
@@ -449,7 +449,7 @@ mod memory {
             slot: StateSlotId(target_slot),
         };
         assert_ne!(second.key, checkpoint.key);
-        assert_eq!(store.write_back(&second).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.store(&second).unwrap(), StoreOutcome::Queued);
         assert!(!store.index().contains(&checkpoint.key));
         assert!(store.index().contains(&second.key));
         assert_eq!(store.pool().free_pages(), 0);
@@ -479,7 +479,7 @@ mod memory {
             tail_pages: 3,
             slot: StateSlotId(target_slot),
         };
-        assert_eq!(store.write_back(&third).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.store(&third).unwrap(), StoreOutcome::Queued);
         assert!(!store.index().contains(&second.key));
         assert_eq!(store.stats().outbound_in_flight, 1);
         store.close().unwrap();
@@ -671,13 +671,13 @@ mod composite {
                 slot: StateSlotId(2 + pair * 2),
             };
             let mut events = Vec::new();
-            assert_eq!(store.write_back(&root).unwrap(), StoreOutcome::Queued);
+            assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
             if wait_for_root_copy {
                 drain(&mut store, &mut events, &|store| {
                     store.stats().bytes_out > 0 && store.memory().record(&root.key).is_some()
                 });
             }
-            assert_eq!(store.write_back(&child).unwrap(), StoreOutcome::Queued);
+            assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
             drain(&mut store, &mut events, &|store| {
                 store.outbound_records() == 0
             });
@@ -780,7 +780,7 @@ mod composite {
         };
         let mut events = Vec::new();
         for checkpoint in [&root, &child, &grandchild] {
-            assert_eq!(store.write_back(checkpoint).unwrap(), StoreOutcome::Queued);
+            assert_eq!(store.store(checkpoint).unwrap(), StoreOutcome::Queued);
             drain(&mut store, &mut events, &|store| {
                 store.outbound_records() == 0
             });
@@ -1017,7 +1017,7 @@ mod composite {
             }
         }
         let store_and_land = |store: &mut CompositeStore, checkpoint: &PublishedCheckpoint| {
-            assert_eq!(store.write_back(checkpoint).unwrap(), StoreOutcome::Queued);
+            assert_eq!(store.store(checkpoint).unwrap(), StoreOutcome::Queued);
             match super::wait_event(store, 120) {
                 StoreEvent::Stored {
                     checkpoint: id,
@@ -1171,7 +1171,7 @@ mod composite {
         let fourth = &checkpoints[3];
         let blocked = directory.join(record::temporary_name(&fourth.key));
         fs::create_dir(&blocked).unwrap();
-        assert_eq!(store.write_back(fourth).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.store(fourth).unwrap(), StoreOutcome::Queued);
         match super::wait_event(&mut store, 120) {
             StoreEvent::Stored { key, result, .. } => {
                 assert_eq!(key, fourth.key);
@@ -1281,8 +1281,8 @@ mod composite {
             3,
             source_slot,
         );
-        assert_eq!(store.write_back(&short).unwrap(), StoreOutcome::Queued);
-        assert_eq!(store.write_back(&large).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.store(&short).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.store(&large).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.outbound_records(), 1);
         assert_eq!(store.disk().stats().outbound_in_flight, 1);
         assert_eq!(store.memory().pool().free_pages(), 0);
@@ -1533,7 +1533,7 @@ mod disk_store {
 
         assert!(scan(&record::DirectoryLock::acquire(&directory).unwrap()).is_empty());
         let mut store = open(Vec::new(), 1 << 40);
-        assert_eq!(store.write_back(&root).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().outbound_in_flight, 1);
         let StoreEvent::Stored {
             checkpoint: stored,
@@ -1689,7 +1689,7 @@ mod disk_store {
             EXTRA as usize,
             child_slot,
         );
-        assert_eq!(store.write_back(&child).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
         let StoreEvent::Stored { key, result, .. } = super::wait_event(&mut store, 120) else {
             panic!("expected a Stored event");
         };
@@ -1779,7 +1779,7 @@ mod disk_store {
             0,
             child_slot,
         );
-        assert_ne!(store.write_back(&grandchild).unwrap(), StoreOutcome::Queued);
+        assert_ne!(store.store(&grandchild).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().store_skipped, 1);
         assert!(store.record(&grandchild.key).is_none());
         let node = store.index().node(&root.key).unwrap();

@@ -10,7 +10,7 @@ impl HostStore for Hooks {
     fn lookup(&mut self, _: &dyn crate::History, _: u64, _: u64) -> Option<HostHit> {
         None
     }
-    fn write_back(&mut self, _: &PublishedCheckpoint) -> crate::Result<StoreOutcome> {
+    fn store(&mut self, _: &PublishedCheckpoint) -> crate::Result<StoreOutcome> {
         Ok(StoreOutcome::Present)
     }
 

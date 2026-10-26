@@ -1308,53 +1308,6 @@ fn speculative_every_committed_prefix_updates_counts_and_tokens_once() {
 }
 
 #[test]
-fn write_back_headroom_counts_two_queued_speculative_rounds() {
-    use flare_selene::writeback::Cache;
-
-    for page_tokens in [64, 128, 256] {
-        let mut s = scheduler_with_geometry(1, 64, 4, page_tokens, 4);
-        s.enable_speculation(&[1, 2, 4, 8]).unwrap();
-        s.fixed_speculative_width(Some(8)).unwrap();
-        let prompt = 2 * page_tokens - 20;
-        let mut request = spec(prompt, 128);
-        request.growable_output = true;
-        let handle = s.admit(request).unwrap();
-        init(&mut s, 1);
-        let prefill = s.plan().unwrap();
-        assert_eq!(prefill.kind, GraphKind::Prefill);
-        s.commit(&prefill, Fence(2)).unwrap();
-        s.complete(
-            Fence(2),
-            &records(handle, 2, prompt as i64, 1, 900, 1),
-            Default::default(),
-        ).unwrap();
-        retain_prompt(&mut s, 3);
-        for fence in [4, 5] {
-            let step = s.plan().unwrap();
-            assert_eq!((step.kind, step.token_capacity), (GraphKind::Speculative, 8));
-            s.commit(&step, Fence(fence)).unwrap();
-        }
-        assert_eq!(s.submissions.len(), 2);
-        assert_eq!(s.request(handle).unwrap().consumed_tokens, prompt as u64);
-        assert_eq!(s.request(handle).unwrap().scheduled_consumed, (prompt + 16) as u64);
-
-        // Release unused reservations to expose the demand beyond the queued work.
-        let reserved = std::mem::take(&mut s.request_mut(handle).unwrap().reserved_pages);
-        s.free_pages.extend(reserved);
-        let mut cache = sharing::WriteBackCache { scheduler: &mut s, next: None };
-        let supply = cache.supply();
-        assert_eq!(supply.demand, 1, "page_tokens={page_tokens}");
-        assert_eq!(supply.largest_admission, 2048 / page_tokens + 1);
-        cache.next = Some(sharing::NextAdmission {
-            prompt_tokens: page_tokens,
-            max_new_tokens: 1,
-            growable: true,
-        });
-        assert_eq!(cache.supply().demand, 4, "page_tokens={page_tokens}");
-    }
-}
-
-#[test]
 fn speculative_rounds_allow_lookahead_and_use_actual_counts() {
     let (mut s, h) = speculative_scheduler(65, 32);
     let first = s.plan().unwrap();

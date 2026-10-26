@@ -12,7 +12,7 @@
 //! A checkpoint whose parent's copy-out is still in flight is held back until
 //! that copy-out finishes, then stored as the parent's child, or as a root
 //! record holding its whole chain when the parent's copy-out failed. A
-//! held-back checkpoint that cannot start fails with an event and releases
+//! held-back checkpoint that cannot start reports Deferred and releases
 //! the checkpoints held back behind it the same way. Index edges therefore
 //! only ever point at ready records, so a failed copy-out can always remove
 //! its node, and a parent is pinned while its child's slabs are allocated so
@@ -774,10 +774,8 @@ impl Core {
                 let result = match self.start_record(&checkpoint, parent, tail, true) {
                     Ok(true) => continue,
                     Ok(false) => {
-                        events.push(StoreEvent::Stored {
+                        events.push(StoreEvent::Deferred {
                             checkpoint: checkpoint.id,
-                            key: checkpoint.key,
-                            result: Err(invalid("no room for the deferred record")),
                         });
                         finished.push(checkpoint.key);
                         continue;
@@ -1287,22 +1285,6 @@ impl MemoryStore {
 }
 
 impl HostStore for MemoryStore {
-    fn has_copy(&self, key: PrefixKey) -> bool { self.core.index.complete(&key) }
-
-    fn write_back_reserve(&self, largest_pages: usize, prefill_rate: f64) -> usize {
-        crate::store::write_back_reserve(
-            largest_pages,
-            &self.core.layout,
-            self.core.outbound_rate.0,
-            prefill_rate,
-        )
-        .min(if self.core.pool.row_count() == 0 {
-            0
-        } else {
-            self.core.pool.page_count()
-        })
-    }
-
     fn reused(&mut self, key: PrefixKey) {
         self.core.reused(&key);
     }
@@ -1311,7 +1293,7 @@ impl HostStore for MemoryStore {
         self.core.lookup(history, resident, before)
     }
 
-    fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
         if self.core.copying_out(&checkpoint.key) {
             self.core.stats.store_skipped += 1;
             return Ok(StoreOutcome::Retry(StoreReason::Inflight));
@@ -1550,28 +1532,13 @@ mod tests {
     }
 
     #[test]
-    fn reserve_fits_page_and_row_capacity() {
-        let geometry = [crate::testing::geometry(64, &[("kv", 4096)], 4096)];
-        let (copier, _) = crate::testing::SimulatedGpu::shared(&geometry).unwrap();
-        let pool = SlabPool::new(4096, 2, 4096, 1, true).unwrap();
-        let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
-        assert_eq!(store.write_back_reserve(1024, 1e9), 2);
-        store.close().unwrap();
-        let (copier, _) = crate::testing::SimulatedGpu::shared(&geometry).unwrap();
-        let pool = SlabPool::new(4096, 2, 4096, 0, true).unwrap();
-        let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
-        assert_eq!(store.write_back_reserve(1024, 1e9), 0);
-        store.close().unwrap();
-    }
-
-    #[test]
     fn releasing_a_host_pin_notifies_capacity_waiters() {
         let geometry = [crate::testing::geometry(64, &[("kv", PAGE)], ROW)];
         let (copier, _) = crate::testing::SimulatedGpu::shared(&geometry).unwrap();
         let pool = SlabPool::new(PAGE, 1, ROW, 1, true).unwrap();
         let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
         let checkpoint = published(&history(64, 1), 64, None, 0, 1);
-        assert_eq!(store.write_back(&checkpoint).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
         let mut events = Vec::new();
         store.poll(&mut events).unwrap();
         store.pin_record(&checkpoint.key).unwrap();
@@ -1580,6 +1547,58 @@ mod tests {
         store.unpin_record(&checkpoint.key).unwrap();
         assert!(store.stats().progress > progress);
         assert_eq!(store.reclaimable_slabs(), (1, 1));
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn published_prompt_copy_survives_reply_and_gpu_storage_reuse() {
+        let geometry = [crate::testing::geometry(64, &[("kv", PAGE)], ROW)];
+        let (copier, gpu) = crate::testing::SimulatedGpu::shared(&geometry).unwrap();
+        let pool = SlabPool::new(PAGE, 2, ROW, 2, true).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
+        let full = history(128, 1);
+        let prompt = published(&full, 64, None, 0, 1);
+        let reply = published(&full, 128, Some(64), 0, 2);
+        gpu.pages.lock().unwrap().insert(0, vec![3; PAGE as usize]);
+        gpu.rows.lock().unwrap().insert(1, vec![17; ROW as usize]);
+        assert_eq!(store.store(&prompt).unwrap(), StoreOutcome::Queued);
+        let mut events = Vec::new();
+        store.poll(&mut events).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [StoreEvent::Stored { result: Ok(_), .. }]
+        ));
+        gpu.pages.lock().unwrap().insert(1, vec![4; PAGE as usize]);
+        gpu.rows.lock().unwrap().insert(2, vec![18; ROW as usize]);
+        assert_eq!(store.store(&reply).unwrap(), StoreOutcome::Queued);
+        events.clear();
+        store.poll(&mut events).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [StoreEvent::Stored { result: Ok(_), .. }]
+        ));
+        gpu.pages.lock().unwrap().insert(0, vec![99; PAGE as usize]);
+        gpu.rows.lock().unwrap().insert(1, vec![99; ROW as usize]);
+        let hit = store.lookup(&full, 0, 128).unwrap();
+        assert_eq!(hit.key, prompt.key);
+        store
+            .fetch(
+                hit,
+                InboundTicket {
+                    key: prompt.key,
+                    pages: vec![PageId(10)],
+                    slot: StateSlotId(3),
+                },
+            )
+            .unwrap();
+        events.clear();
+        store.poll(&mut events).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [StoreEvent::Fetched { result: Ok(_), .. }]
+        ));
+        assert_eq!(gpu.pages.lock().unwrap()[&10], vec![3; PAGE as usize]);
+        assert_eq!(gpu.rows.lock().unwrap()[&3], vec![17; ROW as usize]);
         store.close().unwrap();
     }
 
@@ -1598,6 +1617,27 @@ mod tests {
         assert!(core.index.contains(&a.key));
         assert!(!core.index.contains(&b.key));
         finish(&mut core);
+    }
+
+    #[test]
+    fn gpu_reuse_cannot_prevent_row_compaction_or_recreate_a_host_copy() {
+        let mut core = store_core(3, 2, false);
+        let full = history(128, 1);
+        let root = published(&full, 64, None, 0, 1);
+        let child = published(&full, 128, Some(64), 0, 2);
+        let stranger = published(&history(64, 2), 64, None, 2, 3);
+        assert!(core.store(&root).unwrap());
+        finish(&mut core);
+        assert!(core.store(&child).unwrap());
+        finish(&mut core);
+        core.index.pin(&child.key).unwrap();
+        core.reused(&root.key);
+        assert!(core.store(&stranger).unwrap());
+        finish(&mut core);
+        assert!(!core.index.node(&root.key).unwrap().row);
+        core.reused(&root.key);
+        assert!(core.lookup(&full, 0, 128).is_none());
+        core.index.unpin(&child.key).unwrap();
     }
 
     #[test]
@@ -2186,10 +2226,10 @@ mod tests {
             matches!(&events[0], StoreEvent::Stored { key, result: Ok(_), .. } if *key == root.key)
         );
         assert!(
-            matches!(&events[1], StoreEvent::Stored { checkpoint, result: Err(_), .. } if *checkpoint == child.id)
+            matches!(&events[1], StoreEvent::Deferred { checkpoint } if *checkpoint == child.id)
         );
         assert!(
-            matches!(&events[2], StoreEvent::Stored { checkpoint, result: Err(_), .. } if *checkpoint == grandchild.id)
+            matches!(&events[2], StoreEvent::Deferred { checkpoint } if *checkpoint == grandchild.id)
         );
         assert!(core.deferred.is_empty());
         assert!(core.outbound.is_empty());

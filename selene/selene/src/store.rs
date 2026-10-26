@@ -114,6 +114,8 @@ pub enum StoreEvent {
         key: PrefixKey,
         result: Result<u64>,
     },
+    /// No copy still reads the GPU checkpoint; retry its publication after progress.
+    Deferred { checkpoint: CheckpointId },
     /// The copy-in for an inbound ticket finished; the worker reports it to the scheduler.
     Fetched { key: PrefixKey, result: Result<u64> },
     /// A manager asked this instance to export a GPU checkpoint. The worker
@@ -159,7 +161,7 @@ pub struct StoreStats {
     pub inbound_rate: f64,
 }
 
-/// Immediate disposition of a write-back; only Queued transfers keep a GPU pin.
+/// Immediate disposition of a publication; only Queued transfers keep a GPU pin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreOutcome {
     Queued,
@@ -204,31 +206,18 @@ pub enum Retirement {
 /// A host tier the model worker drives without waiting on it.
 ///
 /// `store` and `fetch` enqueue work and return. `poll` reports completions.
-/// The worker pins queued copy-outs until Stored. Ticket IDs belong to the scheduler until Fetched.
+/// The worker pins queued copy-outs until Stored or Deferred.
+/// Ticket IDs belong to the scheduler until Fetched.
 ///
 /// A store whose transfers can no longer be trusted reports the failure from
 /// `poll` and stops producing events. The worker then stops, so ids and pins
 /// held by transfers it cannot account for are never reused or released.
 pub trait HostStore {
-    /// A complete committed checkpoint, including its continuation row, is retained now.
-    fn has_copy(&self, _key: PrefixKey) -> bool {
-        false
-    }
-
     /// Deepest record chain extending `resident` and strictly below `before`.
     fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit>;
-    /// Announce a GPU publication. Copying it is a separate write-back request.
-    fn published(&mut self, _checkpoint: &PublishedCheckpoint) -> Result<()> {
-        Ok(())
-    }
-    /// Copy a checkpoint selected for eviction. Queued retains its GPU pin until
-    /// Stored; Present means a committed copy exists; Retry means no room now.
-    fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
-    /// Clean pages to keep ahead of pressure, including the largest admission
-    /// and pages consumed while its checkpoint copies out, capped by retention capacity.
-    fn write_back_reserve(&self, largest_pages: usize, _prefill_rate: f64) -> usize {
-        largest_pages
-    }
+    /// Copy a published checkpoint. Only Queued promises an event and retains
+    /// its GPU copy-out pin until Stored or Deferred.
+    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
     /// A request reused this GPU checkpoint: refresh any retained host record.
     fn reused(&mut self, _key: PrefixKey) {}
     /// Copy a looked-up chain into the ticket's ids. An error means no event follows.
@@ -313,19 +302,6 @@ pub(crate) trait TierStore: HostStore {
     fn retired(&mut self, _key: PrefixKey, _tier: PoolTier, _how: Retirement) {}
 }
 
-pub(crate) fn write_back_reserve(
-    largest_pages: usize,
-    layout: &crate::Layout,
-    copy_rate: f64,
-    prefill_rate: f64,
-) -> usize {
-    let bytes =
-        largest_pages as f64 * layout.page_record_bytes as f64 + layout.row_record_bytes as f64;
-    let seconds = bytes / copy_rate.max(1.0);
-    let lead = (seconds * prefill_rate / layout.page_tokens as f64).ceil() as usize;
-    largest_pages.saturating_add(lead)
-}
-
 /// Bytes per second assumed for a tier before its first transfers are measured.
 pub const INITIAL_MEMORY_RATE: f64 = 20e9;
 pub const INITIAL_STAGED_DISK_RATE: f64 = 3e9;
@@ -353,18 +329,6 @@ pub fn worth_transfer(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn clean_reserve_covers_admission_and_measured_copy_lead_including_rows() {
-        let layout =
-            crate::Layout::new(&[crate::testing::geometry(64, &[("kv", 4096)], 4096)]).unwrap();
-        // Ten pages and one row take eleven seconds at this measured rate.
-        assert_eq!(write_back_reserve(10, &layout, 4096.0, 128.0), 32);
-        assert_eq!(write_back_reserve(10, &layout, 8192.0, 128.0), 21);
-        assert_eq!(write_back_reserve(10, &layout, 4096.0, 256.0), 54);
-        assert_eq!(write_back_reserve(0, &layout, 4096.0, 128.0), 2);
-        assert_eq!(write_back_reserve(1024, &layout, 1e12, 128.0), 1025);
-    }
 
     #[test]
     fn fetch_policy_compares_transfer_time_with_half_the_prefill_time() {

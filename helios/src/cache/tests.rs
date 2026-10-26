@@ -1065,13 +1065,12 @@ fn eviction_keeps_lru_leaf_and_compaction_rules() {
     let h = history(3, 0);
     let parent = created(&mut cache, &h, &proposal(None, 64, &[0], 0, 0));
     let child = created(&mut cache, &h, &proposal(Some(parent), 128, &[1], 1, 0));
-    let clean = created(
+    let leaf = created(
         &mut cache,
         &history(1, 1000),
         &proposal(None, 64, &[2], 2, 0),
     );
     cache.pin(child).unwrap();
-    assert_eq!(cache.coldest_unpinned(), [parent, clean]);
     let target = EvictionTarget {
         pages: 0,
         snapshots: 1,
@@ -1079,8 +1078,14 @@ fn eviction_keeps_lru_leaf_and_compaction_rules() {
     // Touch the ancestor so the independent leaf is oldest.
     cache.lookup(&history(1, 0)).unwrap();
     assert_eq!(
-        cache.evict(EvictionTarget { pages: 1, snapshots: 0 }).retired[0].checkpoint,
-        clean
+        cache
+            .evict(EvictionTarget {
+                pages: 1,
+                snapshots: 0
+            })
+            .retired[0]
+            .checkpoint,
+        leaf
     );
     cache.pin(parent).unwrap();
     assert!(cache.evict(target).retired.is_empty());
@@ -1090,14 +1095,11 @@ fn eviction_keeps_lru_leaf_and_compaction_rules() {
     assert_eq!(compacted[0].heir, Some(child));
     assert_eq!(cache.page_chain(child).unwrap(), [PageId(0), PageId(1)]);
     cache.unpin(child).unwrap();
-    assert_eq!(
-        cache.reclaimable_where(&|_| true).pages,
-        [PageId(0), PageId(1)]
-    );
+    assert_eq!(cache.reclaimable(&[]).pages, [PageId(0), PageId(1)]);
 }
 
 #[test]
-fn clean_reclamation_excludes_pins_branches_and_unready_checkpoints() {
+fn reclamation_excludes_pins_branches_and_unready_checkpoints() {
     let mut cache = cache();
     let h = history(3, 0);
     let a = created(&mut cache, &h, &proposal(None, 64, &[0], 0, 0));
@@ -1111,11 +1113,11 @@ fn clean_reclamation_excludes_pins_branches_and_unready_checkpoints() {
         &proposal(None, 64, &[3], 3, 1),
     );
     cache.pin(b).unwrap();
-    let reclaimed = cache.reclaimable_where(&|_| true);
+    let reclaimed = cache.reclaimable(&[]);
     assert_eq!(reclaimed.pages, [PageId(2)]);
     assert!(reclaimed.snapshots.contains(&SnapshotId(0))); // Compacting a retains its pages in b.
     cache.unpin(b).unwrap();
-    let mut reclaimed = cache.reclaimable_where(&|_| true).pages;
+    let mut reclaimed = cache.reclaimable(&[]).pages;
     reclaimed.sort();
     assert_eq!(reclaimed, [PageId(0), PageId(1), PageId(2)]);
 }

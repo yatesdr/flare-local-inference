@@ -1226,8 +1226,7 @@ struct FakeStore {
     copies: std::collections::HashSet<crate::cache::PrefixKey>,
     hit: Option<flare_selene::HostHit>,
     reject_fetch: bool,
-    write_back_outcomes: VecDeque<flare_selene::StoreOutcome>,
-    write_backs: Vec<flare_selene::PublishedCheckpoint>,
+    store_outcomes: VecDeque<flare_selene::StoreOutcome>,
     progress: u64,
     stored: Vec<flare_selene::PublishedCheckpoint>,
     fetched: Vec<(flare_selene::HostHit, flare_selene::InboundTicket)>,
@@ -1266,8 +1265,7 @@ impl FakeStore {
             hit,
             copies: Default::default(),
             reject_fetch: false,
-            write_back_outcomes: VecDeque::new(),
-            write_backs: Vec::new(),
+            store_outcomes: VecDeque::new(),
             progress: 0,
             stored: Vec::new(),
             fetched: Vec::new(),
@@ -1293,15 +1291,6 @@ impl FakeStore {
 }
 
 impl flare_selene::HostStore for FakeStore {
-    fn has_copy(&self, key: crate::cache::PrefixKey) -> bool {
-        self.copies.contains(&key)
-    }
-
-    fn write_back_reserve(&self, largest_pages: usize, _: f64) -> usize {
-        // Lifecycle fixtures use a fixed reservoir; Selene tests exercise its sizing.
-        largest_pages.max(128)
-    }
-
     fn reused(&mut self, key: crate::cache::PrefixKey) {
         self.reused.push(key);
     }
@@ -1377,24 +1366,15 @@ impl flare_selene::HostStore for FakeStore {
                 && hit.consumed_tokens < before
         })
     }
-    fn published(
-        &mut self,
-        checkpoint: &flare_selene::PublishedCheckpoint,
-    ) -> flare_selene::Result<()> {
-        self.stored.push(checkpoint.clone());
-        Ok(())
-    }
-    fn write_back(
+    fn store(
         &mut self,
         checkpoint: &flare_selene::PublishedCheckpoint,
     ) -> flare_selene::Result<flare_selene::StoreOutcome> {
-        self.write_backs.push(checkpoint.clone());
+        self.stored.push(checkpoint.clone());
         let outcome = self
-            .write_back_outcomes
+            .store_outcomes
             .pop_front()
-            .unwrap_or(flare_selene::StoreOutcome::Retry(
-                flare_selene::StoreReason::Queue,
-            ));
+            .unwrap_or(flare_selene::StoreOutcome::Present);
         if outcome == flare_selene::StoreOutcome::Present {
             self.copies.insert(checkpoint.key);
         }
@@ -1666,7 +1646,7 @@ fn host_hit_holds_the_request_inbound_until_the_restore_completes() {
     );
     assert_eq!(publication.key, history.key_at(70).unwrap());
     assert_eq!(pins(&worker, restored), 1);
-    assert!(fake_store(&mut worker).write_backs.is_empty());
+    assert_eq!(fake_store(&mut worker).stored.len(), 1);
     advance(&mut worker, GraphKind::Restore, 1, None);
     advance(&mut worker, GraphKind::Resume, 2, Some(1));
     assert_eq!(
@@ -3467,13 +3447,15 @@ fn completed_copyout_retries_capacity_waiters_without_a_new_model_fence() {
             key: history.key_at(64).unwrap(),
             result: Ok(4096),
         });
+    fake_store(&mut worker)
+        .store_outcomes
+        .push_back(flare_selene::StoreOutcome::Queued);
     worker.service_store().unwrap();
     let publication = fake_store(&mut worker).stored[0].clone();
     worker.scheduler.cancel(handle).unwrap();
     worker.active[0] = None;
-    fake_store(&mut worker).write_back_outcomes.push_back(flare_selene::StoreOutcome::Queued);
     worker.service_store().unwrap();
-    assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
+    assert_eq!(fake_store(&mut worker).stored.len(), 1);
     let (incoming, _other_generation) = fixture.incoming(vec![1; 64], 1);
     sender.send(vec![incoming]).unwrap();
     assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
@@ -3584,34 +3566,16 @@ fn complete_store(worker: &mut Worker<'_>, id: crate::cache::CheckpointId, succe
 }
 
 #[test]
-fn publications_remain_dirty_without_pins_or_copies_when_there_is_room() {
-    for pooled in [false, true] {
-        let mut fixture = Fixture::new();
-        fixture.config.limits.pages = 256;
-        let (_sender, receiver) = mpsc::channel();
-        let mut worker = fixture.worker(receiver);
-        let mut store = FakeStore::new(None);
-        store.pooled = pooled;
-        worker.attach_store(Some(Box::new(store)));
-        let id = unpinned_checkpoint(&mut worker, 0, 64);
-        worker.service_store().unwrap();
-        assert_eq!(pins(&worker, id), 0);
-        assert!(!has_copy(&mut worker, id));
-        assert_eq!(fake_store(&mut worker).stored.len(), 1);
-        assert!(!worker.service_store().unwrap());
-        assert!(fake_store(&mut worker).write_backs.is_empty());
-    }
-}
-
-#[test]
-fn queued_write_backs_release_one_pin_and_only_success_marks_them_clean() {
+fn queued_publication_copies_release_one_pin_on_success_or_failure() {
     for success in [false, true] {
         let mut fixture = Fixture::new();
         fixture.config.limits.pages = 128;
         let (_sender, receiver) = mpsc::channel();
         let mut worker = fixture.worker(receiver);
         let mut store = FakeStore::new(None);
-        store.write_back_outcomes.push_back(flare_selene::StoreOutcome::Queued);
+        store
+            .store_outcomes
+            .push_back(flare_selene::StoreOutcome::Queued);
         worker.attach_store(Some(Box::new(store)));
         let id = unpinned_checkpoint(&mut worker, 0, 64);
         worker.service_store().unwrap();
@@ -3630,94 +3594,13 @@ fn queued_write_backs_release_one_pin_and_only_success_marks_them_clean() {
 }
 
 #[test]
-fn pressure_writes_cold_dirty_checkpoints_and_retry_stops_each_round() {
-    use flare_selene::{StoreOutcome::*, StoreReason};
-    for pooled in [false, true] {
-        let fixture = Fixture::new();
-        let (_sender, receiver) = mpsc::channel();
-        let mut worker = fixture.worker(receiver);
-        let mut store = FakeStore::new(None);
-        store.pooled = pooled;
-        store
-            .write_back_outcomes
-            .extend([Queued, Retry(StoreReason::Queue)]);
-        worker.attach_store(Some(Box::new(store)));
-        let a = unpinned_checkpoint(&mut worker, 0, 64);
-        let b = unpinned_checkpoint(&mut worker, 1, 64);
-        let c = unpinned_checkpoint(&mut worker, 2, 64);
-        worker.service_store().unwrap();
-        assert_eq!(
-            fake_store(&mut worker)
-                .write_backs
-                .iter()
-                .map(|p| p.id)
-                .collect::<Vec<_>>(),
-            [a, b]
-        );
-        assert_eq!(
-            (pins(&worker, a), pins(&worker, b), pins(&worker, c)),
-            (1, 0, 0)
-        );
-        fake_store(&mut worker)
-            .write_back_outcomes
-            .extend([Present, Queued]);
-        worker.service_store().unwrap();
-        assert_eq!(
-            fake_store(&mut worker)
-                .write_backs
-                .iter()
-                .map(|p| p.id)
-                .collect::<Vec<_>>(),
-            [a, b, b, c]
-        );
-        assert!(has_copy(&mut worker, b));
-        assert!(!has_copy(&mut worker, a));
-        complete_store(&mut worker, a, true);
-        complete_store(&mut worker, c, true);
-        worker.service_store().unwrap();
-        worker.service_store().unwrap();
-        assert_eq!(
-            (pins(&worker, a), pins(&worker, b), pins(&worker, c)),
-            (0, 0, 0)
-        );
-        assert_eq!(fake_store(&mut worker).write_backs.len(), 4);
-    }
-}
-
-#[test]
-fn write_back_does_not_take_capacity_from_the_next_admission() {
-    use flare_selene::StoreOutcome::*;
-    let mut fixture = Fixture::new();
-    fixture.config.limits.pages = 3;
-    fixture.config.limits.max_sequence_tokens = 192;
-    let (_sender, receiver) = mpsc::channel();
-    let mut worker = fixture.worker(receiver);
-    let mut store = FakeStore::new(None);
-    store.write_back_outcomes.push_back(Queued);
-    worker.attach_store(Some(Box::new(store)));
-    let id = unpinned_checkpoint(&mut worker, 0, 64);
-    let key = worker.scheduler.publication(id).unwrap().key;
-    let (incoming, generation) = fixture.incoming(vec![1; 150], 4);
-    worker.pending.push_back(incoming);
-    worker.service_store().unwrap();
-    assert!(fake_store(&mut worker).write_backs.is_empty());
-    assert_eq!(pins(&worker, id), 0);
-    let _ = worker.admit().unwrap();
-    assert_eq!(worker.scheduler.stats().active_requests, 1);
-    assert!(worker.scheduler.cache().checkpoint(id).is_err());
-    worker.service_store().unwrap();
-    assert_eq!(fake_store(&mut worker).evicted[0].0, key);
-    drop(generation);
-}
-
-#[test]
-fn admission_proceeds_while_a_write_back_copy_is_in_flight() {
+fn admission_proceeds_while_a_publication_copy_is_in_flight() {
     use flare_selene::StoreOutcome::*;
     let fixture = Fixture::new();
     let (_sender, receiver) = mpsc::channel();
     let mut worker = fixture.worker(receiver);
     let mut store = FakeStore::new(None);
-    store.write_back_outcomes.push_back(Queued);
+    store.store_outcomes.push_back(Queued);
     worker.attach_store(Some(Box::new(store)));
     let id = unpinned_checkpoint(&mut worker, 0, 64);
     worker.service_store().unwrap();
@@ -3734,7 +3617,7 @@ fn admission_proceeds_while_a_write_back_copy_is_in_flight() {
 }
 
 #[test]
-fn write_back_and_export_release_their_own_pins_in_either_completion_order() {
+fn publication_copy_and_export_release_their_own_pins_in_either_completion_order() {
     use flare_selene::StoreOutcome::*;
     for export_first in [false, true] {
         let fixture = Fixture::new();
@@ -3742,7 +3625,7 @@ fn write_back_and_export_release_their_own_pins_in_either_completion_order() {
         let mut worker = fixture.worker(receiver);
         let mut store = FakeStore::new(None);
         store.pooled = true;
-        store.write_back_outcomes.push_back(Queued);
+        store.store_outcomes.push_back(Queued);
         worker.attach_store(Some(Box::new(store)));
         let id = unpinned_checkpoint(&mut worker, 0, 64);
         worker.service_store().unwrap();
@@ -3768,12 +3651,12 @@ fn write_back_and_export_release_their_own_pins_in_either_completion_order() {
         worker.service_store().unwrap();
         assert_eq!(pins(&worker, id), 0);
         assert!(has_copy(&mut worker, id));
-        assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
+        assert_eq!(fake_store(&mut worker).stored.len(), 1);
     }
 }
 
 #[test]
-fn write_back_pins_survive_ancestor_compaction() {
+fn publication_copy_pins_survive_ancestor_compaction() {
     use flare_selene::StoreOutcome::*;
     let mut fixture = Fixture::new();
     fixture.config.limits.max_sequence_tokens = 256;
@@ -3784,14 +3667,11 @@ fn write_back_pins_survive_ancestor_compaction() {
     worker.attach_store(Some(Box::new(store)));
     let a = unpinned_checkpoint(&mut worker, 0, 64);
     let b = unpinned_checkpoint(&mut worker, 0, 128);
-    // Commit the ancestor's host copy so pressure selects the dirty child.
-    let key = worker.scheduler.cache().checkpoint(a).unwrap().prefix();
-    fake_store(&mut worker).copies.insert(key);
     fake_store(&mut worker)
-        .write_back_outcomes
-        .push_back(Queued);
+        .store_outcomes
+        .extend([Present, Queued]);
     worker.service_store().unwrap();
-    let original = fake_store(&mut worker).write_backs[0].clone();
+    let original = fake_store(&mut worker).stored[1].clone();
     assert_eq!(original.id, b);
     assert_eq!(pins(&worker, b), 1);
     let (incoming, generation) = fixture.incoming(vec![1; 70], 4);
@@ -3834,43 +3714,20 @@ fn write_back_pins_survive_ancestor_compaction() {
 }
 
 #[test]
-fn present_stops_write_back_when_clean_reclamation_covers_the_watermark() {
-    use flare_selene::StoreOutcome::*;
-    let mut fixture = Fixture::new();
-    fixture.config.limits.pages = 130;
-    let (_sender, receiver) = mpsc::channel();
-    let mut worker = fixture.worker(receiver);
-    let mut store = FakeStore::new(None);
-    store.write_back_outcomes.push_back(Present);
-    worker.attach_store(Some(Box::new(store)));
-    let a = unpinned_checkpoint(&mut worker, 0, 64);
-    let b = unpinned_checkpoint(&mut worker, 1, 64);
-    let c = unpinned_checkpoint(&mut worker, 2, 64);
-    assert_eq!(worker.scheduler.free_page_count(), 127);
-    worker.service_store().unwrap();
-    assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
-    assert!(has_copy(&mut worker, a));
-    assert!(!has_copy(&mut worker, b));
-    assert!(!has_copy(&mut worker, c));
-    assert!(!worker.service_store().unwrap());
-    assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
-}
-
-#[test]
-fn a_present_write_back_marks_clean_without_a_pin() {
+fn a_present_publication_takes_no_pin() {
     let fixture = Fixture::new();
     let (_sender, receiver) = mpsc::channel();
     let mut worker = fixture.worker(receiver);
     let mut store = FakeStore::new(None);
     store
-        .write_back_outcomes
+        .store_outcomes
         .push_back(flare_selene::StoreOutcome::Present);
     worker.attach_store(Some(Box::new(store)));
     let id = unpinned_checkpoint(&mut worker, 0, 64);
     worker.service_store().unwrap();
     assert_eq!(pins(&worker, id), 0);
     assert!(has_copy(&mut worker, id));
-    assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
+    assert_eq!(fake_store(&mut worker).stored.len(), 1);
 }
 
 fn has_copy(worker: &mut Worker<'_>, id: crate::cache::CheckpointId) -> bool {
@@ -3879,14 +3736,14 @@ fn has_copy(worker: &mut Worker<'_>, id: crate::cache::CheckpointId) -> bool {
 }
 
 #[test]
-fn losing_a_host_copy_keeps_the_gpu_checkpoint_clean() {
+fn losing_a_host_copy_does_not_recopy_a_gpu_checkpoint() {
     use flare_selene::StoreOutcome;
     for outcome in [StoreOutcome::Present, StoreOutcome::Queued] {
         let fixture = Fixture::new();
         let (_sender, receiver) = mpsc::channel();
         let mut worker = fixture.worker(receiver);
         let mut store = FakeStore::new(None);
-        store.write_back_outcomes.push_back(outcome);
+        store.store_outcomes.push_back(outcome);
         worker.attach_store(Some(Box::new(store)));
         let id = unpinned_checkpoint(&mut worker, 0, 64);
         worker.service_store().unwrap();
@@ -3898,37 +3755,83 @@ fn losing_a_host_copy_keeps_the_gpu_checkpoint_clean() {
         fake_store(&mut worker).copies.clear();
         assert!(!worker.service_store().unwrap());
         assert!(!worker.service_store().unwrap());
-        assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
+        assert_eq!(fake_store(&mut worker).stored.len(), 1);
         assert_eq!(pins(&worker, id), 0);
     }
 }
 
 #[test]
-fn write_back_waits_for_host_progress_after_capacity_shortages() {
-    use flare_selene::{StoreOutcome::*, StoreReason};
+fn publications_copy_immediately_even_without_gpu_pressure() {
     for pooled in [false, true] {
-        for reason in [StoreReason::Slabs, StoreReason::Budget] {
-            let fixture = Fixture::new();
-            let (_sender, receiver) = mpsc::channel();
-            let mut worker = fixture.worker(receiver);
-            let mut store = FakeStore::new(None);
-            store.pooled = pooled;
-            store.write_back_outcomes.extend([Retry(reason), Queued]);
-            worker.attach_store(Some(Box::new(store)));
-            let id = unpinned_checkpoint(&mut worker, 0, 64);
-            worker.service_store().unwrap();
-            assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
-            assert_eq!(pins(&worker, id), 0);
-            assert!(!worker.service_store().unwrap());
-            assert!(!worker.service_store().unwrap());
-            assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
-            fake_store(&mut worker).progress += 1;
-            assert!(worker.service_store().unwrap());
-            assert_eq!(fake_store(&mut worker).write_backs.len(), 2);
-            assert_eq!(pins(&worker, id), 1);
-            complete_store(&mut worker, id, true);
-            worker.service_store().unwrap();
-            assert_eq!(pins(&worker, id), 0);
-        }
+        let mut fixture = Fixture::new();
+        fixture.config.limits.pages = 256;
+        let (_sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        let mut store = FakeStore::new(None);
+        store.pooled = pooled;
+        store
+            .store_outcomes
+            .push_back(flare_selene::StoreOutcome::Queued);
+        worker.attach_store(Some(Box::new(store)));
+        let id = unpinned_checkpoint(&mut worker, 0, 64);
+        worker.service_store().unwrap();
+        assert_eq!(fake_store(&mut worker).stored[0].id, id);
+        assert_eq!(pins(&worker, id), 1);
+        assert!(!worker.service_store().unwrap());
+        assert_eq!(fake_store(&mut worker).stored.len(), 1);
+        complete_store(&mut worker, id, true);
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 0);
     }
+}
+
+#[test]
+fn publication_retries_wait_for_progress_and_abandon_evicted_ids() {
+    use flare_selene::{StoreOutcome::*, StoreReason};
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 2;
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store
+        .store_outcomes
+        .extend([Retry(StoreReason::Slabs), Queued]);
+    worker.attach_store(Some(Box::new(store)));
+    let id = unpinned_checkpoint(&mut worker, 0, 64);
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, id), 0);
+    assert_eq!(worker.deferred_stores, [id]);
+    assert!(!worker.service_store().unwrap());
+    assert_eq!(fake_store(&mut worker).stored.len(), 1);
+    fake_store(&mut worker).progress += 1;
+    worker.service_store().unwrap();
+    assert!(worker.deferred_stores.is_empty());
+    assert_eq!(pins(&worker, id), 1);
+    assert_eq!(
+        fixture.metrics.host_retry_success.load(Ordering::Relaxed),
+        1
+    );
+    fake_store(&mut worker)
+        .events
+        .push_back(flare_selene::StoreEvent::Deferred { checkpoint: id });
+    worker.service_store().unwrap();
+    assert_eq!(pins(&worker, id), 0);
+    assert_eq!(worker.deferred_stores, [id]);
+    let spec = RequestSpec {
+        prompt: vec![1; 70],
+        message_boundaries: vec![],
+        conditioning: vec![],
+        max_new_tokens: 1,
+        grammar_constrained: false,
+        host_stops: false,
+        prompt_logprobs: false,
+        growable_output: true,
+    };
+    worker.scheduler.admit(spec).unwrap();
+    worker.service_store().unwrap();
+    assert!(worker.deferred_stores.is_empty());
+    assert_eq!(
+        fixture.metrics.host_retry_abandoned.load(Ordering::Relaxed),
+        1
+    );
 }

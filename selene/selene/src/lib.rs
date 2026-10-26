@@ -9,7 +9,9 @@
 //! in registered host memory, [`disk_store::DiskStore`] retains record files, and
 //! [`composite::CompositeStore`] composes the two with write-through and
 //! read-through. Every store is driven from the model worker thread and never
-//! blocks it: `store` and `fetch` enqueue work, `poll` drains completions.
+//! blocks it: `store` copies each publication into the first host tier, `fetch`
+//! queues restores, and `poll` drains completions. Pooled stores announce GPU
+//! holdings at publication and move retained records down the eviction cascade.
 
 pub mod levels;
 pub mod composite;
@@ -32,7 +34,6 @@ pub mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 mod vocab;
-pub mod writeback;
 
 pub use copier::{CLOSE_TIMEOUT, Direction, Job, PageCopier, QUEUE_DEPTH, Reply, SharedCopier};
 pub use error::{Error, Result};

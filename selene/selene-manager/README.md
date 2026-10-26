@@ -7,6 +7,13 @@ its own store of records in DRAM and on local NVMe for instances to spill into, 
 shared-memory windows the copies go through. It never accesses GPU memory and holds no document
 content in its index.
 
+Flare copies each published GPU checkpoint into its first configured host tier,
+in both local and pool modes. Pooled instances announce the GPU holding at
+publication and cascade retained records under host pressure: DRAM to local
+NVMe, then the manager, then drop. GPU eviction does not initiate a late copy.
+A GPU cache hit refreshes an existing local host record's recency, but cannot
+recreate an evicted record or prevent checkpoint compaction.
+
 The protocol is `selene.v2` ([proto/selene.proto](proto/selene.proto)); the state machines and
 fencing rules are in [PROTOCOL.md](PROTOCOL.md). Running it is in
 [docs/operating.md](docs/operating.md), serving other hosts in

@@ -123,7 +123,7 @@ fn sharded_export_and_restore_use_each_ranks_real_record_file() {
         tail_pages: 2,
         slot: StateSlotId(1),
     };
-    assert_eq!(store.write_back(&checkpoint).unwrap(), StoreOutcome::Queued);
+    assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
     assert!(matches!(
         completed(store.as_mut()),
         StoreEvent::Stored { result: Ok(_), .. }

@@ -68,7 +68,7 @@ impl HostStore for FakeLocal {
             .clone()
             .filter(|hit| hit.resident_tokens == resident && hit.consumed_tokens < before)
     }
-    fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
         let mut state = self.0.lock().unwrap();
         state.stored.push(checkpoint.key);
         Ok(state.store_outcome.unwrap_or(StoreOutcome::Queued))
@@ -599,9 +599,8 @@ fn gpu_publications_are_announced_and_their_evictions_reported() {
         tail_pages: 2,
         slot: StateSlotId(1),
     };
-    // Publishing announces the GPU holding and copies nothing.
-    rig.store.published(&checkpoint).unwrap();
-    assert!(rig.copies().is_empty());
+    assert_eq!(rig.store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
+    assert_eq!(rig.copies(), [checkpoint.key]);
     let saved = rig.pool.lock().unwrap().saved.clone();
     assert_eq!(saved.len(), 1);
     assert_eq!((saved[0].tier, saved[0].tail_pages), (Tier::Gpu, 2));
@@ -1014,29 +1013,23 @@ impl Rig {
 }
 
 #[test]
-fn a_publication_is_noted_and_announced_and_copies_nothing_until_written_back() {
+fn a_publication_is_announced_and_copied_to_the_first_host_tier() {
     let mut rig = rig();
     let checkpoint = rig.publication(800);
-    rig.store.published(&checkpoint).unwrap();
-    assert!(rig.copies().is_empty());
-    assert_eq!(rig.announced_on_gpu(), 1);
-    assert_eq!(
-        rig.store.write_back(&checkpoint).unwrap(),
-        StoreOutcome::Queued
-    );
+    assert_eq!(rig.store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
     assert_eq!(rig.copies(), [checkpoint.key]);
     assert_eq!(rig.announced_on_gpu(), 1, "announced once");
 }
 
 #[test]
-fn write_back_copies_row_only_records_even_when_recompute_is_cheaper() {
+fn publication_copies_row_only_records_even_when_recompute_is_cheaper() {
     let mut rig = rig();
     let parent = rig.publication(800);
     let mut child = rig.publication(800);
     child.key = rig.key(807);
     child.parent = Some(parent.key);
     child.tail_pages = 0;
-    assert_eq!(rig.store.write_back(&child).unwrap(), StoreOutcome::Queued);
+    assert_eq!(rig.store.store(&child).unwrap(), StoreOutcome::Queued);
     assert_eq!(rig.copies(), [child.key]);
     assert_eq!(rig.store.stats().store_skipped, 0);
 }
@@ -1047,10 +1040,7 @@ fn a_pool_hint_never_substitutes_for_a_committed_local_copy() {
     rig.answer(vec![rig.candidate(Level::HostDram, 2, 0, 0, &[800], 0)]);
     rig.lookup();
     let checkpoint = rig.publication(800);
-    assert_eq!(
-        rig.store.write_back(&checkpoint).unwrap(),
-        StoreOutcome::Queued
-    );
+    assert_eq!(rig.store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
     assert_eq!(rig.copies(), [checkpoint.key]);
 }
 
@@ -1060,7 +1050,7 @@ fn a_full_copy_queue_tells_the_worker_to_retry_and_the_tiers_answers_pass_throug
     let checkpoint = rig.publication(800);
     rig.local.0.lock().unwrap().copies_in_flight = 16;
     assert_eq!(
-        rig.store.write_back(&checkpoint).unwrap(),
+        rig.store.store(&checkpoint).unwrap(),
         StoreOutcome::Retry(StoreReason::Queue)
     );
     assert!(rig.copies().is_empty());
@@ -1075,6 +1065,6 @@ fn a_full_copy_queue_tells_the_worker_to_retry_and_the_tiers_answers_pass_throug
         StoreOutcome::Queued,
     ] {
         rig.local.0.lock().unwrap().store_outcome = Some(inner);
-        assert_eq!(rig.store.write_back(&checkpoint).unwrap(), inner);
+        assert_eq!(rig.store.store(&checkpoint).unwrap(), inner);
     }
 }

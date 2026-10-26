@@ -842,7 +842,8 @@ struct Worker<'a> {
     inputs: Option<crate::model::Inputs>,
     queue_capacity: usize,
     store: Option<Box<dyn flare_selene::HostStore>>,
-    write_back: flare_selene::writeback::WriteBack,
+    deferred_stores: Vec<crate::cache::CheckpointId>,
+    store_progress: u64,
     /// The checkpoint each served export pins, until its `ExportEnded`: the only
     /// place an export's pin is released.
     exports: HashMap<flare_selene::ExportId, crate::cache::CheckpointId>,
@@ -874,7 +875,8 @@ impl<'a> Worker<'a> {
             receiver,
             queue_capacity,
             store: None,
-            write_back: Default::default(),
+            deferred_stores: Vec::new(),
+            store_progress: 0,
             exports: HashMap::new(),
             pending: VecDeque::with_capacity(queue_capacity),
             parked: VecDeque::new(),
@@ -1955,7 +1957,7 @@ impl<'a> Worker<'a> {
         Ok(true)
     }
 
-    /// Report publications, apply host transfers, and start write-back under pressure.
+    /// Copy newly ready checkpoints out and apply finished host transfers.
     /// Re-admit the waiters of a failed restore without the host store.
     fn service_store(&mut self) -> Result<bool> {
         self.scheduler
@@ -1963,7 +1965,7 @@ impl<'a> Worker<'a> {
         let Some(store) = self.store.as_mut() else {
             return Ok(false);
         };
-        use flare_selene::StoreEvent;
+        use flare_selene::{StoreEvent, StoreOutcome};
         let mut events = Vec::new();
         store.poll(&mut events)?;
         let mut progress = !events.is_empty();
@@ -1971,14 +1973,16 @@ impl<'a> Worker<'a> {
         let mut released = false;
         for event in events {
             match event {
-                StoreEvent::Stored {
-                    checkpoint,
-                    key,
-                    result,
-                } => {
-                    self.write_back.stored(checkpoint, key, result.is_ok());
+                StoreEvent::Stored { checkpoint, .. } => {
                     self.scheduler.unpin_checkpoint(checkpoint)?;
                     released = true;
+                }
+                StoreEvent::Deferred { checkpoint } => {
+                    self.scheduler.unpin_checkpoint(checkpoint)?;
+                    released = true;
+                    if !self.deferred_stores.contains(&checkpoint) {
+                        self.deferred_stores.push(checkpoint);
+                    }
                 }
                 StoreEvent::Fetched { key, result } => {
                     requeued.extend(self.scheduler.finish_inbound(key, result.is_ok())?);
@@ -2026,17 +2030,55 @@ impl<'a> Worker<'a> {
                 incoming.blocked = None;
             }
         }
-        for publication in self.scheduler.take_publications() {
-            progress = true;
-            store.published(&publication)?;
+        let current_progress = store.stats().progress;
+        let retry = current_progress != self.store_progress;
+        self.store_progress = current_progress;
+        let mut publications = self.scheduler.take_publications();
+        let retry_ids = self.deferred_stores.clone();
+        let mut waiting = Vec::new();
+        for id in self.deferred_stores.drain(..) {
+            if let Some(publication) = self.scheduler.publication(id) {
+                if retry {
+                    publications.push(publication);
+                } else {
+                    waiting.push(id);
+                }
+            } else {
+                self.metrics
+                    .host_retry_abandoned
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
-        let next = next_admission(&self.scheduler, &self.parked, &self.pending);
-        progress |= self.write_back.pump(
-            store.as_mut(),
-            &mut crate::scheduler::WriteBackCache { scheduler: &mut self.scheduler, next },
-            self.prefill_rate,
-            |outcome| self.metrics.host_store_outcome(outcome),
-        )?;
+        for publication in publications {
+            progress = true;
+            let outcome = store.store(&publication);
+            if let Ok(outcome) = outcome {
+                self.metrics.host_store_outcome(outcome);
+                match outcome {
+                    StoreOutcome::Queued => self.scheduler.pin_checkpoint(publication.id)?,
+                    StoreOutcome::Retry(_) => {
+                        if !waiting.contains(&publication.id) {
+                            waiting.push(publication.id);
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                if retry_ids.contains(&publication.id) {
+                    let counter = if outcome == StoreOutcome::Oversize {
+                        &self.metrics.host_retry_abandoned
+                    } else {
+                        &self.metrics.host_retry_success
+                    };
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            } else if retry_ids.contains(&publication.id) {
+                self.metrics
+                    .host_retry_abandoned
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.deferred_stores = waiting;
         // Store gauges change without events, so they are refreshed every pass.
         self.metrics.store(store.stats());
         for handle in requeued {

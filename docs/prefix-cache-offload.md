@@ -29,7 +29,7 @@ defines configuration precedence.
 ## 1. Scope and configurations
 
 - Published prefix checkpoints at instruction, prompt, and terminal endpoints
-  are announced when created and copied to the host store under GPU pressure.
+  are copied to the first host tier when published in both local and pool modes.
   A later matching request restores a retained checkpoint the GPU no longer holds.
 - Live request state, in-flight speculative rounds, and anything not published
   as a checkpoint are never offloaded.
@@ -128,8 +128,7 @@ Its core operations are:
 ```rust
 pub trait HostStore {
     fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit>;
-    fn published(&mut self, checkpoint: &PublishedCheckpoint) -> Result<()>;
-    fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
+    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()>;
     fn poll(&mut self, events: &mut Vec<StoreEvent>) -> Result<()>;
     fn stats(&self) -> StoreStats;
@@ -137,15 +136,15 @@ pub trait HostStore {
 }
 ```
 
-The worker calls `published` to announce each checkpoint without copying or pinning it.
-Under pressure, Selene selects cold, dirty eviction candidates and calls `write_back`.
-`Queued` holds one GPU pin until `Stored`; `Present` requires a committed local copy.
-`Retry` accepts no copy and stops the round. A successful copy releases its pin and
-keeps the GPU checkpoint clean until GPU eviction, even if a host tier later evicts
-its copy. Slab and budget shortages pause write-back until a host completion or
-capacity-release event advances store progress. GPU eviction uses the existing LRU,
-leaf and compaction rules. `fetch` copies a looked-up chain into the ticket's page ids
-and state slot. Submissions never wait; `poll` drains completions and failures.
+The worker calls `store` for each newly published checkpoint, without waiting for
+GPU pressure. `Queued` holds one GPU pin until `Stored` or `Deferred`; `Present`
+requires a committed local copy. `Retry` accepts no copy. The worker retains only
+checkpoint IDs for retries after store progress and discards IDs that have left
+the GPU cache. `Deferred` releases the copy pin and schedules the same retry when
+a queued publication cannot obtain host capacity. A failed transfer releases its
+pin without retrying. GPU eviction uses the existing LRU, leaf and compaction
+rules. `fetch` copies a looked-up chain into the ticket's page IDs and state slot.
+Submissions never wait; `poll` drains completions and failures.
 A `PublishedCheckpoint` names the GPU checkpoint, its key, its parent's key,
 its bucket digest, every page of
 its chain from the root with the count that belongs to the checkpoint itself,
@@ -480,8 +479,8 @@ disk-only store whose ranks each keep their own records; see
 The worker loop admits requests, completes executor frames, and publishes
 finished requests. `service_store` polls host completions, applies inbound and
 outbound results, delivers eviction notices, reports publications through
-`store`, and starts pressure-driven write-back. The worker then plans and
-submits model work. Copy-out pins are taken before the next admission, so a
+`store`, and retries capacity refusals after host progress. The worker then
+plans and submits model work. Copy-out pins are taken before the next admission, so a
 checkpoint cannot be evicted between submission and its pin. Local and pooled
 stores receive logical eviction notices, including compaction. Every store
 call from the worker returns without waiting.
@@ -516,19 +515,13 @@ the store and its transfer threads.
 
 Policy:
 
-- Outbound: publication announces availability; pressure-driven write-back copies
-  selected checkpoints in both local and pool modes. The reserve covers the largest
-  admission the scheduler can make, plus the pages prefill can produce during the
-  estimated copy of that admission and its state row. Copy time uses the existing
-  rolling outbound rate, and the reserve is capped by the retaining tier's capacity.
-  Current decode growth and the next admission are also preserved. Free pages,
-  retirement backing and checkpoints with committed write-backs cover pressure without
-  new copies even after host eviction; snapshot aliases count once. `Retry` stops a
-  round; slab and budget shortages wait for host progress. Before each pin, the export
-  headroom check preserves decode growth, the next admission and its restore row.
-  Admission proceeds without waiting for write-back, using ordinary cache eviction
-  and existing pin and retirement fences.
-  A GPU-resident hit refreshes the matching host record's recency.
+- Outbound: copy each published checkpoint into the first host tier. In local
+  composite mode, write through to disk; in pool mode, move records down the
+  eviction cascade only when the preceding tier needs room. Only queued copies
+  pin GPU checkpoints. A capacity refusal waits for host progress before retry;
+  admission uses ordinary cache eviction and existing pin and retirement fences.
+  A GPU-resident hit refreshes the matching host record's recency. This does not
+  recreate an evicted host copy or protect an endpoint from tree compaction.
 - Inbound: fetch when the estimated transfer time is below half the estimated
   prefill time of the tokens gained. Transfer time is record bytes divided by
   the tier rate; prefill time is tokens gained divided by prefill throughput.
@@ -791,8 +784,8 @@ explicit plaintext `plain:HOST:PORT`. Network ports must be from 1 through
 `--name` salts scope and instance identities; clients learn it from Hello. A
 renamed pool has a distinct namespace, so its cache starts cold. Without the
 pool flag none of the sharing code below runs: the worker builds no pool lookup history and
-sees no export requests. Local and pooled instances use the same GPU write-back
-and eviction policy from section 2.10. A pooled instance still reads
+sees no export requests. Local and pooled instances use the same copy-at-publish
+and GPU eviction policy from section 2.10. A pooled instance still reads
 its own memory and disk tiers first; the pool supplies what they lack.
 
 The loader attaches once before sizing and allocating GPU caches. The
@@ -881,16 +874,13 @@ same completion events the store produces.
   record at once; a failed write is tried once more the next time the tier
   needs room, and the second failure drops it. None of this waits on the
   model worker: moves are queued, and the coldest waiting record is dropped
-  when the queue is full. GPU publication calls `published`, so GPU
-  checkpoints are announced and remain claimable through export before a host
-  copy exists. Pressure-driven `write_back` copies into
-  the first host tier, using the same policy in local and pool modes. A dirty
-  GPU eviction drops the checkpoint and sends the existing eviction notice;
-  it never waits for a host copy.
-- **What write-back copies.** A selected checkpoint is copied into the first
-  host tier. `Present` requires a committed local copy; a lookup hint is not
-  sufficient. `Oversize` means the record exceeds the tier, and `Retry` means
-  that capacity or queue room is temporarily unavailable.
+  when the queue is full. GPU publication calls `store`, announcing the GPU
+  holding and copying it into the instance's first host tier. Neighbours can
+  claim the GPU holding through export while the host copy is in flight. A GPU
+  eviction sends the existing eviction notice and never starts a late copy.
+- **Publication outcomes.** `Present` requires a committed local copy; a lookup
+  hint is not sufficient. `Oversize` means the record exceeds the tier, and
+  `Retry` means that capacity or queue room is temporarily unavailable.
 - **One source.** The store chooses the longest matching prefix, then the
   closest level. It restores the whole suffix after the GPU-resident prefix,
   including the endpoint row, from that source. A failed pool restore may use
@@ -1022,7 +1012,7 @@ on the file format fixed in step 5.
    `selene/selene/src/store.rs` over the components above; the disk store
    behind the `DiskTransport` trait with the `Staged` implementation, its
    staging pool, `write_from`, and `read_into`. Acceptance: the step 7 GPU
-   test repeated through each store's `write_back` and `fetch`, and CPU tests of
+   test repeated through each store's `store` and `fetch`, and CPU tests of
    each store's event sequencing with a transfer stub.
 
 9. **Composite store.** `selene/selene/src/composite.rs`: write-through,

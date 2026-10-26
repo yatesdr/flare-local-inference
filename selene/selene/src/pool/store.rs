@@ -207,7 +207,7 @@ impl<S: crate::store::TierStore, P: PoolPort> PooledStore<S, P> {
         if self.inner.stats().outbound_in_flight >= COPY_QUEUE {
             return Ok(StoreOutcome::Retry(StoreReason::Queue));
         }
-        self.inner.write_back(checkpoint)
+        self.inner.store(checkpoint)
     }
 
     // ---- lookup ---------------------------------------------------------------
@@ -313,12 +313,6 @@ impl<S: crate::store::TierStore, P: PoolPort> PooledStore<S, P> {
 }
 
 impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
-    fn has_copy(&self, key: PrefixKey) -> bool { self.inner.has_copy(key) }
-
-    fn write_back_reserve(&self, largest_pages: usize, prefill_rate: f64) -> usize {
-        self.inner.write_back_reserve(largest_pages, prefill_rate)
-    }
-
     fn reused(&mut self, key: PrefixKey) {
         self.inner.reused(key);
     }
@@ -489,9 +483,8 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
         inner.and(pool)
     }
 
-    fn published(&mut self, checkpoint: &PublishedCheckpoint) -> Result<()> {
-        // The publication is announced as a GPU holding, so neighbours can
-        // claim it; copying it to a host tier waits for `write_back`.
+    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
+        // Announce the GPU holding before starting its host copy.
         PoolPort::saved(
             &self.pool,
             IndexEntry {
@@ -505,10 +498,6 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
                     + self.row_record_bytes,
             },
         );
-        Ok(())
-    }
-
-    fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
         self.copy_out(checkpoint)
     }
 

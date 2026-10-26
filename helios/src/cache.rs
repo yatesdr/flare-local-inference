@@ -512,16 +512,6 @@ impl PrefixCheckpointCache {
         })
     }
 
-    pub(crate) fn coldest_unpinned(&self) -> Vec<CheckpointId> {
-        let mut nodes: Vec<_> = self.eviction_candidates().collect();
-        nodes.sort_by_key(|node| (node.accessed, node.id));
-        nodes.into_iter().map(|node| node.id).collect()
-    }
-
-    pub(crate) fn reclaimable_where(&self, eligible: &impl Fn(&PrefixKey) -> bool) -> Reclaimable {
-        self.reclaimable(&[], eligible)
-    }
-
     /// Thin dense checkpoint chains before retiring endpoints under snapshot pressure.
     /// Only advance_completed permits reuse of the returned storage.
     pub fn evict(&mut self, target: EvictionTarget) -> EvictionReport {
@@ -580,14 +570,10 @@ impl PrefixCheckpointCache {
     /// unready children count as live; compaction keeps a node's pages (they
     /// move to its child and are reclaimed with it) and reclaims its snapshot.
     pub fn reclaimable_if_pinned(&self, id: CheckpointId) -> Result<Reclaimable> {
-        Ok(self.reclaimable(&self.chain(id)?, &|_| true))
+        Ok(self.reclaimable(&self.chain(id)?))
     }
 
-    fn reclaimable(
-        &self,
-        chain: &[CheckpointId],
-        eligible: &impl Fn(&PrefixKey) -> bool,
-    ) -> Reclaimable {
+    fn reclaimable(&self, chain: &[CheckpointId]) -> Reclaimable {
         let pinned = |node: &Checkpoint| node.pins + u64::from(chain.contains(&node.id));
         let direct =
             |node: &Checkpoint| node.direct_pins + u64::from(chain.first() == Some(&node.id));
@@ -611,7 +597,7 @@ impl PrefixCheckpointCache {
                 continue;
             }
             let node = &self.nodes[&next];
-            if !node.ready || !eligible(&node.prefix) {
+            if !node.ready {
                 continue;
             }
             let children = live[&next];

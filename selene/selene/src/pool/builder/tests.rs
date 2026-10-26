@@ -124,7 +124,7 @@ fn over_budget_startup_registers_nothing_and_serves_local_only() {
             tail_pages: 2,
             slot: crate::StateSlotId(1),
         };
-        store.published(&checkpoint).unwrap();
+        store.store(&checkpoint).unwrap();
         store.close().unwrap();
     }
 }

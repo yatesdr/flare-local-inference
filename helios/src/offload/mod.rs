@@ -2,7 +2,7 @@
 //!
 //! A GPU prefix checkpoint owns its tail pages, the complete cache pages since its
 //! parent, and one continuation-state row. The host store copies those bytes out
-//! under GPU cache pressure and copies them back into free GPU
+//! at publication and copies them back into free GPU
 //! ids when a later request matches a checkpoint the GPU no longer holds. The
 //! restored bytes are published as an ordinary GPU checkpoint, so the model
 //! worker, the scheduler, and the recipes see no difference between a checkpoint
