@@ -2462,6 +2462,149 @@ mod tests {
         fs::remove_dir_all(&directory).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sigkill_during_restore_preserves_committed_records() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+
+        const CHILD_DIR: &str = "FLARE_TEST_COMPOSITE_CRASH_DIRECTORY";
+        if let Some(directory) = std::env::var_os(CHILD_DIR) {
+            let directory = Path::new(&directory);
+            let mut store = composite(directory, 48, 4, 1 << 30);
+            let full = history(2000);
+            let mut ids = Ids::new();
+            let root = checkpoint(&mut ids, &full, 700, None, pages(0..10), 10, StateSlotId(1));
+            let child = checkpoint(
+                &mut ids,
+                &full,
+                1500,
+                Some(700),
+                pages(0..23),
+                13,
+                StateSlotId(2),
+            );
+            written(&mut store, &root, None, 1);
+            written(&mut store, &child, Some(root.key), 2);
+            store.memory.remove_record(&root.key).unwrap();
+            store.memory.remove_record(&child.key).unwrap();
+            // An interrupted write has not been renamed to a checkpoint file.
+            let pending = full.key_at(1800).unwrap();
+            fs::write(
+                directory.join(record::temporary_name(&pending)),
+                b"partial write",
+            )
+            .unwrap();
+            let hit = store.lookup(&full, 0, u64::MAX).unwrap();
+            assert_eq!(hit.key, child.key);
+            store
+                .fetch(
+                    hit,
+                    InboundTicket {
+                        key: child.key,
+                        pages: pages(100..123),
+                        slot: StateSlotId(3),
+                    },
+                )
+                .unwrap();
+            assert_eq!(store.inbound.len(), 1);
+            assert!(store.disk.index().node(&root.key).unwrap().pinned());
+            assert!(store.disk.index().node(&child.key).unwrap().pinned());
+            println!("restore-started");
+            std::io::stdout().flush().unwrap();
+            // The parent kills us with reads outstanding; no store close or Drop runs.
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).unwrap();
+            panic!("expected SIGKILL");
+        }
+
+        let Some(directory) = test_directory("composite", "sigkill") else {
+            return;
+        };
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "composite::tests::sigkill_during_restore_preserves_committed_records",
+                "--nocapture",
+            ])
+            .env(CHILD_DIR, &directory)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let ready = std::io::BufReader::new(stdout)
+                .lines()
+                .any(|line| line.unwrap().contains("restore-started"));
+            let _ = send.send(ready);
+        });
+        let ready = receive.recv_timeout(Duration::from_secs(60));
+        child.kill().unwrap();
+        let status = child.wait().unwrap();
+        reader.join().unwrap();
+        assert!(ready.unwrap());
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+
+        let full = history(2000);
+        let root = full.key_at(700).unwrap();
+        let endpoint = full.key_at(1500).unwrap();
+        let pending = directory.join(record::temporary_name(&full.key_at(1800).unwrap()));
+        assert!(pending.exists());
+        let before: Vec<_> = [root, endpoint]
+            .map(|key| {
+                let path = directory.join(record::file_name(&key));
+                (path.clone(), fs::read(path).unwrap())
+            })
+            .into();
+        // The killed process's directory lock and read pins do not survive it.
+        let mut store = composite(&directory, 48, 4, 1 << 30);
+        assert!(!pending.exists());
+        assert_eq!(store.stats().disk_records, 2);
+        for (path, bytes) in &before {
+            assert_eq!(&fs::read(path).unwrap(), bytes);
+        }
+        let hit = store.lookup(&full, 0, u64::MAX).unwrap();
+        assert_eq!((hit.key, hit.tier, hit.pages), (endpoint, Tier::Disk, 23));
+        store
+            .fetch(
+                hit,
+                InboundTicket {
+                    key: endpoint,
+                    pages: pages(100..123),
+                    slot: StateSlotId(3),
+                },
+            )
+            .unwrap();
+        let mut events = Vec::new();
+        poll_until(&mut store, &mut events, |store| store.inbound.is_empty());
+        // The CPU fixture stops the GPU upload; the verified disk reads still fill RAM.
+        assert_eq!(fetched(&events), [(endpoint, false)]);
+        for key in [root, endpoint] {
+            let node = store.disk.index().node(&key).unwrap();
+            let file = fs::read(&node.location.path).unwrap();
+            let header = &node.location.header;
+            let memory = record_bytes(&store, store.memory.record(&key).unwrap());
+            for (index, page) in memory[..header.tail_pages as usize].iter().enumerate() {
+                let start = header.page_segment as usize + index * PAGE_RECORD as usize;
+                assert_eq!(page, &file[start..start + PAGE_RECORD as usize]);
+            }
+            let start = header.row_segment as usize;
+            let record = store.memory.record(&key).unwrap();
+            if record.row.is_some() {
+                assert_eq!(
+                    memory.last().unwrap(),
+                    &file[start..start + ROW_RECORD as usize]
+                );
+            }
+        }
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn close_finishes_a_pending_disk_write() {
         let Some(directory) = test_directory("composite", "close") else {

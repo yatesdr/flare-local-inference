@@ -350,9 +350,19 @@ version, identity, fingerprint, and name, derives row presence from the size,
 seeds the access order from the modification time, deletes temporary files,
 and deletes any node whose parent is missing together with its descendants.
 Leaf-first eviction never unlinks a parent before its children, so orphans
-arise only from interrupted operations or external changes. The disk thread
-owns an `io_uring` ring over files opened with `O_DIRECT`, chunks transfers at
-8 MiB, and computes and verifies checksums. Before accepting payload reads,
+arise only from interrupted operations or external changes.
+
+A process killed mid-restore releases its directory lock without changing
+committed record files; the next scan can reuse those files. Publication and a
+completed GPU-to-RAM copy
+do not imply disk durability: local write-through commits asynchronously after
+copy-out, and SIGKILL loses RAM copies and queued writes. Only records renamed
+into place survive a process restart; partial temporary files are discarded.
+Waiting after restart cannot recover a write the killed process never committed.
+
+The disk thread owns an `io_uring` ring over files opened with `O_DIRECT`,
+chunks transfers at 8 MiB, and computes and verifies checksums. Before accepting
+payload reads,
 it checks the opened file's header against the indexed record, including all
 layout and size fields. Changed headers cannot enlarge reads into registered
 slabs. A failed ring submission drains every kernel-owned buffer reference
