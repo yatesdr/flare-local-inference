@@ -202,6 +202,9 @@ impl flare_selene::writeback::Cache for WriteBackCache<'_> {
     fn publication(&self, id: CheckpointId) -> Option<PublishedCheckpoint> {
         self.scheduler.publication(id)
     }
+    fn resident(&self, id: CheckpointId) -> bool {
+        self.scheduler.cache.checkpoint(id).is_ok()
+    }
     fn can_pin(&self, id: CheckpointId) -> bool {
         self.scheduler.export_fits(id, self.next)
     }

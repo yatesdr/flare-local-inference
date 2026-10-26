@@ -138,14 +138,16 @@ pub trait HostStore {
 ```
 
 The worker calls `published` to announce each checkpoint without copying or pinning it.
-Under pressure, Selene selects cold eviction candidates whose complete bytes are not
-currently retained by a host tier and calls `write_back`. `Queued` holds one GPU pin
-until `Stored`; `Present` requires a committed local copy. `Retry` accepts no copy and
-stops the round. A successful copy releases its pin; later tier eviction makes the
-checkpoint eligible for write-back again. GPU eviction uses the existing LRU, leaf and
-compaction rules. `fetch` copies a looked-up chain into the ticket's page ids and state
-slot. Submissions never wait; `poll` drains completions and failures. A `PublishedCheckpoint` names
-the GPU checkpoint, its key, its parent's key, its bucket digest, every page of
+Under pressure, Selene selects cold, dirty eviction candidates and calls `write_back`.
+`Queued` holds one GPU pin until `Stored`; `Present` requires a committed local copy.
+`Retry` accepts no copy and stops the round. A successful copy releases its pin and
+keeps the GPU checkpoint clean until GPU eviction, even if a host tier later evicts
+its copy. Slab and budget shortages pause write-back until a host completion or
+capacity-release event advances store progress. GPU eviction uses the existing LRU,
+leaf and compaction rules. `fetch` copies a looked-up chain into the ticket's page ids
+and state slot. Submissions never wait; `poll` drains completions and failures.
+A `PublishedCheckpoint` names the GPU checkpoint, its key, its parent's key,
+its bucket digest, every page of
 its chain from the root with the count that belongs to the checkpoint itself,
 and the state slot of its row. `MemoryStore`, `DiskStore`, and `CompositeStore`
 implement the trait for serving, and a test double implements it for worker tests. The
@@ -518,12 +520,14 @@ Policy:
   selected checkpoints in both local and pool modes. The reserve covers the largest
   admission the scheduler can make, plus the pages prefill can produce during the
   estimated copy of that admission and its state row. Copy time uses the existing
-  rolling outbound rate. Current decode growth and the next admission are also
-  preserved. Free pages, retirement backing and checkpoints with complete committed
-  host copies cover pressure without new copies; snapshot aliases count once.
-  `Retry` stops a round. Before each pin, the export headroom check preserves decode
-  growth, the next admission and its restore row. Admission proceeds without waiting
-  for write-back, using ordinary cache eviction and existing pin and retirement fences.
+  rolling outbound rate, and the reserve is capped by the retaining tier's capacity.
+  Current decode growth and the next admission are also preserved. Free pages,
+  retirement backing and checkpoints with committed write-backs cover pressure without
+  new copies even after host eviction; snapshot aliases count once. `Retry` stops a
+  round; slab and budget shortages wait for host progress. Before each pin, the export
+  headroom check preserves decode growth, the next admission and its restore row.
+  Admission proceeds without waiting for write-back, using ordinary cache eviction
+  and existing pin and retirement fences.
   A GPU-resident hit refreshes the matching host record's recency.
 - Inbound: fetch when the estimated transfer time is below half the estimated
   prefill time of the tokens gained. Transfer time is record bytes divided by

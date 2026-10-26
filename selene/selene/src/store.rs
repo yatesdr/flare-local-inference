@@ -139,6 +139,7 @@ pub struct StoreStats {
     pub reused_tokens: u64,
     pub stored: u64,
     pub row_refills: u64,
+    /// Completion and capacity-release events, including host pins and shared disk budget.
     pub progress: u64,
     pub store_skipped: u64,
     pub store_failed: u64,
@@ -224,7 +225,7 @@ pub trait HostStore {
     /// Stored; Present means a committed copy exists; Retry means no room now.
     fn write_back(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
     /// Clean pages to keep ahead of pressure, including the largest admission
-    /// and pages consumed while its checkpoint copies out.
+    /// and pages consumed while its checkpoint copies out, capped by retention capacity.
     fn write_back_reserve(&self, largest_pages: usize, _prefill_rate: f64) -> usize {
         largest_pages
     }

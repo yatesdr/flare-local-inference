@@ -493,6 +493,7 @@ impl Core {
     }
 
     fn release(&mut self, record: &MemoryRecord) {
+        self.stats.progress += 1;
         for slab in &record.pages {
             self.pool.release_page(*slab);
         }
@@ -513,6 +514,7 @@ impl Core {
 
     fn complete_record(&mut self, key: &PrefixKey, success: bool) -> Result<()> {
         self.index.unpin(key)?;
+        self.stats.progress += 1;
         if success {
             let _ = self.index.set_ready(key, true);
             return Ok(());
@@ -529,6 +531,7 @@ impl Core {
             .node_mut(key)
             .ok_or_else(|| invalid("cannot mark an unindexed host record durable"))?;
         node.location.durable = true;
+        self.stats.progress += 1;
         Ok(())
     }
 
@@ -1061,7 +1064,9 @@ impl MemoryStore {
     }
 
     pub fn unpin_record(&mut self, key: &PrefixKey) -> Result<()> {
-        self.core.index.unpin(key)
+        self.core.index.unpin(key)?;
+        self.core.stats.progress += 1;
+        Ok(())
     }
 
     /// Copy a chain of resident records into the ticket's ids. An error means
@@ -1111,12 +1116,14 @@ impl MemoryStore {
         };
         for key in a.releases.drain() {
             let _ = self.core.index.unpin(&key);
+            self.core.stats.progress += 1;
         }
         for done in a.hasher.collect() {
             let Some(notice) = a.hashing.remove(&done.key) else {
                 continue;
             };
             let _ = self.core.index.unpin(&done.key);
+            self.core.stats.progress += 1;
             if self.core.index.node(&done.key).is_some_and(|n| n.ready) {
                 a.sums.insert(done.key, Arc::new(done.sums));
                 a.view
@@ -1289,6 +1296,11 @@ impl HostStore for MemoryStore {
             self.core.outbound_rate.0,
             prefill_rate,
         )
+        .min(if self.core.pool.row_count() == 0 {
+            0
+        } else {
+            self.core.pool.page_count()
+        })
     }
 
     fn reused(&mut self, key: PrefixKey) {
@@ -1535,6 +1547,40 @@ mod tests {
                 _ => panic!("unexpected event"),
             })
             .collect()
+    }
+
+    #[test]
+    fn reserve_fits_page_and_row_capacity() {
+        let geometry = [crate::testing::geometry(64, &[("kv", 4096)], 4096)];
+        let (copier, _) = crate::testing::SimulatedGpu::shared(&geometry).unwrap();
+        let pool = SlabPool::new(4096, 2, 4096, 1, true).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
+        assert_eq!(store.write_back_reserve(1024, 1e9), 2);
+        store.close().unwrap();
+        let (copier, _) = crate::testing::SimulatedGpu::shared(&geometry).unwrap();
+        let pool = SlabPool::new(4096, 2, 4096, 0, true).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
+        assert_eq!(store.write_back_reserve(1024, 1e9), 0);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn releasing_a_host_pin_notifies_capacity_waiters() {
+        let geometry = [crate::testing::geometry(64, &[("kv", PAGE)], ROW)];
+        let (copier, _) = crate::testing::SimulatedGpu::shared(&geometry).unwrap();
+        let pool = SlabPool::new(PAGE, 1, ROW, 1, true).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
+        let checkpoint = published(&history(64, 1), 64, None, 0, 1);
+        assert_eq!(store.write_back(&checkpoint).unwrap(), StoreOutcome::Queued);
+        let mut events = Vec::new();
+        store.poll(&mut events).unwrap();
+        store.pin_record(&checkpoint.key).unwrap();
+        let progress = store.stats().progress;
+        assert_eq!(store.reclaimable_slabs(), (0, 0));
+        store.unpin_record(&checkpoint.key).unwrap();
+        assert!(store.stats().progress > progress);
+        assert_eq!(store.reclaimable_slabs(), (1, 1));
+        store.close().unwrap();
     }
 
     #[test]

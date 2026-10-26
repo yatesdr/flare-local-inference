@@ -3879,25 +3879,56 @@ fn has_copy(worker: &mut Worker<'_>, id: crate::cache::CheckpointId) -> bool {
 }
 
 #[test]
-fn losing_a_host_copy_makes_the_gpu_checkpoint_a_write_back_candidate_again() {
+fn losing_a_host_copy_keeps_the_gpu_checkpoint_clean() {
     use flare_selene::StoreOutcome;
-    let fixture = Fixture::new();
-    let (_sender, receiver) = mpsc::channel();
-    let mut worker = fixture.worker(receiver);
-    let mut store = FakeStore::new(None);
-    store.write_back_outcomes.push_back(StoreOutcome::Present);
-    worker.attach_store(Some(Box::new(store)));
-    let id = unpinned_checkpoint(&mut worker, 0, 64);
-    worker.service_store().unwrap();
-    assert!(has_copy(&mut worker, id));
-    let store = fake_store(&mut worker);
-    store.copies.clear();
-    store.write_back_outcomes.push_back(StoreOutcome::Queued);
-    worker.service_store().unwrap();
-    assert_eq!(fake_store(&mut worker).write_backs.len(), 2);
-    assert_eq!(pins(&worker, id), 1);
-    complete_store(&mut worker, id, true);
-    worker.service_store().unwrap();
-    assert!(has_copy(&mut worker, id));
-    assert_eq!(pins(&worker, id), 0);
+    for outcome in [StoreOutcome::Present, StoreOutcome::Queued] {
+        let fixture = Fixture::new();
+        let (_sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        let mut store = FakeStore::new(None);
+        store.write_back_outcomes.push_back(outcome);
+        worker.attach_store(Some(Box::new(store)));
+        let id = unpinned_checkpoint(&mut worker, 0, 64);
+        worker.service_store().unwrap();
+        if outcome == StoreOutcome::Queued {
+            complete_store(&mut worker, id, true);
+            worker.service_store().unwrap();
+        }
+        assert!(has_copy(&mut worker, id));
+        fake_store(&mut worker).copies.clear();
+        assert!(!worker.service_store().unwrap());
+        assert!(!worker.service_store().unwrap());
+        assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
+        assert_eq!(pins(&worker, id), 0);
+    }
+}
+
+#[test]
+fn write_back_waits_for_host_progress_after_capacity_shortages() {
+    use flare_selene::{StoreOutcome::*, StoreReason};
+    for pooled in [false, true] {
+        for reason in [StoreReason::Slabs, StoreReason::Budget] {
+            let fixture = Fixture::new();
+            let (_sender, receiver) = mpsc::channel();
+            let mut worker = fixture.worker(receiver);
+            let mut store = FakeStore::new(None);
+            store.pooled = pooled;
+            store.write_back_outcomes.extend([Retry(reason), Queued]);
+            worker.attach_store(Some(Box::new(store)));
+            let id = unpinned_checkpoint(&mut worker, 0, 64);
+            worker.service_store().unwrap();
+            assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
+            assert_eq!(pins(&worker, id), 0);
+            assert!(!worker.service_store().unwrap());
+            assert!(!worker.service_store().unwrap());
+            assert_eq!(fake_store(&mut worker).write_backs.len(), 1);
+            fake_store(&mut worker).progress += 1;
+            assert!(worker.service_store().unwrap());
+            assert_eq!(fake_store(&mut worker).write_backs.len(), 2);
+            assert_eq!(pins(&worker, id), 1);
+            complete_store(&mut worker, id, true);
+            worker.service_store().unwrap();
+            assert_eq!(pins(&worker, id), 0);
+        }
+    }
 }

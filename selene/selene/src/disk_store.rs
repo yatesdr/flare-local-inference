@@ -1570,6 +1570,7 @@ impl DiskStore {
         };
         for key in a.releases.drain() {
             let _ = self.index.unpin(&key);
+            self.stats.progress += 1;
         }
         for notice in a.view.drain() {
             match notice.event {
@@ -1700,6 +1701,17 @@ impl DiskStore {
 
     pub fn limit(&self) -> u64 {
         self.limit
+    }
+
+    pub(crate) fn retention_pages(&self) -> usize {
+        let limit = self.budget.as_ref()
+            .map_or(self.limit, |budget| budget.checkpoint_limit())
+            .min(self.limit);
+        // Allow for the header, checksum-block padding, row, and each page checksum.
+        let bytes = limit.saturating_sub(
+            2 * crate::geometry::BLOCK_BYTES + self.layout.row_record_bytes,
+        );
+        (bytes / (self.layout.page_record_bytes + 8)) as usize
     }
 
     pub fn used(&self) -> u64 {
@@ -2318,6 +2330,7 @@ impl HostStore for DiskStore {
             self.outbound_rate.0,
             prefill_rate,
         )
+        .min(self.retention_pages())
     }
 
     fn reused(&mut self, key: PrefixKey) {
@@ -2681,6 +2694,40 @@ mod tests {
         )
         .unwrap();
         (store, log)
+    }
+
+    #[test]
+    fn reserve_fits_disk_and_shared_budget_including_record_overhead() {
+        let (mut store, _) = store_with(vec![], 64 * 1024);
+        let capacity = store.write_back_reserve(1024, 1e9);
+        assert!(capacity > 0);
+        let header = Header::new(
+            store.geometry(),
+            IDENTITY,
+            FINGERPRINT,
+            history(capacity as u64 * PAGE_TOKENS).key_at(capacity as u64 * PAGE_TOKENS).unwrap(),
+            None,
+            [1; 16],
+            capacity as u32,
+            SystemTime::now(),
+        ).unwrap();
+        assert!(header.length_with_row() <= store.limit());
+        let budget = crate::input::DiskBudget::new(64 * 1024, 0);
+        budget.set_limit(32 * 1024);
+        store.share_budget(budget);
+        let smaller = store.write_back_reserve(1024, 1e9);
+        assert!(smaller < capacity);
+        let header = Header::new(
+            store.geometry(),
+            IDENTITY,
+            FINGERPRINT,
+            history(smaller as u64 * PAGE_TOKENS).key_at(smaller as u64 * PAGE_TOKENS).unwrap(),
+            None,
+            [1; 16],
+            smaller as u32,
+            SystemTime::now(),
+        ).unwrap();
+        assert!(header.length_with_row() <= 32 * 1024);
     }
 
     #[test]

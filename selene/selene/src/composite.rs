@@ -952,6 +952,7 @@ impl HostStore for CompositeStore {
 
     fn write_back_reserve(&self, largest_pages: usize, prefill_rate: f64) -> usize {
         self.memory.write_back_reserve(largest_pages, prefill_rate)
+            .min(self.disk.retention_pages())
     }
 
     fn reused(&mut self, key: PrefixKey) {
@@ -1576,6 +1577,21 @@ mod tests {
                 _ => panic!("unexpected event"),
             })
             .collect()
+    }
+
+    #[test]
+    fn reserve_fits_both_retaining_tiers() {
+        for (pages, limit) in [(2, 1 << 20), (16, 64 * 1024)] {
+            let Some(directory) = test_directory("composite", "reserve") else {
+                return;
+            };
+            let mut store = composite(&directory, pages, 2, limit);
+            let reserve = store.write_back_reserve(1024, 1e9);
+            assert_eq!(reserve, pages.min(store.disk.retention_pages()));
+            store.close().unwrap();
+            drop(store);
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]

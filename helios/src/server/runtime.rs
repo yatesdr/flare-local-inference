@@ -842,6 +842,7 @@ struct Worker<'a> {
     inputs: Option<crate::model::Inputs>,
     queue_capacity: usize,
     store: Option<Box<dyn flare_selene::HostStore>>,
+    write_back: flare_selene::writeback::WriteBack,
     /// The checkpoint each served export pins, until its `ExportEnded`: the only
     /// place an export's pin is released.
     exports: HashMap<flare_selene::ExportId, crate::cache::CheckpointId>,
@@ -873,6 +874,7 @@ impl<'a> Worker<'a> {
             receiver,
             queue_capacity,
             store: None,
+            write_back: Default::default(),
             exports: HashMap::new(),
             pending: VecDeque::with_capacity(queue_capacity),
             parked: VecDeque::new(),
@@ -1970,8 +1972,11 @@ impl<'a> Worker<'a> {
         for event in events {
             match event {
                 StoreEvent::Stored {
-                    checkpoint, ..
+                    checkpoint,
+                    key,
+                    result,
                 } => {
+                    self.write_back.stored(checkpoint, key, result.is_ok());
                     self.scheduler.unpin_checkpoint(checkpoint)?;
                     released = true;
                 }
@@ -2026,9 +2031,12 @@ impl<'a> Worker<'a> {
             store.published(&publication)?;
         }
         let next = next_admission(&self.scheduler, &self.parked, &self.pending);
-        progress |= flare_selene::writeback::pump(store.as_mut(),
+        progress |= self.write_back.pump(
+            store.as_mut(),
             &mut crate::scheduler::WriteBackCache { scheduler: &mut self.scheduler, next },
-            self.prefill_rate, |outcome| self.metrics.host_store_outcome(outcome))?;
+            self.prefill_rate,
+            |outcome| self.metrics.host_store_outcome(outcome),
+        )?;
         // Store gauges change without events, so they are refreshed every pass.
         self.metrics.store(store.stats());
         for handle in requeued {
