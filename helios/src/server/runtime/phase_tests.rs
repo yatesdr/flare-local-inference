@@ -192,6 +192,7 @@ impl Fixture {
                 prompt_scored: 0,
                 blocked: None,
                 pool_lookup: None,
+                pool_lookup_started: None,
             },
             Generation {
                 events: receiver,
@@ -2034,21 +2035,74 @@ fn a_local_store_builds_no_lookup_and_a_failed_restore_starts_none() {
 }
 
 #[test]
-fn a_pending_pool_lookup_does_not_delay_admission() {
+fn an_idle_worker_holds_a_pending_pool_lookup_until_answer_or_deadline() {
+    use flare_selene::pool::{Answer, LookupState};
+    use std::time::{Duration, Instant};
+
+    for answer in [
+        Some(LookupState::Ready(Arc::new(Answer { candidates: vec![] }))),
+        Some(LookupState::None),
+        None,
+    ] {
+        let fixture = Fixture::new();
+        let (_sender, receiver) = mpsc::channel();
+        let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
+        let mut worker = fixture.worker(receiver);
+        let mut store = FakeStore::new(None);
+        store.pooled = true;
+        store.pending_tickets = true;
+        let withdrawn = store.withdrawn.clone();
+        worker.attach_store(Some(Box::new(store)));
+        worker.enqueue(vec![incoming]);
+        // Hold the observation fixed even if the test thread is descheduled.
+        let started = Instant::now() + Duration::from_secs(60);
+        worker.pending[0].pool_lookup_started = Some(started);
+        let grace = worker.pending[0].pool_lookup.as_ref().unwrap().grace();
+        assert_eq!(grace, Duration::from_millis(2));
+        assert!(worker.pending[0].awaits_pool(started + grace - Duration::from_nanos(1)));
+        assert!(!worker.pending[0].awaits_pool(started + grace));
+        worker.admit().unwrap();
+        assert!(worker.active.iter().all(Option::is_none));
+        assert_eq!(worker.pending.len(), 1);
+        assert_eq!(worker.idle_wait(), Duration::from_micros(100));
+        assert_eq!(withdrawn.load(Ordering::Relaxed), 0);
+
+        if let Some(answer) = answer {
+            worker.pending[0]
+                .pool_lookup
+                .as_ref()
+                .unwrap()
+                .set_state(answer);
+        } else {
+            worker.pending[0].pool_lookup_started = Some(Instant::now() - grace);
+        }
+        worker.admit().unwrap();
+        assert!(worker.active[0].is_some());
+        assert!(worker.pending.is_empty());
+        assert_eq!(worker.idle_wait(), Duration::from_millis(2));
+        assert_eq!(withdrawn.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[test]
+fn a_pending_pool_lookup_does_not_hold_other_requests() {
     let fixture = Fixture::new();
-    let (sender, receiver) = mpsc::channel();
-    let (incoming, _generation) = fixture.incoming(vec![0; 70], 4);
-    sender.send(vec![incoming]).unwrap();
+    let (_sender, receiver) = mpsc::channel();
     let mut worker = fixture.worker(receiver);
     let mut store = FakeStore::new(None);
     store.pooled = true;
     store.pending_tickets = true;
-    let withdrawn = store.withdrawn.clone();
     worker.attach_store(Some(Box::new(store)));
+    let (waiting, _waiting_generation) = fixture.incoming(vec![0; 70], 4);
+    worker.enqueue(vec![waiting]);
+    worker.pending[0].pool_lookup_started =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    let (ready, _ready_generation) = fixture.incoming(vec![1; 70], 4);
+    worker.pending.push_back(ready);
     worker.admit().unwrap();
     assert!(worker.active[0].is_some());
-    assert!(worker.pending.is_empty());
-    assert_eq!(withdrawn.load(Ordering::Relaxed), 1);
+    assert_eq!(worker.pending.len(), 1);
+    assert!(worker.pending[0].pool_lookup.is_some());
 }
 
 fn group_runtime(

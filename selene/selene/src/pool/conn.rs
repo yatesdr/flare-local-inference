@@ -445,6 +445,7 @@ async fn establish(engine: &mut Engine, link: &Link) -> std::result::Result<Esta
         }
     };
     let mut client = wire::pool_client::PoolClient::new(channel);
+    let hello_started = Instant::now();
     let hello = tokio::time::timeout(
         HELLO_TIMEOUT,
         client.hello(wire::HelloRequest {
@@ -461,6 +462,9 @@ async fn establish(engine: &mut Engine, link: &Link) -> std::result::Result<Esta
     };
     if let Err(reason) = check_hello(&hello, connected_with) {
         return Err(Attempt::Disabled(reason));
+    }
+    if !matches!(link.address, PoolAddress::Unix(_)) {
+        engine.shared.set_lookup_rtt(hello_started.elapsed());
     }
     Arc::make_mut(&mut engine.st)
         .bind_pool(&hello.pool_name)

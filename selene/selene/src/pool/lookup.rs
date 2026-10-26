@@ -1,6 +1,12 @@
 //! The ticket a queued request holds for its asynchronous pool lookup.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+/// UDS lookup p99 was 0.55 ms; allow host scheduling headroom.
+pub const LOOKUP_GRACE: Duration = Duration::from_millis(2);
 
 use crate::plan;
 
@@ -59,13 +65,19 @@ impl TicketInner {
 pub struct LookupTicket {
     inner: Arc<TicketInner>,
     withdraw: Option<Box<dyn FnOnce() + Send>>,
+    grace: Duration,
 }
 
 impl LookupTicket {
-    pub(crate) fn new(inner: Arc<TicketInner>, withdraw: Box<dyn FnOnce() + Send>) -> Self {
+    pub(crate) fn new(
+        inner: Arc<TicketInner>,
+        withdraw: Box<dyn FnOnce() + Send>,
+        grace: Duration,
+    ) -> Self {
         Self {
             inner,
             withdraw: Some(withdraw),
+            grace,
         }
     }
 
@@ -74,7 +86,13 @@ impl LookupTicket {
         Self {
             inner: TicketInner::new(LookupState::None),
             withdraw: None,
+            grace: LOOKUP_GRACE,
         }
+    }
+
+    /// Maximum admission hold for this lookup.
+    pub fn grace(&self) -> Duration {
+        self.grace
     }
 
     /// The current state. Never waits for a reply.
@@ -85,12 +103,18 @@ impl LookupTicket {
 
 #[cfg(any(test, feature = "test-support"))]
 impl LookupTicket {
+    /// Complete a watched lookup without a manager.
+    pub fn set_state(&self, state: LookupState) {
+        self.inner.set(state);
+    }
+
     /// A ticket in `state` that runs `withdraw` when it is dropped, for tests of
     /// the code that holds tickets.
     pub fn watched(state: LookupState, withdraw: impl FnOnce() + Send + 'static) -> Self {
         Self {
             inner: TicketInner::new(state),
             withdraw: Some(Box::new(withdraw)),
+            grace: LOOKUP_GRACE,
         }
     }
 }

@@ -215,6 +215,7 @@ pub(crate) struct Shared {
     topology: std::sync::atomic::AtomicU64,
     /// Lookups the manager accepts at once; 0 until the manager states it.
     max_lookups: AtomicU32,
+    lookup_grace: Mutex<std::time::Duration>,
     /// No lookups start before this instant after a refusal or timeout.
     paused_until: Mutex<Option<Instant>>,
     quarantined: std::sync::atomic::AtomicBool,
@@ -230,6 +231,7 @@ impl Shared {
             registry: Mutex::new(Registry::default()),
             topology: std::sync::atomic::AtomicU64::new(0),
             max_lookups: AtomicU32::new(0),
+            lookup_grace: Mutex::new(super::lookup::LOOKUP_GRACE),
             paused_until: Mutex::new(None),
             quarantined: std::sync::atomic::AtomicBool::new(false),
         })
@@ -296,6 +298,15 @@ impl Shared {
         self.topology.store(topology, Ordering::Relaxed);
     }
 
+    /// TCP Hello measures the control round trip before the first request. Use
+    /// four round trips for jitter, bounded by the wire lookup timeout.
+    pub(crate) fn set_lookup_rtt(&self, rtt: std::time::Duration) {
+        *self.lookup_grace.lock().unwrap() = rtt
+            .saturating_mul(4)
+            .max(super::lookup::LOOKUP_GRACE)
+            .min(super::engine::LOOKUP_TIMEOUT);
+    }
+
     pub(crate) fn set_max_lookups(&self, max: u32) {
         self.max_lookups.store(max, Ordering::Relaxed);
     }
@@ -355,7 +366,11 @@ impl Shared {
         registry.entries.insert(wire, inner.clone());
         drop(registry);
         let shared = self.clone();
-        LookupTicket::new(inner, Box::new(move || shared.withdraw_lookup(wire)))
+        LookupTicket::new(
+            inner,
+            Box::new(move || shared.withdraw_lookup(wire)),
+            *self.lookup_grace.lock().unwrap(),
+        )
     }
 
     fn withdraw_lookup(&self, wire: u64) {
@@ -425,6 +440,22 @@ mod tests {
         shared.set_status(PoolStatus::Ready);
         shared.set_max_lookups(8);
         shared
+    }
+
+    #[test]
+    fn lookup_grace_uses_remote_rtt_and_stays_bounded() {
+        use std::time::Duration;
+        let shared = ready();
+        assert_eq!(lookup(&shared, 1).grace(), Duration::from_millis(2));
+        shared.set_lookup_rtt(Duration::from_millis(8));
+        assert_eq!(lookup(&shared, 1).grace(), Duration::from_millis(32));
+        shared.set_lookup_rtt(Duration::from_secs(1));
+        assert_eq!(
+            lookup(&shared, 1).grace(),
+            super::super::engine::LOOKUP_TIMEOUT
+        );
+        shared.set_lookup_rtt(Duration::from_micros(100));
+        assert_eq!(lookup(&shared, 1).grace(), Duration::from_millis(2));
     }
 
     #[test]

@@ -158,8 +158,18 @@ struct Incoming {
     /// it when the request is admitted, which withdraws a lookup still on the
     /// wire; a cancelled or failed request drops it with the `Incoming`.
     pool_lookup: Option<flare_selene::pool::LookupTicket>,
+    pool_lookup_started: Option<std::time::Instant>,
 }
 impl Incoming {
+    fn awaits_pool(&self, now: std::time::Instant) -> bool {
+        self.pool_lookup.as_ref().is_some_and(|ticket| {
+            matches!(ticket.state(), flare_selene::pool::LookupState::Pending)
+                && self
+                    .pool_lookup_started
+                    .is_some_and(|started| now.saturating_duration_since(started) < ticket.grace())
+        })
+    }
+
     fn prompt_score_range(&self, start: usize, tokens: usize) -> std::ops::Range<usize> {
         let first = (if start == 0 { 0 } else { start + 1 }).max(self.prompt_scored);
         first..(start + tokens + 1).min(self.prompt_score_end)
@@ -702,6 +712,7 @@ impl ModelRuntime {
                 readmitted: false,
                 blocked: None,
                 pool_lookup: None,
+                pool_lookup_started: None,
             };
             let enqueue_ns = observation
                 .filter(|timestamps| *timestamps)
@@ -944,7 +955,7 @@ impl<'a> Worker<'a> {
                     thread::yield_now();
                 } else {
                     self.scheduler.idle()?;
-                    let wait = std::time::Duration::from_millis(2);
+                    let wait = self.idle_wait();
                     match self.receiver.recv_timeout(wait) {
                         Ok(request) => self.enqueue(request),
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -954,6 +965,23 @@ impl<'a> Worker<'a> {
             }
         }
         Ok(())
+    }
+
+    fn idle_wait(&self) -> std::time::Duration {
+        let now = std::time::Instant::now();
+        if self
+            .pending
+            .iter()
+            .any(|incoming| incoming.awaits_pool(now))
+            || self
+                .parked
+                .iter()
+                .any(|(incoming, _)| incoming.awaits_pool(now))
+        {
+            std::time::Duration::from_micros(100)
+        } else {
+            std::time::Duration::from_millis(2)
+        }
     }
 
     fn attach_store(&mut self, store: Option<Box<dyn flare_selene::HostStore>>) {
@@ -985,6 +1013,7 @@ impl<'a> Worker<'a> {
                 .append(&incoming.prompt.tokens, &incoming.prompt.conditioning)
                 .is_ok()
             {
+                incoming.pool_lookup_started = Some(std::time::Instant::now());
                 incoming.pool_lookup = store.begin_lookup(&history);
             }
         }
@@ -1110,7 +1139,10 @@ impl<'a> Worker<'a> {
                 stats.free_snapshots,
                 stats.free_slots,
             );
-            let eligible = |incoming: &Incoming| incoming.blocked != Some(resources);
+            let now = std::time::Instant::now();
+            let eligible = |incoming: &Incoming| {
+                incoming.blocked != Some(resources) && !incoming.awaits_pool(now)
+            };
             let parked = self
                 .parked
                 .iter()
@@ -2675,6 +2707,7 @@ mod tests {
             prompt_scored: 0,
             blocked: None,
             pool_lookup: None,
+            pool_lookup_started: None,
         };
         (
             incoming,
