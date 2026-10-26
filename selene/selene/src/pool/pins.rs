@@ -5,9 +5,7 @@ use std::{fs::File, path::PathBuf, sync::Arc};
 
 use flare_eos::FileReadAt;
 
-use crate::{
-    Error, PrefixKey, Result, disk::ReadAhead, geometry::BLOCK_BYTES, record::Header,
-};
+use crate::{Error, PrefixKey, Result, disk::ReadAhead, geometry::BLOCK_BYTES, record::Header};
 
 use super::{
     exporter::{Checksums, HostChain, HostPin, HostRecord, HostWindow},

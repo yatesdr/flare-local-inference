@@ -6,7 +6,7 @@
 # directory with that ownership first. Instances in other containers need the same two
 # bind mounts and the same PID namespace as the manager.
 #
-#   MANAGER_IMAGE   manager image (default selene:local; from the directory above this one, `docker build -f selene-manager/Dockerfile -t selene:local .`)
+#   MANAGER_IMAGE   manager image (default selene:local; from the Flare repository root, `docker build -f selene/selene-manager/Dockerfile -t selene:local .`)
 #   SELENE_DATA     host directory on local NVMe for the durable records (default /var/lib/selene)
 services:
   manager:

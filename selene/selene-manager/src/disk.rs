@@ -4,6 +4,7 @@ use crate::{
     invalid, proto,
     record::{self, Descriptor, Header},
 };
+use flare_eos::direct_update_file as open;
 use prost::Message;
 use std::{
     fs::{self, File, OpenOptions},
@@ -524,18 +525,6 @@ fn read_into(
         gate.wait()?;
     }
     read_at(file, buffer.bytes_mut(), offset)
-}
-
-fn open(path: &Path, write: bool) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .write(write)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECT);
-    if write {
-        options.create(true).truncate(false);
-    }
-    options.open(path)
 }
 
 pub fn read_at(file: &File, bytes: &mut [u8], offset: u64) -> Result<()> {

@@ -14,7 +14,7 @@ use the existing cache semantics. Scheduler-owned transfer tickets retain
 buffers independently of the requests waiting for them.
 
 Common host file I/O, memory mapping, scheduling-priority and filesystem
-capacity helpers live in `eos/` (`flare-eos`). Both Helios and Selene use Eos;
+capacity helpers live in `eos/` (`flare-eos`). Helios, Selene and its manager use Eos;
 Helios does not depend on Selene for non-cache OS operations. CUDA library
 loading and terminal sizing remain in `helios::os`.
 

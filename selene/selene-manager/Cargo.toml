@@ -19,6 +19,7 @@ test-support = ["dep:rcgen"]
 rdma = ["dep:ibverbs-sys", "flare-selene/rdma"]
 
 [dependencies]
+flare-eos = { path = "../../eos" }
 rcgen = { version = "0.14", features = ["pem"], optional = true }
 flare-selene = { path = "../selene" }
 blake2 = "0.10"

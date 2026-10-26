@@ -17,7 +17,7 @@ fencing rules are in [PROTOCOL.md](PROTOCOL.md). Running it is in
 
 Use Rust 1.88 or newer (validated with 1.94.1 on Linux). Serving is async on tokio and speaks
 gRPC through tonic and prost over a Unix socket; the crate also depends on `flare-selene` (by
-path, for shared record, index and wire types), and `blake2`.
+path, for shared record, index and wire types), `flare-eos` for host file I/O, and `blake2`.
 
 ```sh
 cargo build --release --locked
@@ -63,7 +63,7 @@ process RSS.
 ## Docker and systemd
 
 ```sh
-docker build -f selene-manager/Dockerfile -t selene .   # from the directory above this one
+docker build -f selene/selene-manager/Dockerfile -t selene .   # from the Flare repository root
 docker run --rm --name selene \
   --user "$(id -u):$(id -g)" --pid=host --network=host --ipc=host \
   -v /run/selene:/run/selene \

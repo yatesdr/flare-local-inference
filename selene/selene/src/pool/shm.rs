@@ -7,6 +7,7 @@
 use std::io;
 
 use flare_eos as os;
+
 use crate::{Error, Registration, Result};
 
 use super::wire;
