@@ -229,8 +229,8 @@ impl Prepared {
         let recommended = max_concurrency.saturating_mul(2);
         (rows < recommended).then(|| {
             format!(
-                "pooled host memory has {rows} rows, fewer than twice max concurrency ({recommended}); \
-             publications may be skipped while older records wait for pool persistence; \
+                "host memory has {rows} rows, fewer than twice max concurrency ({recommended}); \
+             publications may be skipped while older records wait for persistence; \
              increase --prefix-cache-memory or reduce --max-concurrency"
             )
         })
@@ -365,7 +365,7 @@ pub fn prepare(
     registrar: &dyn crate::HostRegistrar,
 ) -> Result<Preparation> {
     prepare_with_inputs(
-        options, package, identity, geometry, contexts, 0, None, registrar,
+        options, package, identity, geometry, contexts, 0, None, 0, registrar,
     )
 }
 
@@ -377,6 +377,7 @@ pub fn prepare_with_inputs(
     contexts: Vec<(usize, i32)>,
     input_staging: u64,
     shard: Option<(usize, usize)>,
+    max_concurrency: usize,
     registrar: &dyn crate::HostRegistrar,
 ) -> Result<Preparation> {
     if !options.enabled() {
@@ -454,10 +455,13 @@ pub fn prepare_with_inputs(
                     &layout,
                     checkpoint_memory,
                     &contexts,
+                    max_concurrency.saturating_mul(2),
                     registrar,
                 )?);
             }
-            let mut pool = slab::SlabPool::sized(&layout, checkpoint_memory)?;
+            let mut pool = slab::SlabPool::sized(
+                &layout, checkpoint_memory, max_concurrency.saturating_mul(2),
+            )?;
             pool.register(registrar, context)?;
             Ok::<_, crate::Error>(pool)
         })

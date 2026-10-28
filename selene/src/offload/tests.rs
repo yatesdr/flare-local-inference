@@ -33,6 +33,7 @@ fn prepare_with_inputs(
         contexts,
         inputs,
         shard,
+        0,
         &crate::testing::IdentityRegistrar,
     )
 }

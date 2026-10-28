@@ -1026,6 +1026,12 @@ impl HostStore for CompositeStore {
             self.stats.store_failed += 1;
             return Err(error);
         }
+        let (pages, rows) = self.memory.headroom();
+        self.spill_parked(
+            tail.len().max(pages)
+                .saturating_sub(self.memory.pool().free_pages()),
+            rows.max(1).saturating_sub(self.memory.pool().free_rows()),
+        );
         match self.memory.store_record(checkpoint, parent, &tail, false) {
             Ok(true) => {}
             Ok(false) => {
@@ -3852,4 +3858,61 @@ mod tests {
         assert!(store.parked.is_empty());
         store.close().unwrap();
     }
+    #[test]
+    fn a_burst_spills_cold_records_and_retries_without_losing_them() {
+        let Some(directory) = test_directory("composite", "memory-burst") else {
+            return;
+        };
+        let mut store = composite(&directory, 12, 2, 1 << 30);
+        let (copier, _) = crate::testing::SimulatedGpu::shared(&geometry()).unwrap();
+        store.memory = MemoryStore::new_flat(
+            IDENTITY,
+            SlabPool::new(PAGE_RECORD, 12, ROW_RECORD, 2, true).unwrap(),
+            copier,
+        )
+        .unwrap();
+        store.cascade();
+        let mut ids = Ids::new();
+        let mut keys = Vec::new();
+        for salt in 1..=12u32 {
+            let mut history = PrefixHistory::new(IDENTITY);
+            history.append(&vec![salt; 640], &[]).unwrap();
+            let record = checkpoint(
+                &mut ids,
+                &history,
+                640,
+                None,
+                pages(0..10),
+                10,
+                StateSlotId(1),
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match store.store(&record).unwrap() {
+                    StoreOutcome::Queued => break,
+                    StoreOutcome::Retry(StoreReason::Slabs) => {}
+                    other => panic!("unexpected outcome {other:?}"),
+                }
+                assert!(Instant::now() < deadline);
+                store.poll(&mut Vec::new()).unwrap();
+                std::thread::yield_now();
+            }
+            poll_until(&mut store, &mut Vec::new(), |s| {
+                s.parked.contains_key(&record.key)
+            });
+            keys.push(record.key);
+        }
+        store.spill_parked(usize::MAX, usize::MAX);
+        poll_until(&mut store, &mut Vec::new(), |s| s.outbound.is_empty());
+        assert!(
+            keys.iter()
+                .all(|key| store.disk.index().node(key).is_some_and(|n| n.ready))
+        );
+        assert_eq!(store.stats().store_failed, 0);
+        assert_eq!(store.stats().dropped, [0; 6]);
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
 }

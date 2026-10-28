@@ -109,7 +109,7 @@ mod memory {
             seed(row_plane, source_slot),
         );
 
-        let mut pool = SlabPool::sized(&layout, SlabPool::minimum_bytes(&layout)).unwrap();
+        let mut pool = SlabPool::sized(&layout, SlabPool::minimum_bytes(&layout), 0).unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
             Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
@@ -262,7 +262,7 @@ mod memory {
             0xDD,
         );
 
-        let mut pool = SlabPool::sized(&layout, SlabPool::minimum_bytes(&layout)).unwrap();
+        let mut pool = SlabPool::sized(&layout, SlabPool::minimum_bytes(&layout), 0).unwrap();
         pool.register(&CudaRegistrar, context).unwrap();
         let transfers = Arc::new(Mutex::new(
             Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),

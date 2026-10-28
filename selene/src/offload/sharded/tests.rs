@@ -102,6 +102,7 @@ fn sharded_export_and_restore_use_each_ranks_real_record_file() {
             vec![(rank, 0)],
             0,
             Some((rank, 2)),
+            0,
             &IdentityRegistrar,
         )
         .unwrap();

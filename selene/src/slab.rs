@@ -229,12 +229,12 @@ impl SlabPool {
         })
     }
 
-    /// A retaining pool of at most `bytes`: rows take one quarter and pages the
-    /// rest, each at least its minimum window count, with rows yielding to the
+    /// A retaining pool of at most `bytes`: rows take at least one quarter or
+    /// `target_rows`, each tier keeping its minimum window count. Rows yield to the
     /// page minimum so the pool never exceeds `bytes`. A `bytes` below
     /// [`SlabPool::minimum_bytes`] fails with that minimum in the message.
-    pub fn sized(layout: &Layout, bytes: u64) -> Result<Self> {
-        let (page_count, row_count) = Self::sized_counts(layout, bytes)?;
+    pub fn sized(layout: &Layout, bytes: u64, target_rows: usize) -> Result<Self> {
+        let (page_count, row_count) = Self::sized_counts(layout, bytes, target_rows)?;
         Self::new(
             layout.page_record_bytes,
             page_count,
@@ -255,6 +255,7 @@ impl SlabPool {
         layout: &Layout,
         bytes: u64,
         contexts: &[(usize, i32)],
+        target_rows: usize,
         registrar: &dyn HostRegistrar,
     ) -> Result<Self> {
         if contexts.len() != layout.ranks.len() {
@@ -264,7 +265,7 @@ impl SlabPool {
                 layout.ranks.len()
             )));
         }
-        let (page_count, row_count) = Self::sized_counts(layout, bytes)?;
+        let (page_count, row_count) = Self::sized_counts(layout, bytes, target_rows)?;
         let page_region = region_bytes("page", layout.page_record_bytes, page_count)?;
         let row_region = region_bytes("row", layout.row_record_bytes, row_count)?;
         let shares: Vec<(usize, usize)> = (0..layout.ranks.len())
@@ -334,7 +335,7 @@ impl SlabPool {
     }
 
     /// Page and row slab counts of a retaining pool of at most `bytes`.
-    fn sized_counts(layout: &Layout, bytes: u64) -> Result<(usize, usize)> {
+    fn sized_counts(layout: &Layout, bytes: u64, target_rows: usize) -> Result<(usize, usize)> {
         let page_record = layout.page_record_bytes;
         let row_record = layout.row_record_bytes;
         if page_record == 0 || row_record == 0 {
@@ -352,7 +353,10 @@ impl SlabPool {
         }
         let quarter_rows = bytes / 4 / row_record;
         let most_rows = (bytes - MINIMUM_PAGE_SLABS as u64 * page_record) / row_record;
-        let row_count = quarter_rows.max(MINIMUM_ROW_SLABS as u64).min(most_rows);
+        let row_count = quarter_rows
+            .max(target_rows as u64)
+            .max(MINIMUM_ROW_SLABS as u64)
+            .min(most_rows);
         let page_count = (bytes - row_count * row_record) / page_record;
         Ok((page_count as usize, row_count as usize))
     }
@@ -743,7 +747,7 @@ mod tests {
     fn sized_gives_rows_a_quarter_and_pages_the_rest() {
         let layout = layout();
         let bytes = 16u64 << 20;
-        let pool = SlabPool::sized(&layout, bytes).unwrap();
+        let pool = SlabPool::sized(&layout, bytes, 0).unwrap();
         assert!(pool.retain());
         assert_eq!(pool.page_bytes(), PAGE as usize);
         assert_eq!(pool.row_bytes(), ROW as usize);
@@ -758,19 +762,19 @@ mod tests {
     fn sized_never_goes_below_the_minimum_counts_or_above_the_budget() {
         let layout = layout();
         let minimum = SlabPool::minimum_bytes(&layout);
-        let pool = SlabPool::sized(&layout, minimum).unwrap();
+        let pool = SlabPool::sized(&layout, minimum, 0).unwrap();
         assert_eq!(pool.page_count(), MINIMUM_PAGE_SLABS);
         assert_eq!(pool.row_count(), MINIMUM_ROW_SLABS);
         assert_eq!(pool.bytes(), minimum);
 
         let budget = minimum + 3 * ROW;
-        let pool = SlabPool::sized(&layout, budget).unwrap();
+        let pool = SlabPool::sized(&layout, budget, 0).unwrap();
         assert_eq!(pool.page_count(), MINIMUM_PAGE_SLABS);
         assert_eq!(pool.row_count(), MINIMUM_ROW_SLABS + 3);
         assert_eq!(pool.bytes(), budget);
 
         let budget = minimum + 7 * PAGE + 1;
-        let pool = SlabPool::sized(&layout, budget).unwrap();
+        let pool = SlabPool::sized(&layout, budget, 0).unwrap();
         assert!(pool.page_count() >= MINIMUM_PAGE_SLABS);
         assert!(pool.row_count() >= MINIMUM_ROW_SLABS);
         assert!(pool.bytes() <= budget);
@@ -780,12 +784,12 @@ mod tests {
     fn sized_below_the_minimum_reports_the_minimum() {
         let layout = layout();
         let minimum = SlabPool::minimum_bytes(&layout);
-        let Err(error) = SlabPool::sized(&layout, minimum - 1) else {
+        let Err(error) = SlabPool::sized(&layout, minimum - 1, 0) else {
             panic!("a budget below the minimum must fail");
         };
         let message = error.to_string();
         assert!(message.contains(&minimum.to_string()), "{message}");
-        assert!(SlabPool::sized(&layout, 0).is_err());
+        assert!(SlabPool::sized(&layout, 0, 0).is_err());
     }
 
     #[test]
@@ -857,4 +861,19 @@ mod tests {
         pool.unregister().unwrap();
         assert!(!pool.registered());
     }
+    #[test]
+    fn workload_rows_preserve_page_minimum_and_memory_budget() {
+        let layout = layout();
+        for concurrency in [1usize, 4, 32, 64] {
+            let target = 2 * concurrency;
+            for extra in [0, 3, target] {
+                let bytes = SlabPool::minimum_bytes(&layout) + extra as u64 * ROW;
+                let (pages, rows) = SlabPool::sized_counts(&layout, bytes, target).unwrap();
+                assert!(pages >= MINIMUM_PAGE_SLABS);
+                assert!(rows >= target.min(MINIMUM_ROW_SLABS + extra));
+                assert!(pages as u64 * PAGE + rows as u64 * ROW <= bytes);
+            }
+        }
+    }
+
 }

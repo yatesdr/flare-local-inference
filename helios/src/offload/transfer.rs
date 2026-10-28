@@ -1519,7 +1519,7 @@ mod tests {
         };
         let layout = Layout::new(&geometry).unwrap();
         let before = free();
-        let mut registered = SlabPool::sized(&layout, POOL_BYTES).unwrap();
+        let mut registered = SlabPool::sized(&layout, POOL_BYTES, 0).unwrap();
         registered
             .register(&crate::offload::registrar::CudaRegistrar, contexts[0].0)
             .unwrap();
@@ -1530,6 +1530,7 @@ mod tests {
             &layout,
             POOL_BYTES,
             &contexts,
+            0,
             &crate::offload::registrar::CudaRegistrar,
         )
         .unwrap();

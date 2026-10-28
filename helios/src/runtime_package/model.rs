@@ -837,6 +837,8 @@ impl NativeModel {
             contexts,
             staging,
             shard,
+            self.server_config["max_active"]
+                .as_u64().ok_or("missing selected concurrency")? as usize,
         )?;
         let summary = self.offload.attach(prepared, &crate::offload::transfer::Copiers)?;
         phase.finish(summary);

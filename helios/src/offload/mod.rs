@@ -33,7 +33,7 @@ pub fn prepare(
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
 ) -> Result<Preparation> {
-    prepare_with_inputs(options, package, identity, geometry, contexts, 0, None)
+    prepare_with_inputs(options, package, identity, geometry, contexts, 0, None, 0)
 }
 
 pub fn prepare_with_inputs(
@@ -44,6 +44,7 @@ pub fn prepare_with_inputs(
     contexts: Vec<(usize, i32)>,
     input_staging: u64,
     shard: Option<(usize, usize)>,
+    max_concurrency: usize,
 ) -> Result<Preparation> {
     Ok(flare_selene::offload::prepare_with_inputs(
         options,
@@ -53,6 +54,7 @@ pub fn prepare_with_inputs(
         contexts,
         input_staging,
         shard,
+        max_concurrency,
         &registrar::CudaRegistrar,
     )?)
 }
