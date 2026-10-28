@@ -3601,6 +3601,9 @@ impl Store {
 
     pub fn metrics_text(&self) -> String {
         let mut text = String::new();
+        for (i, tier) in ["dram", "nvme"].into_iter().enumerate() {
+            text.push_str(&format!("selene_expired_total{{tier=\"{tier}\"}} {}\n", self.metrics.expired[i]));
+        }
         for (name, value) in [
             ("unknown_frames_total", self.metrics.dropped),
             ("cancels_total", self.metrics.cancels),
@@ -5814,6 +5817,7 @@ mod tests {
         store.tick();
         assert_eq!(store.namespaces[&id].tree.len(), 6);
         assert_eq!(store.metrics.expired, [64, 0]);
+        assert!(store.metrics_text().contains("selene_expired_total{tier=\"dram\"} 64\n"));
         assert!(store.charged < before);
         store.tick();
         assert_eq!(store.namespaces[&id].tree.len(), 6);

@@ -35,6 +35,7 @@ recovered from file mtime, updated asynchronously at most once a minute per
 record. At most once a minute, the existing tick rotates namespaces and walks
 from the oldest entry, skipping pinned records and active I/O. It stops at the
 first fresh record or 64 expired leaves, which are dropped outright.
+`selene_expired_total{tier="dram"|"nvme"}` counts those removals.
 
 ## Sizing
 

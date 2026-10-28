@@ -966,6 +966,13 @@ same completion events the store produces.
   `io_error`). Tiers are `dram` and `nvme`. The existing `parked_records` count is
   exported as `flare_host_cache_parked_records`, a gauge. `store_skipped` retains
   its existing meaning, including duplicates and retries.
+  `flare_host_cache_expired_total{tier}` counts direct age removals. Row-slot
+  gauges `flare_host_cache_rows_in_use` and `flare_host_cache_rows_total` report
+  actual allocated slabs and capacity, including rows held by in-flight copies.
+  `flare_host_cache_publish_lost_total{reason}` replaces the aggregate retry
+  abandonment counter, retaining the last retry cause (`inflight`, `slabs`,
+  `queue`, `budget`) when a GPU checkpoint disappears. Terminal `oversize` and
+  `io_error` losses are counted too; store-reason counters still count attempts.
 - **Publication outcomes.** `Present` requires a committed local copy; a lookup
   hint is not sufficient. `Oversize` includes required ancestor files that
   cannot coexist within the disk limit even without unrelated records, and
