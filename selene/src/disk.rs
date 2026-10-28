@@ -25,6 +25,7 @@ use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     io,
+    time::SystemTime,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -241,6 +242,7 @@ pub enum Job {
         id: JobId,
         path: PathBuf,
         length: u64,
+        modified: SystemTime,
     },
     Unlink {
         id: JobId,
@@ -587,11 +589,11 @@ impl Worker {
                 reply(id, Operation::ReadRow, 0, self.read_row(id, buffer))
             }
             Job::Close { id } => reply(id, Operation::Close, 0, self.close(id)),
-            Job::Truncate { id, path, length } => {
+            Job::Truncate { id, path, length, modified } => {
                 let result = (|| {
                     #[cfg(any(test, feature = "test-support"))]
                     self.faults.before_io().map_err(Error::carrying)?;
-                    truncate(&path, length)
+                    truncate(&path, length, modified)
                 })();
                 #[cfg(any(test, feature = "test-support"))]
                 self.faults.trace(b'W');
@@ -957,11 +959,11 @@ fn direct_open_failure(action: &str, path: &Path, error: io::Error) -> Error {
     io_failure(format!("{action} {}", path.display()), error)
 }
 
-fn truncate(path: &Path, length: u64) -> Result<u64> {
+fn truncate(path: &Path, length: u64, modified: SystemTime) -> Result<u64> {
     OpenOptions::new()
         .write(true)
         .open(path)
-        .and_then(|file| file.set_len(length))
+        .and_then(|file| file.set_len(length).and_then(|()| file.set_modified(modified)))
         .map(|()| 0)
         .map_err(|error| {
             io_failure(
@@ -1909,6 +1911,7 @@ mod tests {
                 id: JobId(3),
                 path: path.clone(),
                 length: header.row_segment,
+                modified: SystemTime::now(),
             })
             .unwrap();
         let replies = wait(&thread, 1);

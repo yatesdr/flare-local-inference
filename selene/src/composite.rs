@@ -910,7 +910,7 @@ impl CompositeStore {
         match &result {
             Ok(bytes) => {
                 for node in &inbound.chain.nodes {
-                    self.disk.index_mut().touch(node);
+                    self.disk.reused(*node);
                 }
                 self.stats.fetched += 1;
                 self.stats.bytes_in += bytes;
@@ -950,6 +950,7 @@ impl HostStore for CompositeStore {
             self.disk.hit(chain)
         };
         self.stats.hits += 1;
+        self.reused(hit.key);
         Some(hit)
     }
 
@@ -967,12 +968,16 @@ impl HostStore for CompositeStore {
             self.stats.store_skipped += 1;
             // A parked record already has its complete memory copy.
             if self.parked.contains_key(&key) && self.resident(&key, outbound.tail_pages, true) {
+                self.reused(key);
                 return Ok(StoreOutcome::Present);
             }
             return Ok(StoreOutcome::Retry(StoreReason::Inflight));
         }
         if let Some(outcome) = self.disk.store_status(checkpoint)? {
             self.stats.store_skipped += 1;
+            if outcome == StoreOutcome::Present {
+                self.reused(checkpoint.key);
+            }
             self.stats.dropped[4] += u64::from(outcome == StoreOutcome::Oversize);
             return Ok(outcome);
         }
@@ -1168,6 +1173,24 @@ impl HostStore for CompositeStore {
     }
 
     fn poll(&mut self, events: &mut Vec<StoreEvent>) -> Result<()> {
+        for key in self.disk.index_mut().expired(|node| {
+            !node.pinned()
+                || (node.pins() == 1
+                    && self.parked.get(&node.key).is_some_and(|p| !p.writing)
+                    && self
+                        .memory
+                        .index()
+                        .node(&node.key)
+                        .is_some_and(|n| !n.pinned()))
+        }) {
+            if self.parked.remove(&key).is_some() {
+                if let Some(mut outbound) = self.outbound.remove(&key) {
+                    self.release_parent(&mut outbound);
+                }
+                self.disk.index_mut().unpin(&key)?;
+            }
+            self.disk.expire(key)?;
+        }
         let mut memory_events = std::mem::take(&mut self.memory_events);
         self.memory.poll(&mut memory_events)?;
         for event in memory_events.drain(..) {
@@ -1265,6 +1288,7 @@ impl HostStore for CompositeStore {
             disk_records: disk.disk_records,
             disk_bytes: disk.disk_bytes,
             row_refills: disk.row_refills,
+            expired: std::array::from_fn(|i| disk.expired[i] + memory.expired[i]),
             held: std::array::from_fn(|i| self.stats.held[i] + disk.held[i]),
             dropped: std::array::from_fn(|i| self.stats.dropped[i] + disk.dropped[i]),
             progress: disk.progress + memory.progress + self.stats.progress,
@@ -3915,6 +3939,81 @@ mod tests {
         );
         assert_eq!(store.stats().store_failed, 0);
         assert_eq!(store.stats().dropped, [0; 6]);
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn expiry_drops_parked_records_and_recovers_disk_stamps() {
+        for persisted in [false, true] {
+            let Some(directory) = test_directory("composite", "expiry") else {
+                return;
+            };
+            let mut store = composite(&directory, 80, 8, 1 << 30);
+            let root = parked_root(&mut store, &mut Ids::new(), 1, 640);
+            let old = std::time::SystemTime::now() - Duration::from_secs(10800);
+            let path = directory.join(record::file_name(&root.key));
+            if persisted {
+                store.spill(root.key);
+                poll_until(&mut store, &mut Vec::new(), |s| s.outbound.is_empty());
+                fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+                store.close().unwrap();
+                drop(store);
+                store = composite(&directory, 80, 8, 1 << 30);
+                assert_eq!(store.disk.index().node(&root.key).unwrap().last_used, old);
+            } else {
+                store
+                    .disk
+                    .index_mut()
+                    .node_mut(&root.key)
+                    .unwrap()
+                    .last_used = old;
+            }
+            store.disk.index_mut().max_age = Duration::from_secs(7200);
+            store.poll(&mut Vec::new()).unwrap();
+            assert!(!store.disk.index().contains(&root.key));
+            assert!(!store.memory.index().contains(&root.key));
+            assert_eq!(
+                store.stats().expired,
+                if persisted { [0, 1] } else { [1, 0] }
+            );
+            assert!(store.parked.is_empty() && store.outbound.is_empty());
+            store.close().unwrap();
+            assert!(!path.exists());
+            drop(store);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn disk_hits_persist_last_use_once_per_minute_without_changing_bytes() {
+        let Some(directory) = test_directory("composite", "stamp") else {
+            return;
+        };
+        let mut store = composite(&directory, 80, 8, 1 << 30);
+        let root = parked_root(&mut store, &mut Ids::new(), 1, 640);
+        store.spill(root.key);
+        poll_until(&mut store, &mut Vec::new(), |s| s.outbound.is_empty());
+        let path = directory.join(record::file_name(&root.key));
+        let before = fs::read(&path).unwrap();
+        store.disk.index_mut().node_mut(&root.key).unwrap().modified =
+            std::time::SystemTime::UNIX_EPOCH;
+        store.reused(root.key);
+        let stamp = store.disk.index().node(&root.key).unwrap().modified;
+        store.reused(root.key);
+        assert_eq!(store.disk.index().node(&root.key).unwrap().modified, stamp);
+        store.close().unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), stamp);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        drop(store);
+        let mut store = composite(&directory, 80, 8, 1 << 30);
+        assert_eq!(store.disk.index().node(&root.key).unwrap().last_used, stamp);
         store.close().unwrap();
         drop(store);
         fs::remove_dir_all(directory).unwrap();

@@ -8,7 +8,8 @@
 //! to the tokens a request adds beyond its resident GPU checkpoint.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
+    time::{Duration, Instant, SystemTime},
     sync::{Arc, Mutex},
 };
 
@@ -31,9 +32,18 @@ pub struct Node<L> {
     children: u32,
     pins: u32,
     accessed: u64,
+    pub last_used: SystemTime,
+    pub modified: SystemTime,
 }
 
 impl<L> Node<L> {
+    pub fn stamp_due(&self) -> bool {
+        self.last_used
+            .duration_since(self.modified)
+            .unwrap_or_default()
+            >= Duration::from_secs(60)
+    }
+
     pub fn children(&self) -> u32 {
         self.children
     }
@@ -102,6 +112,9 @@ pub struct Index<L> {
     nodes: HashMap<PrefixKey, Node<L>>,
     buckets: HashMap<[u8; 16], Vec<PrefixKey>>,
     clock: u64,
+    order: BTreeSet<(u64, PrefixKey)>,
+    pub max_age: Duration,
+    swept: Option<Instant>,
     notices: Option<NodeNotices>,
 }
 
@@ -112,6 +125,9 @@ impl<L> Index<L> {
             nodes: HashMap::new(),
             buckets: HashMap::new(),
             clock: 0,
+            order: BTreeSet::new(),
+            max_age: Duration::ZERO,
+            swept: None,
             notices: None,
         }
     }
@@ -208,6 +224,10 @@ impl<L> Index<L> {
         self.nodes.values()
     }
 
+    pub fn ordered(&self) -> impl Iterator<Item = &Node<L>> {
+        self.order.iter().map(|(_, key)| &self.nodes[key])
+    }
+
     fn tick(&mut self) -> u64 {
         self.clock += 1;
         self.clock
@@ -250,6 +270,8 @@ impl<L> Index<L> {
             ));
         }
         let accessed = self.tick();
+        self.order.insert((accessed, key));
+        let last_used = SystemTime::now();
         self.buckets.entry(bucket).or_default().push(key);
         self.nodes.insert(
             key,
@@ -264,8 +286,11 @@ impl<L> Index<L> {
                 children: 0,
                 pins: 0,
                 accessed,
+                last_used,
+                modified: last_used,
             },
         );
+        self.touch(&key);
         if ready {
             self.notify(NodeEvent::Ready, &self.nodes[&key]);
         }
@@ -275,7 +300,9 @@ impl<L> Index<L> {
     pub fn access_at(&mut self, key: &PrefixKey, tick: u64) {
         self.clock = self.clock.max(tick);
         if let Some(node) = self.nodes.get_mut(key) {
+            self.order.remove(&(node.accessed, *key));
             node.accessed = tick;
+            self.order.insert((tick, *key));
         }
     }
 
@@ -291,6 +318,7 @@ impl<L> Index<L> {
             ));
         }
         let node = self.nodes.remove(key).unwrap();
+        self.order.remove(&(node.accessed, *key));
         if let Some(keys) = self.buckets.get_mut(&node.bucket) {
             keys.retain(|k| k != key);
             if keys.is_empty() {
@@ -305,10 +333,43 @@ impl<L> Index<L> {
     }
 
     pub fn touch(&mut self, key: &PrefixKey) {
+        self.touch_with(key, |_| {});
+    }
+
+    pub fn touch_with(&mut self, key: &PrefixKey, mut used: impl FnMut(&mut Node<L>)) {
+        let now = SystemTime::now();
         let tick = self.tick();
-        if let Some(node) = self.nodes.get_mut(key) {
-            node.accessed = tick;
+        let mut cursor = Some(*key);
+        while let Some(key) = cursor {
+            self.access_at(&key, tick);
+            let Some(node) = self.nodes.get_mut(&key) else {
+                break;
+            };
+            node.last_used = now;
+            used(node);
+            cursor = node.parent;
         }
+    }
+
+    /// Select at most 64 expired leaves per minute, oldest first.
+    pub fn expired(&mut self, eligible: impl Fn(&Node<L>) -> bool) -> Vec<PrefixKey> {
+        if self.max_age.is_zero()
+            || self
+                .swept
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(60))
+        {
+            return Vec::new();
+        }
+        self.swept = Some(Instant::now());
+        let now = SystemTime::now();
+        self.ordered()
+            .take_while(|node| {
+                node.children > 0 || now.duration_since(node.last_used).unwrap_or_default() >= self.max_age
+            })
+            .filter(|node| node.children == 0 && eligible(node))
+            .take(64)
+            .map(|node| node.key)
+            .collect()
     }
 
     pub fn pin(&mut self, key: &PrefixKey) -> Result<()> {
@@ -460,6 +521,10 @@ impl<L> Index<L> {
 
     /// Remove a childless node and any page-only ancestors it leaves childless.
     pub fn remove(&mut self, key: &PrefixKey) -> Result<Vec<Node<L>>> {
+        self.remove_up_to(key, usize::MAX)
+    }
+
+    pub fn remove_up_to(&mut self, key: &PrefixKey, limit: usize) -> Result<Vec<Node<L>>> {
         let node = self
             .nodes
             .get(key)
@@ -472,7 +537,9 @@ impl<L> Index<L> {
         let mut removed = Vec::new();
         let mut next = Some(*key);
         while let Some(key) = next {
+            if removed.len() == limit { break; }
             let node = self.nodes.remove(&key).unwrap();
+            self.order.remove(&(node.accessed, key));
             if let Some(keys) = self.buckets.get_mut(&node.bucket) {
                 keys.retain(|k| *k != key);
                 if keys.is_empty() {
@@ -499,15 +566,13 @@ impl<L> Index<L> {
         need_row: bool,
         evictable: impl Fn(&Node<L>) -> bool,
     ) -> Option<PrefixKey> {
-        self.nodes
-            .values()
-            .filter(|node| {
+        self.ordered()
+            .find(|node| {
                 node.ready
                     && node.pins == 0
                     && evictable(node)
                     && (node.children == 0 || (need_row && node.row && node.children == 1))
             })
-            .min_by_key(|node| (node.accessed, node.key.consumed_tokens))
             .map(|node| node.key)
     }
 
@@ -660,6 +725,7 @@ mod tests {
         insert(&mut index, &full, 600, Some(400));
         index.touch(&full.key_at(200).unwrap());
         index.touch(&full.key_at(600).unwrap());
+        index.access_at(&full.key_at(400).unwrap(), 0);
         // Rows are needed and every leaf is pinned, so the oldest single-child ancestor compacts.
         index.pin(&full.key_at(600).unwrap()).unwrap();
         match index.evict(true, |_| true) {
@@ -994,4 +1060,75 @@ mod tests {
         );
         assert_eq!(tree.len(), 1);
     }
+    #[test]
+    fn expiry_is_bounded_and_advances_past_pinned_records() {
+        let mut tree = Index::new(64);
+        let old = SystemTime::now() - Duration::from_secs(10800);
+        for n in 1..=130u64 {
+            let key = test_key(n * 64);
+            tree.insert(key, None, [0; 16], n as usize, true, true, ())
+                .unwrap();
+            tree.node_mut(&key).unwrap().last_used = old;
+            if n <= 64 {
+                tree.pin(&key).unwrap();
+            }
+        }
+        assert!(tree.expired(|node| !node.pinned()).is_empty());
+        tree.max_age = Duration::from_secs(7200);
+        let first = tree.expired(|node| !node.pinned());
+        assert_eq!(first.len(), 64);
+        assert_eq!(first[0], test_key(65 * 64));
+        for key in first {
+            tree.remove_node(&key).unwrap();
+        }
+        assert!(tree.expired(|node| !node.pinned()).is_empty());
+        tree.swept = Some(Instant::now() - Duration::from_secs(60));
+        tree.touch(&test_key(129 * 64));
+        assert_eq!(tree.expired(|node| !node.pinned()), [test_key(130 * 64)]);
+        tree.max_age = Duration::ZERO;
+        tree.swept = None;
+        assert!(tree.expired(|node| !node.pinned()).is_empty());
+
+        let mut tree = Index::new(64);
+        let h = history(192);
+        insert(&mut tree, &h, 64, None);
+        insert(&mut tree, &h, 128, Some(64));
+        insert(&mut tree, &h, 192, None);
+        // A fresh ancestor with an old tick must not hide an expired leaf.
+        tree.access_at(&h.key_at(64).unwrap(), 0);
+        let cold = h.key_at(192).unwrap();
+        tree.access_at(&cold, 1);
+        tree.node_mut(&cold).unwrap().last_used = old;
+        tree.max_age = Duration::from_secs(7200);
+        assert_eq!(tree.expired(|node| !node.pinned()), [cold]);
+    }
+
+    #[test]
+    fn child_publication_and_hits_refresh_ancestry_and_limit_stamps() {
+        let mut tree = Index::new(64);
+        let h = history(192);
+        insert(&mut tree, &h, 64, None);
+        let cold = test_key(256);
+        tree.insert(cold, None, [0; 16], 4, true, true, ()).unwrap();
+        let parent = h.key_at(64).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(10800);
+        tree.node_mut(&parent).unwrap().last_used = old;
+        tree.node_mut(&parent).unwrap().modified = old;
+        insert(&mut tree, &h, 128, Some(64));
+        assert!(tree.node(&parent).unwrap().last_used > old);
+        let mut stamps = 0;
+        for _ in 0..2 {
+            tree.touch_with(&h.key_at(128).unwrap(), |node| {
+                if node.stamp_due() {
+                    stamps += 1;
+                    node.modified = node.last_used;
+                }
+            });
+        }
+        assert_eq!(stamps, 1);
+        tree.node_mut(&cold).unwrap().last_used = old;
+        tree.max_age = Duration::from_secs(7200);
+        assert_eq!(tree.expired(|node| !node.pinned()), [cold]);
+    }
+
 }

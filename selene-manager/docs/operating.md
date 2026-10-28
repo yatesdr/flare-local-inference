@@ -28,6 +28,14 @@ upgrades for `selene`. The wire contract is [PROTOCOL.md](../PROTOCOL.md) and
   identical paths, and (in containers) share a PID namespace so peer credentials are real.
   Instances that cannot meet this still work over `--listen`, without shared memory.
 
+Record expiry is off by default. `--max-age DURATION|off`
+accepts positive durations in ms, s, m, h, or bare seconds; `off` disables expiry.
+Puts, gets and child publication refresh the required chain. Last use is
+recovered from file mtime, updated asynchronously at most once a minute per
+record. At most once a minute, the existing tick rotates namespaces and walks
+from the oldest entry, skipping pinned records and active I/O. It stops at the
+first fresh record or 64 expired leaves, which are dropped outright.
+
 ## Sizing
 
 The service is CPU-only and never touches GPU memory. Three budgets are configured

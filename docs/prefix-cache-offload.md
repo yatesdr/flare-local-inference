@@ -385,6 +385,22 @@ are preserved. Limits and write failures do not fail shutdown; accepted transfer
 still drain before memory is released. Size a container's stop grace as Flare's
 usual stop time plus DRAM bytes ÷ measured disk write rate.
 
+Host record expiry is off by default. Enable it with
+`--prefix-cache-max-age DURATION|off` or `[prefix_cache] max_age = "2h"`;
+positive durations accept ms, s, m, h, or bare seconds. `off` disables expiry.
+Publication, reuse, restore and child publication refresh the record and its
+required ancestors. File mtime preserves last use across restart, with updates
+queued on the existing disk worker at most once a minute per record. Metadata
+writes preserve payload bytes and compaction preserves the last-use stamp.
+
+At most once a minute, the model-thread poll walks from the oldest entry,
+skipping records that cannot be dropped and stopping at the first fresh record
+or 64 expired leaves. Expired leaves are dropped outright; they are never sent
+down the cascade. Ancestors remain until children leave, and in-flight copies
+and exports retain their storage. The manager uses the same index and limit,
+rotating namespaces on its existing tick. The GPU tier keeps its existing
+eviction policy.
+
 The disk thread owns an `io_uring` ring over files opened with `O_DIRECT`,
 chunks transfers at 8 MiB, and computes and verifies checksums. Before accepting
 payload reads,
@@ -941,7 +957,7 @@ same completion events the store produces.
   disk LRU makes room; with DRAM alone, durable DRAM LRU is the local end.
   Local mode uses the same parked/spill path and LRU unlink at the end of its
   chain, with the same completed-maintenance budget accounting. Only end-of-chain eviction,
-  infeasible footprints (`Oversize`) and terminal disk I/O errors discard data.
+  expiry, infeasible footprints (`Oversize`) and terminal disk I/O errors discard data.
   GPU publication announces the GPU holding and starts its first host copy;
   GPU eviction sends the existing notice and never starts a late copy.
 - **Retention metrics.** `flare_host_cache_held_total{tier}` counts record

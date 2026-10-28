@@ -107,7 +107,8 @@ pub trait DiskTransport {
         plan: Vec<FetchSegment>,
         ticket: &InboundTicket,
     ) -> Result<()>;
-    fn truncate(&mut self, id: super::JobId, path: PathBuf, length: u64) -> Result<()>;
+    /// Update file length and last-use mtime on the disk worker; equal length only touches mtime.
+    fn truncate(&mut self, id: super::JobId, path: PathBuf, length: u64, modified: SystemTime) -> Result<()>;
     fn unlink(&mut self, id: super::JobId, path: PathBuf) -> Result<()>;
     /// Report completed jobs. `Err` means this transport can no longer report
     /// them: a job it accepted may still run, so the caller must stop rather
@@ -1323,7 +1324,7 @@ impl DiskTransport for Staged {
         Ok(())
     }
 
-    fn truncate(&mut self, id: super::JobId, path: PathBuf, length: u64) -> Result<()> {
+    fn truncate(&mut self, id: super::JobId, path: PathBuf, length: u64, modified: SystemTime) -> Result<()> {
         if self.closed {
             return Err(invalid("the staged transport is closed"));
         }
@@ -1335,6 +1336,7 @@ impl DiskTransport for Staged {
                 id: disk,
                 path,
                 length,
+                modified,
             },
         ));
         Ok(())
@@ -1493,8 +1495,11 @@ impl DiskStore {
         }
         let mut by_age: Vec<&Scanned> = scanned.iter().collect();
         by_age.sort_by_key(|record| (record.modified, record.header.key.consumed_tokens));
-        for record in by_age {
-            index.touch(&record.header.key);
+        for (tick, record) in by_age.into_iter().enumerate() {
+            index.access_at(&record.header.key, tick as u64 + 1);
+            let node = index.node_mut(&record.header.key).unwrap();
+            node.last_used = record.modified;
+            node.modified = record.modified;
         }
         Ok(Self {
             index,
@@ -1939,6 +1944,9 @@ impl DiskStore {
         self.used += bytes;
         self.largest = self.largest.max(bytes);
         self.stats.progress += 1;
+        if !parked {
+            self.reused(key);
+        }
         Ok(Some((header, temporary, path)))
     }
 
@@ -2186,6 +2194,15 @@ impl DiskStore {
         Ok(())
     }
 
+    pub(crate) fn expire(&mut self, key: PrefixKey) -> Result<()> {
+        if let Ok(node) = self.index.remove_node(&key) {
+            if node.location.bytes == 0 { self.evicted.push(key); }
+            self.stats.expired[usize::from(node.ready)] += 1;
+            self.unlink(node)?;
+        }
+        Ok(())
+    }
+
     /// Drop a compacted node's row segment from its file and the budget.
     fn compact(&mut self, key: &PrefixKey) -> Result<()> {
         let node = self
@@ -2193,6 +2210,7 @@ impl DiskStore {
             .node_mut(key)
             .ok_or_else(|| invalid("cannot compact an unindexed host record"))?;
         let length = node.location.header.row_segment;
+        let modified = node.last_used;
         let freed = node.location.bytes.saturating_sub(length);
         node.location.bytes = length;
         let path = node.location.path.clone();
@@ -2206,7 +2224,7 @@ impl DiskStore {
             },
         );
         self.sync_budget();
-        if let Err(error) = self.transport.truncate(id, path, length) {
+        if let Err(error) = self.transport.truncate(id, path, length, modified) {
             self.apply(
                 TransportEvent::Truncated {
                     id,
@@ -2315,7 +2333,7 @@ impl DiskStore {
                 match &result {
                     Ok(bytes) => {
                         for key in &job.nodes {
-                            self.index.touch(key);
+                            self.reused(*key);
                         }
                         self.stats.fetched += 1;
                         self.stats.bytes_in += bytes;
@@ -2342,9 +2360,15 @@ impl DiskStore {
                 let Some(reclaim) = self.maintenance.remove(&id) else {
                     return;
                 };
+                if reclaim.bytes == 0 && let Some(key) = reclaim.key {
+                    self.index.unpin(&key).expect("pinned timestamp record");
+                }
                 if result.is_ok() {
                     self.sync_budget();
                     return;
+                }
+                if reclaim.bytes == 0 {
+                    eprintln!("warning: prefix cache timestamp: {}", result.unwrap_err());
                 }
                 // The file keeps the bytes, so they stay charged against the
                 // limit until the next startup scan reconciles the directory.
@@ -2397,7 +2421,40 @@ impl DiskStore {
 
 impl HostStore for DiskStore {
     fn reused(&mut self, key: PrefixKey) {
-        self.index.touch(&key);
+        let (transport, maintenance, next) = (
+            &mut self.transport,
+            &mut self.maintenance,
+            &mut self.next_job,
+        );
+        let mut pinned = Vec::new();
+        self.index.touch_with(&key, |node| {
+            if node.ready && node.stamp_due() {
+                let id = JobId(*next);
+                *next += 1;
+                match transport.truncate(
+                    id,
+                    node.location.path.clone(),
+                    node.location.bytes,
+                    node.last_used,
+                ) {
+                    Ok(()) => {
+                        maintenance.insert(
+                            id,
+                            Reclaim {
+                                key: Some(node.key),
+                                bytes: 0,
+                            },
+                        );
+                        pinned.push(node.key);
+                        node.modified = node.last_used;
+                    }
+                    Err(error) => eprintln!("warning: prefix cache timestamp: {error}"),
+                }
+            }
+        });
+        for key in pinned {
+            self.index.pin(&key).expect("indexed timestamp record");
+        }
     }
 
     fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit> {
@@ -2406,12 +2463,16 @@ impl HostStore for DiskStore {
             .index
             .lookup_below(history, resident, before, |node| node.ready)?;
         self.stats.hits += 1;
+        self.reused(chain.key);
         Some(self.hit(chain))
     }
 
     fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
         if let Some(outcome) = self.store_status(checkpoint)? {
             self.stats.store_skipped += 1;
+            if outcome == StoreOutcome::Present {
+                self.reused(checkpoint.key);
+            }
             self.stats.dropped[4] += u64::from(outcome == StoreOutcome::Oversize);
             return Ok(outcome);
         }
@@ -2490,6 +2551,9 @@ impl HostStore for DiskStore {
     }
 
     fn poll(&mut self, events: &mut Vec<StoreEvent>) -> Result<()> {
+        for key in self.index.expired(|node| !node.pinned()) {
+            self.expire(key)?;
+        }
         self.reclaim_inputs();
         let mut completed = Vec::new();
         let polled = self.transport.poll(&mut completed);
@@ -2629,7 +2693,7 @@ mod tests {
             header,
             row,
             bytes,
-            modified: UNIX_EPOCH + CREATED + Duration::from_secs(age),
+            modified: SystemTime::now() - Duration::from_secs(50u64.saturating_sub(age)),
         }
     }
 
@@ -2716,7 +2780,7 @@ mod tests {
             Ok(())
         }
 
-        fn truncate(&mut self, id: JobId, path: PathBuf, length: u64) -> Result<()> {
+        fn truncate(&mut self, id: JobId, path: PathBuf, length: u64, _modified: SystemTime) -> Result<()> {
             self.0
                 .borrow_mut()
                 .calls
@@ -4361,8 +4425,7 @@ mod tests {
             .truncate(
                 JobId(3),
                 directory.join(record::file_name(&root.key)),
-                root.row_segment,
-            )
+                root.row_segment, SystemTime::now())
             .unwrap();
         assert!(matches!(
             &transport_events(&mut staged, 1)[0],
@@ -4694,7 +4757,7 @@ mod tests {
         // Truncation drops the row, after which reading it fails; unlinking
         // removes the file, and unlinking again fails.
         staged
-            .truncate(JobId(6), path.clone(), header.row_segment)
+            .truncate(JobId(6), path.clone(), header.row_segment, SystemTime::now())
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
             [TransportEvent::Truncated { id, result }] => {
@@ -4752,7 +4815,7 @@ mod tests {
                 )
                 .is_err()
         );
-        assert!(staged.truncate(JobId(10), path.clone(), 0).is_err());
+        assert!(staged.truncate(JobId(10), path.clone(), 0, SystemTime::now()).is_err());
         assert!(staged.unlink(JobId(10), path.clone()).is_err());
         let mut events = Vec::new();
         staged.poll(&mut events).unwrap();

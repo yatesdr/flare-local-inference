@@ -982,6 +982,10 @@ impl MemoryStore {
         self.core.flat
     }
 
+    pub fn index_mut(&mut self) -> &mut Index<MemoryRecord> {
+        &mut self.core.index
+    }
+
     pub fn index(&self) -> &Index<MemoryRecord> {
         &self.core.index
     }
@@ -1334,6 +1338,7 @@ impl HostStore for MemoryStore {
         if let Some(node) = self.core.index.node(&checkpoint.key) {
             if node.ready && node.row {
                 self.core.stats.store_skipped += 1;
+                self.reused(checkpoint.key);
                 return Ok(StoreOutcome::Present);
             }
             if node.pinned() {
@@ -1383,6 +1388,13 @@ impl HostStore for MemoryStore {
         events.append(&mut self.events);
         // Inside a composite the disk index supplies parents, so it flushes.
         if !self.core.flat {
+            for key in self.core.index.expired(|node| !node.pinned()) {
+                if let Ok(node) = self.core.index.remove_node(&key) {
+                    self.core.release(&node.location);
+                    self.core.stats.expired[0] += 1;
+                    self.core.stats.progress += 1;
+                }
+            }
             self.flush_announcements(&|_, parent| parent, &|_| None);
         }
         Ok(())
@@ -2572,4 +2584,31 @@ mod tests {
         core.finish_retired();
         assert!(!core.index.contains(&cold.key));
     }
+    #[test]
+    fn expired_memory_records_release_their_slabs() {
+        let geometry = [crate::testing::geometry(64, &[("kv", PAGE)], ROW)];
+        let (copier, _) = crate::testing::SimulatedGpu::shared(&geometry).unwrap();
+        let mut store = MemoryStore::new(
+            IDENTITY,
+            SlabPool::new(PAGE, 2, ROW, 2, true).unwrap(),
+            copier,
+        )
+        .unwrap();
+        store.index_mut().max_age = std::time::Duration::from_secs(7200);
+        let checkpoint = published(&history(64, 1), 64, None, 0, 1);
+        store.store(&checkpoint).unwrap();
+        store
+            .index_mut()
+            .node_mut(&checkpoint.key)
+            .unwrap()
+            .last_used = std::time::SystemTime::UNIX_EPOCH;
+        store.poll(&mut Vec::new()).unwrap();
+        assert_eq!(store.stats().expired, [1, 0]);
+        assert_eq!(
+            (store.pool().free_pages(), store.pool().free_rows()),
+            (2, 2)
+        );
+        store.close().unwrap();
+    }
+
 }

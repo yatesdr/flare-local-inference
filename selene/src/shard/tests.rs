@@ -95,7 +95,7 @@ use std::net::TcpListener;
 
         // A peer's failure fails the job and names the rank.
         let second = record_file(&directory, 256);
-        transport.truncate(JobId(2), second.clone(), 4096).unwrap();
+        transport.truncate(JobId(2), second.clone(), 4096, SystemTime::now()).unwrap();
         assert_eq!(reply(&mut peer).0, TRUNCATE);
         peer.send(&encode_event(
             Kind::Truncated,
@@ -306,7 +306,7 @@ use std::net::TcpListener;
         );
         transport.unlink(JobId(1), ours.clone()).unwrap();
         transport
-            .truncate(JobId(2), kept_ours.clone(), 4096)
+            .truncate(JobId(2), kept_ours.clone(), 4096, SystemTime::now())
             .unwrap();
         let mut events = events(&mut transport, 2);
         events.sort_by_key(|event| Kind::of(event).1);

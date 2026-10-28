@@ -17,7 +17,7 @@ use std::{
         mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
     },
     thread::JoinHandle,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 pub const IDLE: Duration = Duration::from_millis(1);
 pub const BUSY: Duration = Duration::from_micros(100);
@@ -875,12 +875,13 @@ impl DiskTransport for Sharded {
         Ok(())
     }
 
-    fn truncate(&mut self, id: JobId, path: PathBuf, length: u64) -> Result<()> {
+    fn truncate(&mut self, id: JobId, path: PathBuf, length: u64, modified: SystemTime) -> Result<()> {
         self.accept()?;
         let mut writer = Writer::new(TRUNCATE);
-        writer.u64(id.0).text(name(&path)?).u64(length);
+        let stamp = modified.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+        writer.u64(id.0).text(name(&path)?).u64(length).u64(stamp.as_secs()).u32(stamp.subsec_nanos());
         let frame = writer.finish();
-        self.local.truncate(id, path, length)?;
+        self.local.truncate(id, path, length, modified)?;
         self.begin(Kind::Truncated, id, None, &frame);
         Ok(())
     }
@@ -1069,8 +1070,10 @@ impl Peer {
         if tag == TRUNCATE {
             let path = file(&self.directory, reader.text()?)?;
             let length = reader.u64()?;
+            let modified = SystemTime::UNIX_EPOCH.checked_add(Duration::new(reader.u64()?, reader.u32()?))
+                .ok_or_else(|| invalid("record timestamp overflows"))?;
             reader.end()?;
-            let result = self.staged.truncate(id, path, length);
+            let result = self.staged.truncate(id, path, length, modified);
             return Ok(result.err().map(|error| (Kind::Truncated, id, error)));
         }
         if tag == UNLINK {
