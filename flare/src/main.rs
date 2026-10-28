@@ -225,6 +225,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+    if membership.is_some() {
+        cluster::require_transport()?;
+    }
     let options = args.load_options();
     let local_devices: Vec<i32> = (0..args.gpus.len() as i32).collect();
     let shape = cluster::Shape::from_flags(args.roce_ring, args.roce_chain);

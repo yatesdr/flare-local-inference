@@ -11,10 +11,22 @@ use flare_helios::{
 
 type Failure = Box<dyn std::error::Error>;
 
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+/// Reject unsupported serving before loading resources or sizing caches.
+pub fn require_transport() -> Result<(), Failure> {
+    if cfg!(all(
+        target_os = "linux",
+        any(target_arch = "aarch64", feature = "roce")
+    )) {
+        Ok(())
+    } else {
+        Err("this flare build has no RoCE transport for multi-host packages; on Linux x86_64, rebuild with --features roce".into())
+    }
+}
+
+#[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
 pub use flare_helios::execution::roce::RoceTransport;
 
-#[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+#[cfg(not(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce"))))]
 pub struct RoceTransport;
 
 /// A rank's connection to the rest of its cluster; the transport must outlive every replay.
@@ -27,21 +39,23 @@ pub struct Joined<S> {
 
 /// The check every completed frame passes: a failed transport poisons the rank.
 pub fn health(transport: &Arc<RoceTransport>) -> CollectiveHealth {
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
     {
         let transport = transport.clone();
         CollectiveHealth(Arc::new(move || transport.health()))
     }
-    #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+    #[cfg(not(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce"))))]
     {
         let _ = transport;
-        unreachable!("no transport without RoCE support")
+        CollectiveHealth(Arc::new(|| {
+            Err("this flare build has no RoCE transport for multi-host packages".into())
+        }))
     }
 }
 
 /// Open this rank's transport over the fabric every rank discovered, from their endpoint lists in
 /// rank order.
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
 fn open(
     owner: &NativeModel,
     fabric: &flare_helios::execution::roce_fabric::Fabric,
@@ -63,7 +77,7 @@ fn open(
     Ok(unsafe { RoceTransport::open(spec, &topology)? })
 }
 
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
 fn connected(transport: &RoceTransport) -> String {
     format!(
         "{} rails per {} over {}",
@@ -108,7 +122,7 @@ pub enum Membership {
 impl Membership {
     /// The continuation rows and KV pages every rank allocates: the fewest any rank can back.
     pub fn agree(&mut self, local: (u64, u64)) -> flare_helios::Result<(u64, u64)> {
-        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        #[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
         {
             use flare_helios::execution::rendezvous;
 
@@ -117,10 +131,10 @@ impl Membership {
                 Membership::Peer(stream) => rendezvous::propose_capacity(stream, local),
             }
         }
-        #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+        #[cfg(not(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce"))))]
         {
             let _ = local;
-            unreachable!("no membership without RoCE support")
+            Err("this flare build has no RoCE transport for multi-host packages".into())
         }
     }
 }
@@ -161,7 +175,7 @@ pub fn rank_zero(
     progress: &StartupProgress,
     shape: Shape,
 ) -> Result<Joined<Vec<RankStream>>, Failure> {
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
     {
         use flare_helios::execution::{rendezvous, roce_fabric};
 
@@ -188,7 +202,7 @@ pub fn rank_zero(
             records: None,
         })
     }
-    #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+    #[cfg(not(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce"))))]
     {
         let _ = (owner, streams, progress, shape);
         Err("this flare build has no RoCE transport for multi-host packages".into())
@@ -203,7 +217,7 @@ pub fn peer(
     progress: &StartupProgress,
     shape: Shape,
 ) -> Result<Joined<RankStream>, Failure> {
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))]
     {
         use flare_helios::execution::{rendezvous, roce_fabric};
 
@@ -239,7 +253,7 @@ pub fn peer(
             records,
         })
     }
-    #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+    #[cfg(not(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce"))))]
     {
         let _ = (owner, cluster, stream, progress, shape);
         Err("this flare build has no RoCE transport for multi-host packages".into())
@@ -278,5 +292,25 @@ mod pool_tests {
             assert_eq!(started.recv().unwrap(), peer_approved);
             assert_eq!(zero.join().unwrap(), peer_approved);
         }
+    }
+}
+
+#[cfg(all(
+    test,
+    not(all(target_os = "linux", any(target_arch = "aarch64", feature = "roce")))
+))]
+mod transport_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_build_rejects_multi_host_serving_and_capacity_agreement() {
+        assert!(
+            require_transport()
+                .unwrap_err()
+                .to_string()
+                .contains("--features roce")
+        );
+        let error = Membership::Zero(Vec::new()).agree((1, 1)).unwrap_err();
+        assert!(error.to_string().contains("no RoCE transport"));
     }
 }
