@@ -4469,6 +4469,67 @@ mod tests {
             .unwrap();
     }
 
+    /// The store-thread work after a publish must not grow with the number of records held.
+    /// Release builds only: `cargo test --release --features test-support -- --ignored`.
+    #[test]
+    #[ignore = "scale test; release builds only"]
+    fn publishing_into_a_large_store_takes_under_a_millisecond() {
+        let (mut store, base, _directory) = store_with_root("scale", 1 << 20);
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let extent = || Some(Arc::new(DiskExtent::new(base.join("record"))));
+        let insert = |store: &mut Store, key: Key, parent: Option<Key>| {
+            let header = crate::record::new_header(&value, key, parent, [0; 16], 1).unwrap();
+            let location = Location {
+                header,
+                memory: None,
+                disk: extent(),
+                durable: false,
+                writing: false,
+                job: None,
+                retry: Instant::now(),
+                bytes: 0,
+            };
+            let tree = &mut store.namespaces.get_mut(&id).unwrap().tree;
+            tree.insert(key, parent, [0; 16], 1, true, true, location)
+                .unwrap();
+        };
+        let mut last = None;
+        for chain in 0..6_250u64 {
+            let mut parent = None;
+            for depth in 0..16u64 {
+                let mut digest = [0; 16];
+                digest[..8].copy_from_slice(&chain.to_le_bytes());
+                digest[8] = depth as u8;
+                let key = Key {
+                    consumed_tokens: (depth + 1) * 64,
+                    digest,
+                };
+                insert(&mut store, key, parent);
+                parent = Some(key);
+            }
+            last = parent;
+        }
+        store.refresh_durability(id, None);
+        assert!(store.namespaces[&id].tree.nodes().all(|n| n.location.durable));
+        let leaf = Key {
+            consumed_tokens: 17 * 64,
+            digest: [255; 16],
+        };
+        insert(&mut store, leaf, last);
+        let started = Instant::now();
+        store.refresh_durability(id, Some(leaf));
+        store.schedule();
+        let elapsed = started.elapsed();
+        assert!(
+            store.namespaces[&id].tree[&leaf].location.durable,
+            "the new record follows its durable parent"
+        );
+        assert!(elapsed < Duration::from_millis(1), "took {elapsed:?}");
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+    }
+
     #[test]
     fn catalog_snapshot_precedes_ordered_unbounded_deltas() {
         let (mut store, directory) = store("catalog");
