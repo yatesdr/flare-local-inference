@@ -1078,6 +1078,10 @@ impl MemoryStore {
         }
     }
 
+    pub fn announced_sums(&self, key: &PrefixKey) -> Option<Arc<RecordSums>> {
+        self.announce.as_ref()?.sums.get(key).cloned()
+    }
+
     /// The slabs of a ready record.
     pub fn record(&self, key: &PrefixKey) -> Option<&MemoryRecord> {
         self.core.record(key)
