@@ -38,6 +38,7 @@ use crate::{
         Announcer, FilePin, HostPin, IndexEntry, Releases, Tier as PoolTier, TierView,
         pins::{FileSpan, host_chain_kept},
     },
+    shared::SliceSums,
 };
 
 use super::{
@@ -113,6 +114,7 @@ pub trait DiskTransport {
         plan: Vec<FetchSegment>,
         ticket: &InboundTicket,
     ) -> Result<()>;
+    /// Drop the row segment of a committed record.
     fn truncate(&mut self, id: super::JobId, path: PathBuf, length: u64) -> Result<()>;
     fn unlink(&mut self, id: super::JobId, path: PathBuf) -> Result<()>;
     /// Report completed jobs. `Err` means this transport can no longer report
@@ -254,8 +256,12 @@ enum Source {
         pages: Vec<PageId>,
         slot: StateSlotId,
     },
-    /// Caller-owned registered buffers already holding every record.
-    Host { pages: Vec<usize>, row: usize },
+    /// Caller-owned registered buffers already holding every record, and their checksums if known.
+    Host {
+        pages: Vec<usize>,
+        row: usize,
+        sums: Option<SliceSums>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -397,6 +403,10 @@ impl OutboundRecord {
                 id: self.disk,
                 temporary: self.temporary.clone(),
                 header: self.header.clone(),
+                sums: match &self.source {
+                    Source::Host { sums, .. } => sums.clone(),
+                    Source::Device { .. } => None,
+                },
             };
             match resources.submit_disk(job) {
                 Ok(()) => {
@@ -499,7 +509,7 @@ impl OutboundRecord {
                 self.outstanding += 1;
                 (buffers, OutPhase::Transferring, 1)
             }
-            Source::Host { pages, row } => (
+            Source::Host { pages, row, .. } => (
                 Buffers {
                     pages: pages[first..first + count].to_vec(),
                     row: last.then_some(*row),
@@ -1029,6 +1039,7 @@ impl Staged {
 
     /// Write a record whose page and row bytes already sit in caller-owned
     /// registered buffers (host addresses in record order).
+    #[allow(clippy::too_many_arguments)]
     pub fn write_from(
         &mut self,
         id: super::JobId,
@@ -1037,6 +1048,7 @@ impl Staged {
         path: PathBuf,
         pages: Vec<usize>,
         row: Option<usize>,
+        sums: Option<SliceSums>,
     ) -> Result<()> {
         self.accept(id)?;
         if pages.len() != header.tail_pages as usize {
@@ -1050,7 +1062,8 @@ impl Staged {
         let Some(row) = row else {
             return Err(invalid("a record cannot be written without its row"));
         };
-        self.start_outbound(id, header, temporary, path, Source::Host { pages, row });
+        let source = Source::Host { pages, row, sums };
+        self.start_outbound(id, header, temporary, path, source);
         Ok(())
     }
 
@@ -1499,8 +1512,10 @@ impl DiskStore {
         }
         let mut by_age: Vec<&Scanned> = scanned.iter().collect();
         by_age.sort_by_key(|record| (record.modified, record.header.key.consumed_tokens));
-        for record in by_age {
-            index.touch(&record.header.key);
+        for (tick, record) in by_age.into_iter().enumerate() {
+            index.access_at(&record.header.key, tick as u64 + 1);
+            let node = index.node_mut(&record.header.key).unwrap();
+            node.last_used = record.modified;
         }
         Ok(Self {
             index,
@@ -1680,14 +1695,7 @@ impl DiskStore {
 
     fn sync_budget(&self) {
         if let Some(budget) = &self.budget {
-            budget.set_checkpoint(
-                self.used.saturating_add(
-                    self.maintenance
-                        .values()
-                        .map(|reclaim| reclaim.bytes)
-                        .sum::<u64>(),
-                ),
-            );
+            budget.set_checkpoint(self.used.saturating_add(self.pending_bytes()));
         }
     }
 
@@ -2068,7 +2076,7 @@ impl DiskStore {
     }
 
     fn pending_bytes(&self) -> u64 {
-        self.maintenance.values().map(|r| r.bytes).sum()
+        self.maintenance.values().map(|reclaim| reclaim.bytes).sum()
     }
 
     pub(crate) fn maintain(&mut self) {
@@ -2189,6 +2197,18 @@ impl DiskStore {
             return Err(error);
         }
         self.evicted.push(node.key);
+        Ok(())
+    }
+
+    pub(crate) fn expire(&mut self, key: PrefixKey) -> Result<()> {
+        for node in self.index.remove(&key)? {
+            if node.location.bytes == 0 {
+                self.evicted.push(node.key);
+            }
+            // Unready records are parked memory copies in a composite.
+            self.stats.expired[usize::from(node.ready)] += 1;
+            self.unlink(node)?;
+        }
         Ok(())
     }
 
@@ -2320,8 +2340,11 @@ impl DiskStore {
                 }
                 match &result {
                     Ok(bytes) => {
-                        for key in &job.nodes {
-                            self.index.touch(key);
+                        for key in job.nodes.iter().rev().skip(1).rev() {
+                            self.index.access(key);
+                        }
+                        if let Some(key) = job.nodes.last() {
+                            self.reused(*key);
                         }
                         self.stats.fetched += 1;
                         self.stats.bytes_in += bytes;
@@ -2348,6 +2371,7 @@ impl DiskStore {
                 let Some(reclaim) = self.maintenance.remove(&id) else {
                     return;
                 };
+                let Reclaim { key, bytes } = reclaim;
                 if result.is_ok() {
                     self.sync_budget();
                     return;
@@ -2356,12 +2380,12 @@ impl DiskStore {
                 // limit until the next startup scan reconciles the directory.
                 // A compacted record regains its full length; its row stays
                 // unmatchable. An unlinked record is already out of the index.
-                if let Some(node) = reclaim.key.and_then(|key| self.index.node_mut(&key))
+                if let Some(node) = key.and_then(|key| self.index.node_mut(&key))
                     && node.location.bytes == node.location.header.row_segment
                 {
-                    node.location.bytes += reclaim.bytes;
+                    node.location.bytes += bytes;
                 }
-                self.used = self.used.saturating_add(reclaim.bytes);
+                self.used = self.used.saturating_add(bytes);
                 self.sync_budget();
             }
         }
@@ -2390,6 +2414,7 @@ impl DiskStore {
         events.push(if pressure {
             StoreEvent::Deferred {
                 checkpoint: job.checkpoint,
+                reason: StoreReason::Budget,
             }
         } else {
             StoreEvent::Stored {
@@ -2418,6 +2443,9 @@ impl HostStore for DiskStore {
     fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
         if let Some(outcome) = self.store_status(checkpoint)? {
             self.stats.store_skipped += 1;
+            if outcome == StoreOutcome::Present {
+                self.index.touch_ancestors(&checkpoint.key);
+            }
             self.stats.dropped[4] += u64::from(outcome == StoreOutcome::Oversize);
             return Ok(outcome);
         }
@@ -2497,6 +2525,9 @@ impl HostStore for DiskStore {
     }
 
     fn poll(&mut self, events: &mut Vec<StoreEvent>) -> Result<()> {
+        for key in self.index.expired(|node| !node.pinned()) {
+            self.expire(key)?;
+        }
         self.reclaim_inputs();
         let mut completed = Vec::new();
         let polled = self.transport.poll(&mut completed);
@@ -2636,7 +2667,7 @@ mod tests {
             header,
             row,
             bytes,
-            modified: UNIX_EPOCH + CREATED + Duration::from_secs(age),
+            modified: SystemTime::now() - Duration::from_secs(50u64.saturating_sub(age)),
         }
     }
 
@@ -2758,7 +2789,7 @@ mod tests {
     fn store_with(scanned: Vec<Scanned>, limit: u64) -> (DiskStore, Rc<RefCell<Log>>) {
         let log = Rc::new(RefCell::new(Log::default()));
         let store = DiskStore::new(
-            record::DirectoryLock::acquire(&directory()).unwrap(),
+            crate::testing::directory_lock(&directory()).unwrap(),
             IDENTITY,
             FINGERPRINT,
             limit,
@@ -2902,12 +2933,12 @@ mod tests {
     #[test]
     fn disk_store_keeps_exclusive_directory_ownership_until_drop() {
         let (mut store, _) = store_with(Vec::new(), 1 << 30);
-        assert!(record::DirectoryLock::acquire(store.directory()).is_err());
+        assert!(crate::testing::directory_lock(store.directory()).is_err());
         store.close().unwrap();
-        assert!(record::DirectoryLock::acquire(store.directory()).is_err());
+        assert!(crate::testing::directory_lock(store.directory()).is_err());
         let path = store.directory().to_owned();
         drop(store);
-        let reopened = record::DirectoryLock::acquire(&path).unwrap();
+        let reopened = crate::testing::directory_lock(&path).unwrap();
         drop(reopened);
         fs::remove_dir_all(path).unwrap();
     }
@@ -2967,7 +2998,7 @@ mod tests {
             &mut events,
         );
         assert!(
-            matches!(&events[..], [StoreEvent::Deferred { checkpoint }] if *checkpoint == record.id)
+            matches!(&events[..], [StoreEvent::Deferred { checkpoint, reason: StoreReason::Budget }] if *checkpoint == record.id)
         );
         assert!(store.outbound.is_empty());
         assert_eq!(store.stats().dropped, [0; 6]);
@@ -4357,6 +4388,7 @@ mod tests {
                     directory.join(record::file_name(&header.key)),
                     addresses(&pool, &source),
                     Some(pool.row_address(row)),
+                    None,
                 )
                 .unwrap();
             assert!(matches!(
@@ -4375,7 +4407,7 @@ mod tests {
             &transport_events(&mut staged, 1)[0],
             TransportEvent::Truncated { result: Ok(_), .. }
         ));
-        let guard = record::DirectoryLock::acquire(&directory).unwrap();
+        let guard = crate::testing::directory_lock(&directory).unwrap();
         let scanned = record::scan(&guard, &IDENTITY, &FINGERPRINT, geometry()[0].page_tokens, &record::rank_sizes(&geometry())).unwrap();
         let mut store = DiskStore::new(
             guard,
@@ -4407,6 +4439,7 @@ mod tests {
                 path.clone(),
                 addresses(&pool, &source),
                 Some(pool.row_address(row)),
+                None,
             )
             .unwrap();
         assert!(matches!(
@@ -4438,22 +4471,7 @@ mod tests {
         );
         store.close().unwrap();
         drop(store);
-        // Parallel subprocess tests can inherit the flock until their exec completes.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let guard = loop {
-            match record::DirectoryLock::acquire(&directory) {
-                Ok(guard) => break guard,
-                Err(error) => {
-                    let busy = error.cause().is_some_and(|cause| {
-                        cause
-                            .downcast_ref::<std::io::Error>()
-                            .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
-                    });
-                    assert!(busy && Instant::now() < deadline, "{error}");
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-            }
-        };
+        let guard = crate::testing::directory_lock(&directory).unwrap();
         let scanned = record::scan(&guard, &IDENTITY, &FINGERPRINT, geometry()[0].page_tokens, &record::rank_sizes(&geometry())).unwrap();
         assert_eq!(scanned.len(), 2);
         assert!(scanned.iter().all(|record| record.row));
@@ -4529,7 +4547,8 @@ mod tests {
                     temporary.clone(),
                     path.clone(),
                     source_addresses[..PAGES - 1].to_vec(),
-                    Some(pool.row_address(source_row))
+                    Some(pool.row_address(source_row)),
+                    None,
                 )
                 .is_err()
         );
@@ -4541,7 +4560,8 @@ mod tests {
                     temporary.clone(),
                     path.clone(),
                     source_addresses.clone(),
-                    None
+                    None,
+                    None,
                 )
                 .is_err()
         );
@@ -4562,6 +4582,7 @@ mod tests {
                 path.clone(),
                 source_addresses.clone(),
                 Some(pool.row_address(source_row)),
+                None,
             )
             .unwrap();
         assert!(
@@ -4572,7 +4593,8 @@ mod tests {
                     temporary.clone(),
                     path.clone(),
                     source_addresses.clone(),
-                    Some(pool.row_address(source_row))
+                    Some(pool.row_address(source_row)),
+                    None,
                 )
                 .is_err()
         );
@@ -4587,7 +4609,7 @@ mod tests {
         assert_eq!(fs::metadata(&path).unwrap().len(), header.length_with_row());
         assert!(!temporary.exists());
         let scanned = record::scan(
-            &record::DirectoryLock::acquire(&directory).unwrap(),
+            &crate::testing::directory_lock(&directory).unwrap(),
             &IDENTITY,
             &FINGERPRINT,
             geometry[0].page_tokens,
@@ -4755,7 +4777,8 @@ mod tests {
                     temporary.clone(),
                     path.clone(),
                     source_addresses.clone(),
-                    Some(pool.row_address(source_row))
+                    Some(pool.row_address(source_row)),
+                    None,
                 )
                 .is_err()
         );
@@ -4803,6 +4826,7 @@ mod tests {
                 path.clone(),
                 source_addresses.clone(),
                 Some(host.row_address(source_row)),
+                None,
             )
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
@@ -4944,6 +4968,7 @@ mod tests {
                 missing.join(record::file_name(&lost.key)),
                 source_addresses.clone(),
                 Some(host.row_address(source_row)),
+                None,
             )
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
@@ -4963,6 +4988,7 @@ mod tests {
                 directory.join(record::file_name(&lost.key)),
                 source_addresses.clone(),
                 Some(host.row_address(source_row)),
+                None,
             )
             .unwrap();
         match &transport_events(&mut staged, 1)[..] {
@@ -4976,7 +5002,7 @@ mod tests {
         assert_eq!(free(&staged), all);
         assert_eq!(
             record::scan(
-                &record::DirectoryLock::acquire(&directory).unwrap(),
+                &crate::testing::directory_lock(&directory).unwrap(),
                 &IDENTITY,
                 &FINGERPRINT,
                 geometry[0].page_tokens,
@@ -5023,6 +5049,7 @@ mod tests {
                     directory.join(record::file_name(&header.key)),
                     source_addresses.clone(),
                     Some(host.row_address(source_row)),
+                    None,
                 )
                 .unwrap();
         }
@@ -5080,7 +5107,7 @@ mod tests {
         assert!(settled(&staged));
         assert_eq!(
             record::scan(
-                &record::DirectoryLock::acquire(&directory).unwrap(),
+                &crate::testing::directory_lock(&directory).unwrap(),
                 &IDENTITY,
                 &FINGERPRINT,
                 geometry[0].page_tokens,
