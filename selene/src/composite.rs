@@ -2479,8 +2479,8 @@ mod tests {
         let before = started.elapsed();
         poll_until(&mut store, &mut Vec::new(), |s| s.jobs.is_empty());
         let bytes = (20 * PAGE_RECORD + ROW_RECORD) as f64;
-        assert!(store.disk_inbound_rate.0 >= bytes / started.elapsed().as_secs_f64());
-        assert!(store.disk_inbound_rate.0 <= bytes / before.as_secs_f64());
+        assert!(store.disk_inbound_rate.get() >= bytes / started.elapsed().as_secs_f64());
+        assert!(store.disk_inbound_rate.get() <= bytes / before.as_secs_f64());
         store.close().unwrap();
         drop(store);
         fs::remove_dir_all(directory).unwrap();
