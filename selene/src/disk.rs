@@ -43,11 +43,11 @@ use io_uring::{EnterFlags, IoUring, opcode, types};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
-use crate::{Error, Result};
+use crate::{Error, Result, shared::SliceSums};
 
 use super::{
     JobId,
-    geometry::{BLOCK_BYTES, invalid},
+    geometry::{BLOCK_BYTES, Layout, invalid},
     record::{HEADER_BYTES, Header, checksum, io_failure},
 };
 
@@ -172,7 +172,7 @@ pub enum Operation {
     Unlink,
 }
 
-/// Work for the disk thread. Buffers are host addresses of page or row slabs.
+/// Work for the disk thread. Buffers are host addresses of page or row slots.
 /// `Create` through `Commit` or `Abort` share one id and run in submission
 /// order; `Open` through `Close` likewise. A buffer must stay valid and
 /// untouched until the job's reply arrives.
@@ -199,6 +199,7 @@ pub enum Job {
         id: JobId,
         temporary: PathBuf,
         header: Header,
+        sums: Option<SliceSums>,
     },
     /// Write page records `first..first + buffers.len()` from `buffers`.
     WritePages {
@@ -209,7 +210,7 @@ pub enum Job {
     },
     WriteRow {
         id: JobId,
-        buffer: usize,
+        buffers: Vec<usize>,
     },
     /// Write the checksum segment and header, optionally `fdatasync`, rename to
     /// `path`, and close. Every page record and the row must have been written.
@@ -237,7 +238,7 @@ pub enum Job {
     },
     ReadRow {
         id: JobId,
-        buffer: usize,
+        buffers: Vec<usize>,
     },
     Close {
         id: JobId,
@@ -459,6 +460,7 @@ struct Writing {
     temporary: PathBuf,
     header: Header,
     checksums: Vec<u64>,
+    hashed: bool,
     written: Vec<bool>,
     row_written: bool,
     bytes: u64,
@@ -547,7 +549,13 @@ impl Worker {
                 id,
                 temporary,
                 header,
-            } => reply(id, Operation::Create, 0, self.create(id, temporary, header)),
+                sums,
+            } => reply(
+                id,
+                Operation::Create,
+                0,
+                self.create(id, temporary, header, sums),
+            ),
             Job::WritePages {
                 id,
                 window,
@@ -559,8 +567,8 @@ impl Worker {
                 window,
                 self.write_pages(id, first, &buffers),
             ),
-            Job::WriteRow { id, buffer } => {
-                reply(id, Operation::WriteRow, 0, self.write_row(id, buffer))
+            Job::WriteRow { id, buffers } => {
+                reply(id, Operation::WriteRow, 0, self.write_row(id, &buffers))
             }
             Job::Commit { id, path, sync } => {
                 reply(id, Operation::Commit, 0, self.commit(id, &path, sync))
@@ -589,8 +597,8 @@ impl Worker {
                 window,
                 self.read_pages(id, first, &buffers),
             ),
-            Job::ReadRow { id, buffer } => {
-                reply(id, Operation::ReadRow, 0, self.read_row(id, buffer))
+            Job::ReadRow { id, buffers } => {
+                reply(id, Operation::ReadRow, 0, self.read_row(id, &buffers))
             }
             Job::Close { id } => reply(id, Operation::Close, 0, self.close(id)),
             Job::Truncate { id, path, length } => {
@@ -607,26 +615,50 @@ impl Worker {
         }
     }
 
-    fn create(&mut self, id: JobId, temporary: PathBuf, header: Header) -> Result<u64> {
+    fn create(
+        &mut self,
+        id: JobId,
+        temporary: PathBuf,
+        mut header: Header,
+        sums: Option<SliceSums>,
+    ) -> Result<u64> {
         if self.records.contains_key(&id) {
             return Err(invalid(format!("disk job {} is already open", id.0)));
         }
         check_tail_pages(&header)?;
         let file = flare_eos::direct_file(&temporary, true)
             .map_err(|error| direct_open_failure("create record file", &temporary, error))?;
+        // Allocated blocks make every direct write an overwrite, which ext4 runs under a shared
+        // inode lock, so the ring's writes overlap instead of serializing at queue depth one.
+        // A sparse `set_len` would not: writes into holes still take the lock exclusively.
+        if let Err(error) = preallocate(&file, header.length(true)) {
+            drop(file);
+            let _ = fs::remove_file(&temporary);
+            return Err(io_failure("preallocate record file", error));
+        }
         #[cfg(windows)]
         self.ring
             .queue
             .attach(&file)
             .map_err(|e| io_failure("attach record writer", e))?;
         let tail = header.tail_pages as usize;
+        let given = sums.is_some();
+        let (checksums, hashed) = match sums {
+            Some(SliceSums { pages, row: Some(row) }) if pages.len() == tail => {
+                header.row_checksum = row;
+                (pages, true)
+            }
+            _ => (vec![0; tail], false),
+        };
+        debug_assert!(given == hashed, "supplied checksums do not fit the record");
         self.records.insert(
             id,
             Record::Writing(Writing {
                 file,
                 temporary,
                 header,
-                checksums: vec![0; tail],
+                checksums,
+                hashed,
                 written: vec![false; tail],
                 row_written: false,
                 bytes: 0,
@@ -656,29 +688,26 @@ impl Worker {
         let moved = self.ring.transfer(&writing.file, &spans, true)?;
         for (page, address) in pages.zip(buffers) {
             // SAFETY: The transfer checked the span's alignment and completed;
-            // the caller keeps the slab at `address` valid and unchanged for
+            // the caller keeps the slot at `address` valid and unchanged for
             // `page_bytes` until this job's reply.
             let bytes =
                 unsafe { std::slice::from_raw_parts(*address as *const u8, page_bytes as usize) };
-            writing.checksums[page] = checksum(bytes);
+            if !writing.hashed {
+                writing.checksums[page] = checksum(bytes);
+            }
             writing.written[page] = true;
         }
         writing.bytes += moved;
         Ok(moved)
     }
 
-    fn write_row(&mut self, id: JobId, buffer: usize) -> Result<u64> {
+    fn write_row(&mut self, id: JobId, buffers: &[usize]) -> Result<u64> {
         let writing = writing(&mut self.records, id)?;
-        let row_bytes = writing.header.row_record_bytes();
-        let span = Span {
-            address: buffer,
-            offset: writing.header.row_segment,
-            length: row_bytes as usize,
-        };
-        let moved = self.ring.transfer(&writing.file, &[span], true)?;
-        // SAFETY: As for page buffers.
-        let bytes = unsafe { std::slice::from_raw_parts(buffer as *const u8, row_bytes as usize) };
-        writing.header.row_checksum = checksum(bytes);
+        let (layout, spans) = row_spans(&writing.header, buffers)?;
+        let moved = self.ring.transfer(&writing.file, &spans, true)?;
+        if !writing.hashed {
+            writing.header.row_checksum = crate::record::row_checksum(&layout, buffers);
+        }
         writing.row_written = true;
         writing.bytes += moved;
         Ok(moved)
@@ -850,7 +879,7 @@ impl Worker {
             .collect();
         let moved = self.ring.transfer(&reading.file, &spans, false)?;
         for (page, address) in pages.zip(buffers) {
-            // SAFETY: The caller keeps the slab at `address` valid for
+            // SAFETY: The caller keeps the slot at `address` valid for
             // `page_bytes` until this job's reply, and the read into it completed.
             let bytes =
                 unsafe { std::slice::from_raw_parts(*address as *const u8, page_bytes as usize) };
@@ -864,18 +893,11 @@ impl Worker {
         Ok(moved)
     }
 
-    fn read_row(&mut self, id: JobId, buffer: usize) -> Result<u64> {
+    fn read_row(&mut self, id: JobId, buffers: &[usize]) -> Result<u64> {
         let reading = reading(&mut self.records, id)?;
-        let row_bytes = reading.header.row_record_bytes();
-        let span = Span {
-            address: buffer,
-            offset: reading.header.row_segment,
-            length: row_bytes as usize,
-        };
-        let moved = self.ring.transfer(&reading.file, &[span], false)?;
-        // SAFETY: As for page buffers.
-        let bytes = unsafe { std::slice::from_raw_parts(buffer as *const u8, row_bytes as usize) };
-        if checksum(bytes) != reading.header.row_checksum {
+        let (layout, spans) = row_spans(&reading.header, buffers)?;
+        let moved = self.ring.transfer(&reading.file, &spans, false)?;
+        if crate::record::row_checksum(&layout, buffers) != reading.header.row_checksum {
             return Err(invalid(format!(
                 "row record of {} failed checksum verification",
                 reading.path.display()
@@ -889,6 +911,21 @@ impl Worker {
         self.records.remove(&id);
         Ok(0)
     }
+}
+
+fn row_spans(header: &Header, buffers: &[usize]) -> Result<(Layout, Vec<Span>)> {
+    let layout = header.layout()?;
+    if buffers.len() != layout.row_slots() {
+        return Err(invalid("row buffer count disagrees with record layout"));
+    }
+    let spans = crate::slab::row_pieces(&layout, buffers)
+        .map(|(address, offset, length)| Span {
+            address,
+            offset: header.row_segment + offset,
+            length,
+        })
+        .collect();
+    Ok((layout, spans))
 }
 
 fn reply(id: JobId, operation: Operation, window: u32, outcome: Result<u64>) -> Reply {
@@ -961,6 +998,26 @@ fn direct_open_failure(action: &str, path: &Path, error: io::Error) -> Error {
         ));
     }
     io_failure(format!("{action} {}", path.display()), error)
+}
+
+/// Reserve `length` bytes of `file`; a filesystem without `fallocate` keeps the old behavior.
+#[cfg(target_os = "linux")]
+fn preallocate(file: &File, length: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: The descriptor is open for the call.
+    if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, length as libc::off_t) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EOPNOTSUPP | libc::ENOSYS) => Ok(()),
+        _ => Err(error),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn preallocate(_file: &File, _length: u64) -> io::Result<()> {
+    Ok(())
 }
 
 fn truncate(path: &Path, length: u64) -> Result<u64> {
@@ -1718,6 +1775,100 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn created_record_file_has_its_final_length() {
+        let Some(directory) = test_directory("preallocated") else {
+            return;
+        };
+        let key = PrefixKey {
+            consumed_tokens: 200,
+            digest: [8; 16],
+        };
+        let header = header(key, 3);
+        let temporary = directory.join(temporary_name(&key));
+        let mut thread = DiskThread::start("flare-offload-disk").unwrap();
+        thread
+            .submit(Job::Create {
+                id: JobId(1),
+                temporary: temporary.clone(),
+                header: header.clone(),
+                sums: None,
+            })
+            .unwrap();
+        let replies = wait(&thread, 1);
+        assert_eq!(succeeded(&replies[0]), 0);
+        assert_eq!(fs::metadata(&temporary).unwrap().len(), header.length(true));
+        thread.submit(Job::Abort { id: JobId(1) }).unwrap();
+        wait(&thread, 1);
+        assert!(!temporary.exists());
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn supplied_checksums_are_recorded_instead_of_computed() {
+        let Some(directory) = test_directory("supplied-sums") else {
+            return;
+        };
+        let key = PrefixKey {
+            consumed_tokens: 200,
+            digest: [8; 16],
+        };
+        let header = header(key, 3);
+        let pages: Vec<AlignedBuffer> = (0..3u8)
+            .map(|index| buffer(header.page_record_bytes() as usize, index + 1))
+            .collect();
+        let row = buffer(header.row_record_bytes() as usize, 9);
+        let path = directory.join(file_name(&key));
+        let mut thread = DiskThread::start("flare-offload-disk").unwrap();
+        let writer = JobId(1);
+        // Marker values no hash of these bytes would produce.
+        let sums = SliceSums {
+            pages: vec![111, 222, 444],
+            row: Some(333),
+        };
+        for job in [
+            Job::Create {
+                id: writer,
+                temporary: directory.join(temporary_name(&key)),
+                header: header.clone(),
+                sums: Some(sums),
+            },
+            Job::WritePages {
+                id: writer,
+                window: 0,
+                first: 0,
+                buffers: pages.iter().map(AlignedBuffer::address).collect(),
+            },
+            Job::WriteRow {
+                id: writer,
+                buffers: (0..header.layout().unwrap().row_slots())
+                    .map(|i| row.address() + i * header.page_record_bytes() as usize)
+                    .collect(),
+            },
+            Job::Commit {
+                id: writer,
+                path: path.clone(),
+                sync: false,
+            },
+        ] {
+            thread.submit(job).unwrap();
+        }
+        assert!(wait(&thread, 4).iter().all(|reply| reply.result.is_ok()));
+        let contents = fs::read(&path).unwrap();
+        let written = Header::decode(&contents[..HEADER_BYTES]).unwrap();
+        assert_eq!(written.row_checksum, 333);
+        for (index, expected) in [111u64, 222, 444].into_iter().enumerate() {
+            let slot = HEADER_BYTES + index * 8;
+            assert_eq!(
+                u64::from_le_bytes(contents[slot..slot + 8].try_into().unwrap()),
+                expected
+            );
+        }
+        thread.close().unwrap();
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
     #[test]
     fn record_round_trips_through_direct_io() {
         let Some(directory) = test_directory("round-trip") else {
@@ -1746,6 +1897,7 @@ mod tests {
                 id: writer,
                 temporary: temporary.clone(),
                 header: header.clone(),
+                sums: None,
             })
             .unwrap();
         thread
@@ -1767,7 +1919,9 @@ mod tests {
         thread
             .submit(Job::WriteRow {
                 id: writer,
-                buffer: row.address(),
+                buffers: (0..header.layout().unwrap().row_slots())
+                    .map(|i| row.address() + i * header.page_record_bytes() as usize)
+                    .collect(),
             })
             .unwrap();
         thread
@@ -1849,7 +2003,9 @@ mod tests {
         thread
             .submit(Job::ReadRow {
                 id: reader,
-                buffer: fresh_row.address(),
+                buffers: (0..header.layout().unwrap().row_slots())
+                    .map(|i| fresh_row.address() + i * header.page_record_bytes() as usize)
+                    .collect(),
             })
             .unwrap();
         thread
@@ -1900,7 +2056,9 @@ mod tests {
         thread
             .submit(Job::ReadRow {
                 id: reader,
-                buffer: fresh_row.address(),
+                buffers: (0..header.layout().unwrap().row_slots())
+                    .map(|i| fresh_row.address() + i * header.page_record_bytes() as usize)
+                    .collect(),
             })
             .unwrap();
         thread.submit(Job::Close { id: reader }).unwrap();
@@ -1943,7 +2101,9 @@ mod tests {
         thread
             .submit(Job::ReadRow {
                 id: reopened,
-                buffer: fresh_row.address(),
+                buffers: (0..header.layout().unwrap().row_slots())
+                    .map(|i| fresh_row.address() + i * header.page_record_bytes() as usize)
+                    .collect(),
             })
             .unwrap();
         thread.submit(Job::Close { id: reopened }).unwrap();
@@ -2002,6 +2162,7 @@ mod tests {
                 id,
                 temporary: temporary.clone(),
                 header: header.clone(),
+                sums: None,
             })
             .unwrap();
         thread
@@ -2031,7 +2192,9 @@ mod tests {
         thread
             .submit(Job::WriteRow {
                 id,
-                buffer: row.address(),
+                buffers: (0..header.layout().unwrap().row_slots())
+                    .map(|i| row.address() + i * header.page_record_bytes() as usize)
+                    .collect(),
             })
             .unwrap();
         thread
@@ -2058,6 +2221,7 @@ mod tests {
                 id,
                 temporary: temporary.clone(),
                 header: header.clone(),
+                sums: None,
             })
             .unwrap();
         thread
@@ -2095,6 +2259,7 @@ mod tests {
                 id,
                 temporary: temporary.clone(),
                 header: header.clone(),
+                sums: None,
             })
             .unwrap();
         thread
@@ -2128,6 +2293,7 @@ mod tests {
                 id,
                 temporary: temporary.clone(),
                 header,
+                sums: None,
             })
             .unwrap();
         succeeded(&wait(&thread, 1)[0]);
@@ -2179,6 +2345,7 @@ mod tests {
                 id: writer,
                 temporary,
                 header: header.clone(),
+                sums: None,
             })
             .unwrap();
         thread
@@ -2192,7 +2359,9 @@ mod tests {
         thread
             .submit(Job::WriteRow {
                 id: writer,
-                buffer: row.address(),
+                buffers: (0..header.layout().unwrap().row_slots())
+                    .map(|i| row.address() + i * header.page_record_bytes() as usize)
+                    .collect(),
             })
             .unwrap();
         thread
@@ -2233,7 +2402,9 @@ mod tests {
         thread
             .submit(Job::ReadRow {
                 id: reader,
-                buffer: fresh_row.address(),
+                buffers: (0..header.layout().unwrap().row_slots())
+                    .map(|i| fresh_row.address() + i * header.page_record_bytes() as usize)
+                    .collect(),
             })
             .unwrap();
         thread.submit(Job::Close { id: reader }).unwrap();
@@ -2328,7 +2499,7 @@ mod tests {
             thread
                 .submit(Job::ReadRow {
                     id,
-                    buffer: row.address(),
+                    buffers: vec![row.address()],
                 })
                 .unwrap();
             let replies = wait(&thread, 3);
@@ -2400,6 +2571,7 @@ mod tests {
                 id: JobId(5),
                 temporary: wide_temporary.clone(),
                 header: wide,
+                sums: None,
             })
             .unwrap();
         for id in 1..=5 {
@@ -2685,5 +2857,108 @@ mod tests {
         small.read(&mut got).unwrap();
         assert_eq!(got, bytes[8192..16384]);
         fs::remove_dir_all(&directory).unwrap();
+    }
+    #[test]
+    fn legacy_record_recovers_into_scattered_slots_and_rewrites_identically() {
+        let Some(directory) = test_directory("legacy-slots") else {
+            return;
+        };
+        // The two-rank fixture was written by the 67752e55 DiskThread (Create,
+        // WritePages, contiguous WriteRow, Commit). The two-rank fixture uses
+        // page shares 4096/8192 and row shares 12288/4096, with byte i set to
+        // (i * 11 + i / 4096 * 37 + seed) as u8: page seed 7, row seed 19.
+        for golden in [
+            include_bytes!("../tests/data/legacy-record.bin").as_slice(),
+            include_bytes!("../tests/data/legacy-two-rank-record.bin").as_slice(),
+        ] {
+            let header = Header::decode(&golden[..HEADER_BYTES]).unwrap();
+            let layout = header.layout().unwrap();
+            let path = directory.join(file_name(&header.key));
+            fs::write(&path, golden).unwrap();
+            let guard = crate::testing::directory_lock(&directory).unwrap();
+            let scanned = crate::record::scan(
+                &guard,
+                &header.identity,
+                &header.fingerprint,
+                header.page_tokens,
+                &header.ranks,
+            )
+            .unwrap();
+            assert_eq!(scanned.len(), 1);
+            let page = buffer(layout.page_record_bytes as usize, 0);
+            let pieces: Vec<_> = (0..layout.row_slots())
+                .map(|_| buffer(layout.page_record_bytes as usize, 0))
+                .collect();
+            let addresses: Vec<_> = pieces.iter().map(AlignedBuffer::address).collect();
+            let mut disk = DiskThread::start("legacy-slots").unwrap();
+            disk.submit(Job::Open {
+                id: JobId(1),
+                path: path.clone(),
+                expected: header.clone(),
+            })
+            .unwrap();
+            disk.submit(Job::ReadPages {
+                id: JobId(1),
+                window: 0,
+                first: 0,
+                buffers: vec![page.address()],
+            })
+            .unwrap();
+            disk.submit(Job::ReadRow {
+                id: JobId(1),
+                buffers: addresses.clone(),
+            })
+            .unwrap();
+            for reply in wait(&disk, 3) {
+                succeeded(&reply);
+            }
+            assert_eq!(
+                page.as_slice(),
+                &golden[header.page_segment as usize..header.row_segment as usize]
+            );
+            let row: Vec<u8> = crate::slab::row_pieces(&layout, &addresses)
+                .flat_map(|(address, _, len)| {
+                    unsafe { std::slice::from_raw_parts(address as *const u8, len) }
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            assert_eq!(row, golden[header.row_segment as usize..]);
+            disk.submit(Job::Close { id: JobId(1) }).unwrap();
+            succeeded(&wait(&disk, 1)[0]);
+            disk.submit(Job::Create {
+                id: JobId(2),
+                temporary: directory.join(temporary_name(&header.key)),
+                header: header.clone(),
+                sums: None,
+            })
+            .unwrap();
+            disk.submit(Job::WritePages {
+                id: JobId(2),
+                window: 0,
+                first: 0,
+                buffers: vec![page.address()],
+            })
+            .unwrap();
+            disk.submit(Job::WriteRow {
+                id: JobId(2),
+                buffers: addresses,
+            })
+            .unwrap();
+            disk.submit(Job::Commit {
+                id: JobId(2),
+                path: path.clone(),
+                sync: false,
+            })
+            .unwrap();
+            for reply in wait(&disk, 4) {
+                succeeded(&reply);
+            }
+            disk.close().unwrap();
+            assert_eq!(fs::read(&path).unwrap(), golden);
+            drop(guard);
+            fs::remove_file(path).unwrap();
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 }
