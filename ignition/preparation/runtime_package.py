@@ -165,6 +165,11 @@ def _publisher_metadata(publisher):
     return None if publisher is None else publisher.native_request
 
 
+def _exported_server_options(server: dict) -> dict:
+    """The server settings a package records; the reasoning budget is a runtime setting, not package data."""
+    return {key: value for key, value in server.items() if key != "thinking_token_budget"}
+
+
 def export_model(prepared, images, storage, path, *, options, progress=None, publisher=None, bundle_only=False,
                  sources=False):
     """Hand captured handles and preparation metadata to the native exporter."""
@@ -226,7 +231,7 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
         events=prepared.export_events, numeric=numeric, inactive=inactive,
         parameter_layouts=parameter_layouts, zero_ranges=zero_ranges, transports=transports,
         device_address_floor=storage.EXTERNAL_FLOOR if storage.integrated else 0,
-        execution=prepared.manifest(all_variants=True), server=None if bundle_only else {**prepared.server_config, **options},
+        execution=prepared.manifest(all_variants=True), server=None if bundle_only else _exported_server_options({**prepared.server_config, **options}),
         package_data=None if bundle_only or prepared.package_data is None else prepared.package_data.export_metadata(),
         rebuild_weights=None if getattr(prepared, "rebuild_weights", None) is None else
             rebuild_weights_metadata(prepared.rebuild_weights),
