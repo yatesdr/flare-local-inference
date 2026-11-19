@@ -85,9 +85,22 @@ prefixes, and committed state agree across ranks.
 Confidence forecasts and verified acceptance are separate observations.
 A request's forecast averages its completed joint-prefix probabilities,
 starting from a population prior. That prior begins at `0.5^d` for the `d`-th
-draft position and moves toward each completed prefix probability with weight
-one sixty-fourth. Forecast and acceptance prefix estimates start with
-weight two, cap at 128, and age with a half-life of 128 generated tokens.
+draft position and moves toward each observed prefix value with weight one
+sixty-fourth. It is one mean per position across all requests, so it follows
+whichever traffic ran most recently. A model whose graphs allocate prefix
+lengths on the GPU takes the value from the completed prefix probability of
+each lane in the round's confidence sidecar; a model with any such graph is
+treated this way for all its rounds. Every other model takes it from the
+verification outcome: for each position a completed MTP round determined, the
+value is the reported survival, or one for an accepted position and zero for a
+rejected one. On this path only lanes whose request is live and whose status
+is not an error count, which are the rounds the request's own acceptance
+profile learns from. Each round updates the population once, by one of the two
+sources. On a model without GPU confidence a new request's MTP acceptance
+estimates start at the population with weight two; with GPU confidence, and
+for copy proposals, they start at `0.5^d`. Forecast and acceptance prefix
+estimates start with weight two, cap at 128, and age with a half-life of 128
+generated tokens.
 Unobserved suffixes retain their means. Ordinary selection uses the historical
 means; funded acceptance learning uses the bounded optimistic estimate
 `min(1, mean + sqrt(ln(20) / (2 * aged_weight)))`.
@@ -125,7 +138,8 @@ output delivery: g/z
 Only decoding requests have a delivery coordinate or output-age cost. Normalized
 service prices follow the entropy-dual update in `scheduling-utility.md`. Actual
 service updates history; expected acceptance scores choices. Conditional
-acceptance is request-local and respects available proposals, grammar and stop
+acceptance is estimated per request, started from the population mean when the
+model reports no GPU confidence, and respects available proposals, grammar and stop
 restrictions, output limits, and remaining context.
 
 Let `T` be the graph duration in milliseconds and `A_i` the age of a decoding

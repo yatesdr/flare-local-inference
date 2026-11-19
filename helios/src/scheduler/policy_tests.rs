@@ -2640,6 +2640,249 @@ fn acceptance_learning_escapes_width_one_and_pays_for_complete_rounds() {
 }
 
 #[test]
+fn host_rounds_move_the_population_and_seed_later_requests() {
+    let mut s = engine(2, true);
+    s.fixed_speculative_width(Some(4)).unwrap();
+    let geometric = s.forecasts.population.clone();
+    let first = add(&mut s, 1, 64, 4096);
+    let mtp = |s: &RequestScheduler, h: RequestHandle| (0..7).map(|depth|
+        s.request(h).unwrap().acceptance.prefix_probability(speculation::ProposalSource::Mtp, depth).unwrap())
+        .collect::<Vec<_>>();
+    let prior: Vec<f64> = geometric[..7].iter().map(|&p| f64::from(p)).collect();
+    assert_eq!(mtp(&s, first), prior);
+    ready(&mut s, &[first]);
+    assert_eq!(s.forecasts.population, geometric);
+    for _ in 0..64 { step(&mut s, 3); }
+    // Width four offers three drafts, all accepted: depths 0 to 2 move toward one, deeper depths are not offered.
+    let population = s.forecasts.population.clone();
+    let remaining = (1.0f32 - 1.0 / 64.0).powi(64);
+    for depth in 0..3 {
+        assert!((population[depth] - (1.0 - (1.0 - geometric[depth]) * remaining)).abs() < 1e-4, "depth {depth}");
+    }
+    assert_eq!(population[3..], geometric[3..]);
+    let second = add(&mut s, 2, 64, 4096);
+    let seeded = mtp(&s, second);
+    for depth in 0..7 { assert_eq!(seeded[depth], f64::from(population[depth])); }
+    assert_eq!(s.request(second).unwrap().acceptance.prefix_probability(speculation::ProposalSource::Copy, 0), Some(0.5));
+    assert_eq!(s.request(second).unwrap().acceptance.rounds(), 0);
+}
+
+/// Plans, commits and completes one speculative round on a live request of a host-estimated scheduler.
+fn host_round(s: &mut RequestScheduler, accepted: usize, survival: Option<(RequestHandle, &[f32])>) {
+    let plan = s.plan().unwrap();
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&plan, fence).unwrap();
+    s.advance_to(s.now_ns + plan.estimated_duration_ns()).unwrap();
+    let records = completion_records(s, &plan, fence, accepted);
+    let rows = survival.map(|(handle, row)| {
+        let mut rows = vec![vec![-1.0f32; 15]; s.limits.request_capacity()];
+        rows[handle.slot as usize] = row.to_vec();
+        rows
+    });
+    let output = s.complete_with_survival(fence, &records, gpu_time(plan.estimated_duration_ns()), rows.as_deref()).unwrap();
+    for token in output { s.published_output(token.request, fence).unwrap(); }
+}
+
+fn moved(population: f32, observed: f32) -> f32 { population + (observed - population) / 64.0 }
+
+#[test]
+fn rejected_and_survival_rounds_move_the_population_by_the_observed_values() {
+    let mut s = engine(1, true);
+    s.fixed_speculative_width(Some(4)).unwrap();
+    let handle = add(&mut s, 1, 64, 4096);
+    ready(&mut s, &[handle]);
+    let start = s.forecasts.population.clone();
+    // Three drafts offered, one accepted, then rejected: depth 0 observed true, depths 1 and 2 observed false.
+    host_round(&mut s, 1, None);
+    let rejected = s.forecasts.population.clone();
+    assert_eq!(rejected[..3], [moved(start[0], 1.0), moved(start[1], 0.0), moved(start[2], 0.0)]);
+    assert_eq!(rejected[3..], start[3..]);
+    // The same rejected round with survival feedback: the reported values replace the 0 and 1 samples.
+    let mut row = [-1.0f32; 15];
+    row[..3].copy_from_slice(&[0.9, 0.6, 0.2]);
+    host_round(&mut s, 1, Some((handle, &row)));
+    let soft = s.forecasts.population.clone();
+    assert_eq!(soft[..3], [moved(rejected[0], 0.9), moved(rejected[1], 0.6), moved(rejected[2], 0.2)]);
+    assert_eq!(soft[3..], start[3..]);
+    // The request's own profile saw the same two rounds.
+    assert_eq!(s.request(handle).unwrap().acceptance.rounds(), 2);
+}
+
+/// Completes a round whose request was cancelled in flight, with the lane's record built by `record`.
+fn cancelled_lane_round(record: impl Fn(&RequestScheduler, &ScheduledPlan, Fence) -> Vec<CompletionRecord>) {
+    let mut s = engine(1, true);
+    s.fixed_speculative_width(Some(4)).unwrap();
+    let handle = add(&mut s, 1, 64, 4096);
+    ready(&mut s, &[handle]);
+    let before = s.forecasts.population.clone();
+    let plan = s.plan().unwrap();
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&plan, fence).unwrap();
+    let records = record(&s, &plan, fence);
+    s.cancel(handle).unwrap();
+    assert!(s.request(handle).is_err());
+    s.complete(fence, &records, gpu_time(MS)).unwrap();
+    assert_eq!(s.forecasts.population, before);
+}
+
+#[test]
+fn a_lane_whose_request_is_gone_leaves_the_population_unchanged() {
+    // A full record: the request completed a round with three offered drafts before it was cancelled.
+    cancelled_lane_round(|s, plan, fence| completion_records(s, plan, fence, 1));
+    // A failed lane: status 3 with a vector that emitted nothing.
+    cancelled_lane_round(|s, plan, fence| {
+        let mut records = completion_records(s, plan, fence, 0);
+        for lane in &plan.lanes {
+            let record = &mut records[lane.request.slot as usize];
+            let vector = record.vector.as_mut().unwrap();
+            (record.status, record.error_code, record.token_id) = (3, 1, -1);
+            (vector.emitted_count, vector.accepted_drafts, vector.offered_drafts) = (0, 0, 0);
+            vector.tokens.fill(-1);
+        }
+        records
+    });
+}
+
+#[test]
+fn a_failed_lane_of_a_live_request_leaves_the_population_and_profile_unchanged() {
+    let mut s = engine(1, true);
+    s.fixed_speculative_width(Some(4)).unwrap();
+    let handle = add(&mut s, 1, 64, 4096);
+    ready(&mut s, &[handle]);
+    let before = s.forecasts.population.clone();
+    let plan = s.plan().unwrap();
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&plan, fence).unwrap();
+    let request = s.request(handle).unwrap();
+    let (consumed, generated) = (request.consumed_tokens as i64, request.generated_tokens as i64);
+    let mut records = completion_records(&s, &plan, fence, 0);
+    let record = &mut records[handle.slot as usize];
+    (record.status, record.error_code, record.token_id) = (3, 1, -1);
+    (record.consumed_tokens, record.generated_tokens) = (consumed, generated);
+    let vector = record.vector.as_mut().unwrap();
+    (vector.emitted_count, vector.accepted_drafts) = (0, 0);
+    vector.tokens.fill(-1);
+    assert_eq!(vector.offered_drafts, 3);
+    s.complete(fence, &records, gpu_time(MS)).unwrap();
+    assert_eq!(s.request(handle).unwrap().error_code, Some(1));
+    assert_eq!(s.request(handle).unwrap().acceptance.rounds(), 0);
+    assert_eq!(s.forecasts.population, before);
+}
+
+/// The population after `rounds` fully accepted width-8 host rounds of one request.
+fn population_after_full_acceptance(rounds: usize) -> Vec<f32> {
+    let mut s = engine(1, true);
+    s.fixed_speculative_width(Some(8)).unwrap();
+    let handle = add(&mut s, 1, 64, 4096);
+    ready(&mut s, &[handle]);
+    for _ in 0..rounds { step(&mut s, 7); }
+    s.forecasts.population.clone()
+}
+
+/// Width of the first round of a new request when the scheduler starts from `population` and picks widths itself.
+fn adaptive_width(population: Option<Vec<f32>>) -> usize {
+    let mut s = engine(1, true);
+    if let Some(population) = population { s.forecasts.population = population; }
+    let handle = add(&mut s, 1, 64, 4096);
+    ready(&mut s, &[handle]);
+    s.plan().unwrap().token_capacity
+}
+
+#[test]
+fn a_request_admitted_after_high_survival_plans_a_wider_round_than_on_a_fresh_scheduler() {
+    // No fixed width in either case: only the request's starting estimate differs.
+    let learned = population_after_full_acceptance(300);
+    assert!(learned.iter().take(7).all(|&p| p > 0.97), "{learned:?}");
+    let fresh = adaptive_width(None);
+    let seeded = adaptive_width(Some(learned));
+    assert!(seeded > fresh, "seeded width {seeded}, fresh width {fresh}");
+}
+
+/// A scheduler whose catalog has host-allocated shapes at every width and one GPU-allocated shape (width 8).
+fn mixed_catalog_engine(width: usize) -> RequestScheduler {
+    let mut s = joined_round_engine(crate::execution::PrefixAllocation::Gpu);
+    s.capabilities.speculative_allocations.push((1, 3, 4, 4, crate::execution::PrefixAllocation::Host));
+    s.fixed_speculative_width(Some(width)).unwrap();
+    assert!(s.gpu_confidence());
+    s
+}
+
+fn assert_new_request_keeps_the_geometric_prior(s: &mut RequestScheduler) {
+    let handle = add(s, 9, 64, 4096);
+    let fresh = speculation::AcceptanceProfile::new(16);
+    for depth in 0..15 {
+        assert_eq!(s.request(handle).unwrap().acceptance.prefix_probability(speculation::ProposalSource::Mtp, depth),
+            fresh.prefix_probability(speculation::ProposalSource::Mtp, depth), "depth {depth}");
+    }
+}
+
+#[test]
+fn a_catalog_with_host_and_gpu_shapes_is_gpu_confidence_and_moves_the_population_once_per_gpu_round() {
+    // A round on a host-allocated shape completes without a sidecar and leaves the population alone.
+    let mut s = mixed_catalog_engine(4);
+    let handle = add(&mut s, 1, 64, 4096);
+    ready(&mut s, &[handle]);
+    let geometric = s.forecasts.population.clone();
+    let plan = s.plan().unwrap();
+    assert_eq!((plan.batch_capacity, plan.token_capacity), (1, 4));
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&plan, fence).unwrap();
+    let records = completion_records(&s, &plan, fence, 1);
+    s.complete(fence, &records, gpu_time(MS)).unwrap();
+    assert_eq!(s.forecasts.population, geometric);
+    s.cancel(handle).unwrap();
+    assert_new_request_keeps_the_geometric_prior(&mut s);
+    // A round on the GPU-allocated shape moves each reported depth once.
+    let mut s = mixed_catalog_engine(8);
+    let handle = add(&mut s, 1, 64, 4096);
+    ready(&mut s, &[handle]);
+    let mut expected = s.forecasts.population.clone();
+    let observed = gpu_confidence_round(&mut s, 0.9);
+    assert!(!observed.is_empty());
+    for (depth, prefix) in observed.into_iter().enumerate() { expected[depth] = moved(expected[depth], prefix); }
+    assert_eq!(s.forecasts.population, expected);
+    s.cancel(handle).unwrap();
+    assert_new_request_keeps_the_geometric_prior(&mut s);
+}
+
+/// A GPU-confidence scheduler with one decoding request.
+fn gpu_confidence_round(s: &mut RequestScheduler, confidence: f32) -> Vec<f32> {
+    let plan = s.plan().unwrap();
+    assert_eq!(plan.lanes.len(), 1);
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&plan, fence).unwrap();
+    let mut records = completion_records(s, &plan, fence, 0);
+    records[plan.lanes[0].request.slot as usize].vector.as_mut().unwrap().offered_drafts = 4;
+    s.complete_packed_round(fence, &records, gpu_time(MS), &vec![vec![confidence; 15]; 2]).unwrap();
+    // The depths this lane reports confidence for, as joint prefix products.
+    let mut prefix = 1.0f32;
+    (0..plan.lanes[0].tokens.saturating_sub(1).min(plan.draft_tokens)).map(|_| { prefix *= confidence; prefix }).collect()
+}
+
+#[test]
+fn gpu_confidence_models_keep_the_geometric_prior_and_one_population_update_per_round() {
+    let mut s = joined_round_engine(crate::execution::PrefixAllocation::Gpu);
+    let first = add(&mut s, 1, 64, 4096);
+    ready(&mut s, &[first]);
+    let geometric = s.forecasts.population.clone();
+    let mut expected = geometric.clone();
+    for _ in 0..3 {
+        let observed = gpu_confidence_round(&mut s, 0.9);
+        assert!(!observed.is_empty());
+        for (depth, prefix) in observed.into_iter().enumerate() { expected[depth] = moved(expected[depth], prefix); }
+        // One update per depth and round from the confidence sidecar; the rejected host outcomes add nothing.
+        assert_eq!(s.forecasts.population, expected);
+    }
+    assert_ne!(s.forecasts.population, geometric);
+    let second = add(&mut s, 2, 64, 4096);
+    let fresh = speculation::AcceptanceProfile::new(16);
+    for depth in 0..15 {
+        assert_eq!(s.request(second).unwrap().acceptance.prefix_probability(speculation::ProposalSource::Mtp, depth),
+            fresh.prefix_probability(speculation::ProposalSource::Mtp, depth), "depth {depth}");
+    }
+}
+
+#[test]
 fn survival_feedback_is_transactional_and_replaces_binary_acceptance() {
     let mut s = engine(1, true);
     s.fixed_speculative_width(Some(4)).unwrap();

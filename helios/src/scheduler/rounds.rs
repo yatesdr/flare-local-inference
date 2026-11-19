@@ -31,6 +31,12 @@ impl Forecasts {
         Self { requests: std::array::from_fn(|_| None), population: (0..token_capacity - 1)
             .map(|i| 0.5f32.powi(i as i32 + 1)).collect() }
     }
+
+    /// Moves the mean survival of the prefix at `depth` toward one observed value.
+    pub(super) fn observe_population(&mut self, depth: usize, prefix: f32) {
+        debug_assert!(prefix.is_finite() && (0.0..=1.0).contains(&prefix));
+        self.population[depth] += POPULATION_WEIGHT * (prefix - self.population[depth]);
+    }
 }
 
 pub(super) struct HostPrefixRanking {
@@ -73,8 +79,7 @@ impl RequestScheduler {
     }
 
     pub(super) fn speculative_curve(&self, request: &LiveRequest, optimistic: bool) -> Vec<f64> {
-        if self.proposal_source == speculation::ProposalSource::Mtp
-            && self.capabilities.speculative_allocations.iter().any(|shape| shape.4 == crate::execution::PrefixAllocation::Gpu) {
+        if self.proposal_source == speculation::ProposalSource::Mtp && self.gpu_confidence() {
             let forecast = self.forecasts.requests[request.handle.slot as usize].as_ref()
                 .filter(|forecast| forecast.request == request.handle)
                 .cloned().unwrap_or_else(|| Forecast::new(request.handle, &self.forecasts.population, request.generated_tokens));
@@ -86,6 +91,11 @@ impl RequestScheduler {
         } else {
             request.acceptance.curve(self.proposal_source, request.generated_tokens, optimistic)
         }
+    }
+
+    /// Whether the model reports per-depth confidence on the GPU rather than leaving it to host estimates.
+    pub(super) fn gpu_confidence(&self) -> bool {
+        self.capabilities.speculative_allocations.iter().any(|shape| shape.4 == crate::execution::PrefixAllocation::Gpu)
     }
 
     pub(super) fn gpu_prefix_allocation(&self, batch: usize, drafts: usize, width: usize, packed: usize) -> bool {
@@ -205,6 +215,8 @@ impl RequestScheduler {
 
     pub(super) fn observe_packed_forecasts(&mut self, step: &ScheduledStep,
         records: &[CompletionRecord], confidence: &[Vec<f32>]) {
+        // A model that does not report GPU confidence feeds the population from host estimates instead.
+        let gpu_confidence = self.gpu_confidence();
         for (row, lane) in step.lanes.iter().enumerate() {
             let record = &records[lane.request.slot as usize];
             let Some(vector) = record.vector.as_ref() else { continue; };
@@ -218,7 +230,7 @@ impl RequestScheduler {
             for depth in 0..lane.tokens.saturating_sub(1).min(step.draft_tokens) {
                 prefix *= confidence[row][depth];
                 forecast.prefixes[depth].observe(f64::from(prefix), generated);
-                self.forecasts.population[depth] += POPULATION_WEIGHT * (prefix - self.forecasts.population[depth]);
+                if gpu_confidence { self.forecasts.observe_population(depth, prefix); }
             }
             self.forecasts.requests[lane.request.slot as usize] = Some(forecast);
         }

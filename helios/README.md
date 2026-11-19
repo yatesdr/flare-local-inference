@@ -398,8 +398,11 @@ requires confirmed stream drain before `release_after_shutdown` releases
 resources associated with the attempted submission.
 
 Each request owns conditional draft-acceptance statistics by depth and proposal
-source. Validated speculative completions update only that request. The emitted
-accepted prefix supplies positive observations. When a correction token was
+source. Validated speculative completions update that request. On a model
+without GPU confidence they also move a population mean per depth, which
+starts each later request's MTP estimates. With GPU confidence the population
+comes from the confidence forecasts, seeds the forecasts, and acceptance
+estimates start at the geometric prior. The emitted accepted prefix supplies positive observations. When a correction token was
 emitted and an offered draft remained, the next draft supplies a rejection.
 Termination within an accepted prefix censors the remaining depths. Expected
 yield is clipped by the remaining output limit, context capacity, and available
@@ -429,8 +432,9 @@ verification work. Another refresh waits for full credit. Idle discards positive
 This bounds aggregate refresh expense, not individual stalls; see
 [funded timing refresh](../docs/scheduling-runtime-design.md#funded-timing-refresh).
 
-Speculative width selection combines this cost with request-local expected
-prefix survival. Complete programs learn from terminal verification and keep
+Speculative width selection combines this cost with expected prefix survival,
+estimated per request and, on a model without GPU confidence, started from the
+population mean of earlier requests. Complete programs learn from terminal verification and keep
 completed confidence forecasts separate from acceptance outcomes. Ordinary selection uses
 historical means, while a separate 1% raw-time budget funds optimistic
 acceptance probes. Observational weight ages without changing unobserved means;

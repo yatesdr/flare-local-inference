@@ -385,7 +385,8 @@ capture.
 | Acceptance/cost statistics and bounded exploration policy | Rust, using completed-round records |
 | Grammar advancement, stop sequences, output presentation | Rust with ordered token-vector completions |
 
-Rust adapts among prepared widths from request-local prefix survival and measured
+Rust adapts among prepared widths from per-request prefix survival, started from
+the population mean on a model without GPU confidence, and measured
 full-round costs. Every speculative graph is a complete proposal, verification,
 and commit program. The controller learns from its emitted/offered/accepted
 records, or optional verification probabilities supplied by prepared graphs;

@@ -105,6 +105,16 @@ impl AcceptanceProfile {
             .map(|i| PrefixEstimate::new(0.5f64.powi(i as i32 + 1), 0)).collect()), rounds: 0 }
     }
 
+    /// Starts the MTP estimates at the survival that earlier requests observed per depth.
+    pub(super) fn seeded(token_capacity: usize, mtp_population: &[f32]) -> Self {
+        debug_assert_eq!(mtp_population.len(), token_capacity - 1);
+        let mut profile = Self::new(token_capacity);
+        for (estimate, &mean) in profile.prefixes[ProposalSource::Mtp as usize].iter_mut().zip(mtp_population) {
+            *estimate = PrefixEstimate::new(f64::from(mean), 0);
+        }
+        profile
+    }
+
     /// Depth zero is the first draft after the pending target token.
     pub fn prefix_probability(&self, source: ProposalSource, depth: usize) -> Option<f64> {
         self.prefixes[source as usize]
@@ -132,7 +142,6 @@ impl AcceptanceProfile {
         self.prefixes[source as usize][depth].weight_at(generated)
     }
 
-    /// Rejection falsifies every longer offered prefix; termination censors its suffix.
     pub(super) fn observe(
         &mut self,
         source: ProposalSource,
@@ -146,13 +155,19 @@ impl AcceptanceProfile {
         if offered == 0 {
             return;
         }
-        let observed = if rejected { offered } else { accepted };
-        for depth in 0..observed {
-            let value = survival.map_or(f64::from(depth < accepted), |p| f64::from(p[depth]));
+        for (depth, value) in observed_prefixes(offered, accepted, rejected, survival) {
             self.prefixes[source as usize][depth].observe(value, generated);
         }
         self.rounds = self.rounds.saturating_add(1);
     }
+}
+
+/// Offered prefix depths whose survival a round determined, with the observed value.
+/// Rejection falsifies every longer offered prefix; termination censors its suffix.
+pub(super) fn observed_prefixes(offered: usize, accepted: usize, rejected: bool,
+    survival: Option<&[f32]>) -> impl Iterator<Item = (usize, f64)> + '_ {
+    let observed = if rejected { offered } else { accepted };
+    (0..observed).map(move |depth| (depth, survival.map_or(f64::from(depth < accepted), |p| f64::from(p[depth]))))
 }
 
 #[cfg(test)]
@@ -187,6 +202,34 @@ mod tests {
         assert!(means[1] < 0.01);
         assert!(upper[1] > before[1] + 0.5);
         assert!(upper.windows(2).all(|p| p[0] >= p[1]));
+    }
+
+    #[test]
+    fn seeded_profile_replaces_only_the_mtp_prior() {
+        let population = [0.9f32, 0.5, 0.25, 0.0625, 0.03125, 0.015625, 0.0078125];
+        let seeded = AcceptanceProfile::seeded(8, &population);
+        let fresh = AcceptanceProfile::new(8);
+        for depth in 0..7 {
+            assert_eq!(seeded.prefix_probability(ProposalSource::Mtp, depth),
+                Some(f64::from(population[depth])));
+            assert_eq!(seeded.prefix_probability(ProposalSource::Copy, depth),
+                fresh.prefix_probability(ProposalSource::Copy, depth));
+        }
+        assert_eq!(seeded.rounds(), 0);
+        let geometric: Vec<f32> = (0..7).map(|i| 0.5f32.powi(i + 1)).collect();
+        let unchanged = AcceptanceProfile::seeded(8, &geometric);
+        assert_eq!(unchanged.curve(ProposalSource::Mtp, 0, true), fresh.curve(ProposalSource::Mtp, 0, true));
+        assert_eq!(unchanged.curve(ProposalSource::Mtp, 0, false), fresh.curve(ProposalSource::Mtp, 0, false));
+    }
+
+    #[test]
+    fn observed_prefixes_cover_offered_depths_only() {
+        let depths = |offered, accepted, rejected, survival: Option<&[f32]>|
+            observed_prefixes(offered, accepted, rejected, survival).collect::<Vec<_>>();
+        assert_eq!(depths(3, 1, true, None), [(0, 1.0), (1, 0.0), (2, 0.0)]);
+        assert_eq!(depths(3, 1, false, None), [(0, 1.0)]);
+        assert_eq!(depths(0, 0, true, None), []);
+        assert_eq!(depths(2, 0, true, Some(&[0.5, 0.25])), [(0, 0.5), (1, 0.25)]);
     }
 
     #[test]

@@ -2340,6 +2340,37 @@ fn fixed_copy_graph_masks_each_available_chain_independently() {
 }
 
 #[test]
+fn copy_source_rounds_leave_the_mtp_population_alone() {
+    let mut s = scheduler(1, 32, 4);
+    s.enable_speculation(&(1..=16).collect::<Vec<_>>()).unwrap();
+    s.proposal_source(speculation::ProposalSource::Copy).unwrap();
+    s.fixed_speculative_width(Some(8)).unwrap();
+    let geometric = s.forecasts.population.clone();
+    let h = s.admit(spec(65, 32)).unwrap();
+    init(&mut s, 1);
+    let prefill = s.plan().unwrap();
+    s.commit(&prefill, Fence(2)).unwrap();
+    s.complete(Fence(2), &records(h, 2, 65, 1, 9, 1), Default::default()).unwrap();
+    retain_prompt(&mut s, 3);
+    s.set_copy_proposal(h, copied(65, 3, false)).unwrap();
+    let step = s.plan().unwrap();
+    assert_eq!(step.lanes[0].tokens, 4);
+    s.commit(&step, Fence(4)).unwrap();
+    let mut complete = bounded_vector_records(h, 4, 66, 2, &[40], 8, 1, 4);
+    complete[h.slot as usize].vector.as_mut().unwrap().draft_cache_consumed = -1;
+    s.complete(Fence(4), &complete, Default::default()).unwrap();
+    // The request's own copy estimates saw the round; the population did not move.
+    assert_eq!(s.request(h).unwrap().acceptance.rounds(), 1);
+    assert_eq!(s.forecasts.population, geometric);
+    s.cancel(h).unwrap();
+    let next = s.admit(spec(65, 32)).unwrap();
+    for depth in 0..15 {
+        assert_eq!(s.request(next).unwrap().acceptance.prefix_probability(speculation::ProposalSource::Mtp, depth),
+            Some(f64::from(geometric[depth])));
+    }
+}
+
+#[test]
 fn copy_source_uses_no_draft_page_and_fixed_graph_masks_host_stops() {
     let mut s = scheduler(1, 2, 2);
     s.limits.max_sequence_tokens = 128;
