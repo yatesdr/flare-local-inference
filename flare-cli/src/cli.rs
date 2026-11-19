@@ -979,7 +979,9 @@ pub struct ServingOptions {
     #[arg(long, value_name = "DURATION|off", value_parser = parse_max_age, help_heading = "Prefix cache options")]
     pub prefix_cache_max_age: Option<std::time::Duration>,
 
-    /// Share prefix checkpoints at `unix:PATH`, plain TCP `HOST:PORT`, or TLS `tls:HOST:PORT` [default: not shared].
+    /// Share prefix checkpoints at `unix:PATH`, plain TCP `HOST:PORT`, or TLS `tls:HOST:PORT`.
+    /// Storing records in the pool requires --prefix-cache-memory and/or --prefix-cache-disk;
+    /// restores from other instances remain available without a local host tier [default: not shared].
     #[arg(long, value_name = "ADDRESS", value_parser = parse_pool_address,
         help_heading = "Prefix cache options")]
     pub prefix_cache_pool: Option<String>,

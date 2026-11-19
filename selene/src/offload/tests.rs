@@ -361,10 +361,10 @@ fn ordinary_input_share_preserves_mapping() {
 }
 
 #[test]
-fn intake_warning_only_reports_shrinkage_and_the_required_memory() {
+fn intake_warning_reports_shrinkage_and_the_required_memory() {
     let geometry = vec![crate::testing::geometry(64, &[("kv", 4096)], 4096)];
     let layout = Layout::new(&geometry).unwrap();
-    let mut options = PrefixCacheOffload {
+    let options = PrefixCacheOffload {
         memory_bytes: Some(layout.page_record_bytes * 128),
         pool: Some(pool("unix:/run/selene.sock")),
         ..Default::default()
@@ -412,8 +412,42 @@ fn intake_warning_only_reports_shrinkage_and_the_required_memory() {
             }
         }
     }
-    options.memory_bytes = Some(0);
-    assert!(build(&options).intake_warning(32).is_none());
+}
+
+#[test]
+fn pool_without_local_intake_warns_at_startup() {
+    for memory_bytes in [None, Some(0)] {
+        for disk in [None, Some(test_directory())] {
+            let options = PrefixCacheOffload {
+                memory_bytes,
+                disk: disk.clone(),
+                disk_limit: disk.as_ref().map(|_| 0),
+                pool: Some(pool("unix:/run/selene.sock")),
+                ..Default::default()
+            };
+            let Preparation::Store(prepared) = prepare(
+                &options,
+                std::path::Path::new("model.safetensors"),
+                [0; 32],
+                vec![crate::testing::geometry(64, &[("kv", 4096)], 4096)],
+                vec![(0, 0)],
+            )
+            .unwrap() else {
+                panic!("no pool store")
+            };
+            assert_eq!(
+                prepared.intake_warning(1).as_deref(),
+                Some(
+                    "prefix cache pool will receive no records from this instance because no local host tier is enabled; \
+                     restores from other instances remain available; \
+                     enable --prefix-cache-memory and/or --prefix-cache-disk to store records in the pool"
+                )
+            );
+            if let Some(directory) = disk {
+                assert!(!directory.exists());
+            }
+        }
+    }
 }
 
 struct RecordingFactory {

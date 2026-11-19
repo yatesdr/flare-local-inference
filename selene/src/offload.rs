@@ -231,7 +231,15 @@ impl Preparation {
 
 impl Prepared {
     pub fn intake_warning(&self, max_concurrency: usize) -> Option<String> {
-        let pool = self.memory_pool.as_ref()?;
+        let Some(pool) = &self.memory_pool else {
+            // Preparation without local intake exists only for a configured pool.
+            return Some(
+                "prefix cache pool will receive no records from this instance because no local host tier is enabled; \
+                 restores from other instances remain available; \
+                 enable --prefix-cache-memory and/or --prefix-cache-disk to store records in the pool"
+                    .to_owned(),
+            );
+        };
         let required = intake_slots(&self.layout, max_concurrency);
         (pool.intake_slots() < required).then(|| {
             let bytes = required as u64 * self.layout.page_record_bytes;

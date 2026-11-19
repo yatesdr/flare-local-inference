@@ -1223,6 +1223,12 @@ index when its session ends. Restarting with wiped local disks therefore
 restores nothing unless records had already cascaded to the manager. This holds
 on a single host too.
 
+With a pool configured but no local memory or disk tier enabled, startup warns
+that the pool will receive no records from this instance. It can still restore
+records stored by other instances and serve cross-instance GPU exports. Enable
+`--prefix-cache-memory` and/or `--prefix-cache-disk` to let local records cascade
+to the manager.
+
 ## 3. Components and required test coverage
 
 Each mechanism of section 2 has one owning module. Its tests cover the behavior
