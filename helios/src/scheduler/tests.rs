@@ -2636,7 +2636,7 @@ fn inbound_request_waits_unscheduled_then_restores_like_a_gpu_prefix_hit() {
         (stats.cache_lookups, stats.cache_hits, stats.reused_tokens),
         (1, 0, 0)
     );
-    assert_eq!((stats.host_hits, stats.host_reused_tokens), (1, 64));
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (0, 0));
     // The ticket holds one page and one snapshot; the request holds one reserved
     // page; checkpoint retention reserves no destination yet.
     assert_eq!(free(&scheduler), (6, 3));
@@ -2661,6 +2661,7 @@ fn inbound_request_waits_unscheduled_then_restores_like_a_gpu_prefix_hit() {
     assert_eq!(checkpoint.tail_pages(), &ticket.pages[..]);
     assert_eq!(checkpoint.pin_count(), 1);
     let stats = scheduler.stats();
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (1, 64));
     assert_eq!(
         (
             stats.inbound_waiting,
@@ -2831,7 +2832,7 @@ fn inbound_restore_above_a_resident_checkpoint_pins_the_ancestor_until_completio
         (stats.cache_lookups, stats.cache_hits, stats.reused_tokens),
         (2, 1, 64)
     );
-    assert_eq!((stats.host_hits, stats.host_reused_tokens), (1, 64));
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (0, 0));
     // Ticket: one page and one snapshot. Request: one page beyond the two
     // complete pages. Checkpoint retention has no reserved destination.
     assert_eq!(free(&scheduler), (5, 2));
@@ -2845,6 +2846,8 @@ fn inbound_restore_above_a_resident_checkpoint_pins_the_ancestor_until_completio
     assert_eq!(free(&scheduler), (5, 2));
 
     scheduler.finish_inbound(key, true).unwrap();
+    let stats = scheduler.stats();
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (1, 64));
     let request = scheduler.request(handle).unwrap();
     let restored = request.prefix().unwrap();
     let mut chain = ancestor_pages.clone();
@@ -2997,6 +3000,8 @@ fn inbound_alias_backing_survives_cancellation_until_transfer_completion() {
         assert_eq!(free(&scheduler), (11, 1));
         assert_eq!(scheduler.stats().snapshot_backing_pages, 4);
         scheduler.finish_inbound(ticket.key, success).unwrap();
+        let stats = scheduler.stats();
+        assert_eq!((stats.host_hits, stats.host_reused_tokens), (0, 0));
         if success {
             assert_eq!(scheduler.stats().snapshot_backing_pages, 4);
             scheduler.ensure_resources(16, 0).unwrap();
@@ -3022,6 +3027,7 @@ fn failed_inbound_frees_the_ticket_and_returns_waiters_for_readmission() {
     assert!(scheduler.request(first.handle).is_err());
     assert!(scheduler.request(second.handle).is_err());
     let stats = scheduler.stats();
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (0, 0));
     assert_eq!(
         (
             stats.active_requests,
@@ -3043,6 +3049,24 @@ fn failed_inbound_frees_the_ticket_and_returns_waiters_for_readmission() {
 }
 
 #[test]
+fn inbound_waiters_count_only_the_tokens_above_their_admission_prefix() {
+    let mut scheduler = host_scheduler(2, 16, 6);
+    let first = inbound(&mut scheduler, spec(129, 2), 128);
+    let ticket = first.ticket.unwrap();
+    seed_checkpoint(&mut scheduler, 1);
+    let second = inbound(&mut scheduler, spec(130, 2), 128);
+    assert!(second.ticket.is_none());
+    let stats = scheduler.stats();
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (0, 0));
+    scheduler.finish_inbound(ticket.key, true).unwrap();
+    let stats = scheduler.stats();
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (2, 192));
+    for handle in [first.handle, second.handle] {
+        assert_eq!(scheduler.request(handle).unwrap().phase, RequestPhase::Restore);
+    }
+}
+
+#[test]
 fn waiters_sharing_one_ticket_restore_together_and_both_complete() {
     let mut scheduler = host_scheduler(2, 8, 4);
     let first = inbound(&mut scheduler, spec(65, 1), 64);
@@ -3056,11 +3080,16 @@ fn waiters_sharing_one_ticket_restore_together_and_both_complete() {
             stats.host_reused_tokens,
             stats.inbound_waiting
         ),
-        (2, 128, 2)
+        (0, 0, 2)
     );
     assert_eq!(free(&scheduler), (5, 3));
     assert!(scheduler.plan().is_none());
     scheduler.finish_inbound(ticket.key, true).unwrap();
+    let stats = scheduler.stats();
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (2, 128));
+    assert!(scheduler.finish_inbound(ticket.key, true).is_err());
+    let stats = scheduler.stats();
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (2, 128));
     let restored = scheduler.request(first.handle).unwrap().prefix().unwrap();
     assert_eq!(
         scheduler.request(second.handle).unwrap().prefix(),

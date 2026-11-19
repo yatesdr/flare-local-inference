@@ -110,9 +110,9 @@ pub struct Snapshot {
     pub total_pages: u64,
     /// Logical history tokens per KV page.
     pub page_tokens: u64,
-    /// Host prefix store lookups whose chain admission fetched.
+    /// Requests attached to a successfully restored host prefix.
     pub host_hits: u64,
-    /// Tokens covered by host prefix store chains beyond the GPU checkpoint.
+    /// Successfully restored tokens beyond each request's admission GPU prefix.
     pub host_reused_tokens: u64,
     /// Checkpoint records resident in the host store's registered memory.
     pub host_memory_records: u64,
@@ -949,12 +949,12 @@ impl Metrics {
             ),
             (
                 "host_cache_hits_total",
-                "Host prefix store lookups whose chain the admission fetched.",
+                "Requests attached to a successfully restored host prefix.",
                 &self.host_hits,
             ),
             (
                 "host_cache_reused_tokens_total",
-                "Tokens covered by host prefix store chains beyond the GPU checkpoint.",
+                "Successfully restored tokens beyond each request's admission GPU prefix.",
                 &self.host_reused_tokens,
             ),
             (

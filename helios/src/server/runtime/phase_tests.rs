@@ -2390,7 +2390,7 @@ fn host_hit_holds_the_request_inbound_until_the_restore_completes() {
             worker.scheduler.stats().host_lookups,
             worker.scheduler.stats().host_hits
         ),
-        (1, 1)
+        (1, 0)
     );
     let (hit, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
     assert_eq!((ticket.key, ticket.pages.len()), (hit.key, 1));
@@ -2401,6 +2401,8 @@ fn host_hit_holds_the_request_inbound_until_the_restore_completes() {
             result: Ok(1 << 20),
         });
     assert!(worker.service_store().unwrap());
+    let stats = worker.scheduler.stats();
+    assert_eq!((stats.host_hits, stats.host_reused_tokens), (1, 70));
     let live = worker.scheduler.request(handle).unwrap();
     assert_eq!(
         (live.phase, live.pages().count()),

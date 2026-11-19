@@ -464,9 +464,9 @@ fails. Restart the group after a record-connection failure.
 
 The startup phase `Join host prefix stores` reports how many records every rank
 holds. In `/metrics`, `flare_host_cache_stored_total` counts copy-outs,
-`flare_host_cache_hits_total` counts restores, and
-`flare_host_cache_reused_tokens_total` counts the tokens those restores
-covered. See
+`flare_host_cache_hits_total` counts requests served by a successful restore, and
+`flare_host_cache_reused_tokens_total` counts the tokens those restores added
+beyond each request's GPU prefix. See
 [prefix cache offload](prefix-cache-offload.md#214-ranks-on-separate-hosts).
 
 A printed URL or successful `--detach` means rank processes started; wait for

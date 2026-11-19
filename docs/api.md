@@ -335,8 +335,8 @@ without the `flare_` prefix, such as `input_decoded_images_total`.
 | `free_pages` | KV pages reusable after completed GPU fences | `flare_free_kv_pages` |
 | `total_pages` | Pages in the per-rank KV pool | `flare_total_kv_pages` |
 | `page_tokens` | Logical history tokens per KV page | `flare_kv_page_tokens` |
-| `host_hits` | Host prefix-store lookups whose chain admission fetched | `flare_host_cache_hits_total` |
-| `host_reused_tokens` | Tokens covered by host prefix-store chains beyond the GPU checkpoint | `flare_host_cache_reused_tokens_total` |
+| `host_hits` | Requests attached to a successfully restored host prefix | `flare_host_cache_hits_total` |
+| `host_reused_tokens` | Successfully restored tokens beyond each request's admission GPU prefix | `flare_host_cache_reused_tokens_total` |
 | `host_memory_records` | Checkpoint records in the host store's registered memory | `flare_host_cache_memory_records` |
 | `host_disk_records` | Checkpoint records in the host store's record directory | `flare_host_cache_disk_records` |
 | `host_bytes_out` | Bytes copied from GPU checkpoints to the host store | `flare_host_cache_bytes_out_total` |
