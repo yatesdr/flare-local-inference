@@ -1816,10 +1816,24 @@ impl DiskStore {
             .is_some_and(|node| !node.location.failed)
     }
 
-    /// The record shape for a published checkpoint: a child of its parent when
-    /// the parent is indexed, otherwise a root record holding the whole chain.
-    /// The remnant of a failed write, which has neither a row nor readable
-    /// pages, counts as absent.
+    /// The one parent choice for a published checkpoint, used by the planner and
+    /// by the row decision so a record's row and its link agree: the first
+    /// offered ancestor this index accepts children under.
+    fn select_parent(&self, checkpoint: &PublishedCheckpoint) -> Option<PrefixKey> {
+        checkpoint
+            .offered()
+            .filter(|key| self.accepts_children(key))
+            .find(|key| {
+                checkpoint
+                    .tail_below(key, self.layout.page_tokens)
+                    .is_some()
+            })
+    }
+
+    /// The record shape for a published checkpoint: a child of its selected
+    /// ancestor when the parent is indexed, otherwise a root record holding the
+    /// whole chain. The remnant of a failed write, which has neither a row nor
+    /// readable pages, counts as absent.
     pub fn plan_record(
         &self,
         checkpoint: &PublishedCheckpoint,
@@ -1829,9 +1843,10 @@ impl DiskStore {
             let first = parent.map_or(0, |p| p.consumed_tokens / self.layout.page_tokens) as usize;
             return (parent, checkpoint.chain_pages[first..].to_vec());
         }
-        let parent = checkpoint.parent.filter(|key| self.accepts_children(key));
-        let tail = match parent {
-            Some(_) => checkpoint.tail().to_vec(),
+        let parent = self.select_parent(checkpoint);
+        let tail = match parent.and_then(|key| checkpoint.tail_below(&key, self.layout.page_tokens))
+        {
+            Some(tail) => tail.to_vec(),
             None => checkpoint.chain_pages.clone(),
         };
         (parent, tail)
@@ -1843,10 +1858,7 @@ impl DiskStore {
         readable: impl Fn(&Node<DiskRecord>) -> bool,
     ) -> bool {
         let held = self.index.node(&checkpoint.key);
-        let parent = held.map_or_else(
-            || checkpoint.parent.filter(|p| self.accepts_children(p)),
-            |n| n.parent,
-        );
+        let parent = held.map_or_else(|| self.select_parent(checkpoint), |n| n.parent);
         let role = held.map_or(checkpoint.capture_role, |n| {
             n.location
                 .header
@@ -2663,8 +2675,7 @@ impl HostStore for DiskStore {
         };
         let id = self.next_job();
         let detect = self.announce.is_none() && self.geometry.len() > 1;
-        self.index
-            .set_published_parent(&checkpoint.key, checkpoint.parent);
+        self.index.set_published_ancestors(&checkpoint.key, parent, &checkpoint.ancestors);
         let write = if row {
             self.transport
                 .store(id, header, temporary, path, checkpoint, detect)
@@ -3255,6 +3266,65 @@ mod tests {
         }
         assert!(!store.index[&endpoint.key].row);
         assert_eq!(store.lookup(&full, 0, 135).unwrap().consumed_tokens, 130);
+    }
+
+    #[test]
+    fn a_covered_endpoint_uses_its_held_ancestors_row() {
+        // The Message at 128 holds a row. The prompt-end Endpoint at 130 was never stored.
+        // The terminal Endpoint at 134 shares their page, so the Message covers it, and
+        // its record must hang under the Message with no row of its own.
+        let full = history(256);
+        let records: Vec<_> = [
+            endpoint_header(&geometry(), &full, 32, None),
+            header(&geometry(), &full, 64, Some(32)),
+            header(&geometry(), &full, 128, Some(64))
+                .with_capture_role(crate::CaptureRole::Message),
+        ]
+        .into_iter()
+        .map(|h| scanned(&directory(), h, 0, true))
+        .collect();
+        let (mut store, log) = store_with(records, 1 << 30);
+        let message = full.key_at(128).unwrap();
+        let mut endpoint = checkpoint(
+            &mut Ids::new(),
+            &full,
+            134,
+            Some(130),
+            pages(0..2),
+            0,
+            StateSlotId(1),
+        );
+        endpoint.ancestors = vec![full.key_at(130).unwrap(), message];
+        let (parent, tail) = store.plan_record(&endpoint);
+        assert_eq!(parent, Some(message));
+        assert!(tail.is_empty());
+        assert!(store.covered_endpoint(&endpoint, |n| n.ready));
+        assert_eq!(store.store(&endpoint).unwrap(), StoreOutcome::Queued);
+        let (id, header) = match log.borrow().calls.as_slice() {
+            [Call::Empty { id, header }] => (*id, header.clone()),
+            calls => panic!("expected a header-only link, got {calls:?}"),
+        };
+        assert_eq!(header.parent, Some(message));
+        complete(
+            &log,
+            TransportEvent::Stored {
+                id,
+                result: Ok(header.length(false)),
+                header: None,
+            },
+            &mut store,
+        );
+        let node = &store.index[&endpoint.key];
+        assert_eq!(node.parent, Some(message));
+        assert_eq!(node.published_ancestors, [full.key_at(130).unwrap()]);
+        assert!(!node.row);
+        // Without any ancestor the disk keeps a root and its row.
+        let mut lone = endpoint.clone();
+        lone.key = full.key_at(135).unwrap();
+        lone.ancestors.clear();
+        lone.tail_pages = lone.chain_pages.len();
+        assert_eq!(store.plan_record(&lone).0, None);
+        assert!(!store.covered_endpoint(&lone, |n| n.ready));
     }
 
     #[test]
@@ -3964,24 +4034,30 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_root_keeps_its_published_parent_for_the_pool_put() {
+    fn a_stored_root_keeps_its_offered_ancestors_for_the_pool_put() {
         let (mut store, _log) = store_with(Vec::new(), 1 << 30);
         let full = history(2000);
         let mut ids = Ids::new();
-        // The parent is not indexed, so the record is a root that still names it.
-        let root = checkpoint(
+        // No ancestor is indexed, so the record is a root that still names them all.
+        let mut root = checkpoint(
             &mut ids,
             &full,
             1300,
             Some(700),
             pages(0..20),
-            20,
+            10,
             StateSlotId(1),
         );
+        root.ancestors.push(full.key_at(300).unwrap());
         assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
+        let stats = store.stats();
+        assert_eq!(stats.root_records, [[0; crate::RootReason::COUNT]; 2]);
+        assert_eq!(stats.root_pages, [[0; crate::RootReason::COUNT]; 2]);
+        assert_eq!(stats.deeper_link_records, [0; 2]);
+        assert_eq!(stats.deeper_link_pages, [0; 2]);
         assert_eq!(
             store.index().ancestor_keys(&root.key),
-            [full.key_at(700).unwrap()]
+            [full.key_at(700).unwrap(), full.key_at(300).unwrap()]
         );
     }
 

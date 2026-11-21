@@ -385,11 +385,12 @@ pub fn checkpoint(
     tail_pages: usize,
     slot: StateSlotId,
 ) -> PublishedCheckpoint {
+    let parent = parent.map(|tokens| history.key_at(tokens).unwrap());
     PublishedCheckpoint {
         capture_role: crate::CaptureRole::Endpoint,
         id: ids.next(),
         key: history.key_at(consumed).unwrap(),
-        parent: parent.map(|parent| history.key_at(parent).unwrap()),
+        ancestors: parent.into_iter().collect(),
         bucket: history
             .key_at(consumed - consumed % HASH_BLOCK_TOKENS as u64)
             .unwrap()

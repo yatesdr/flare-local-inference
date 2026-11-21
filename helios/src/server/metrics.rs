@@ -287,6 +287,10 @@ pub(super) struct Metrics {
     host_packed_records: [AtomicU64; 2],
     host_per_rank_records: [AtomicU64; 2],
     host_abandoned_stores: AtomicU64,
+    host_root_records: [[AtomicU64; flare_selene::RootReason::COUNT]; 2],
+    host_root_pages: [[AtomicU64; flare_selene::RootReason::COUNT]; 2],
+    host_deeper_link_records: [AtomicU64; 2],
+    host_deeper_link_pages: [AtomicU64; 2],
     host_slots: [AtomicU64; 3],
     host_dropped: [AtomicU64; 8],
     host_refusal_drops: [AtomicU64; 5],
@@ -594,6 +598,18 @@ impl Metrics {
         {
             counter.store(value, Ordering::Relaxed);
         }
+        for tier in 0..stats.root_records.len() {
+            self.host_deeper_link_records[tier]
+                .store(stats.deeper_link_records[tier], Ordering::Relaxed);
+            self.host_deeper_link_pages[tier]
+                .store(stats.deeper_link_pages[tier], Ordering::Relaxed);
+            for reason in 0..flare_selene::RootReason::COUNT {
+                self.host_root_records[tier][reason]
+                    .store(stats.root_records[tier][reason], Ordering::Relaxed);
+                self.host_root_pages[tier][reason]
+                    .store(stats.root_pages[tier][reason], Ordering::Relaxed);
+            }
+        }
         for (target, value) in [
             (&self.host_stored, stats.stored),
             (&self.host_abandoned_stores, stats.abandoned_stores),
@@ -698,6 +714,34 @@ impl Metrics {
             "flare_host_cache_abandoned_stores_total {}",
             self.host_abandoned_stores.load(Ordering::Relaxed)
         );
+        text.push_str("# HELP flare_host_cache_root_records_total Records copied as roots.\n# TYPE flare_host_cache_root_records_total counter\n");
+        text.push_str("# HELP flare_host_cache_root_pages_total Pages copied in root records.\n# TYPE flare_host_cache_root_pages_total counter\n");
+        text.push_str("# HELP flare_host_cache_deeper_link_records_total Records linked under a later offered ancestor.\n# TYPE flare_host_cache_deeper_link_records_total counter\n");
+        text.push_str("# HELP flare_host_cache_deeper_link_pages_total Pages copied in records linked under a later offered ancestor.\n# TYPE flare_host_cache_deeper_link_pages_total counter\n");
+        for (tier, name) in ["dram", "pool"].into_iter().enumerate() {
+            for (metric, counters) in [
+                ("deeper_link_records", &self.host_deeper_link_records),
+                ("deeper_link_pages", &self.host_deeper_link_pages),
+            ] {
+                let _ = writeln!(
+                    text,
+                    "flare_host_cache_{metric}_total{{tier=\"{name}\"}} {}",
+                    counters[tier].load(Ordering::Relaxed)
+                );
+            }
+            for (reason, label) in ["first", "no_held_ancestor"].into_iter().enumerate() {
+                let _ = writeln!(
+                    text,
+                    "flare_host_cache_root_records_total{{tier=\"{name}\",reason=\"{label}\"}} {}",
+                    self.host_root_records[tier][reason].load(Ordering::Relaxed)
+                );
+                let _ = writeln!(
+                    text,
+                    "flare_host_cache_root_pages_total{{tier=\"{name}\",reason=\"{label}\"}} {}",
+                    self.host_root_pages[tier][reason].load(Ordering::Relaxed)
+                );
+            }
+        }
         for (i, tier) in ["dram", "nvme"].into_iter().enumerate() {
             for (name, counters) in [
                 ("packed_records", &self.host_packed_records),
@@ -1649,6 +1693,10 @@ mod tests {
             held: [3, 4],
             dropped: [1, 2, 3, 4, 5, 6, 7, 8],
             refusal_drops: [1, 2, 3, 4, 5],
+            root_records: [[1, 2], [3, 4]],
+            deeper_link_records: [5, 6],
+            deeper_link_pages: [50, 60],
+            root_pages: [[10, 20], [30, 40]],
             retirement_paths: 2,
             retirement_ns: 1_250_000_000,
             retirement_latency_buckets: [0, 0, 0, 1, 2, 2, 2, 2],
@@ -1684,6 +1732,26 @@ mod tests {
         assert!(text.contains("flare_host_cache_per_rank_records_total{tier=\"dram\"} 9\n"));
         assert!(text.contains("flare_host_cache_per_rank_records_total{tier=\"nvme\"} 10\n"));
         assert!(text.contains("flare_host_cache_abandoned_stores_total 11\n"));
+        for (tier, name) in ["dram", "pool"].into_iter().enumerate() {
+            for (metric, value) in [
+                ("deeper_link_records", 5 + tier),
+                ("deeper_link_pages", (5 + tier) * 10),
+            ] {
+                assert!(text.contains(&format!(
+                    "flare_host_cache_{metric}_total{{tier=\"{name}\"}} {value}\n"
+                )));
+            }
+            for (reason, label) in ["first", "no_held_ancestor"].into_iter().enumerate() {
+                let records = (tier * flare_selene::RootReason::COUNT + reason + 1) as u64;
+                assert!(text.contains(&format!(
+                    "flare_host_cache_root_records_total{{tier=\"{name}\",reason=\"{label}\"}} {records}\n"
+                )));
+                assert!(text.contains(&format!(
+                    "flare_host_cache_root_pages_total{{tier=\"{name}\",reason=\"{label}\"}} {}\n",
+                    records * 10
+                )));
+            }
+        }
         assert!(text.contains("flare_host_cache_rows_thinned_total{tier=\"dram\"} 5\n"));
         assert!(text.contains("flare_host_cache_rows_thinned_total{tier=\"nvme\"} 6\n"));
         for reason in [

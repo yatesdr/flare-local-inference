@@ -26,8 +26,11 @@ pub struct PublishedCheckpoint {
     pub capture_role: crate::CaptureRole,
     pub id: CheckpointId,
     pub key: PrefixKey,
-    /// Key of the GPU parent checkpoint, or `None` at the root.
-    pub parent: Option<PrefixKey>,
+    /// Every offered GPU ancestor on the checkpoint's parent chain, nearest first
+    /// with strictly decreasing consumed tokens, at most [`MAX_PUBLISHED_ANCESTORS`].
+    /// A tier links the record under the first ancestor it holds, so a skipped
+    /// same-page Endpoint does not force a copy of the whole chain.
+    pub ancestors: Vec<PrefixKey>,
     /// Digest of the aligned hash-block boundary at or below the endpoint.
     pub bucket: [u8; 16],
     /// Every page of the checkpoint's chain from the root in ascending order.
@@ -38,9 +41,48 @@ pub struct PublishedCheckpoint {
     pub slot: StateSlotId,
 }
 
+/// Limits the length and memory of each publication's ancestor list.
+/// 256 leaves ample room for offered conversation boundaries and is well
+/// below the manager's limit of 4096 candidates per put.
+pub const MAX_PUBLISHED_ANCESTORS: usize = 256;
+
+/// Why a tier stored a root record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootReason {
+    /// The checkpoint offered no ancestor.
+    First = 0,
+    /// The tier stored a root despite receiving candidate ancestors.
+    NoHeldAncestor = 1,
+}
+
+impl RootReason {
+    pub const COUNT: usize = 2;
+
+    pub(crate) fn from_nearest(nearest: Option<PrefixKey>) -> Self {
+        if nearest.is_some() {
+            Self::NoHeldAncestor
+        } else {
+            Self::First
+        }
+    }
+}
+
 impl PublishedCheckpoint {
-    pub fn tail(&self) -> &[PageId] {
-        &self.chain_pages[self.chain_pages.len() - self.tail_pages..]
+    /// Key of the nearest offered GPU ancestor, if any.
+    pub fn parent(&self) -> Option<PrefixKey> {
+        self.ancestors.first().copied()
+    }
+
+    /// Offered GPU ancestors, nearest first.
+    pub fn offered(&self) -> impl Iterator<Item = PrefixKey> + '_ {
+        self.ancestors.iter().copied()
+    }
+
+    /// The pages after `ancestor`'s own: what a record linked under it copies.
+    /// `None` when `ancestor` is not below the checkpoint's chain.
+    pub fn tail_below(&self, ancestor: &PrefixKey, page_tokens: u64) -> Option<&[PageId]> {
+        let first = usize::try_from(ancestor.consumed_tokens / page_tokens).ok()?;
+        self.chain_pages.get(first..)
     }
 }
 
@@ -175,6 +217,13 @@ pub struct StoreStats {
     pub per_rank_records: [u64; 2],
     /// Disk-only stores abandoned when later pages disagree with the initial packed decision.
     pub abandoned_stores: u64,
+    /// Root records by tier (GPU-to-DRAM copy or stored pool put) and [`RootReason`].
+    pub root_records: [[u64; RootReason::COUNT]; 2],
+    /// Pages those copies carried, by the same indexes.
+    pub root_pages: [[u64; RootReason::COUNT]; 2],
+    /// Records linked under a later offered ancestor and their tail pages, by tier.
+    pub deeper_link_records: [u64; 2],
+    pub deeper_link_pages: [u64; 2],
     pub fetched: u64,
     pub fetch_failed: u64,
     pub bytes_out: u64,
@@ -351,8 +400,8 @@ pub trait TierStore: HostStore {
     fn take_retiring(&mut self) -> Vec<Retiring> {
         Vec::new()
     }
-    /// Retained DRAM predecessor on the selected leaf's path.
-    fn retirement_predecessor(&self, _key: PrefixKey) -> Option<Retiring> {
+    /// Retained DRAM record on the selected path, with pool candidates when preparing its put.
+    fn retirement_predecessor(&self, _key: PrefixKey, _candidates: bool) -> Option<Retiring> {
         None
     }
     /// The move of a retiring record ended.

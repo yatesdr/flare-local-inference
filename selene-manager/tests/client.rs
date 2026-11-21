@@ -124,20 +124,19 @@ fn geo() -> Vec<flare_selene::CacheGeometry> {
 }
 
 fn config(manager: &Manager, gpu: u8) -> PoolConfig {
-    config_on(manager, gpu, false)
+    config_on(manager, gpu, false, &geo())
 }
 
 /// As [`config`]; `local` reaches a network manager over its socket, as an instance on the
 /// manager's own host does.
-fn config_on(manager: &Manager, gpu: u8, local: bool) -> PoolConfig {
-    let geometry = geo();
+fn config_on(manager: &Manager, gpu: u8, local: bool, geometry: &[CacheGeometry]) -> PoolConfig {
     let (address, ca) = remote(manager)
         .filter(|_| !local)
         .unwrap_or_else(|| (PoolAddress::Unix(manager.config.socket.clone()), None));
     PoolConfig {
         address,
         ca,
-        scope: Scope::new([7; 32], fingerprint(&geometry), &geometry).unwrap(),
+        scope: Scope::new([7; 32], fingerprint(geometry), geometry).unwrap(),
         gpu_uuids: vec![[gpu; 16]],
         export_slots: 2,
         claim_slots: 2,
@@ -154,13 +153,13 @@ struct Instance {
 }
 
 fn instance(manager: &Manager, gpu: u8) -> Instance {
-    instance_on(manager, gpu, false)
+    instance_on(manager, gpu, false, &geo())
 }
 
-fn instance_on(manager: &Manager, gpu: u8, local: bool) -> Instance {
-    let (copier, memory) = SimulatedGpu::shared(&geo()).unwrap();
+fn instance_on(manager: &Manager, gpu: u8, local: bool, geometry: &[CacheGeometry]) -> Instance {
+    let (copier, memory) = SimulatedGpu::shared(geometry).unwrap();
     let client = PoolClient::start(
-        config_on(manager, gpu, local),
+        config_on(manager, gpu, local, geometry),
         None,
         copier,
         Arc::new(OkRegistrar),
@@ -213,10 +212,10 @@ fn history_of(tokens: u32) -> TestHistory {
     history
 }
 
-fn identity() -> Identity {
+fn identity(geometry: &[CacheGeometry]) -> Identity {
     Identity {
         model: [7; 32],
-        layout: fingerprint(&geo()),
+        layout: fingerprint(geometry),
     }
 }
 
@@ -258,6 +257,16 @@ fn fetch_for(
     pages: usize,
     scratch: &[u32],
 ) -> PoolFetch {
+    fetch_for_geometry(instance, history, pages, scratch, &geo())
+}
+
+fn fetch_for_geometry(
+    instance: &Instance,
+    history: &TestHistory,
+    pages: usize,
+    scratch: &[u32],
+    geometry: &[CacheGeometry],
+) -> PoolFetch {
     let ticket = instance.client.begin_lookup(history, 0);
     wait("the lookup", || {
         !matches!(ticket.state(), LookupState::Pending)
@@ -271,7 +280,7 @@ fn fetch_for(
     );
     let request = Request {
         history,
-        identity: &identity(),
+        identity: &identity(geometry),
         page_tokens: PT,
         resident: 0,
         before: u64::MAX,
@@ -426,18 +435,19 @@ fn wait_store_index(requester: &Instance, history: &TestHistory) {
 
 fn restore(requester: &mut Instance, history: &TestHistory, pages: usize, scratch: &[u32]) {
     let fetch = fetch_for(requester, history, pages, scratch);
-    requester.client.fetch(fetch).unwrap();
-    let result = requester.event("the restore", |e| match e {
-        PoolEvent::Fetched { result, .. } => {
-            Some(result.as_ref().map(|b| *b).map_err(|f| f.error.to_string()))
-        }
-        _ => None,
-    });
-    assert_eq!(result, Ok((pages * PAGE + ROW) as u64));
+    assert_eq!(restore_bytes(requester, fetch), (pages * PAGE + ROW) as u64);
     let gpu = requester.gpu.pages.lock().unwrap();
     for page in 0..pages {
         assert_eq!(gpu[&scratch[page]], expected_page(page), "page {page}");
     }
+}
+
+fn restore_bytes(requester: &mut Instance, fetch: PoolFetch) -> u64 {
+    requester.client.fetch(fetch).unwrap();
+    requester.event("the restore", |event| match event {
+        PoolEvent::Fetched { result, .. } => Some(*result.as_ref().unwrap()),
+        _ => None,
+    })
 }
 
 fn busy_source_restores(manager: &Manager) {
@@ -1260,7 +1270,7 @@ fn publication(gpu: &GpuMemory, salt: u32, pages: usize) -> (PublishedCheckpoint
         capture_role: flare_selene::CaptureRole::Endpoint,
         id: CheckpointId::new(u64::from(salt)),
         key,
-        parent: None,
+        ancestors: Vec::new(),
         bucket: history.bucket_at(key.consumed_tokens).unwrap(),
         chain_pages: (base..base + pages as u32).map(PageId).collect(),
         tail_pages: pages,
@@ -1360,14 +1370,7 @@ fn restore_salted(
     });
     let scratch: Vec<u32> = (0..pages as u32).map(|p| 700 + salt * 10 + p).collect();
     let fetch = fetch_for(requester, history, pages, &scratch);
-    requester.client.fetch(fetch).unwrap();
-    let result = requester.event("the restore", |e| match e {
-        PoolEvent::Fetched { result, .. } => {
-            Some(result.as_ref().map(|b| *b).map_err(|f| f.error.to_string()))
-        }
-        _ => None,
-    });
-    assert_eq!(result, Ok((pages * PAGE + ROW) as u64));
+    assert_eq!(restore_bytes(requester, fetch), (pages * PAGE + ROW) as u64);
     let gpu = requester.gpu.pages.lock().unwrap();
     for (page, id) in scratch.iter().enumerate() {
         assert_eq!(
@@ -1380,22 +1383,20 @@ fn restore_salted(
     assert_eq!(requester.gpu.rows.lock().unwrap()[&9], salted_row(salt));
 }
 
-/// A pooled store over a standalone memory store of `pages` pages, with its
-/// own simulated device.
-fn memory_instance(manager: &Manager, pages: usize) -> (PooledStore<MemoryStore>, GpuMemory) {
-    let (transfers, gpu) = SimulatedGpu::shared_mapped(&geo()).unwrap();
-    let layout = Layout::new(&geo()).unwrap();
+/// A pooled memory store with the specified retention slots and a simulated device.
+fn memory_instance(
+    manager: &Manager,
+    geometry: &[CacheGeometry],
+    slots: usize,
+) -> (PooledStore<MemoryStore>, GpuMemory) {
+    let (transfers, gpu) = SimulatedGpu::shared_mapped(geometry).unwrap();
+    let layout = Layout::new(geometry).unwrap();
     let intake = flare_selene::offload::intake_slots(&layout, 1);
-    let pool = SlabPool::new(
-        PAGE as u64,
-        2 * intake + pages + 2 * layout.row_slots(),
-        intake,
-    )
-    .unwrap();
+    let pool = SlabPool::new(layout.page_record_bytes, intake + slots, intake).unwrap();
     let memory = MemoryStore::new([7; 32], pool, transfers).unwrap();
-    let (copier, _unused) = SimulatedGpu::shared(&geo()).unwrap();
-    let store =
-        PooledStore::connect(memory, config(manager, 1), copier, Arc::new(OkRegistrar)).unwrap();
+    let (copier, _) = SimulatedGpu::shared(geometry).unwrap();
+    let config = config_on(manager, 1, false, geometry);
+    let store = PooledStore::connect(memory, config, copier, Arc::new(OkRegistrar)).unwrap();
     wait("Ready", || store.pool().status() == PoolStatus::Ready);
     (store, gpu)
 }
@@ -1405,7 +1406,11 @@ fn an_evicted_dram_record_reaches_the_manager_store_and_is_restored_by_another_i
     let manager = Manager::start();
     let mut requester = instance(&manager, 2);
     requester.ready();
-    let (mut store, gpu) = memory_instance(&manager, 8);
+    let geometry = geo();
+    let layout = Layout::new(&geometry).unwrap();
+    let intake = flare_selene::offload::intake_slots(&layout, 1);
+    let slots = intake + 8 + 2 * layout.row_slots();
+    let (mut store, gpu) = memory_instance(&manager, &geometry, slots);
     let (first, first_history) = publication(&gpu, 1, 4);
     let (second, second_history) = publication(&gpu, 2, 4);
     let (third, third_history) = publication(&gpu, 3, 4);
@@ -1445,7 +1450,7 @@ fn a_retired_same_page_tip_restores_from_its_endpoint_parent() {
             .unwrap()
             .insert(page, expected_page(page as usize));
     }
-    let mut parent = None;
+    let mut ancestors = Vec::new();
     for (tokens, tail) in [(PT, 1), (2 * PT, 1), (2 * PT + 1, 0)] {
         gpu.rows
             .lock()
@@ -1458,14 +1463,14 @@ fn a_retired_same_page_tip_restores_from_its_endpoint_parent() {
                 capture_role: flare_selene::CaptureRole::Endpoint,
                 id: CheckpointId::new(tokens),
                 key,
-                parent,
+                ancestors: ancestors.clone(),
                 bucket: history.bucket_at(tokens).unwrap(),
                 chain_pages: (0..(tokens / PT) as u32).map(PageId).collect(),
                 tail_pages: tail,
                 slot: StateSlotId(tokens as u32),
             },
         );
-        parent = Some(key);
+        ancestors.insert(0, key);
     }
     assert_eq!(memory.stats().memory_records, 3);
     let (copier, _) = SimulatedGpu::shared(&geometry).unwrap();
@@ -1486,7 +1491,10 @@ fn a_retired_same_page_tip_restores_from_its_endpoint_parent() {
     );
 }
 
-fn retire_leaf_over_root_hint(evict_hint: bool) {
+/// A leaf retires through its local root, which was published under the held `hint`.
+/// With `list` the root names the prompt-end Endpoint no tier stores before it, so the
+/// put carries two candidate ancestors and only the second is held.
+fn retire_leaf_over_root_hint(evict_hint: bool, list: bool) {
     let manager = Manager::with_memory(128 << 10);
     let mut reader = instance(&manager, 2);
     reader.ready();
@@ -1533,7 +1541,12 @@ fn retire_leaf_over_root_hint(evict_hint: bool) {
             .unwrap()
             .insert(page, expected_page(page as usize));
     }
-    let mut parent = Some(hint);
+    let prompt_end = history.key_at(PT + 1).unwrap();
+    let mut ancestors = if list {
+        vec![prompt_end, hint]
+    } else {
+        vec![hint]
+    };
     for pages in 2..=4 {
         let row = (pages * PAGE..pages * PAGE + ROW)
             .map(|byte| (byte * 13 + 5) as u8)
@@ -1543,21 +1556,21 @@ fn retire_leaf_over_root_hint(evict_hint: bool) {
             capture_role: flare_selene::CaptureRole::Endpoint,
             id: CheckpointId::new(pages as u64),
             key: history.key_at(pages as u64 * PT).unwrap(),
-            parent,
+            ancestors: ancestors.clone(),
             bucket: history.bucket_at(pages as u64 * PT).unwrap(),
             chain_pages: (0..pages as u32).map(PageId).collect(),
             tail_pages: 1,
             slot: StateSlotId(pages as u32),
         };
         store_and_wait(&mut memory, &checkpoint);
-        parent = Some(checkpoint.key);
+        ancestors.insert(0, checkpoint.key);
     }
     assert_eq!(memory.stats().memory_records, 3);
     let (copier, _) = SimulatedGpu::shared(&geometry).unwrap();
     let mut store =
         PooledStore::connect(memory, config(&manager, 1), copier, Arc::new(OkRegistrar)).unwrap();
     wait("Ready", || store.pool().status() == PoolStatus::Ready);
-    let leaf = parent.unwrap();
+    let leaf = ancestors[0];
     drive(&mut store, "the retired leaf to commit", |store| {
         let ticket = reader.client.begin_lookup(&history, 0);
         wait("the manager lookup", || {
@@ -1596,12 +1609,237 @@ fn retire_leaf_over_root_hint(evict_hint: bool) {
 
 #[test]
 fn a_retired_leaf_links_to_the_published_hint_of_its_local_root() {
-    retire_leaf_over_root_hint(false);
+    retire_leaf_over_root_hint(false, false);
 }
 
 #[test]
 fn a_retired_leaf_with_an_evicted_root_hint_is_stored_as_a_root() {
-    retire_leaf_over_root_hint(true);
+    retire_leaf_over_root_hint(true, false);
+}
+
+#[test]
+fn a_retired_leaf_links_through_the_second_of_its_local_roots_offered_ancestors() {
+    retire_leaf_over_root_hint(false, true);
+}
+
+#[test]
+fn a_retired_leaf_with_every_offered_ancestor_evicted_is_stored_as_a_root() {
+    retire_leaf_over_root_hint(true, true);
+}
+
+#[test]
+fn a_retired_child_links_to_a_nearer_ancestor_held_only_by_the_manager() {
+    let mut manager = Manager::dram_only(16 << 20);
+    manager.run();
+    let geometry = geo();
+    let mut reader = instance(&manager, 2);
+    reader.ready();
+
+    let (mut source, gpu) = memory_instance(&manager, &geometry, 4);
+    let (nearer, history) = publication(&gpu, 7, 3);
+    publish(&mut source, &nearer);
+    drive(&mut source, "the three-page ancestor to retire", |store| {
+        store.stats().memory_records == 0
+    });
+    source.close().unwrap();
+    wait_store_index(&reader, &history);
+    stored_candidate(&reader, &history, nearer.key);
+
+    let intake = flare_selene::offload::intake_slots(&Layout::new(&geometry).unwrap(), 1);
+    let pool = SlabPool::new(PAGE as u64, intake + 6, intake).unwrap();
+    let (transfers, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
+    let mut memory = MemoryStore::new([7; 32], pool, transfers).unwrap();
+    let (local, _) = publication(&gpu, 7, 1);
+    store_and_wait(&mut memory, &local);
+    let (mut child, _) = publication(&gpu, 7, 4);
+    child.id = CheckpointId::new(8);
+    child.slot = StateSlotId(8);
+    gpu.rows.lock().unwrap().insert(8, salted_row(8));
+    child.ancestors = vec![nearer.key, local.key];
+    child.tail_pages = 1;
+    store_and_wait(&mut memory, &child);
+    assert_eq!(memory.index()[&child.key].parent, Some(local.key));
+    assert_eq!(memory.index()[&child.key].tail_pages, 3);
+
+    let (copier, _) = SimulatedGpu::shared(&geometry).unwrap();
+    let mut store =
+        PooledStore::connect(memory, config(&manager, 1), copier, Arc::new(OkRegistrar)).unwrap();
+    drive(&mut store, "the local chain to retire", |store| {
+        store.stats().memory_records == 0
+    });
+    assert_eq!(store.stats().deeper_link_records[1], 0);
+    store.close().unwrap();
+    let candidate = stored_candidate(&reader, &history, child.key);
+    let nodes: Vec<_> = candidate.plan.nodes.iter().map(|node| (node.key, node.tail_pages)).collect();
+    assert_eq!(nodes, [(nearer.key, 3), (child.key, 1)]);
+    // Three pages for the nearer ancestor, one for the local parent, one for the child.
+    assert_eq!(manager.gauge("put_bytes_total{part=\"pages\"}"), (5 * PAGE) as u64);
+
+    let scratch = [100, 101, 102, 103];
+    let fetch = fetch_for(&mut reader, &history, 4, &scratch);
+    assert!(fetch.part.candidate.source.instance.is_empty());
+    assert_eq!(restore_bytes(&mut reader, fetch), (4 * PAGE + ROW) as u64);
+    for (page, dest) in scratch.iter().enumerate() {
+        assert_eq!(reader.gpu.pages.lock().unwrap()[dest], salted_page(7, page));
+    }
+    assert_eq!(reader.gpu.rows.lock().unwrap()[&9], salted_row(8));
+    reader.client.close().unwrap();
+}
+
+/// Retire the Anchor before publishing the terminal under its missing prompt end.
+fn retire_anchor_and_terminal(
+    manager: &Manager,
+    geometry: &[CacheGeometry],
+) -> (Instance, GpuMemory, flare_selene::StoreStats) {
+    let layout = Layout::new(geometry).unwrap();
+    let page_bytes = layout.page_record_bytes as usize;
+    let row_bytes = layout.row_record_bytes as usize;
+    let (mut store, gpu) = memory_instance(manager, geometry, 64 + layout.row_slots());
+    let reader = instance_on(manager, 2, false, geometry);
+    reader.ready();
+    let history = history_of(64 * PT as u32);
+    let page = |index: u32| -> Vec<u8> {
+        (0..page_bytes)
+            .map(|byte| (index * 13 + byte as u32 / PAGE as u32 * 71 + byte as u32 % 251) as u8)
+            .collect()
+    };
+    let row = |salt: u32| -> Vec<u8> {
+        (0..row_bytes)
+            .map(|byte| (salt as usize * 17 + byte / ROW * 91 + byte % 251) as u8)
+            .collect()
+    };
+    for index in 0..24 {
+        gpu.pages.lock().unwrap().insert(index, page(index));
+    }
+    gpu.rows.lock().unwrap().insert(1, row(1));
+    gpu.rows.lock().unwrap().insert(2, row(2));
+    let anchor = history.key_at(16 * PT).unwrap();
+    let prompt_end = history.key_at(16 * PT + 1).unwrap();
+    let terminal = history.key_at(24 * PT).unwrap();
+    assert_eq!(prompt_end.consumed_tokens / PT, anchor.consumed_tokens / PT);
+    let publication = |id: u64, key: PrefixKey, ancestors: Vec<PrefixKey>| {
+        let parent = ancestors.first().copied();
+        let pages = (key.consumed_tokens / PT) as usize;
+        PublishedCheckpoint {
+            capture_role: if id == 1 {
+                flare_selene::CaptureRole::Anchor
+            } else {
+                flare_selene::CaptureRole::Endpoint
+            },
+            id: CheckpointId::new(id),
+            key,
+            ancestors,
+            bucket: history.bucket_at(key.consumed_tokens).unwrap(),
+            chain_pages: (0..pages as u32).map(PageId).collect(),
+            tail_pages: pages - parent.map_or(0, |p| (p.consumed_tokens / PT) as usize),
+            slot: StateSlotId(id as u32),
+        }
+    };
+    publish(&mut store, &publication(1, anchor, Vec::new()));
+    drive(&mut store, "the Anchor to leave local memory", |store| {
+        store.stats().memory_records == 0
+    });
+    wait_store_index(&reader, &history_of(16 * PT as u32));
+    // With both ancestors absent locally, the terminal copies its full chain.
+    store_and_wait(
+        &mut store,
+        &publication(2, terminal, vec![prompt_end, anchor]),
+    );
+    drive(&mut store, "the terminal to leave local memory", |store| {
+        store.stats().memory_records == 0
+    });
+    let stats = store.stats();
+    store.close().unwrap();
+    (reader, gpu, stats)
+}
+
+#[test]
+fn retired_terminal_counts_only_its_linked_tail_in_the_pool() {
+    let mut manager = Manager::with_storage(4096, 64 << 20);
+    manager.run();
+    let geometry = [geo(), geo()].concat();
+    let (mut reader, _, stats) = retire_anchor_and_terminal(&manager, &geometry);
+    let layout = Layout::new(&geometry).unwrap();
+    let page_bytes = layout.page_record_bytes;
+    let row_bytes = layout.row_record_bytes;
+    let history = history_of(24 * PT as u32);
+    let anchor = history.key_at(16 * PT).unwrap();
+    let terminal = history.key_at(24 * PT).unwrap();
+    let directory = manager
+        .config
+        .root
+        .as_ref()
+        .unwrap()
+        .join(record::directory_name(&[7; 32], &fingerprint(&geometry)));
+    assert_eq!(stats.root_records[0], [1, 1]);
+    assert_eq!(stats.deeper_link_records[0], 0);
+    assert_eq!(stats.root_pages[0], [16, 24]);
+    assert_eq!(stats.deeper_link_pages[0], 0);
+    // The manager already holds the Anchor's first 16 pages.
+    let stored = std::fs::read(directory.join(record::file_name(&terminal))).unwrap();
+    let header = record::Header::decode(&stored[..4096]).unwrap();
+    assert_eq!(header.parent, Some(anchor));
+    assert_eq!(header.tail_pages, 8);
+    let metrics = manager.metrics();
+    for line in [
+        "selene_put_links_total{parent=\"root\"} 1\n".to_string(),
+        "selene_put_links_total{parent=\"linked\"} 1\n".to_string(),
+        format!(
+            "selene_put_bytes_total{{part=\"pages\"}} {}\n",
+            24 * page_bytes
+        ),
+        format!(
+            "selene_put_bytes_total{{part=\"rows\"}} {}\n",
+            2 * row_bytes
+        ),
+    ] {
+        assert!(metrics.contains(&line), "missing metric {line}");
+    }
+    assert_eq!(stats.root_records[1], [1, 0]);
+    assert_eq!(stats.deeper_link_records[1], 1);
+    assert_eq!(stats.root_pages[1], [16, 0]);
+    assert_eq!(stats.deeper_link_pages[1], 8);
+    reader.client.close().unwrap();
+}
+
+#[test]
+fn restarted_manager_restores_terminal_anchor_and_branch_bytes() {
+    let mut manager = Manager::with_storage(4096, 64 << 20);
+    manager.run();
+    let geometry = [geo(), geo()].concat();
+    let (mut reader, source, _) = retire_anchor_and_terminal(&manager, &geometry);
+    let layout = Layout::new(&geometry).unwrap();
+    manager.restart();
+    reader.ready();
+    let terminal = history_of(24 * PT as u32);
+    let anchor = history_of(16 * PT as u32);
+    let mut branch = history_of(16 * PT as u32);
+    branch
+        .append(&(9000..9000 + 8 * PT as u32).collect::<Vec<_>>(), &[])
+        .unwrap();
+    wait_store_index(&reader, &terminal);
+    for (history, pages, slot, first) in [
+        (&terminal, 24, 2, 100),
+        (&anchor, 16, 1, 200),
+        (&branch, 16, 1, 300),
+    ] {
+        let scratch: Vec<_> = (first..first + pages).collect();
+        let fetch = fetch_for_geometry(&reader, history, pages as usize, &scratch, &geometry);
+        assert!(fetch.part.candidate.source.instance.is_empty());
+        let expected_key = history.key_at(u64::from(pages) * PT).unwrap();
+        assert_eq!(fetch.part.candidate.plan.key, expected_key);
+        let bytes = restore_bytes(&mut reader, fetch);
+        assert_eq!(
+            bytes,
+            u64::from(pages) * layout.page_record_bytes + layout.row_record_bytes
+        );
+        let restored = reader.gpu.pages.lock().unwrap();
+        for (page, dest) in scratch.iter().enumerate() {
+            assert_eq!(restored[dest], source.pages.lock().unwrap()[&(page as u32)]);
+        }
+        assert_eq!(reader.gpu.rows.lock().unwrap()[&9], source.rows.lock().unwrap()[&slot]);
+    }
+    reader.client.close().unwrap();
 }
 
 /// The candidate the manager's store offers for `key`, once its lookup answers.
@@ -1655,33 +1893,8 @@ fn successive_retired_conversation_turns_store_only_tails_and_restore_every_rank
     let layout = Layout::new(&geometry).unwrap();
     let page_bytes = layout.page_record_bytes as usize;
     let row_bytes = layout.row_record_bytes as usize;
-    let pool_config = |gpu| {
-        let mut config = config(&manager, gpu);
-        config.scope = Scope::new([7; 32], fingerprint(&geometry), &geometry).unwrap();
-        config
-    };
-    let (transfers, gpu) = SimulatedGpu::shared_mapped(&geometry).unwrap();
-    let intake = flare_selene::offload::intake_slots(&layout, 1);
-    let pool = SlabPool::new(page_bytes as u64, intake + 64 + layout.row_slots(), intake).unwrap();
-    let memory = MemoryStore::new([7; 32], pool, transfers).unwrap();
-    let (copier, _) = SimulatedGpu::shared(&geometry).unwrap();
-    let mut store =
-        PooledStore::connect(memory, pool_config(1), copier, Arc::new(OkRegistrar)).unwrap();
-    wait("Ready", || store.pool().status() == PoolStatus::Ready);
-    let (copier, restored) = SimulatedGpu::shared(&geometry).unwrap();
-    let mut reader = Instance {
-        client: PoolClient::start(
-            pool_config(2),
-            None,
-            copier,
-            Arc::new(OkRegistrar),
-            flare_selene::pool::Roots::System,
-            STARTUP_WAIT,
-        )
-        .unwrap(),
-        gpu: restored,
-        events: Vec::new(),
-    };
+    let (mut store, gpu) = memory_instance(&manager, &geometry, 64 + layout.row_slots());
+    let mut reader = instance_on(&manager, 2, false, &geometry);
     reader.ready();
     let history = history_of(64 * PT as u32);
     let page = |index: u32| -> Vec<u8> {
@@ -1692,7 +1905,7 @@ fn successive_retired_conversation_turns_store_only_tails_and_restore_every_rank
     for index in 0..64 {
         gpu.pages.lock().unwrap().insert(index, page(index));
     }
-    let mut parent = None;
+    let mut ancestors = Vec::new();
     let mut expected_bytes = 0;
     let mut stored_page_bytes = 0;
     let mut stored_row_bytes = 0;
@@ -1710,7 +1923,7 @@ fn successive_retired_conversation_turns_store_only_tails_and_restore_every_rank
             capture_role: flare_selene::CaptureRole::Endpoint,
             id: CheckpointId::new(turn as u64),
             key,
-            parent,
+            ancestors: ancestors.clone(),
             bucket: history.bucket_at(tokens).unwrap(),
             chain_pages: (0..pages as u32).map(PageId).collect(),
             tail_pages: pages - previous_pages,
@@ -1726,7 +1939,7 @@ fn successive_retired_conversation_turns_store_only_tails_and_restore_every_rank
             [7; 32],
             fingerprint(&geometry),
             key,
-            parent,
+            ancestors.first().copied(),
             checkpoint.bucket,
             (pages - previous_pages) as u32,
             std::time::SystemTime::now(),
@@ -1739,11 +1952,11 @@ fn successive_retired_conversation_turns_store_only_tails_and_restore_every_rank
         stored_page_bytes += stored_header.tail_pages as usize * page_bytes;
         stored_row_bytes += row_bytes;
         assert_eq!(record_files_bytes(&directory), expected_bytes);
-        assert_eq!(stored_header.parent, parent);
+        assert_eq!(stored_header.parent, ancestors.first().copied());
         assert_eq!(stored_header.tail_pages, 16);
         assert_eq!(candidate.plan.nodes.len(), turn);
         assert_eq!(candidate.plan.nodes.last().unwrap().tail_pages, 16);
-        parent = Some(key);
+        ancestors.insert(0, key);
         previous_pages = pages;
     }
     assert_eq!(stored_page_bytes, 64 * page_bytes);
@@ -1773,7 +1986,7 @@ fn successive_retired_conversation_turns_store_only_tails_and_restore_every_rank
         resident: 0,
         before: u64::MAX,
     };
-    let candidate = stored_candidate(&reader, &history, parent.unwrap());
+    let candidate = stored_candidate(&reader, &history, ancestors[0]);
     let plan = plan::plan(&request, std::slice::from_ref(&candidate.plan)).unwrap();
     let part = plan.part;
     reader
@@ -2101,7 +2314,7 @@ fn large_recovered_nvme_records_restore_consecutively() {
             capture_role: flare_selene::CaptureRole::Endpoint,
             id: CheckpointId::new(u64::from(salt)),
             key: history.key_at(110_000).unwrap(),
-            parent: None,
+            ancestors: Vec::new(),
             bucket: history.bucket_at(110_000).unwrap(),
             chain_pages: (0..pages as u32).map(PageId).collect(),
             tail_pages: pages,
@@ -2391,8 +2604,8 @@ fn check_restored(requester: &Instance, scratch: &[u32], pages: usize) {
 /// A host record of `pages` pages moves from `source` to `requester` through the manager,
 /// whichever of them are on the manager's host.
 fn relay_host_record(manager: &Manager, source_local: bool, requester_local: bool, pages: usize) {
-    let mut source = instance_on(manager, 1, source_local);
-    let mut requester = instance_on(manager, 2, requester_local);
+    let mut source = instance_on(manager, 1, source_local, &geo());
+    let mut requester = instance_on(manager, 2, requester_local, &geo());
     source.ready();
     requester.ready();
     let history = history_of(pages as u32 * PT as u32 + 64);

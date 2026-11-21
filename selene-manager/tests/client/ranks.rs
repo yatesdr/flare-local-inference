@@ -613,7 +613,7 @@ fn rank_agents_restore_an_anchor_below_page_only_tails() {
                 let expected =
                     8192 + tail_pages * page as u64 + if anchor { row as u64 } else { 0 };
                 assert!(
-                    matches!(outcome, flare_selene::pool::PutOutcome::Stored { bytes } if bytes == expected),
+                    matches!(outcome, flare_selene::pool::PutOutcome::Stored { bytes, .. } if bytes == expected),
                     "{tokens}: {outcome:?}, expected {expected} bytes"
                 );
             }
@@ -716,7 +716,7 @@ fn rank_writers_send_only_the_pages_of_a_single_child_endpoint() {
     wait("the writer", || writer.client.status() == PoolStatus::Ready);
     let root = put_and_wait(&mut writer, &history, world, 2 * PT, None, true, Anchor, 1);
     assert!(
-        matches!(root, PutOutcome::Stored { bytes } if bytes == (8192 + 2 * page + row) as u64)
+        matches!(root, PutOutcome::Stored { bytes, .. } if bytes == (8192 + 2 * page + row) as u64)
     );
     let parent = history.key_at(2 * PT);
     let child = put_and_wait(
@@ -729,7 +729,7 @@ fn rank_writers_send_only_the_pages_of_a_single_child_endpoint() {
         Endpoint,
         1,
     );
-    assert!(matches!(child, PutOutcome::Stored { bytes } if bytes == (8192 + 2 * page) as u64));
+    assert!(matches!(child, PutOutcome::Stored { bytes, .. } if bytes == (8192 + 2 * page) as u64));
     writer.client.close().unwrap();
     let metrics = manager.metrics();
     assert!(metrics.contains("selene_put_shapes_total{shape=\"row\"} 1\n"));

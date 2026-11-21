@@ -15,6 +15,10 @@ fn history(blocks: u32) -> PrefixHistory {
     history
 }
 
+fn tail(publication: &PublishedCheckpoint) -> &[PageId] {
+    &publication.chain_pages[publication.chain_pages.len() - publication.tail_pages..]
+}
+
 /// Publishes a checkpoint ending at `end` tokens with the given tail pages.
 fn publish(
     s: &mut RequestScheduler,
@@ -44,6 +48,41 @@ fn publish(
         )
         .unwrap()
         .id()
+}
+
+#[test]
+fn publication_keeps_the_nearest_256_offered_ancestors() {
+    let mut scheduler = scheduler(1, 8, 260);
+    scheduler.enable_publications();
+    let history = history(5);
+    let mut parent = None;
+    for end in 1..=260 {
+        let tail: Vec<_> = ((end - 1) as u32 / 64..end as u32 / 64).collect();
+        let id = publish(&mut scheduler, &history, parent, end, &tail, 0);
+        scheduler.record_publication(id);
+        parent = Some(id);
+    }
+    let publication = scheduler.publication(parent.unwrap()).unwrap();
+    let nearest: Vec<_> = (4..260).rev().map(|n| history.key_at(n).unwrap()).collect();
+    assert_eq!(publication.ancestors, nearest);
+    assert_eq!(publication.parent(), nearest.first().copied());
+}
+
+#[test]
+fn offered_ancestors_skip_keys_at_or_above_the_child() {
+    let mut scheduler = scheduler(1, 8, 4);
+    scheduler.enable_publications();
+    let history = history(1);
+    let root = publish(&mut scheduler, &history, None, 10, &[], 0);
+    let middle = publish(&mut scheduler, &history, Some(root), 20, &[], 0);
+    let tip = publish(&mut scheduler, &history, Some(middle), 30, &[], 0);
+    for id in [root, middle, tip] {
+        scheduler.record_publication(id);
+    }
+    assert_eq!(
+        scheduler.offered_ancestors(Some(tip), 20).unwrap(),
+        [history.key_at(10).unwrap()]
+    );
 }
 
 #[test]
@@ -90,7 +129,7 @@ fn compaction_and_leaf_eviction_are_reported_with_the_heir() {
     });
     let heir = s.publication(b).unwrap();
     assert_eq!(heir.chain_pages, [PageId(0), PageId(1)]);
-    assert_eq!(heir.parent, None);
+    assert_eq!(heir.parent(), None);
     assert_eq!(heir.tail_pages, 2);
     assert_eq!(
         s.take_evictions(),
@@ -127,16 +166,16 @@ fn deferred_heirs_are_not_announced_and_offered_descendants_skip_them() {
     s.record_publication(a);
     s.record_publication(d);
     let offered = s.take_publications();
-    assert_eq!(offered[1].parent, Some(h.key_at(64).unwrap()));
-    assert_eq!(offered[1].tail(), &[PageId(1), PageId(2), PageId(3)]);
+    assert_eq!(offered[1].parent(), Some(h.key_at(64).unwrap()));
+    assert_eq!(tail(&offered[1]), &[PageId(1), PageId(2), PageId(3)]);
     s.evict(EvictionTarget {
         pages: 1,
         snapshots: 1,
     });
     assert!(s.cache.checkpoint(a).is_err());
     let heir = s.publication(d).unwrap();
-    assert_eq!(heir.parent, None);
-    assert_eq!(heir.tail(), &[PageId(0), PageId(1), PageId(2), PageId(3)]);
+    assert_eq!(heir.parent(), None);
+    assert_eq!(tail(&heir), &[PageId(0), PageId(1), PageId(2), PageId(3)]);
     assert_eq!(
         s.take_evictions(),
         [EvictedCheckpoint {
@@ -172,15 +211,15 @@ fn a_deferred_branch_point_is_offered_as_the_heir() {
     assert!(
         offered[1..]
             .iter()
-            .all(|node| node.parent == Some(offered[0].key))
+            .all(|node| node.parent() == Some(offered[0].key))
     );
     s.evict(EvictionTarget {
         pages: 0,
         snapshots: 1,
     });
     let heir = s.publication(b).unwrap();
-    assert_eq!(heir.parent, None);
-    assert_eq!(heir.tail(), &[PageId(0), PageId(1)]);
+    assert_eq!(heir.parent(), None);
+    assert_eq!(tail(&heir), &[PageId(0), PageId(1)]);
     let refreshed = s.take_publications();
     assert_eq!(refreshed[0], heir);
     assert_eq!(
@@ -198,7 +237,7 @@ fn a_deferred_branch_point_is_offered_as_the_heir() {
         }]
     );
     for child in &refreshed[1..] {
-        assert_eq!(child.parent, Some(heir.key));
+        assert_eq!(child.parent(), Some(heir.key));
         assert_eq!(child.tail_pages, 1);
     }
 }

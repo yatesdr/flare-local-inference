@@ -122,7 +122,7 @@ impl crate::store::TierStore for FakeLocal {
     fn set_spill(&mut self, enabled: bool) {
         self.0.lock().unwrap().spill = Some(enabled);
     }
-    fn retirement_predecessor(&self, key: PrefixKey) -> Option<Retiring> {
+    fn retirement_predecessor(&self, key: PrefixKey, _candidates: bool) -> Option<Retiring> {
         self.0
             .lock()
             .unwrap()
@@ -611,17 +611,17 @@ fn gpu_publications_are_announced_and_their_evictions_reported() {
         capture_role: crate::CaptureRole::Endpoint,
         id: CheckpointId::new(42),
         key,
-        parent: Some(rig.key(64)),
+        ancestors: vec![rig.key(64)],
         bucket: [4; 16],
-        chain_pages: vec![PageId(1), PageId(2)],
-        tail_pages: 2,
+        chain_pages: (0..10).map(PageId).collect(),
+        tail_pages: 6,
         slot: StateSlotId(1),
     };
     assert_eq!(rig.store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
     assert_eq!(rig.copies(), [checkpoint.key]);
     let saved = rig.pool.lock().unwrap().saved.clone();
     assert_eq!(saved.len(), 1);
-    assert_eq!((saved[0].tier, saved[0].tail_pages), (Tier::Gpu, 2));
+    assert_eq!((saved[0].tier, saved[0].tail_pages), (Tier::Gpu, 6));
     assert_eq!(saved[0].parent, Some(rig.key(64)));
     let mut heir = checkpoint.clone();
     heir.id = CheckpointId::new(43);
@@ -820,9 +820,17 @@ fn a_retiring_record_is_put_and_released_only_when_the_manager_commits_it() {
     rig.poll();
     assert!(rig.retired().is_empty());
     let (id, _) = rig.started()[0];
-    rig.end(id, PutOutcome::Stored { bytes: 1 });
+    rig.end(id, stored());
     rig.poll();
     assert_eq!(rig.retired(), [(record.key, Retirement::Moved)]);
+}
+
+fn stored() -> PutOutcome {
+    PutOutcome::Stored {
+        bytes: 1,
+        pages: 0,
+        linked: None,
+    }
 }
 
 #[test]
@@ -845,9 +853,132 @@ fn a_page_only_local_root_is_sent_with_its_deeper_row() {
     assert_eq!(started.len(), 1);
     assert_eq!(started[0].1, tip.key);
     assert_eq!(rig.pool.lock().unwrap().puts[0].1.ancestor_keys, [root.key]);
-    rig.end(started[0].0, PutOutcome::Stored { bytes: 1 });
+    rig.end(started[0].0, stored());
     rig.poll();
     assert_eq!(rig.retired(), [(tip.key, Retirement::Moved)]);
+}
+
+#[test]
+fn a_dram_leaf_retires_through_its_local_root_carrying_every_offered_ancestor() {
+    let mut rig = rig();
+    rig.ready(true);
+    // The local root was published under two ancestors the local tier does not hold.
+    let b = rig.key(3 * PT + 1);
+    let a = rig.key(2 * PT);
+    let mut root = rig.retiring(4);
+    root.tier = Tier::Dram;
+    root.parent = None;
+    root.ancestor_keys = vec![b, a];
+    let mut tip = rig.retiring(5);
+    tip.tier = Tier::Dram;
+    tip.parent = Some(root.key);
+    let nearer = rig.key(5 * PT - 1);
+    let next = rig.key(5 * PT - 2);
+    tip.ancestor_keys = vec![nearer, next, root.key, b, a];
+    rig.local.0.lock().unwrap().ancestors = vec![root.clone(), tip.clone()];
+    rig.offer(std::slice::from_ref(&tip));
+    rig.poll();
+    // The root goes first, and both ancestors travel as its candidates, nearest first.
+    assert_eq!(rig.started().len(), 1);
+    assert_eq!(rig.started()[0].1, root.key);
+    assert_eq!(rig.pool.lock().unwrap().puts[0].1.ancestor_keys, [b, a]);
+    rig.end(
+        rig.started()[0].0,
+        PutOutcome::Stored {
+            bytes: 1,
+            pages: 3,
+            linked: Some(a),
+        },
+    );
+    rig.poll();
+    assert_eq!(rig.started()[1].1, tip.key);
+    assert_eq!(rig.pool.lock().unwrap().puts[1].1.parent, Some(root.key));
+    rig.end(
+        rig.started()[1].0,
+        PutOutcome::Stored {
+            bytes: 1,
+            pages: 1,
+            linked: Some(next),
+        },
+    );
+    rig.poll();
+    assert_eq!(rig.retired(), [(tip.key, Retirement::Moved)]);
+    assert_eq!(rig.store.stats().deeper_link_records[1], 2);
+    assert_eq!(rig.store.stats().deeper_link_pages[1], 4);
+}
+
+#[test]
+fn a_local_root_outside_the_leafs_candidate_list_still_retires_first() {
+    let mut rig = rig();
+    rig.ready(true);
+    rig.history.append(&vec![1; 4200], &[]).unwrap();
+    let limit = crate::shared::MAX_CHAIN_NODES as usize;
+    let keys: Vec<_> = (0..limit + 2).map(|i| rig.key(32 + i as u64)).collect();
+    let template = rig.retiring(2);
+    let mut path = Vec::new();
+    for (i, key) in keys.iter().copied().enumerate() {
+        let mut record = template.clone();
+        record.tier = Tier::Dram;
+        record.key = key;
+        record.parent = path.last().map(|parent: &Retiring| parent.key);
+        record.tail_pages = (key.consumed_tokens / PT
+            - record.parent.map_or(0, |p| p.consumed_tokens / PT)) as usize;
+        if i == 0 {
+            record.ancestor_keys.push(rig.key(16));
+        }
+        path.push(record);
+    }
+    let leaf = path.last_mut().unwrap();
+    leaf.ancestor_keys = keys[1..keys.len() - 1].iter().rev().copied().collect();
+    rig.offer(std::slice::from_ref(leaf));
+    rig.local.0.lock().unwrap().ancestors = path;
+    rig.poll();
+    assert_eq!(rig.started()[0].1, keys[0]);
+    assert_eq!(rig.pool.lock().unwrap().puts[0].1.ancestor_keys, [rig.key(16)]);
+}
+
+#[test]
+fn pool_puts_count_roots_and_deeper_offered_links() {
+    let mut rig = rig();
+    rig.ready(true);
+    let b = rig.key(3 * PT + 1);
+    let a = rig.key(2 * PT);
+    // (candidate ancestors, the record the manager linked under, pages it carried).
+    let cases: [(Vec<PrefixKey>, Option<PrefixKey>, u64); 6] = [
+        (vec![], None, 9),
+        (vec![b, a], None, 8),
+        (vec![b, a], Some(a), 3),
+        (vec![b, a], Some(b), 2),
+        (vec![b, a], Some(a), 4),
+        (vec![b, a], Some(rig.key(PT)), 5),
+    ];
+    for (n, (hints, linked, pages)) in cases.into_iter().enumerate() {
+        let mut record = rig.retiring(6 + n as u64);
+        record.parent = None;
+        record.ancestor_keys = hints;
+        rig.offer(&[record]);
+        rig.poll();
+        rig.end(
+            rig.started()[n].0,
+            PutOutcome::Stored {
+                bytes: 1,
+                pages,
+                linked,
+            },
+        );
+        rig.poll();
+    }
+    rig.offer(&[rig.retiring(1)]);
+    rig.poll();
+    rig.end(rig.started().last().unwrap().0, PutOutcome::Present);
+    rig.poll();
+    let stats = rig.store.stats();
+    assert_eq!(stats.root_records[1], [1, 1]);
+    assert_eq!(stats.deeper_link_records[1], 2);
+    assert_eq!(stats.root_pages[1], [9, 8]);
+    assert_eq!(stats.deeper_link_pages[1], 7);
+    assert_eq!(stats.root_records[0], [0, 0]);
+    assert_eq!(stats.deeper_link_records[0], 0);
 }
 
 #[test]
@@ -877,7 +1008,7 @@ fn losing_the_descendant_row_before_retirement_keeps_the_source() {
             local.ancestors[1].descendant_row = false;
             local.ancestors[2].row = false;
         }
-        rig.end(id, PutOutcome::Stored { bytes: 1 });
+        rig.end(id, stored());
     }
     rig.poll();
     assert_eq!(rig.retired(), [(keys[2], Retirement::Failed)]);
@@ -901,7 +1032,7 @@ fn a_permanent_middle_refusal_retries_only_the_leaf() {
         rig.offer(&path[2..]);
         rig.poll();
         assert_eq!(rig.started()[0].1, keys[0]);
-        rig.end(rig.started()[0].0, PutOutcome::Stored { bytes: 1 });
+        rig.end(rig.started()[0].0, stored());
         rig.poll();
         assert_eq!(rig.started()[1].1, keys[1]);
         rig.end(rig.started()[1].0, PutOutcome::Refused(PutRefusal::Invalid));
@@ -1001,7 +1132,7 @@ fn a_page_only_retirement_is_put_without_its_row() {
         assert!(!request.row);
         assert_eq!(request.capture_role, crate::CaptureRole::Endpoint);
     }
-    rig.end(rig.started()[0].0, PutOutcome::Stored { bytes: 1 });
+    rig.end(rig.started()[0].0, stored());
     rig.poll();
     assert_eq!(rig.retired(), [(record.key, Retirement::Moved)]);
 }
@@ -1296,7 +1427,7 @@ fn a_full_queue_stops_selection_and_keeps_every_record_local() {
     assert_eq!(rig.store.cascade.in_progress(), MOVES_MAX + PENDING_MAX);
     // As moves end, the waiting records start in order.
     let first = rig.started()[0];
-    rig.end(first.0, PutOutcome::Stored { bytes: 1 });
+    rig.end(first.0, stored());
     rig.poll();
     assert_eq!(rig.started().len(), MOVES_MAX + 1);
     assert_eq!(rig.started()[MOVES_MAX].1, records[MOVES_MAX].key);
@@ -1322,7 +1453,7 @@ impl Rig {
             capture_role: crate::CaptureRole::Endpoint,
             id: CheckpointId::new(5),
             key: self.key(end),
-            parent: None,
+            ancestors: Vec::new(),
             bucket: [3; 16],
             chain_pages: (0..pages as u32).map(PageId).collect(),
             tail_pages: pages,
@@ -1360,7 +1491,7 @@ fn publication_copies_row_only_records_even_when_recompute_is_cheaper() {
     let parent = rig.publication(800);
     let mut child = rig.publication(800);
     child.key = rig.key(807);
-    child.parent = Some(parent.key);
+    child.ancestors.push(parent.key);
     child.tail_pages = 0;
     assert_eq!(rig.store.store(&child).unwrap(), StoreOutcome::Queued);
     assert_eq!(rig.copies(), [child.key]);

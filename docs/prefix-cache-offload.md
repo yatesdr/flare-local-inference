@@ -202,10 +202,10 @@ a queued publication cannot obtain host capacity. A failed transfer releases its
 pin without retrying. GPU eviction uses demand/role retention ranking with leaf removal or
 ancestor compaction. `fetch` copies a looked-up chain into the ticket's page IDs and state slot.
 Submissions never wait; `poll` drains completions and failures.
-A `PublishedCheckpoint` names the GPU checkpoint, its key, its nearest offered
-ancestor's key, its bucket digest, every page of
-its chain from the root with the tail count since that offered ancestor,
-and the state slot of its row. `MemoryStore`, `DiskStore`, and `CompositeStore`
+A `PublishedCheckpoint` names the GPU checkpoint, its key and bucket digest,
+its complete page chain, and the state slot of its row. It lists up to 256
+offered ancestors, nearest first with strictly decreasing consumed tokens,
+and gives the tail page count since the nearest offered ancestor. `MemoryStore`, `DiskStore`, and `CompositeStore`
 implement the trait for serving, `PooledStore` wraps them when a pool is
 attached (section 2.15), and a test double implements it for worker tests. The
 worker holds `Option<Box<dyn HostStore>>`. The trait's remaining methods have
@@ -250,13 +250,23 @@ probe count is about the new tokens divided by 64.
 Page content is determined by the token prefix ending at the page, so a
 suffix of a host chain's pages combines correctly with the GPU ancestor's
 pages, in the same way a GPU checkpoint's pages combine with a child computed
-later from a different request. A checkpoint published while its parent key
-is absent from the host index is stored as a root record holding its complete
+later from a different request. A checkpoint published while none of its offered
+ancestors is in the host index is stored as a root record holding its complete
 page chain, so a skipped or evicted ancestor never makes its descendants
-unrestorable. A put to the manager's store instead lists the record's local
-ancestors, deepest first, and the manager links it to the deepest one it holds
-ready; the writer sends only the pages after that ancestor. The manager stores
-a root with the complete chain only when it holds none of them, when the
+unrestorable. A host tier links a record under the first
+offered ancestor, nearest first, that it holds ready, and copies only the pages
+after it. The nearest offered ancestor can be a same-page Endpoint that no tier
+stores, so the whole list is offered. Each tier chooses its parent in one place
+(the DRAM store's ready ancestor, the disk store's first ancestor that accepts
+children), and that choice also decides whether an Endpoint keeps its row, so an
+Endpoint covered by a row on its page is always stored under the record that
+covers it. In a standalone DRAM store, a publication waits for the first known
+offered ancestor that is still copying out; inside a composite store the DRAM
+tier is flat and the disk index chooses the parent. A put to the manager offers up to 4096 ancestors, nearest first.
+Each record offers any ancestors nearer than its local parent before that parent,
+and the local root offers its remaining ancestors. The manager links the record under the
+nearest ready candidate. The writer sends only the pages after that ancestor.
+The manager stores a root with the complete chain only when it holds none of them, when the
 chosen ancestor's chain is already half the lookup limit long, or when the
 arena is under pressure.
 
@@ -643,8 +653,9 @@ both transports.
 - Cancelling a waiter removes it from the ticket. The ticket completes
   regardless, because the restored checkpoint is useful on its own.
 - `take_publications()` returns GPU-ready checkpoints offered since the previous
-  call, each once, with their id, key, nearest offered ancestor's key, bucket
-  digest, whole page chain, tail count since that ancestor, and row state slot.
+  call, each once, with their id, key, up to 256 offered ancestor keys
+  (nearest first), bucket digest, whole page chain, tail count since
+  the nearest offered ancestor, and row state slot.
   Deferred checkpoints enter the list on reuse or the fallback above.
 - `SchedulerStats` reports `host_lookups`, `host_hits`, `host_reused_tokens`,
   and `inbound_waiting`.
@@ -1152,6 +1163,14 @@ same completion events the store produces.
   exported as `flare_host_cache_parked_records`, a gauge.
   `flare_host_cache_store_skipped_total` counts publications that started no
   copy, including duplicates and retries.
+  `flare_host_cache_root_records_total{tier,reason}` and
+  `flare_host_cache_root_pages_total{tier,reason}` count root records and their pages.
+  `flare_host_cache_deeper_link_records_total{tier}` and
+  `flare_host_cache_deeper_link_pages_total{tier}` count records linked under a
+  later offered ancestor and the pages copied after it. These counters cover
+  GPU-to-DRAM copies started and puts the pool manager stored. Pool root
+  counters cover puts of local roots that the manager also stored as roots.
+  A `Present` response and local writes in a disk-only store contribute zero.
   `flare_host_cache_expired_total{tier}` counts direct age removals. Slot gauges
   `flare_host_cache_slots_in_use`, `flare_host_cache_slots_total` and
   `flare_host_cache_intake_slots` report the shared local pool, including

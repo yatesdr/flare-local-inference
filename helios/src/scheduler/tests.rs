@@ -1345,7 +1345,7 @@ fn capture_under_reused_chain_pressure(alias_pages: u32) {
     let evictions = scheduler.take_evictions();
     assert_eq!(evictions.len(), 1);
     let heir = evictions[0].heir.as_ref().unwrap();
-    assert_eq!(heir.parent, None);
+    assert_eq!(heir.parent(), None);
     assert_eq!(heir.chain_pages, pages[..2]);
     scheduler.release_snapshot(capture.unwrap());
     scheduler.cancel(pending).unwrap();
@@ -2708,7 +2708,7 @@ fn inbound_request_waits_unscheduled_then_restores_like_a_gpu_prefix_hit() {
             capture_role: flare_selene::CaptureRole::Endpoint,
             id: restored,
             key,
-            parent: None,
+            ancestors: Vec::new(),
             bucket: key.digest,
             chain_pages: ticket.pages.clone(),
             tail_pages: 1,
@@ -2756,7 +2756,7 @@ fn inbound_request_waits_unscheduled_then_restores_like_a_gpu_prefix_hit() {
     assert_eq!(published.len(), 1);
     let prompt = &published[0];
     assert_eq!(prompt.key, history(65).key_at(65).unwrap());
-    assert_eq!(prompt.parent, Some(key));
+    assert_eq!(prompt.parent(), Some(key));
     assert_eq!(prompt.bucket, key.digest);
     assert_eq!(prompt.chain_pages, ticket.pages);
     assert_eq!(prompt.tail_pages, 0);
@@ -2820,7 +2820,7 @@ fn inbound_full_prompt_hit_resumes_without_prefill() {
         scheduler
             .take_publications()
             .iter()
-            .map(|p| (p.id, p.parent, p.tail_pages, p.chain_pages.clone()))
+            .map(|p| (p.id, p.parent(), p.tail_pages, p.chain_pages.clone()))
             .collect::<Vec<_>>(),
         [(restored, None, 1, ticket.pages.clone())]
     );
@@ -2837,7 +2837,7 @@ fn inbound_restore_above_a_resident_checkpoint_pins_the_ancestor_until_completio
     let ancestor_key = history(64).key_at(64).unwrap();
     let notices = scheduler.take_publications();
     assert_eq!(notices.len(), 1);
-    assert_eq!((notices[0].id, notices[0].key, notices[0].parent, notices[0].tail_pages),
+    assert_eq!((notices[0].id, notices[0].key, notices[0].parent(), notices[0].tail_pages),
         (ancestor, ancestor_key, None, 1));
     assert_eq!(notices[0].chain_pages, ancestor_pages);
     assert_eq!(free(&scheduler), (7, 3));
@@ -2903,7 +2903,7 @@ fn inbound_restore_above_a_resident_checkpoint_pins_the_ancestor_until_completio
             capture_role: flare_selene::CaptureRole::Endpoint,
             id: restored,
             key,
-            parent: Some(ancestor_key),
+            ancestors: vec![ancestor_key],
             bucket: key.digest,
             chain_pages: chain.clone(),
             tail_pages: 1,
@@ -2934,7 +2934,7 @@ fn inbound_restore_above_a_resident_checkpoint_pins_the_ancestor_until_completio
     assert_eq!(
         (
             published[0].key,
-            published[0].parent,
+            published[0].parent(),
             published[0].bucket,
             published[0].tail_pages,
             &published[0].chain_pages
@@ -3184,7 +3184,7 @@ fn waiters_sharing_one_ticket_restore_together_and_both_complete() {
         scheduler
             .take_publications()
             .iter()
-            .map(|p| (p.id, p.parent))
+            .map(|p| (p.id, p.parent()))
             .collect::<Vec<_>>(),
         [(restored, None),
             (first_terminal, Some(ticket.key)),
@@ -3346,27 +3346,32 @@ fn pinned_checkpoints_survive_eviction_pressure_until_unpinned() {
     assert_eq!(scheduler.stats().host_lookups, 2);
 }
 
-#[test]
-fn take_publications_reports_boundaries_and_defers_terminals() {
+fn prefill_to_publication_boundary(tokens: usize, boundary: usize) -> (RequestScheduler, RequestHandle) {
     let mut scheduler = host_scheduler(1, 8, 4);
     let handle = scheduler
         .admit(RequestSpec {
-            message_boundaries: vec![64],
-            ..spec(130, 2)
+            message_boundaries: vec![boundary],
+            ..spec(tokens, 2)
         })
         .unwrap();
-    let history = history(130);
     init(&mut scheduler, 1);
     let step = scheduler.plan().unwrap();
-    assert_eq!((step.kind, step.lanes[0].tokens), (GraphKind::Prefill, 64));
+    assert_eq!((step.kind, step.lanes[0].tokens), (GraphKind::Prefill, boundary));
     scheduler.commit(&step, Fence(2)).unwrap();
     scheduler
         .complete(
             Fence(2),
-            &records(handle, 2, 64, 0, -1, 1),
+            &records(handle, 2, boundary as i64, 0, -1, 1),
             Default::default(),
         )
         .unwrap();
+    (scheduler, handle)
+}
+
+#[test]
+fn take_publications_reports_boundaries_and_defers_terminals() {
+    let (mut scheduler, handle) = prefill_to_publication_boundary(130, 64);
+    let history = history(130);
     assert!(scheduler.take_publications().is_empty());
     let first_page = scheduler
         .request(handle)
@@ -3382,7 +3387,7 @@ fn take_publications_reports_boundaries_and_defers_terminals() {
             capture_role: flare_selene::CaptureRole::Anchor,
             id: system,
             key: history.key_at(64).unwrap(),
-            parent: None,
+            ancestors: Vec::new(),
             bucket: history.key_at(64).unwrap().digest,
             chain_pages: first_page.clone(),
             tail_pages: 1,
@@ -3434,7 +3439,7 @@ fn take_publications_reports_boundaries_and_defers_terminals() {
             capture_role: flare_selene::CaptureRole::Endpoint,
             id: prompt,
             key: history.key_at(130).unwrap(),
-            parent: Some(history.key_at(64).unwrap()),
+            ancestors: vec![history.key_at(64).unwrap()],
             bucket: history.key_at(128).unwrap().digest,
             chain_pages: pages[..2].to_vec(),
             tail_pages: 1,
@@ -3449,6 +3454,53 @@ fn take_publications_reports_boundaries_and_defers_terminals() {
     assert_eq!(free(&scheduler), (6, 1));
     scheduler.ensure_resources(8, 4).unwrap();
     assert_eq!(free(&scheduler), (8, 4));
+}
+
+#[test]
+fn a_publication_lists_a_same_page_prompt_end_ahead_of_its_anchor() {
+    // The Anchor at 70 tokens, the prompt-end Endpoint at 100 and the terminal at 101
+    // all lie on one page. A host tier that holds only the prompt-end, or only the
+    // Anchor, links under what it holds.
+    let (mut scheduler, handle) = prefill_to_publication_boundary(100, 70);
+    let history = history(100);
+    retain_prompt(&mut scheduler, 3);
+    let anchor = history.key_at(70).unwrap();
+    let published = scheduler.take_publications();
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].key, anchor);
+    let step = scheduler.plan().unwrap();
+    scheduler.commit(&step, Fence(4)).unwrap();
+    scheduler
+        .complete(
+            Fence(4),
+            &records(handle, 4, 100, 1, 77, 1),
+            Default::default(),
+        )
+        .unwrap();
+    retain_prompt(&mut scheduler, 5);
+    let prompt_end = history.key_at(100).unwrap();
+    let published = scheduler.take_publications();
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].key, prompt_end);
+    assert_eq!(published[0].ancestors, [anchor]);
+    let step = scheduler.plan().unwrap();
+    assert_eq!(step.kind, GraphKind::Decode);
+    scheduler.commit(&step, Fence(6)).unwrap();
+    scheduler
+        .complete(
+            Fence(6),
+            &records(handle, 6, 101, 2, 78, 2),
+            Default::default(),
+        )
+        .unwrap();
+    freeze(&mut scheduler, handle, 7);
+    let terminal = scheduler.finish(handle).unwrap().unwrap();
+    let publication = scheduler.publication(terminal).unwrap();
+    assert_eq!(publication.key.consumed_tokens, 101);
+    assert_eq!(publication.parent(), Some(prompt_end));
+    // The prompt-end shares its parent's page and is still listed, before the Anchor.
+    assert_eq!(publication.ancestors, [prompt_end, anchor]);
+    assert_eq!(publication.tail_pages, 0);
 }
 
 #[test]

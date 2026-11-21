@@ -513,7 +513,7 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
             &self.pool,
             IndexEntry {
                 key: checkpoint.key,
-                parent: checkpoint.parent,
+                parent: checkpoint.parent(),
                 bucket: checkpoint.bucket,
                 tail_pages: checkpoint.tail_pages as u32,
                 row: true,
@@ -537,6 +537,12 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
         stats.retirement_max_depth = self.cascade.max_depth;
         stats.retirement_ns = self.cascade.latency_ns;
         stats.retirement_max_ns = self.cascade.max_latency_ns;
+        stats.deeper_link_records[1] += self.cascade.deeper_link_records;
+        stats.deeper_link_pages[1] += self.cascade.deeper_link_pages;
+        for reason in 0..crate::RootReason::COUNT {
+            stats.root_records[1][reason] += self.cascade.root_records[reason];
+            stats.root_pages[1][reason] += self.cascade.root_pages[reason];
+        }
         stats.fetch_failed += self.pool_fetch_failed;
         stats.bytes_in += self.pool_bytes_in;
         for (index, count) in self.cascade.dropped.iter().enumerate() {
@@ -572,7 +578,7 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
             Tier::Gpu,
             heir.map(|heir| IndexEntry {
                 key: heir.key,
-                parent: heir.parent,
+                parent: heir.parent(),
                 bucket: heir.bucket,
                 tail_pages: heir.tail_pages as u32,
                 row: true,
