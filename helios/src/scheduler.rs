@@ -1803,16 +1803,9 @@ impl RequestScheduler {
 
     pub(crate) fn publication(&self, id: CheckpointId) -> Option<PublishedCheckpoint> {
         let checkpoint = self.cache.checkpoint(id).ok()?;
-        let mut ancestor = checkpoint.parent();
-        let mut parent = None;
-        while let Some(ancestor_id) = ancestor {
-            let node = self.cache.checkpoint(ancestor_id).ok()?;
-            if self.offered_publications.contains(&ancestor_id) {
-                parent = Some(node.prefix());
-                break;
-            }
-            ancestor = node.parent();
-        }
+        let ancestors =
+            self.offered_ancestors(checkpoint.parent(), checkpoint.prefix().consumed_tokens)?;
+        let parent = ancestors.first().copied();
         let page_tokens = self.capabilities.page_tokens as u64;
         Some(PublishedCheckpoint {
             capture_role: match checkpoint.retention_rank().role {
@@ -1822,7 +1815,7 @@ impl RequestScheduler {
             },
             id,
             key: checkpoint.prefix(),
-            parent,
+            ancestors,
             bucket: checkpoint.bucket(),
             chain_pages: self.cache.page_chain(id).ok()?,
             tail_pages: (checkpoint.prefix().consumed_tokens / page_tokens
@@ -1830,6 +1823,32 @@ impl RequestScheduler {
                 as usize,
             slot: self.snapshot_slot(checkpoint.snapshot()),
         })
+    }
+
+    fn offered_ancestors(
+        &self,
+        mut ancestor: Option<CheckpointId>,
+        mut below: u64,
+    ) -> Option<Vec<PrefixKey>> {
+        let mut ancestors = Vec::new();
+        while let Some(ancestor_id) = ancestor {
+            let node = match self.cache.checkpoint(ancestor_id) {
+                Ok(node) => node,
+                // Keep a publication that the nearest readable ancestor already permits.
+                Err(_) if !ancestors.is_empty() => break,
+                Err(_) => return None,
+            };
+            let key = node.prefix();
+            if self.offered_publications.contains(&ancestor_id) && key.consumed_tokens < below {
+                below = key.consumed_tokens;
+                ancestors.push(key);
+                if ancestors.len() == flare_selene::MAX_PUBLISHED_ANCESTORS {
+                    break;
+                }
+            }
+            ancestor = node.parent();
+        }
+        Some(ancestors)
     }
 
     pub(crate) fn reoffer_publication(&mut self, id: CheckpointId) {

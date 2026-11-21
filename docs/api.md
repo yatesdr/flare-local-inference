@@ -357,7 +357,24 @@ deferred by the GPU headroom check before acquiring checkpoint pins.
 Host retention also exports `flare_host_cache_held_total{tier}` and
 `flare_host_cache_dropped_total{tier,reason}`, with `dram` and `nvme` tiers and
 `end_of_chain`, `oversize`, `io_error`, and `pool_refused` (pooled deployments only)
-drop reasons. The gauge
+drop reasons.
+
+`flare_host_cache_root_records_total{tier,reason}` and
+`flare_host_cache_root_pages_total{tier,reason}` count roots and their pages.
+`first` means the checkpoint offered no ancestor. `no_held_ancestor` means
+the tier stored a root despite receiving candidates.
+`flare_host_cache_deeper_link_records_total{tier}` and
+`flare_host_cache_deeper_link_pages_total{tier}` count records linked under a
+later offered ancestor and the tail pages they carried. The scheduler offers
+up to 256 ancestors per publication. A pool put offers up to 4096 candidates,
+including local parents and the nearer ancestors offered along the chain.
+
+For these four counters, `dram` counts copies started from the GPU and
+`pool` counts puts the manager stored. `pool` is the shared manager, not this
+process's local disk tier, which other `flare_host_cache_` families label
+`nvme`. Pool root counters cover local roots
+that the manager also stored as roots. A `Present` outcome and
+a disk-only store's local writes contribute zero. The gauge
 `flare_host_cache_parked_records` counts complete DRAM copies awaiting disk
 writes. `flare_host_cache_store_skipped_total` includes duplicates and
 retries; it is not a dropped-record counter. Local checkpoint pool capacity is

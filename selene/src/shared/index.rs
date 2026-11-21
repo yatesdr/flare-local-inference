@@ -27,8 +27,9 @@ use crate::geometry::invalid;
 pub struct Node<L> {
     pub key: PrefixKey,
     pub parent: Option<PrefixKey>,
-    /// Published ancestor hint; does not own pages or form an index edge.
-    pub published_parent: Option<PrefixKey>,
+    /// Offered ancestors nearer than the record's parent, nearest first.
+    /// A root keeps all offered ancestors. These keys do not own pages.
+    pub published_ancestors: Vec<PrefixKey>,
     /// Number of records from the root through this node.
     pub chain_depth: usize,
     pub bucket: [u8; 16],
@@ -261,29 +262,44 @@ impl<L> Index<L> {
         self.nodes.get_mut(key)
     }
 
-    /// Record the ancestor a checkpoint was published under, for puts to the pool.
-    pub(crate) fn set_published_parent(&mut self, key: &PrefixKey, parent: Option<PrefixKey>) {
-        if let Some(node) = self.nodes.get_mut(key) {
-            node.published_parent = parent;
+    /// Keep the offered ancestors between the record and its chosen parent.
+    pub(crate) fn set_published_ancestors(
+        &mut self,
+        key: &PrefixKey,
+        parent: Option<PrefixKey>,
+        ancestors: &[PrefixKey],
+    ) {
+        let Some(node) = self.node_mut(key) else {
+            return;
+        };
+        let kept = &mut node.published_ancestors;
+        kept.clear();
+        let mut below = key.consumed_tokens;
+        for &ancestor in ancestors {
+            if parent.is_some_and(|p| ancestor.consumed_tokens <= p.consumed_tokens) {
+                break;
+            }
+            if ancestor.consumed_tokens < below {
+                kept.push(ancestor);
+                below = ancestor.consumed_tokens;
+            }
         }
     }
 
-    /// Candidate ancestors for a pool put, deepest first, including a root's hint.
+    /// Each local record offers its nearer ancestors before its parent.
     pub(crate) fn ancestor_keys(&self, key: &PrefixKey) -> Vec<PrefixKey> {
         let mut keys = Vec::new();
         let mut node = self.node(key);
+        let limit = crate::shared::MAX_CHAIN_NODES as usize;
         while let Some(current) = node {
-            match current.parent {
-                Some(parent) => {
-                    keys.push(parent);
-                    node = self.node(&parent);
-                }
-                None => {
-                    keys.extend(current.published_parent);
-                    break;
-                }
+            let candidates = current.published_ancestors.iter().chain(&current.parent);
+            keys.extend(candidates.take(limit - keys.len()).copied());
+            if keys.len() == limit {
+                break;
             }
+            node = current.parent.and_then(|parent| self.node(&parent));
         }
+        debug_assert!(keys.windows(2).all(|pair| pair[0].consumed_tokens > pair[1].consumed_tokens));
         keys
     }
 
@@ -389,7 +405,7 @@ impl<L> Index<L> {
             Node {
                 key,
                 parent,
-                published_parent: None,
+                published_ancestors: Vec::new(),
                 chain_depth,
                 bucket,
                 tail_pages,
@@ -783,6 +799,61 @@ mod tests {
                 (),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn a_roots_candidate_ancestors_are_its_hint_list_strictly_descending() {
+        let mut index = Index::new(64);
+        let full = history(2000);
+        insert(&mut index, &full, 700, None);
+        insert(&mut index, &full, 1300, Some(700));
+        let [b, a, older] = [650, 640, 320].map(|c| full.key_at(c).unwrap());
+        let root = full.key_at(700).unwrap();
+        // A list with a repeat and a key at or above its predecessor keeps only strictly
+        // descending keys.
+        index.set_published_ancestors(&root, None, &[b, b, a, full.key_at(645).unwrap(), older]);
+        assert_eq!(
+            index.ancestor_keys(&full.key_at(1300).unwrap()),
+            [root, b, a, older]
+        );
+        assert_eq!(index.ancestor_keys(&root), [b, a, older]);
+        // A hint at or above the root's own key cannot be an ancestor.
+        index.set_published_ancestors(&root, None, &[full.key_at(1300).unwrap(), root, b]);
+        assert_eq!(index.ancestor_keys(&root), [b]);
+    }
+
+    #[test]
+    fn each_local_link_offers_its_nearer_ancestors_before_its_parent() {
+        let full = history(900);
+        let mut index = Index::new(64);
+        insert(&mut index, &full, 300, None);
+        insert(&mut index, &full, 600, Some(300));
+        insert(&mut index, &full, 900, Some(600));
+        let [hint, root, middle_hint, middle, far, near, leaf] =
+            [100, 300, 500, 600, 700, 800, 900].map(|n| full.key_at(n).unwrap());
+        index.set_published_ancestors(&root, None, &[hint]);
+        index.set_published_ancestors(&middle, Some(root), &[middle_hint, root, hint]);
+        index.set_published_ancestors(&leaf, Some(middle), &[near, far, middle, root]);
+        assert_eq!(index.ancestor_keys(&leaf), [near, far, middle, middle_hint, root, hint]);
+    }
+
+    #[test]
+    fn pool_candidate_limit_applies_to_local_parents_and_root_hints() {
+        let mut index = Index::new(64);
+        let full = history(4100);
+        insert(&mut index, &full, 3, None);
+        index.set_published_ancestors(&full.key_at(3).unwrap(), None, &[
+            full.key_at(2).unwrap(),
+            full.key_at(1).unwrap(),
+        ]);
+        for end in 4..=4100 {
+            insert(&mut index, &full, end, Some(end - 1));
+        }
+        for end in [4098, 4100] {
+            let keys = index.ancestor_keys(&full.key_at(end).unwrap());
+            let expected: Vec<_> = (end - 4096..end).rev().map(|n| full.key_at(n).unwrap()).collect();
+            assert_eq!(keys, expected);
+        }
     }
 
     #[test]

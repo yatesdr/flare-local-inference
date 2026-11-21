@@ -207,6 +207,17 @@ struct Core {
     announced: std::collections::HashSet<PrefixKey>,
 }
 
+/// Where a standalone store puts a publication, from its offered ancestors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParentChoice<'a> {
+    /// The nearest known ancestor is ready: link under it.
+    Ready(PrefixKey, &'a [PageId]),
+    /// The nearest known ancestor is still copying out: wait for it.
+    Waiting(PrefixKey),
+    /// No offered ancestor is known: store a root holding the whole chain.
+    Root,
+}
+
 fn evictable(node: &Node<MemoryRecord>, spill: bool, announced: bool) -> bool {
     node.location.durable && !(spill && announced)
 }
@@ -277,15 +288,49 @@ impl Core {
         self.index.node(key).is_some_and(|node| !node.ready) || self.deferred_key(key)
     }
 
-    /// The record shape for a standalone store: a child of a ready parent, or
-    /// a root holding the whole chain.
+    /// The one parent choice for a standalone store, used by the store, its
+    /// preflight and the retry of a deferred publication. It walks the offered
+    /// ancestors nearest first, skipping keys this index does not know, and stops
+    /// at the first known one: ready, the record links under it; still copying
+    /// out, the record waits for it. With none known it is a root.
+    fn select_parent<'a>(&self, checkpoint: &'a PublishedCheckpoint) -> ParentChoice<'a> {
+        for key in checkpoint.offered() {
+            if self.index.node(&key).is_some_and(|node| node.ready)
+                && let Some(tail) = checkpoint.tail_below(&key, self.layout.page_tokens)
+            {
+                return ParentChoice::Ready(key, tail);
+            }
+            if self.copying_out(&key) {
+                return ParentChoice::Waiting(key);
+            }
+        }
+        ParentChoice::Root
+    }
+
+    /// The record shape for a standalone store: a child of the selected ready
+    /// ancestor holding the pages after it, or a root holding the whole chain.
+    /// A publication that waits for an ancestor is sized as a root.
     fn shape<'a>(&self, checkpoint: &'a PublishedCheckpoint) -> (Option<PrefixKey>, &'a [PageId]) {
-        match checkpoint
-            .parent
-            .filter(|parent| self.index.node(parent).is_some_and(|node| node.ready))
-        {
-            Some(parent) => (Some(parent), checkpoint.tail()),
-            None => (None, &checkpoint.chain_pages),
+        match self.select_parent(checkpoint) {
+            ParentChoice::Ready(parent, tail) => (Some(parent), tail),
+            ParentChoice::Waiting(_) | ParentChoice::Root => (None, &checkpoint.chain_pages),
+        }
+    }
+
+    /// Count a record that was not linked under the nearest offered ancestor.
+    fn count_copy(
+        &mut self,
+        checkpoint: &PublishedCheckpoint,
+        parent: Option<PrefixKey>,
+        pages: usize,
+    ) {
+        if parent.is_none() {
+            let reason = crate::RootReason::from_nearest(checkpoint.parent());
+            self.stats.root_records[0][reason as usize] += 1;
+            self.stats.root_pages[0][reason as usize] += pages as u64;
+        } else if parent != checkpoint.parent() {
+            self.stats.deeper_link_records[0] += 1;
+            self.stats.deeper_link_pages[0] += pages as u64;
         }
     }
 
@@ -318,10 +363,9 @@ impl Core {
             return Ok(false);
         }
         if !self.flat
-            && let Some(parent) = checkpoint.parent
-            && self.copying_out(&parent)
+            && let ParentChoice::Waiting(ancestor) = self.select_parent(checkpoint)
         {
-            self.deferred.push((parent, checkpoint.clone()));
+            self.deferred.push((ancestor, checkpoint.clone()));
             return Ok(true);
         }
         let (parent, tail) = self.shape(checkpoint);
@@ -344,7 +388,7 @@ impl Core {
             self.needs_row(checkpoint, parent),
         );
         match &result {
-            Ok(true) => {}
+            Ok(true) => self.count_copy(checkpoint, parent, tail.len()),
             Ok(false) => self.stats.store_skipped += 1,
             Err(_) => self.stats.store_failed += 1,
         }
@@ -364,30 +408,29 @@ impl Core {
         if self.known(&checkpoint.key) {
             return Ok(false);
         }
-        let parent = if self.flat { None } else { parent };
+        let indexed_parent = if self.flat { None } else { parent };
         // Eviction during allocation must not remove the record being extended.
-        if let Some(parent) = &parent
+        if let Some(parent) = &indexed_parent
             && self.pin_record(parent).is_err()
         {
             return Err(invalid("host record parent is not indexed"));
         }
         let allocated = self.allocate(
             checkpoint.key,
-            parent,
+            indexed_parent,
             checkpoint.bucket,
             tail.len(),
             row,
             durable,
         );
-        if let Some(parent) = &parent {
+        if let Some(parent) = &indexed_parent {
             let _ = self.unpin_record(parent);
         }
         let Some(record) = allocated? else {
             return Ok(false);
         };
         self.index[&checkpoint.key].location.capture_role = checkpoint.capture_role;
-        self.index
-            .set_published_parent(&checkpoint.key, checkpoint.parent);
+        self.index.set_published_ancestors(&checkpoint.key, parent, &checkpoint.ancestors);
         let id = self.next_job();
         let pages = tail
             .iter()
@@ -1162,6 +1205,12 @@ impl Core {
                 }
             });
             for checkpoint in waiting {
+                // The ancestor that finished may have failed, leaving a deeper one
+                // still copying out to wait for.
+                if let ParentChoice::Waiting(ancestor) = self.select_parent(&checkpoint) {
+                    self.deferred.push((ancestor, checkpoint));
+                    continue;
+                }
                 let (parent, tail) = self.shape(&checkpoint);
                 let result = match self.start_record(
                     &checkpoint,
@@ -1170,7 +1219,10 @@ impl Core {
                     true,
                     self.needs_row(&checkpoint, parent),
                 ) {
-                    Ok(true) => continue,
+                    Ok(true) => {
+                        self.count_copy(&checkpoint, parent, tail.len());
+                        continue;
+                    }
                     Ok(false) => {
                         events.push(StoreEvent::Deferred {
                             checkpoint: checkpoint.id,
@@ -1439,8 +1491,12 @@ impl MemoryStore {
     }
 
     /// Index the zero-page link without allocating a row or starting a device copy.
-    pub(crate) fn store_empty(&mut self, checkpoint: &PublishedCheckpoint) -> Result<bool> {
-        self.core.start_record(checkpoint, None, &[], false, false)
+    pub(crate) fn store_empty(
+        &mut self,
+        checkpoint: &PublishedCheckpoint,
+        parent: Option<PrefixKey>,
+    ) -> Result<bool> {
+        self.core.start_record(checkpoint, parent, &[], false, false)
     }
 
     /// Allocate slots for a record read in from elsewhere, evicting under the
@@ -1898,8 +1954,12 @@ impl crate::store::TierStore for MemoryStore {
         self.core.stats.progress += u64::from(self.core.spill != enabled);
         self.core.set_spill(enabled);
     }
-    fn retirement_predecessor(&self, key: PrefixKey) -> Option<Retiring> {
-        self.core.retirement_record(key)
+    fn retirement_predecessor(&self, key: PrefixKey, candidates: bool) -> Option<Retiring> {
+        let mut record = self.core.retirement_record(key)?;
+        if candidates {
+            record.ancestor_keys = self.core.index.ancestor_keys(&key);
+        }
+        Some(record)
     }
     fn take_retiring(&mut self) -> Vec<Retiring> {
         std::mem::take(&mut self.core.retiring)
@@ -1966,11 +2026,12 @@ mod tests {
     ) -> PublishedCheckpoint {
         let chain = (consumed / PT) as u32;
         let tail = chain - parent.map_or(0, |p| (p / PT) as u32);
+        let parent = parent.map(|tokens| history.key_at(tokens).unwrap());
         PublishedCheckpoint {
             capture_role: crate::CaptureRole::Endpoint,
             id: checkpoint_id(slot),
             key: history.key_at(consumed).unwrap(),
-            parent: parent.map(|p| history.key_at(p).unwrap()),
+            ancestors: parent.into_iter().collect(),
             bucket: history.bucket_at(consumed).unwrap(),
             chain_pages: (first_page..first_page + chain).map(PageId).collect(),
             tail_pages: tail as usize,
@@ -2551,16 +2612,406 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_root_keeps_its_published_parent_for_the_pool_put() {
+    fn a_stored_root_keeps_its_offered_ancestors_for_the_pool_put() {
         let mut core = store_core(32, 4, false);
         let full = history(1200, 1);
-        // The parent is not indexed, so the record is a root that still names it.
-        let root = published(&full, 400, Some(200), 10, 1);
+        // No ancestor is indexed, so the record is a root that still names them all.
+        let mut root = published(&full, 400, Some(200), 10, 1);
+        root.ancestors.push(full.key_at(128).unwrap());
         assert!(core.store(&root).unwrap());
         assert_eq!(
             core.index.ancestor_keys(&root.key),
-            [full.key_at(200).unwrap()]
+            [full.key_at(200).unwrap(), full.key_at(128).unwrap()]
         );
+    }
+
+    /// A publication at `consumed` whose offered ancestors are `ancestors`, nearest
+    /// first, the nearest being its `parent`.
+    fn published_under(
+        history: &PrefixHistory,
+        consumed: u64,
+        ancestors: &[u64],
+        first_page: u32,
+        slot: u32,
+    ) -> PublishedCheckpoint {
+        let mut checkpoint = published(
+            history,
+            consumed,
+            ancestors.first().copied(),
+            first_page,
+            slot,
+        );
+        checkpoint.ancestors = ancestors
+            .iter()
+            .map(|tokens| history.key_at(*tokens).unwrap())
+            .collect();
+        checkpoint
+    }
+
+    /// The pages the queued copy of `key` reads, in order.
+    fn queued_pages(core: &Core, key: PrefixKey) -> Vec<PageId> {
+        let (_, outbound) = core
+            .outbound
+            .iter()
+            .find(|(_, outbound)| outbound.key == key)
+            .expect("the record is copying out");
+        outbound
+            .pending
+            .queued
+            .iter()
+            .flat_map(|job| job.pages.iter().map(|(page, _)| *page))
+            .collect()
+    }
+
+    /// Poll `store` until every copy-out it accepted has finished.
+    fn settle_store(store: &mut MemoryStore) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut events = Vec::new();
+        while !store.core.outbound.is_empty() {
+            assert!(Instant::now() < deadline, "copy-outs did not finish");
+            store.poll(&mut events).unwrap();
+            std::thread::yield_now();
+        }
+    }
+
+    /// Store `checkpoint` as an Anchor and finish its copy.
+    fn store_anchor(core: &mut Core, history: &PrefixHistory, consumed: u64, slot: u32) {
+        let mut anchor = published(history, consumed, None, 0, slot);
+        anchor.capture_role = crate::CaptureRole::Anchor;
+        assert!(core.store(&anchor).unwrap());
+        finish(core);
+    }
+
+    #[test]
+    fn a_terminal_endpoint_links_under_the_held_anchor_past_an_unstored_prompt_end() {
+        // Anchor A (a row, held) at 10 pages; the prompt-end Endpoint B shares A's
+        // page and is never stored; the terminal Endpoint C is 7 pages past A.
+        let mut core = store_core(64, 8, false);
+        let full = history(1200, 1);
+        store_anchor(&mut core, &full, 640, 1);
+        let anchor = full.key_at(640).unwrap();
+        let terminal = published_under(&full, 1098, &[642, 640], 0, 3);
+        assert_eq!(terminal.parent(), Some(full.key_at(642).unwrap()));
+        assert!(core.store(&terminal).unwrap());
+        let node = core.index.node(&terminal.key).unwrap();
+        assert_eq!(node.parent, Some(anchor));
+        assert_eq!(node.tail_pages, 7);
+        assert!(node.location.row.is_some());
+        let copied = queued_pages(&core, terminal.key);
+        assert_eq!(copied, (10..17).map(PageId).collect::<Vec<_>>());
+        // The Anchor was the lineage's first root; C is the one linked deeper than its
+        // nearest offered ancestor, and copied only its seven pages.
+        assert_eq!(core.stats().root_records[0], [1, 0]);
+        assert_eq!(core.stats().deeper_link_records[0], 1);
+        assert_eq!(core.stats().root_pages[0], [10, 0]);
+        assert_eq!(core.stats().deeper_link_pages[0], 7);
+        finish(&mut core);
+        // The chain restores whole: A's ten pages, then the seven.
+        let hit = core.lookup(&full, 0, u64::MAX).unwrap();
+        assert_eq!(hit.key, terminal.key);
+        assert_eq!(hit.pages, 17);
+    }
+
+    #[test]
+    fn root_copies_count_pages_by_whether_ancestors_were_offered() {
+        let mut core = store_core(64, 8, false);
+        let full = history(1200, 1);
+        let terminal = published_under(&full, 1098, &[642, 640], 0, 3);
+        assert!(core.store(&terminal).unwrap());
+        let node = core.index.node(&terminal.key).unwrap();
+        assert_eq!(node.parent, None);
+        assert_eq!(node.tail_pages, 17);
+        assert_eq!(
+            queued_pages(&core, terminal.key),
+            (0..17).map(PageId).collect::<Vec<_>>()
+        );
+        assert_eq!(core.stats().root_records[0], [0, 1]);
+        assert_eq!(core.stats().deeper_link_records[0], 0);
+        assert_eq!(core.stats().root_pages[0], [0, 17]);
+        assert_eq!(core.stats().deeper_link_pages[0], 0);
+        // Without any offered ancestor the reason is the first of its lineage.
+        let first = published(&full, 1200, None, 100, 4);
+        assert!(core.store(&first).unwrap());
+        assert_eq!(core.stats().root_records[0], [1, 1]);
+        assert_eq!(core.stats().deeper_link_records[0], 0);
+        assert_eq!(core.stats().root_pages[0], [18, 17]);
+        assert_eq!(core.stats().deeper_link_pages[0], 0);
+        // The offered ancestors are the hint a pool put carries for the root.
+        assert_eq!(
+            core.index.ancestor_keys(&terminal.key),
+            [full.key_at(642).unwrap(), full.key_at(640).unwrap()]
+        );
+    }
+
+    #[test]
+    fn the_deepest_held_ancestor_wins_over_a_shallower_one() {
+        let mut core = store_core(96, 8, false);
+        let full = history(1200, 1);
+        store_anchor(&mut core, &full, 320, 1);
+        let shallow = full.key_at(320).unwrap();
+        let deep = published_under(&full, 640, &[320], 0, 2);
+        assert!(core.store(&deep).unwrap());
+        finish(&mut core);
+        assert_eq!(core.index[&deep.key].parent, Some(shallow));
+        let terminal = published_under(&full, 1098, &[642, 640, 320], 0, 3);
+        assert!(core.store(&terminal).unwrap());
+        assert_eq!(core.index[&terminal.key].parent, Some(deep.key));
+        assert_eq!(core.index[&terminal.key].tail_pages, 7);
+        finish(&mut core);
+    }
+
+    #[test]
+    fn a_held_same_page_message_ahead_of_an_unheld_anchor_is_the_parent() {
+        // The Anchor X is not held. The Message M shares X's page, is held, and is
+        // nearer: M is the only held key.
+        let mut core = store_core(64, 8, false);
+        let full = history(1200, 1);
+        let mut message = published(&full, 330, None, 0, 1);
+        message.capture_role = crate::CaptureRole::Message;
+        assert!(core.store(&message).unwrap());
+        finish(&mut core);
+        let terminal = published_under(&full, 522, &[340, 330, 320], 0, 2);
+        assert!(core.store(&terminal).unwrap());
+        let node = core.index.node(&terminal.key).unwrap();
+        assert_eq!(node.parent, Some(message.key));
+        assert_eq!(node.tail_pages, 3);
+        assert_eq!(
+            queued_pages(&core, terminal.key),
+            (5..8).map(PageId).collect::<Vec<_>>()
+        );
+        finish(&mut core);
+    }
+
+    #[test]
+    fn a_publication_waits_for_the_first_known_ancestor_still_copying_out() {
+        // The nearest ancestor was never stored. The next copy-out is in flight and a
+        // deeper one is ready: the publication waits for the nearer one rather than
+        // copying pages the nearer one will hold.
+        let mut core = store_core(96, 8, false);
+        let full = history(1200, 1);
+        store_anchor(&mut core, &full, 320, 1);
+        let held = published_under(&full, 640, &[320], 0, 2);
+        assert!(core.store(&held).unwrap());
+        let terminal = published_under(&full, 1098, &[700, 640, 320], 0, 3);
+        assert!(core.store(&terminal).unwrap());
+        assert!(!core.index.contains(&terminal.key));
+        assert_eq!(core.deferred.len(), 1);
+        assert_eq!(core.deferred[0].0, held.key);
+        finish(&mut core);
+        let node = core.index.node(&terminal.key).unwrap();
+        assert_eq!(node.parent, Some(held.key));
+        assert_eq!(node.tail_pages, 7);
+        assert!(core.deferred.is_empty());
+        finish(&mut core);
+    }
+
+    #[test]
+    fn a_failed_copy_defers_its_child_until_the_next_ancestor_is_ready() {
+        let mut core = store_core(96, 8, false);
+        let full = history(1200, 1);
+        let near = published_under(&full, 640, &[], 0, 1);
+        let far = published_under(&full, 320, &[], 100, 2);
+        assert!(core.store(&far).unwrap());
+        assert!(core.store(&near).unwrap());
+        let terminal = published_under(&full, 1098, &[640, 320], 0, 3);
+        assert!(core.store(&terminal).unwrap());
+        assert_eq!(core.deferred[0].0, near.key);
+        // The nearer copy-out fails while the farther is still in flight.
+        let mut submitted = Vec::new();
+        pump_into(&mut core, &mut submitted);
+        let (failing, running): (Vec<_>, Vec<_>) = submitted
+            .iter()
+            .partition(|job| job.pages.first().map(|(page, _)| *page) == Some(PageId(0)));
+        let mut events = Vec::new();
+        for job in &failing {
+            core.absorb(reply(job, Err(invalid("copy engine fault"))));
+        }
+        core.settle(&mut events);
+        assert!(!core.index.contains(&near.key));
+        // It waits on the farther ancestor, which is still copying out.
+        assert_eq!(core.deferred.len(), 1);
+        assert_eq!(core.deferred[0].0, far.key);
+        assert!(!core.index.contains(&terminal.key));
+        for job in &running {
+            core.absorb(reply(job, Ok(())));
+        }
+        core.settle(&mut events);
+        finish(&mut core);
+        let node = core.index.node(&terminal.key).unwrap();
+        assert_eq!(node.parent, Some(far.key));
+        assert_eq!(node.tail_pages, 12);
+    }
+
+    /// An Endpoint that shares its page with a held Anchor keeps no row of its own:
+    /// the Anchor's row and an in-page replay restore it. That holds only when the
+    /// record is stored under the Anchor, so the row and the parent must agree.
+    fn assert_row_follows_parent(core: &Core, key: PrefixKey, anchor: PrefixKey) {
+        let node = core.index.node(&key).expect("the endpoint is stored");
+        if !node.row {
+            assert_eq!(
+                node.parent,
+                Some(anchor),
+                "an endpoint without a row must hang under the row that covers it"
+            );
+            assert!(core.index.covered_endpoint(
+                key,
+                node.parent,
+                crate::CaptureRole::Endpoint,
+                node.children(),
+                |n| n.ready
+            ));
+        }
+    }
+
+    #[test]
+    fn store_links_a_covered_endpoint_to_its_covering_row() {
+        let full = history(1200, 1);
+        // The Anchor at 640 tokens holds a row; the unstored prompt-end sits at 642 and
+        // the terminal Endpoint at 650 shares their page, so the Anchor covers it.
+        let covered = published_under(&full, 650, &[642, 640], 0, 3);
+        let anchor = full.key_at(640).unwrap();
+
+        let mut core = store_core(64, 8, false);
+        store_anchor(&mut core, &full, 640, 1);
+        assert!(core.store(&covered).unwrap());
+        assert!(!core.index[&covered.key].row);
+        assert_row_follows_parent(&core, covered.key, anchor);
+        finish(&mut core);
+    }
+
+    #[test]
+    fn deferred_retry_links_a_covered_endpoint_to_its_covering_row() {
+        let full = history(1200, 1);
+        let covered = published_under(&full, 650, &[642, 640], 0, 3);
+        let anchor = full.key_at(640).unwrap();
+        let mut core = store_core(64, 8, false);
+        let mut first = published(&full, 640, None, 0, 1);
+        first.capture_role = crate::CaptureRole::Anchor;
+        assert!(core.store(&first).unwrap());
+        assert!(core.store(&covered).unwrap());
+        assert_eq!(core.deferred.len(), 1);
+        finish(&mut core);
+        assert!(!core.index[&covered.key].row);
+        assert_row_follows_parent(&core, covered.key, anchor);
+    }
+
+    #[test]
+    fn preflight_links_a_covered_endpoint_to_its_covering_row() {
+        let full = history(1200, 1);
+        let covered = published_under(&full, 650, &[642, 640], 0, 3);
+        let anchor = full.key_at(640).unwrap();
+        let geometry = [geometry(PT, &[("kv", PAGE)], ROW)];
+        let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, host_pool(64), copier).unwrap();
+        let mut first = published(&full, 640, None, 0, 1);
+        first.capture_role = crate::CaptureRole::Anchor;
+        assert_eq!(store.store(&first).unwrap(), StoreOutcome::Queued);
+        settle_store(&mut store);
+        assert_eq!(store.store(&covered).unwrap(), StoreOutcome::Queued);
+        assert!(!store.core.index[&covered.key].row);
+        assert_row_follows_parent(&store.core, covered.key, anchor);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn terminal_anchor_and_branch_restore_exact_bytes() {
+        // Two ranks, each with its own planes and row share.
+        let geometry = [
+            geometry(PT, &[("kv", PAGE)], ROW),
+            geometry(PT, &[("kv", PAGE)], ROW),
+        ];
+        let layout = Layout::new(&geometry).unwrap();
+        let (page_bytes, row_bytes) = (
+            layout.page_record_bytes as usize,
+            layout.row_record_bytes as usize,
+        );
+        let (copier, gpu) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let intake = crate::offload::intake_slots(&layout, 1);
+        let pool = SlabPool::new(page_bytes as u64, 64 + intake, intake).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
+        let page = |index: u32| -> Vec<u8> {
+            (0..page_bytes)
+                .map(|byte| (index as usize * 29 + byte / PAGE as usize * 71 + byte % 251) as u8)
+                .collect()
+        };
+        let row = |slot: u32| -> Vec<u8> {
+            (0..row_bytes)
+                .map(|byte| (slot as usize * 17 + byte / ROW as usize * 91 + byte % 251) as u8)
+                .collect()
+        };
+        for index in 0..17 {
+            gpu.pages.lock().unwrap().insert(index, page(index));
+        }
+        gpu.rows.lock().unwrap().insert(1, row(1));
+        gpu.rows.lock().unwrap().insert(3, row(3));
+        let full = history(1200, 1);
+        let mut anchor = published(&full, 640, None, 0, 1);
+        anchor.capture_role = crate::CaptureRole::Anchor;
+        // The prompt-end shares the Anchor's page and is never stored.
+        let terminal = published_under(&full, 1098, &[642, 640], 0, 3);
+        assert_eq!(store.store(&anchor).unwrap(), StoreOutcome::Queued);
+        settle_store(&mut store);
+        assert_eq!(store.store(&terminal).unwrap(), StoreOutcome::Queued);
+        settle_store(&mut store);
+        assert_eq!(
+            store.core.index[&terminal.key].parent,
+            Some(anchor.key),
+            "the terminal links under the Anchor"
+        );
+
+        let mut branch = history(640, 1);
+        branch.append(&[99; 300], &[]).unwrap();
+        let mut scratch = 100u32;
+        for (history, key, pages, slot) in [
+            (history(1098, 1), terminal.key, 17u32, 3u32),
+            (history(640, 1), anchor.key, 10, 1),
+            (branch, anchor.key, 10, 1),
+        ] {
+            let hit = store.lookup(&history, 0, u64::MAX).unwrap();
+            assert_eq!((hit.key, hit.pages), (key, pages as usize));
+            store
+                .fetch(
+                    hit,
+                    InboundTicket {
+                        key,
+                        pages: (scratch..scratch + pages).map(PageId).collect(),
+                        slot: StateSlotId(scratch),
+                    },
+                )
+                .unwrap();
+            crate::testing::poll_until(&mut store, Instant::now() + Duration::from_secs(20), |event| {
+                matches!(event, StoreEvent::Fetched { result: Ok(_), .. })
+            });
+            for index in 0..pages {
+                assert_eq!(
+                    gpu.pages.lock().unwrap()[&(scratch + index)],
+                    page(index),
+                    "page {index} of the restore of {key:?}"
+                );
+            }
+            assert_eq!(gpu.rows.lock().unwrap()[&scratch], row(slot));
+            scratch += 100;
+        }
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn the_preflight_sizes_a_record_under_the_ancestor_the_store_will_choose() {
+        // The chain is too large to hold as a root, but the Anchor holds its first two
+        // pages, so the record is stored under it. The preflight must not call it
+        // oversize because it priced the whole chain.
+        let geometry = [geometry(PT, &[("kv", PAGE)], ROW)];
+        let (copier, _) = crate::testing::SimulatedGpu::shared_mapped(&geometry).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, host_pool(12), copier).unwrap();
+        let full = history(1200, 1);
+        let mut anchor = published(&full, 128, None, 0, 1);
+        anchor.capture_role = crate::CaptureRole::Anchor;
+        assert_eq!(store.store(&anchor).unwrap(), StoreOutcome::Queued);
+        settle_store(&mut store);
+        // 12 pages and a row cannot be a root in 12 slots; 10 pages and a row can.
+        let terminal = published_under(&full, 12 * PT + 5, &[130, 128], 0, 2);
+        assert_ne!(store.store(&terminal).unwrap(), StoreOutcome::Oversize);
+        store.close().unwrap();
     }
 
     #[test]
@@ -3016,13 +3467,15 @@ mod tests {
 
         // A child record under flat links is a root holding only its tail.
         let child = published(&full, 400, Some(200), 10, 2);
+        let parent = child.parent().unwrap();
+        let tail = child.tail_below(&parent, PT).unwrap();
         assert!(
-            core.store_record(&child, child.parent, child.tail(), false)
+            core.store_record(&child, Some(parent), tail, false)
                 .unwrap()
         );
         assert!(
             !core
-                .store_record(&child, child.parent, child.tail(), false)
+                .store_record(&child, Some(parent), tail, false)
                 .unwrap()
         );
         let node = core.index.node(&child.key).unwrap();

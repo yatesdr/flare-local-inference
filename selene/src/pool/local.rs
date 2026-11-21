@@ -102,8 +102,8 @@ impl crate::store::TierStore for Tiers {
             tiers.set_spill(enabled);
         }
     }
-    fn retirement_predecessor(&self, key: PrefixKey) -> Option<crate::Retiring> {
-        self.0.as_ref()?.retirement_predecessor(key)
+    fn retirement_predecessor(&self, key: PrefixKey, candidates: bool) -> Option<crate::Retiring> {
+        self.0.as_ref()?.retirement_predecessor(key, candidates)
     }
     fn take_retiring(&mut self) -> Vec<crate::Retiring> {
         self.0

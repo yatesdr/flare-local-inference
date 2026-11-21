@@ -599,7 +599,11 @@ impl Engine {
         }
         let put = self.writer.puts.remove(&id).expect("present");
         let outcome = if let Some(bytes) = put.stored {
-            PutOutcome::Stored { bytes }
+            PutOutcome::Stored {
+                bytes,
+                pages: put.chain_pages - put.first_page,
+                linked: put.parent,
+            }
         } else if let Some(outcome) = put.refused {
             outcome
         } else if put.cancelled {

@@ -146,6 +146,11 @@ pub enum PutOutcome {
     /// Committed and indexed in the manager's store.
     Stored {
         bytes: u64,
+        /// Pages this put carried: the chain minus those of the record the
+        /// manager linked it under.
+        pages: u64,
+        /// The record the manager linked the put under, if any.
+        linked: Option<PrefixKey>,
     },
     /// Already stored there: a successful deduplication, nothing moved.
     Present,
